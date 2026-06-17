@@ -1,0 +1,864 @@
+"""Contact-keyed Codex sessions.
+
+One :class:`ContactSession` per remote party, spanning every channel
+(email + SMS + iMessage + voice) — the same person texting and then
+emailing lands in the same Codex conversation. Each session owns
+one ``CodexAppServerClient`` (a dedicated Codex app-server subprocess) and a
+serial turn queue; Codex session ids are persisted so conversations
+survive bridge restarts.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, Optional
+
+try:
+    from .codex_client import CodexAppServerClient
+    from .config import BridgeConfig
+    from .escalation import (
+        PendingInteraction,
+        format_codex_approval_request,
+        format_poll,
+        parse_permission_reply,
+        parse_poll_reply,
+    )
+    from .prompts import build_channel_prompt, frame_inbound
+except ImportError:  # pragma: no cover - direct local import/test fallback
+    from codex_client import CodexAppServerClient
+    from config import BridgeConfig
+    from escalation import (
+        PendingInteraction,
+        format_codex_approval_request,
+        format_poll,
+        parse_permission_reply,
+        parse_poll_reply,
+    )
+    from prompts import build_channel_prompt, frame_inbound
+
+logger = logging.getLogger(__name__)
+
+# gateway.send_to_contact(chat_id, text, mode, meta) signature.
+SendFn = Callable[[str, str, str, Dict[str, Any]], Awaitable[Any]]
+# gateway.send_typing(chat_id, mode, meta) signature.
+TypingFn = Callable[[str, str, Dict[str, Any]], Awaitable[Any]]
+# gateway.health_report() signature.
+HealthFn = Callable[[], Awaitable[str]]
+
+# iMessage typing bubbles expire after a few seconds, so we refresh the
+# indicator on this cadence for as long as a turn is running.
+TYPING_REFRESH_SECONDS = 4.0
+
+
+@dataclass
+class _Turn:
+    """One unit of work for a session's single Codex client.
+
+    Everything that drives a turn — inbound messages and capture turns alike —
+    goes through one queue and one worker, so two turns can never hit the
+    subprocess at once. A normal turn (``future is None``) sends its reply on
+    the channel the human last used. A capture turn (``future`` set) hands the
+    reply text back to the awaiting caller instead and never auto-replies —
+    used by voice consults, post-call actions, and delivery-failure notices.
+    """
+
+    text: str
+    future: Optional["asyncio.Future[str]"] = None
+    # True for a one-shot turn spawned to recover from a rejected reply send.
+    # A recovery turn that itself fails to send is not recovered again (no loop).
+    recovery: bool = False
+
+# Leading slash-commands the human can text to steer the conversation itself.
+# The bridge acts on these locally — they never reach Codex as a turn.
+RESET_COMMANDS = frozenset({"/clear", "/new"})  # start a fresh conversation
+STOP_COMMANDS = frozenset({"/stop", "/cancel"})  # abort whatever's in flight
+RESUME_COMMANDS = frozenset({"/resume"})        # pick a past session to reopen
+STATUS_COMMANDS = frozenset({"/status"})        # report what the bridge is doing
+USAGE_COMMANDS = frozenset({"/usage"})          # report Codex usage this convo
+HEALTH_COMMANDS = frozenset({"/health"})        # probe Inkbox + Codex reachability
+
+# How many recent sessions to offer when the human texts /resume.
+RESUME_LIST_LIMIT = 5
+
+
+def _control_command(text: str) -> Optional[str]:
+    """Classify a message as a bridge control command, if it is one.
+
+    Args:
+        text (str): The raw inbound message text.
+
+    Returns:
+        Optional[str]: "reset", "stop", "resume", "status", "usage", or "health"
+            when the whole message is exactly that command, else None (forwarded).
+    """
+    token = text.strip().lower()
+    if token in RESET_COMMANDS:
+        return "reset"
+    if token in STOP_COMMANDS:
+        return "stop"
+    if token in RESUME_COMMANDS:
+        return "resume"
+    if token in STATUS_COMMANDS:
+        return "status"
+    if token in USAGE_COMMANDS:
+        return "usage"
+    if token in HEALTH_COMMANDS:
+        return "health"
+    return None
+
+
+def _send_error_reason(exc: Exception) -> str:
+    """Pull a human reason out of a send exception.
+
+    Inkbox API errors carry a ``detail`` dict whose ``message`` is already a
+    clear, actionable sentence (e.g. the spam-filter rejection). Fall back to
+    the string form for anything else.
+
+    Args:
+        exc (Exception): The exception raised by the send.
+
+    Returns:
+        str: A human-readable failure reason.
+    """
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict):
+        message = detail.get("message") or detail.get("error")
+        if message:
+            return str(message)
+    return str(exc)
+
+
+def _send_rejected_prompt(reply: str, reason: str) -> str:
+    """Build the recovery prompt for a reply the provider rejected at send time.
+
+    Args:
+        reply (str): The text that was blocked.
+        reason (str): Why the send was rejected.
+
+    Returns:
+        str: A prompt telling Codex to rephrase or switch channels.
+    """
+    return "\n".join([
+        "[reply rejected] Your last reply was NOT delivered — the messaging "
+        "provider rejected it before sending.",
+        f"Reason: {reason}",
+        "",
+        f'Your blocked reply was:\n"{reply}"',
+        "",
+        "Recover now: rephrase to avoid whatever was flagged (e.g. drop the "
+        "restricted content), or send it over a different channel with your "
+        "Inkbox tools — iMessage isn't subject to carrier SMS content filtering. "
+        "Send the recovered version now.",
+    ])
+
+
+def _codex_home() -> Path:
+    return Path(os.getenv("CODEX_HOME") or (Path.home() / ".codex"))
+
+
+def _clean_summary(text: str) -> str:
+    # Drop the leading channel tag the bridge prepends ("[iMessage from ...]").
+    text = text.strip()
+    if text.startswith("["):
+        end = text.find("]")
+        if end != -1:
+            text = text[end + 1:].strip()
+    # Collapse whitespace and keep it short enough for a text message.
+    return " ".join(text.split())[:80]
+
+
+def _parse_updated_at(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def list_recent_sessions(
+    project_dir: Optional[str],
+    limit: int = RESUME_LIST_LIMIT,
+    exclude_id: Optional[str] = None,
+) -> list[Dict[str, Any]]:
+    """List a project's most recent Codex sessions, newest first.
+
+    Args:
+        project_dir (Optional[str]): Project working directory.
+        limit (int): Max sessions to return.
+        exclude_id (Optional[str]): Session id to omit (e.g. the live one).
+
+    Returns:
+        list[Dict[str, Any]]: Digests {id, summary, mtime}, newest first.
+    """
+    del project_dir  # Codex's session index is global; thread cwd is not stored here.
+    index_path = _codex_home() / "session_index.jsonl"
+    if not index_path.exists():
+        return []
+    out: list[Dict[str, Any]] = []
+    try:
+        rows = index_path.read_text().splitlines()
+    except OSError:
+        return []
+    for raw in reversed(rows):
+        try:
+            entry = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        session_id = str(entry.get("id") or "")
+        if not session_id or session_id == exclude_id:
+            continue
+        summary = _clean_summary(str(entry.get("thread_name") or "")) or "(no summary)"
+        out.append({
+            "id": session_id,
+            "summary": summary,
+            "mtime": _parse_updated_at(entry.get("updated_at")),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _format_resume_list(sessions: list[Dict[str, Any]]) -> str:
+    # A numbered, one-line-each menu sized for a text message.
+    lines = ["Recent conversations — reply with a number to resume:"]
+    for i, s in enumerate(sessions, 1):
+        when = datetime.fromtimestamp(s["mtime"]).strftime("%b %d %H:%M")
+        lines.append(f"{i}. ({when}) {s['summary']}")
+    return "\n".join(lines)
+
+
+def _parse_index(reply: str, count: int) -> Optional[int]:
+    # Pull the first integer out of the reply ("2", "#2", "option 2").
+    match = re.search(r"\d+", reply or "")
+    if not match:
+        return None
+    choice = int(match.group())
+    return choice - 1 if 1 <= choice <= count else None
+
+
+def _answer_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def _codex_decision(decision: Optional[str]) -> str:
+    if decision == "always":
+        return "acceptForSession"
+    if decision == "allow":
+        return "accept"
+    return "decline"
+
+
+def _state_path() -> Path:
+    root = Path(os.getenv("INKBOX_CODEX_HOME") or Path.home() / ".inkbox-codex")
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "sessions.json"
+
+
+class ContactSession:
+    """One Codex conversation bound to one remote human."""
+
+    def __init__(
+        self,
+        chat_id: str,
+        cfg: BridgeConfig,
+        send_fn: SendFn,
+        mcp_server_config: Dict[str, Any],
+        identity_info: Dict[str, str],
+        resume_session_id: Optional[str] = None,
+        on_session_id: Optional[Callable[[str, str], None]] = None,
+        on_clear: Optional[Callable[[str], None]] = None,
+        typing_fn: Optional[TypingFn] = None,
+        health_fn: Optional[HealthFn] = None,
+    ):
+        self.chat_id = chat_id
+        self.cfg = cfg
+        self.send_fn = send_fn
+        self.typing_fn = typing_fn
+        self.health_fn = health_fn
+        self.mcp_server_config = dict(mcp_server_config or {})
+        self.identity_info = identity_info
+        self.resume_session_id = resume_session_id
+        self.on_session_id = on_session_id
+        self.on_clear = on_clear
+
+        self.mode = "email"  # last inbound modality; selects the reply channel
+        self.reply_meta: Dict[str, Any] = {}
+        self.pending: Optional[PendingInteraction] = None
+        self.always_allowed: set[str] = set()
+
+        self._client: Optional[CodexAppServerClient] = None
+        self._queue: asyncio.Queue[_Turn] = asyncio.Queue()
+        self._worker: Optional[asyncio.Task] = None
+        self._resume_task: Optional[asyncio.Task] = None  # /resume pick in flight
+        self._turn_active = False     # a Codex turn is mid-flight
+        self._interrupting = False    # a new message asked us to abort it
+        self._current_turn: Optional[_Turn] = None  # the turn the worker is running
+
+    # ------------------------------------------------------------------
+    # Inbound routing
+    # ------------------------------------------------------------------
+
+    async def handle_inbound(self, text: str, mode: str, meta: Dict[str, Any]) -> None:
+        """Route one inbound message: answer a pending escalation, or queue a turn.
+
+        Args:
+            text (str): The human's message text.
+            mode (str): Channel it arrived on (email/sms/imessage/voice).
+            meta (dict): Reply-routing metadata (conversation ids, subject, ...).
+
+        Returns:
+            None
+        """
+        self.mode = mode
+        self.reply_meta = dict(meta or {})
+
+        # Bridge control commands (/clear, /new, /stop) steer the conversation
+        # itself — handle them here instead of forwarding them to Codex.
+        command = _control_command(text)
+        if command == "reset":
+            await self._reset_session()
+            return
+        if command == "stop":
+            await self._stop_turn()
+            return
+        if command == "resume":
+            await self._begin_resume()
+            return
+        # /status and /usage just report back — they don't disturb a running turn.
+        if command == "status":
+            await self._report_status()
+            return
+        if command == "usage":
+            await self._report_usage()
+            return
+        if command == "health":
+            await self._report_health()
+            return
+
+        # A reply while an escalation is outstanding answers the escalation —
+        # it does not start a new agent turn.
+        if self.pending is not None and not self.pending.future.done():
+            logger.info("[session %s] reply consumed by pending %s", self.chat_id, self.pending.kind)
+            self.pending.future.set_result(text)
+            return
+
+        # Tag the message with its channel + sender so Codex knows where it
+        # is and who it's talking to (the static system prompt can't).
+        await self._queue.put(_Turn(text=frame_inbound(mode, meta, text)))
+
+        # Texting again while Codex is mid-turn behaves like hitting Esc and
+        # typing a new message: interrupt the running turn so the worker drops
+        # to this fresh message instead of making the human wait it out. Only
+        # interrupt a normal turn — a capture turn (voice consult, post-call,
+        # delivery-failure recovery) runs to completion and this message just
+        # queues behind it.
+        running_normal = self._current_turn is not None and self._current_turn.future is None
+        if self._turn_active and self._client is not None and running_normal:
+            logger.info("[session %s] new message interrupts the running turn", self.chat_id)
+            self._interrupting = True
+            try:
+                await self._client.interrupt()
+            except Exception:
+                logger.debug("[session %s] interrupt failed", self.chat_id, exc_info=True)
+
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+
+    async def _drain(self) -> None:
+        while not self._queue.empty():
+            turn = await self._queue.get()
+            try:
+                await self._run_turn(turn)
+            except Exception:
+                # An interrupt aborts the turn on purpose — the next queued
+                # message takes over, so it is not an error to report.
+                if self._interrupting:
+                    logger.info("[session %s] turn interrupted by a new message", self.chat_id)
+                    continue
+                logger.exception("[session %s] turn failed", self.chat_id)
+                try:
+                    await self._reply(
+                        "Sorry — I hit an error while working on that and had to stop. "
+                        "Try sending it again."
+                    )
+                except Exception:
+                    logger.exception("[session %s] could not send the error notice", self.chat_id)
+
+    # ------------------------------------------------------------------
+    # Control commands (/clear, /new, /stop)
+    # ------------------------------------------------------------------
+
+    async def _reset_session(self) -> None:
+        """Start a fresh conversation: drop the resumed Codex session id and
+        tear down the client so the next turn opens a brand-new session.
+
+        Returns:
+            None
+        """
+        await self._abort_in_flight()
+        # Forget the resumed conversation everywhere — in memory, the live
+        # client, the persisted map, and any session-scoped tool grants.
+        self.resume_session_id = None
+        await self.close()
+        if self.on_clear is not None:
+            self.on_clear(self.chat_id)
+        self.always_allowed.clear()
+        await self._reply("Started a fresh conversation — previous context cleared.")
+
+    async def _stop_turn(self) -> None:
+        """Interrupt the running turn (if any) and drop anything queued,
+        keeping the conversation context intact.
+
+        Returns:
+            None
+        """
+        had_work = (
+            self._turn_active or self.pending is not None or not self._queue.empty()
+        )
+        await self._abort_in_flight()
+        await self._reply("Stopped." if had_work else "Nothing to stop — I'm idle.")
+
+    async def _abort_in_flight(self) -> None:
+        """Cancel whatever the session is currently doing: a parked
+        escalation, a running turn, and any queued-but-unstarted messages.
+
+        Returns:
+            None
+        """
+        # Unblock a parked permission/poll so its turn can unwind (None reads
+        # as "no answer" — the same as a timeout).
+        if self.pending is not None and not self.pending.future.done():
+            self.pending.future.set_result(None)
+            self.pending = None
+        # Interrupt a turn that's actively running, like pressing Esc.
+        if self._turn_active and self._client is not None:
+            self._interrupting = True
+            try:
+                await self._client.interrupt()
+            except Exception:
+                logger.debug("[session %s] interrupt failed", self.chat_id, exc_info=True)
+        # Discard messages queued but not yet started. Settle any capture-turn
+        # futures (consult / post-call / failure recovery) so their awaiters
+        # don't hang waiting on work we just dropped.
+        while not self._queue.empty():
+            try:
+                turn = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if turn.future is not None and not turn.future.done():
+                turn.future.set_result("")
+
+    async def _begin_resume(self) -> None:
+        """List recent sessions and let the human pick one to reopen.
+
+        Returns:
+            None
+        """
+        sessions = list_recent_sessions(
+            self.cfg.project_dir, exclude_id=self.resume_session_id
+        )
+        if not sessions:
+            await self._reply("No other recent conversations to resume.")
+            return
+        # Run the numbered pick in the background so the inbound webhook can
+        # return promptly while we wait (up to the escalation timeout) for the
+        # human's choice. Keep a reference so the task isn't GC'd.
+        self._resume_task = asyncio.create_task(self._run_resume_pick(sessions))
+
+    async def _run_resume_pick(self, sessions: list[Dict[str, Any]]) -> None:
+        try:
+            reply = await self._escalate("resume", _format_resume_list(sessions))
+            if reply is None:
+                await self._reply("No pick — staying in the current conversation.")
+                return
+            index = _parse_index(reply, len(sessions))
+            if index is None:
+                await self._reply(
+                    f"Didn't catch a number from 1-{len(sessions)} — staying put. "
+                    "Send /resume to try again."
+                )
+                return
+            chosen = sessions[index]
+            # Swap in the chosen session and tear down the client so the next
+            # turn continues it; persist it so it survives bridge restarts.
+            await self.close()
+            self.resume_session_id = chosen["id"]
+            if self.on_session_id is not None:
+                self.on_session_id(self.chat_id, chosen["id"])
+            self.always_allowed.clear()
+            await self._reply(f"Resumed: {chosen['summary']}")
+        except Exception:
+            logger.exception("[session %s] resume pick failed", self.chat_id)
+
+    # ------------------------------------------------------------------
+    # Status / usage reports (/status, /usage)
+    # ------------------------------------------------------------------
+
+    async def _report_status(self) -> None:
+        """Text back what the bridge is doing for this contact right now.
+
+        Returns:
+            None
+        """
+        if self._turn_active:
+            state = "I'm working on your last message right now."
+        elif self.pending is not None and not self.pending.future.done():
+            state = f"I'm waiting on your reply to a {self.pending.kind}."
+        elif not self._queue.empty():
+            state = "I'm about to start on your message."
+        else:
+            state = "I'm idle and ready for your next message."
+        convo = "an ongoing conversation" if self.resume_session_id else "a fresh conversation"
+        await self._reply(f"{state} We're in {convo}.")
+
+    async def _report_usage(self) -> None:
+        """Text back Codex subscription usage, mirroring Codex's /usage.
+
+        Returns:
+            None
+        """
+        try:
+            from .codex_usage import usage_report
+        except ImportError:  # pragma: no cover - direct local import/test fallback
+            from codex_usage import usage_report
+        await self._reply(usage_report())
+
+    async def _report_health(self) -> None:
+        """Text back Inkbox + Codex reachability (the gateway probes it).
+
+        Returns:
+            None
+        """
+        if self.health_fn is None:
+            await self._reply("Health check unavailable.")
+            return
+        await self._reply(await self.health_fn())
+
+    # ------------------------------------------------------------------
+    # Codex turn
+    # ------------------------------------------------------------------
+
+    async def _run_turn(self, turn: _Turn) -> None:
+        self._interrupting = False  # fresh turn starts un-interrupted
+        self._current_turn = turn
+        typing_task: Optional[asyncio.Task] = None
+        try:
+            client = await self._ensure_client()
+            # Keep a typing indicator alive on the human's channel for the whole
+            # turn, then always tear it down — even if the turn raises.
+            self._turn_active = True
+            typing_task = asyncio.create_task(self._typing_loop())
+            reply = (await client.run(turn.text)).strip()
+            if client.thread_id and self.on_session_id:
+                self.resume_session_id = client.thread_id
+                self.on_session_id(self.chat_id, client.thread_id)
+        except Exception as exc:
+            # A capture turn must always settle its waiter — surface the error
+            # there. A normal turn re-raises so _drain shows the human a notice.
+            if turn.future is not None and not turn.future.done():
+                turn.future.set_exception(exc)
+                return
+            raise
+        finally:
+            self._turn_active = False
+            self._current_turn = None
+            if typing_task is not None:
+                typing_task.cancel()
+                try:
+                    await typing_task
+                except asyncio.CancelledError:
+                    pass
+
+        # Route the result. Capture turns hand the text back to their waiter and
+        # never auto-reply (the caller speaks/queues/swallows it). Normal turns
+        # reply on the channel the human last used — unless a new message
+        # interrupted this one, in which case the partial answer is dropped.
+        if turn.future is not None:
+            if not turn.future.done():
+                turn.future.set_result(reply or "I finished that, but didn't have anything to say back.")
+            return
+        if self._interrupting:
+            return
+        if reply:
+            await self._deliver_reply(turn, reply)
+
+    async def _deliver_reply(self, turn: _Turn, reply: str) -> None:
+        """Send a normal turn's reply, recovering once if the send is rejected.
+
+        A synchronous send rejection (carrier spam filter, opt-out, invalid
+        recipient) comes back as an API error, not a webhook. Rather than
+        surfacing a generic failure, hand the reason back to Codex once so it
+        can rephrase or switch channels. A recovery turn that itself fails is
+        re-raised (the worker logs it) — never retried, so it can't loop.
+
+        Args:
+            turn (_Turn): The turn whose reply is being sent.
+            reply (str): Codex's reply text.
+
+        Returns:
+            None
+        """
+        try:
+            await self._reply(reply)
+        except Exception as exc:
+            reason = _send_error_reason(exc)
+            logger.warning("[session %s] reply send rejected: %s", self.chat_id, reason)
+            if turn.recovery:
+                raise  # already a recovery attempt — don't spawn another
+            await self._queue.put(
+                _Turn(text=_send_rejected_prompt(reply, reason), recovery=True)
+            )
+
+    async def run_consult(self, query: str) -> str:
+        """Run one Codex turn and RETURN its text (don't send it).
+
+        Used by the Realtime voice bridge, post-call actions, and delivery-
+        failure recovery: the caller wants Codex to act, then to receive the
+        reply text rather than have it auto-sent. Runs on the same resumed
+        session as this contact's texts, so it shares context across channels.
+
+        Goes through the session's single queue/worker like a normal turn, so it
+        can never run concurrently with one — it just carries a future the worker
+        resolves instead of replying on a channel.
+
+        Args:
+            query (str): Plain-English request for Codex.
+
+        Returns:
+            str: Codex's reply text, or a short fallback if it produced none.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        await self._queue.put(_Turn(text=query, future=future))
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+        return await future
+
+    async def _typing_loop(self) -> None:
+        """Refresh the channel's typing indicator until the turn ends.
+
+        Returns:
+            None: Runs until cancelled by :meth:`_run_turn`.
+        """
+        if self.typing_fn is None:
+            return
+        try:
+            while True:
+                # Only iMessage has a typing bubble; stay quiet while an
+                # escalation is parked waiting on the human to reply.
+                if self.mode == "imessage" and self.pending is None:
+                    try:
+                        await self.typing_fn(self.chat_id, self.mode, self.reply_meta)
+                    except Exception:
+                        logger.debug("[session %s] typing ping failed", self.chat_id, exc_info=True)
+                await asyncio.sleep(TYPING_REFRESH_SECONDS)
+        except asyncio.CancelledError:
+            return
+
+    async def _ensure_client(self) -> CodexAppServerClient:
+        if self._client is not None:
+            return self._client
+        developer_instructions = build_channel_prompt(
+            project_dir=self.cfg.project_dir,
+            identity_handle=self.identity_info.get("handle", ""),
+            email_address=self.identity_info.get("email", ""),
+            phone_number=self.identity_info.get("phone", ""),
+        )
+        self._client = CodexAppServerClient(
+            self.cfg,
+            developer_instructions=developer_instructions,
+            mcp_server_config=self.mcp_server_config,
+            approval_handler=self._handle_codex_request,
+        )
+        thread_id = await self._client.connect(self.resume_session_id or None)
+        if self.on_session_id:
+            self.resume_session_id = thread_id
+            self.on_session_id(self.chat_id, thread_id)
+        logger.info(
+            "[session %s] Codex session started (resume=%s)",
+            self.chat_id, self.resume_session_id or "fresh",
+        )
+        return self._client
+
+    # ------------------------------------------------------------------
+    # Escalation (app-server approvals + request_user_input polls)
+    # ------------------------------------------------------------------
+
+    async def _handle_codex_request(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        if method == "item/tool/requestUserInput":
+            questions = list(params.get("questions") or [])
+            reply = await self._escalate("poll", format_poll(questions), questions=questions)
+            answers = parse_poll_reply(reply or "", questions) if reply else {}
+            return {
+                "answers": {
+                    str(question.get("id") or question.get("question") or f"q{index}"): {
+                        "answers": _answer_list(answers.get(str(question.get("question") or ""), reply or ""))
+                    }
+                    for index, question in enumerate(questions)
+                }
+            }
+
+        if method == "mcpServer/elicitation/request":
+            message = str(params.get("message") or params.get("prompt") or "Codex needs your input.")
+            reply = await self._escalate("poll", message)
+            return {"action": "accept", "content": {"text": reply or ""}}
+
+        if method in {
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
+            "execCommandApproval",
+            "applyPatchApproval",
+        }:
+            reply = await self._escalate(
+                "permission",
+                format_codex_approval_request(method, params),
+                tool_name=method,
+            )
+            decision = parse_permission_reply(reply or "")
+            if method == "item/permissions/requestApproval":
+                if decision == "always":
+                    return {"permissions": params.get("permissions") or {}, "scope": "session"}
+                if decision == "allow":
+                    return {"permissions": params.get("permissions") or {}, "scope": "turn"}
+                return {"permissions": {}, "scope": "turn"}
+            if method in {"item/commandExecution/requestApproval", "execCommandApproval"}:
+                return {"decision": _codex_decision(decision)}
+            return {"decision": _codex_decision(decision)}
+
+        raise RuntimeError(f"unsupported Codex app-server request: {method}")
+
+    async def _escalate(
+        self,
+        kind: str,
+        prompt_text: str,
+        questions: Optional[list] = None,
+        tool_name: str = "",
+    ) -> Optional[str]:
+        """Send an escalation text and wait for the next inbound reply.
+
+        Args:
+            kind (str): "permission" or "poll".
+            prompt_text (str): Pre-formatted message for the human.
+            questions (Optional[list]): AskUserQuestion questions, for polls.
+            tool_name (str): Tool being gated, for permission requests.
+
+        Returns:
+            Optional[str]: The human's reply text, or None on timeout.
+        """
+        loop = asyncio.get_running_loop()
+        self.pending = PendingInteraction(
+            kind=kind,
+            prompt_text=prompt_text,
+            future=loop.create_future(),
+            questions=list(questions or []),
+            tool_name=tool_name,
+        )
+        await self._reply(prompt_text)
+        try:
+            return await asyncio.wait_for(
+                self.pending.future, timeout=self.cfg.permission_timeout_s
+            )
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self.pending = None
+
+    async def _reply(self, text: str) -> None:
+        await self.send_fn(self.chat_id, text, self.mode, self.reply_meta)
+
+    async def close(self) -> None:
+        if self._client is not None:
+            try:
+                await self._client.disconnect()
+            except Exception:
+                pass
+            self._client = None
+
+
+class SessionManager:
+    """Owns every ContactSession and the chat_id → codex session_id map."""
+
+    def __init__(
+        self,
+        cfg: BridgeConfig,
+        send_fn: SendFn,
+        mcp_server_config: Dict[str, Any],
+        identity_info: Dict[str, str],
+        typing_fn: Optional[TypingFn] = None,
+        health_fn: Optional[HealthFn] = None,
+    ):
+        self.cfg = cfg
+        self.send_fn = send_fn
+        self.typing_fn = typing_fn
+        self.health_fn = health_fn
+        self.mcp_server_config = dict(mcp_server_config or {})
+        self.identity_info = identity_info
+        self.sessions: Dict[str, ContactSession] = {}
+        self._session_ids: Dict[str, str] = self._load_state()
+
+    def _load_state(self) -> Dict[str, str]:
+        try:
+            return json.loads(_state_path().read_text())
+        except Exception:
+            return {}
+
+    def _persist(self) -> None:
+        try:
+            path = _state_path()
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._session_ids, indent=2) + "\n")
+            os.replace(tmp, path)
+        except Exception:
+            logger.exception("failed to persist session state")
+
+    def _save_session_id(self, chat_id: str, session_id: str) -> None:
+        self._session_ids[chat_id] = session_id
+        self._persist()
+
+    def _clear_state(self, chat_id: str) -> None:
+        """Forget a contact's persisted Codex session id (for /clear, /new)."""
+        if self._session_ids.pop(chat_id, None) is not None:
+            self._persist()
+
+    def get(self, chat_id: str) -> ContactSession:
+        """Fetch or lazily create the session for one remote party.
+
+        Args:
+            chat_id (str): Contact id, or raw address/number fallback.
+
+        Returns:
+            ContactSession: The (possibly new) session for that contact.
+        """
+        session = self.sessions.get(chat_id)
+        if session is None:
+            session = ContactSession(
+                chat_id=chat_id,
+                cfg=self.cfg,
+                send_fn=self.send_fn,
+                mcp_server_config=self.mcp_server_config,
+                identity_info=self.identity_info,
+                resume_session_id=self._session_ids.get(chat_id),
+                on_session_id=self._save_session_id,
+                on_clear=self._clear_state,
+                typing_fn=self.typing_fn,
+                health_fn=self.health_fn,
+            )
+            self.sessions[chat_id] = session
+        return session
+
+    async def close_all(self) -> None:
+        for session in self.sessions.values():
+            await session.close()

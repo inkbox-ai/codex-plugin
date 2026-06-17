@@ -1,0 +1,499 @@
+import asyncio
+import json
+from pathlib import Path
+
+from inkbox_codex.config import BridgeConfig
+from inkbox_codex.sessions import (
+    ContactSession,
+    _Turn,
+    _parse_index,
+    list_recent_sessions,
+)
+
+
+def make_session(sent, typing=None):
+    async def send_fn(chat_id, text, mode, meta):
+        sent.append((chat_id, text, mode, dict(meta)))
+
+    typing_fn = None
+    if typing is not None:
+        async def typing_fn(chat_id, mode, meta):  # noqa: F811
+            typing.append((chat_id, mode, dict(meta)))
+
+    cfg = BridgeConfig(permission_timeout_s=2.0, project_dir="/tmp")
+    return ContactSession(
+        chat_id="contact-1",
+        cfg=cfg,
+        send_fn=send_fn,
+        mcp_server_config={},
+        identity_info={"handle": "t", "email": "", "phone": ""},
+        typing_fn=typing_fn,
+    )
+
+
+def test_abort_settles_queued_capture_future():
+    # A consult/post-call/failure turn waiting in the queue must not hang when
+    # the session is aborted (/stop, /clear) — its future settles to "".
+    async def scenario():
+        session = make_session([])
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        await session._queue.put(_Turn(text="do work", future=fut))
+
+        await session._abort_in_flight()
+
+        assert fut.done()
+        assert fut.result() == ""
+        assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_new_message_does_not_interrupt_a_running_capture_turn():
+    # A capture turn (voice consult, post-call, failure recovery) runs to
+    # completion; a new inbound queues behind it instead of interrupting.
+    async def scenario():
+        session = make_session([])
+
+        class FakeClient:
+            def __init__(self):
+                self.interrupts = 0
+
+            async def interrupt(self):
+                self.interrupts += 1
+
+        fake = FakeClient()
+        session._client = fake
+        session._turn_active = True
+        # A capture turn is mid-flight (future set) — must NOT be interrupted.
+        session._current_turn = _Turn(text="consult", future=asyncio.get_running_loop().create_future())
+        session._worker = asyncio.create_task(asyncio.sleep(10))
+
+        await session.handle_inbound("hello while busy", "sms", {})
+
+        assert fake.interrupts == 0
+        assert session._interrupting is False
+        assert session._queue.get_nowait().text.endswith("hello while busy")
+        session._worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_rejected_reply_send_spawns_one_recovery_turn():
+    # A blocked outbound reply (e.g. carrier spam filter 422) must not surface a
+    # generic error — it queues a one-shot recovery turn with the real reason so
+    # Codex can rephrase or switch channels.
+    async def scenario():
+        session = make_session([])
+
+        class Blocked(Exception):
+            detail = {"error": "message_blocked_spam_filter", "rule": "crypto_content",
+                      "message": "Cryptocurrency price content is restricted."}
+
+        async def boom(_text):
+            raise Blocked()
+        session._reply = boom
+
+        # First (normal) turn's reply is rejected → one recovery turn queued.
+        await session._deliver_reply(_Turn(text="orig"), "Bitcoin: $63295")
+        assert session._queue.qsize() == 1
+        recovery = session._queue.get_nowait()
+        assert recovery.recovery is True
+        assert "Cryptocurrency price content is restricted." in recovery.text
+        assert "Bitcoin: $63295" in recovery.text
+
+        # A recovery turn that ALSO fails re-raises (no second recovery → no loop).
+        raised = False
+        try:
+            await session._deliver_reply(_Turn(text="retry", recovery=True), "Bitcoin: $1")
+        except Blocked:
+            raised = True
+        assert raised is True
+        assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_pending_escalation_consumes_next_inbound():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.mode = "sms"
+
+        task = asyncio.create_task(
+            session._escalate("permission", "ok to run tests?", tool_name="Bash")
+        )
+        await asyncio.sleep(0.05)  # escalation text goes out, future is pending
+        assert sent and sent[0][1] == "ok to run tests?"
+
+        # The human's reply answers the escalation instead of queueing a turn.
+        await session.handle_inbound("yes", "sms", {"conversation_id": "c1"})
+        assert await task == "yes"
+        assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_escalation_timeout_returns_none():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.cfg.permission_timeout_s = 0.05
+        result = await session._escalate("permission", "anyone there?")
+        assert result is None
+        assert session.pending is None
+
+    asyncio.run(scenario())
+
+
+def test_typing_loop_pings_imessage_only():
+    async def scenario():
+        typing = []
+        session = make_session([], typing)
+        session.mode = "imessage"
+        session.reply_meta = {"conversation_id": "c1"}
+
+        task = asyncio.create_task(session._typing_loop())
+        await asyncio.sleep(0.05)  # first tick fires immediately
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert typing and typing[0] == ("contact-1", "imessage", {"conversation_id": "c1"})
+
+    asyncio.run(scenario())
+
+
+def test_typing_loop_skips_non_imessage():
+    async def scenario():
+        typing = []
+        session = make_session([], typing)
+        session.mode = "sms"  # SMS has no typing indicator
+
+        task = asyncio.create_task(session._typing_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert typing == []
+
+    asyncio.run(scenario())
+
+
+def test_clear_command_starts_fresh_session():
+    async def scenario():
+        sent = []
+        cleared = []
+        session = make_session(sent)
+        session.on_clear = lambda chat_id: cleared.append(chat_id)
+        session.mode = "imessage"
+
+        class FakeClient:
+            def __init__(self):
+                self.disconnects = 0
+
+            async def disconnect(self):
+                self.disconnects += 1
+
+        fake = FakeClient()
+        session._client = fake
+        session.resume_session_id = "old-session"
+        session.always_allowed.add("Bash")
+
+        await session.handle_inbound("/clear", "imessage", {"conversation_id": "c1"})
+
+        # Resume id forgotten, client torn down, persisted state cleared.
+        assert session.resume_session_id is None
+        assert session._client is None
+        assert fake.disconnects == 1
+        assert cleared == ["contact-1"]
+        assert session.always_allowed == set()
+        # The command is confirmed and never queued as a Codex turn.
+        assert session._queue.empty()
+        assert "fresh conversation" in sent[-1][1].lower()
+
+    asyncio.run(scenario())
+
+
+def test_stop_command_interrupts_turn_without_clearing():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+
+        class FakeClient:
+            def __init__(self):
+                self.interrupts = 0
+
+            async def interrupt(self):
+                self.interrupts += 1
+
+        fake = FakeClient()
+        session._client = fake
+        session._turn_active = True
+        session.resume_session_id = "keep-me"
+        session._worker = asyncio.create_task(asyncio.sleep(10))
+
+        await session.handle_inbound("/stop", "imessage", {"conversation_id": "c1"})
+
+        assert fake.interrupts == 1
+        assert session._interrupting is True
+        # Context is preserved — /stop only halts the current work.
+        assert session.resume_session_id == "keep-me"
+        assert session._queue.empty()
+        assert sent[-1][1] == "Stopped."
+
+        session._worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_stop_command_when_idle():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        await session.handle_inbound("/stop", "sms", {"conversation_id": "c1"})
+        assert sent[-1][1] == "Nothing to stop — I'm idle."
+        assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_cancel_is_an_alias_for_stop():
+    from inkbox_codex.sessions import _control_command
+
+    assert _control_command("/cancel") == "stop"
+
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        await session.handle_inbound("/cancel", "sms", {"conversation_id": "c1"})
+        assert sent[-1][1] == "Nothing to stop — I'm idle."  # same behavior as /stop
+        assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_non_command_is_forwarded_as_a_turn():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        # A message that merely mentions a slash word is a normal turn.
+        await session.handle_inbound("please /clear the cache", "sms", {})
+        assert not session._queue.empty()
+        assert session._queue.get_nowait().text.endswith("please /clear the cache")
+        session._worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_status_command_reports_idle_without_queueing():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        await session.handle_inbound("/status", "imessage", {"conversation_id": "c1"})
+        # Reports state, starts no turn.
+        assert "idle" in sent[-1][1].lower()
+        assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_status_command_does_not_interrupt_a_running_turn():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+
+        class FakeClient:
+            def __init__(self):
+                self.interrupts = 0
+
+            async def interrupt(self):
+                self.interrupts += 1
+
+        fake = FakeClient()
+        session._client = fake
+        session._turn_active = True
+        session._worker = asyncio.create_task(asyncio.sleep(10))
+
+        await session.handle_inbound("/status", "imessage", {"conversation_id": "c1"})
+
+        # Read-only: it reports "working" and leaves the turn running.
+        assert fake.interrupts == 0
+        assert session._interrupting is False
+        assert "working" in sent[-1][1].lower()
+
+        session._worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_health_command_reports_gateway_health():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+
+        async def fake_health():
+            return "Inkbox: reachable as agent (iMessage)\nCodex: ready (subscription login)"
+
+        session.health_fn = fake_health
+        await session.handle_inbound("/health", "imessage", {"conversation_id": "c1"})
+        assert "Inkbox: reachable" in sent[-1][1]
+        assert "Codex: ready" in sent[-1][1]
+        assert session._queue.empty()  # report only, no Codex turn
+
+    asyncio.run(scenario())
+
+
+def test_usage_command_reports_codex_usage(monkeypatch):
+    # /usage delegates to codex_usage.usage_report (the real subscription fetch).
+    import inkbox_codex.codex_usage as cu
+
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        monkeypatch.setattr(cu, "usage_report", lambda: "Codex usage:\n5-hour session: 12% used")
+        await session.handle_inbound("/usage", "imessage", {"conversation_id": "c1"})
+        assert "5-hour session: 12% used" in sent[-1][1]
+        assert session._queue.empty()  # report only, no Codex turn
+
+    asyncio.run(scenario())
+
+
+def _write_session_index(base, specs):
+    """Write fake Codex session_index.jsonl rows.
+
+    Each spec is (id, thread_name, updated_at_iso).
+    """
+    base = Path(base)
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / "session_index.jsonl"
+    path.write_text("".join(json.dumps({
+        "id": session_id,
+        "thread_name": thread_name,
+        "updated_at": updated_at,
+    }) + "\n" for session_id, thread_name, updated_at in specs))
+    return path
+
+
+def test_list_recent_sessions_orders_excludes_and_summarizes(tmp_path, monkeypatch):
+    project = str(tmp_path / "proj")
+    base = tmp_path / "cfg"
+    monkeypatch.setenv("CODEX_HOME", str(base))
+
+    _write_session_index(
+        base,
+        [
+            ("ccc", "older one", "2026-06-16T10:00:00Z"),
+            ("aaa", "[iMessage from +1] fix the auth bug", "2026-06-16T11:00:00Z"),
+            ("bbb", "exclude me", "2026-06-16T12:00:00Z"),
+            ("ddd", "the real message", "2026-06-16T13:00:00Z"),
+        ],
+    )
+
+    out = list_recent_sessions(project, exclude_id="bbb")
+    # Newest first, excluded id dropped.
+    assert [s["id"] for s in out] == ["ddd", "aaa", "ccc"]
+    # Channel tag stripped.
+    assert out[1]["summary"] == "fix the auth bug"
+    assert out[0]["summary"] == "the real message"
+
+
+def test_parse_index():
+    assert _parse_index("2", 3) == 1
+    assert _parse_index("#3 please", 3) == 2
+    assert _parse_index("0", 3) is None
+    assert _parse_index("9", 3) is None
+    assert _parse_index("nope", 3) is None
+
+
+def test_resume_command_with_no_sessions(tmp_path, monkeypatch):
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.cfg.project_dir = str(tmp_path / "empty-proj")
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "cfg"))
+        await session.handle_inbound("/resume", "imessage", {"conversation_id": "c1"})
+        assert sent[-1][1] == "No other recent conversations to resume."
+        assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_resume_command_lists_then_swaps_on_pick(tmp_path, monkeypatch):
+    async def scenario():
+        project = str(tmp_path / "proj")
+        base = tmp_path / "cfg"
+        monkeypatch.setenv("CODEX_HOME", str(base))
+        _write_session_index(
+            base,
+            [
+                ("older", "the older conversation", "2026-06-16T10:00:00Z"),
+                ("newer", "the newer conversation", "2026-06-16T11:00:00Z"),
+            ],
+        )
+
+        sent = []
+        persisted = []
+        session = make_session(sent)
+        session.cfg.project_dir = project
+        session.on_session_id = lambda chat_id, sid: persisted.append((chat_id, sid))
+
+        class FakeClient:
+            async def disconnect(self):
+                pass
+
+        session._client = FakeClient()
+
+        # /resume sends the numbered menu and parks waiting for a pick.
+        await session.handle_inbound("/resume", "imessage", {"conversation_id": "c1"})
+        await asyncio.sleep(0.05)
+        assert "Recent conversations" in sent[-1][1]
+        assert session.pending is not None
+
+        # Picking #2 swaps in the older session and persists it.
+        await session.handle_inbound("2", "imessage", {"conversation_id": "c1"})
+        await asyncio.sleep(0.05)
+        assert session.resume_session_id == "older"
+        assert persisted == [("contact-1", "older")]
+        assert session._client is None
+        assert sent[-1][1] == "Resumed: the older conversation"
+
+    asyncio.run(scenario())
+
+
+def test_double_text_interrupts_running_turn():
+    async def scenario():
+        session = make_session([])
+
+        class FakeClient:
+            def __init__(self):
+                self.interrupts = 0
+
+            async def interrupt(self):
+                self.interrupts += 1
+
+        fake = FakeClient()
+        session._client = fake
+        session._turn_active = True
+        # A normal turn is mid-flight (future is None) — that's what makes a new
+        # message interrupt it. A capture turn would instead be left to finish.
+        session._current_turn = _Turn(text="previous message")
+        # Pretend a turn worker is already draining so handle_inbound doesn't
+        # spawn a real one (which would touch the fake client).
+        session._worker = asyncio.create_task(asyncio.sleep(10))
+
+        await session.handle_inbound("do this instead", "imessage", {"conversation_id": "c1"})
+
+        assert fake.interrupts == 1
+        assert session._interrupting is True
+        # The new (channel-tagged) message is queued for the worker to pick up.
+        assert session._queue.get_nowait().text.endswith("do this instead")
+
+        session._worker.cancel()
+
+    asyncio.run(scenario())
