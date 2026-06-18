@@ -1,5 +1,6 @@
 import asyncio
 import json
+import types
 
 from inkbox_codex import realtime
 from inkbox_codex.realtime import (
@@ -14,7 +15,9 @@ from inkbox_codex.realtime import (
     _BridgeState,
     _dispatch_post_call,
     _dispatch_tool_call,
+    _openai_to_inkbox_pump,
     _send_session_update,
+    build_realtime_greeting,
     build_realtime_instructions,
 )
 
@@ -63,6 +66,24 @@ def test_instructions_name_the_consult_tool_and_project():
     text = build_realtime_instructions(_meta())
     assert CONSULT_TOOL_NAME in text
     assert "/tmp/proj" in text
+
+
+def test_outbound_call_context_shapes_realtime_prompt_and_greeting():
+    meta = RealtimeCallMeta(
+        call_id="c1",
+        remote_phone_number="+15551234567",
+        project_dir="/tmp/proj",
+        outbound_purpose="tell them the deployment is fixed",
+        outbound_opening="Hi, this is Codex calling with the deployment update.",
+        outbound_context="Deployment failed twice before the final fix.",
+    )
+
+    text = build_realtime_instructions(meta)
+
+    assert "OUTBOUND call" in text
+    assert "tell them the deployment is fixed" in text
+    assert "Deployment failed twice before the final fix." in text
+    assert "Hi, this is Codex calling with the deployment update." in build_realtime_greeting(meta)
 
 
 def test_dispatch_consult_runs_agent_and_speaks_answer():
@@ -267,3 +288,76 @@ def test_post_call_dispatch_reflects_when_no_actions():
 
     asyncio.run(_dispatch_post_call(state, on_actions, on_ended))
     assert seen["transcript"] == [("agent", "bye")]
+
+
+class _FakeOpenAIWS:
+    """Async-iterates a fixed list of OpenAI frames as WS TEXT messages."""
+
+    def __init__(self, frames):
+        self._msgs = [
+            type("Msg", (), {"type": "TEXT", "data": json.dumps(f)})()
+            for f in frames
+        ]
+
+    def __aiter__(self):
+        async def gen():
+            for message in self._msgs:
+                yield message
+        return gen()
+
+
+def test_realtime_transcripts_are_mirrored_into_inkbox(monkeypatch):
+    monkeypatch.setattr(
+        realtime,
+        "aiohttp",
+        types.SimpleNamespace(
+            WSMsgType=types.SimpleNamespace(
+                TEXT="TEXT",
+                CLOSE="CLOSE",
+                CLOSED="CLOSED",
+                ERROR="ERROR",
+            )
+        ),
+    )
+    openai = _FakeOpenAIWS([
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "hey can you check the build",
+        },
+        {
+            "type": "response.output_audio_transcript.done",
+            "transcript": "sure, the build is green",
+        },
+    ])
+    ink = _FakeInkboxWS()
+    state = _BridgeState()
+    state.stream_id = "s1"
+
+    asyncio.run(_openai_to_inkbox_pump(
+        openai_ws=openai,
+        inkbox_ws=ink,
+        state=state,
+        config=RealtimeConfig(api_key="sk-x"),
+        meta=_meta(),
+        on_agent_consult=lambda _q, _t: (_ for _ in ()).throw(AssertionError("no consult")),
+    ))
+
+    transcripts = [frame for frame in ink.sent if frame.get("event") == "transcript"]
+    assert transcripts == [
+        {
+            "event": "transcript",
+            "party": "remote",
+            "text": "hey can you check the build",
+            "is_final": True,
+        },
+        {
+            "event": "transcript",
+            "party": "local",
+            "text": "sure, the build is green",
+            "is_final": True,
+        },
+    ]
+    assert state.transcript == [
+        ("caller", "hey can you check the build"),
+        ("agent", "sure, the build is green"),
+    ]

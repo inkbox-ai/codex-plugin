@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List
 
 from .realtime import (
@@ -17,6 +18,22 @@ INKBOX_WS_PATH = "/phone/media/ws"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8767
 DEFAULT_WEBHOOK_PATH = "/webhook"
+
+
+def call_contexts_dir() -> Path:
+    """Directory where ``inkbox_place_call`` stashes per-call context.
+
+    The tool process writes purpose/opening details here and the gateway reads
+    them when Inkbox connects back to the call-media WebSocket.
+
+    Returns:
+        Path: The created ``<home>/call_contexts`` directory.
+    """
+    root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
+    path = root / "call_contexts"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
 
 def env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)

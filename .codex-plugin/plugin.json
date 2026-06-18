@@ -1,6 +1,6 @@
 {
   "name": "codex-plugin",
-  "version": "0.1.0",
+  "version": "0.1.0+codex.20260618150542",
   "description": "Inkbox bridge for Codex over email, SMS, iMessage, and voice.",
   "author": {
     "name": "Inkbox AI",
@@ -10,14 +10,24 @@
   "homepage": "https://inkbox.ai",
   "repository": "https://github.com/inkbox-ai/codex-plugin",
   "license": "MIT",
-  "keywords": ["codex", "inkbox", "sms", "imessage", "voice"],
+  "keywords": [
+    "codex",
+    "inkbox",
+    "sms",
+    "imessage",
+    "voice"
+  ],
   "interface": {
     "displayName": "Codex Inkbox Bridge",
     "shortDescription": "Talk to Codex from email, SMS, iMessage, and calls.",
     "longDescription": "Give a Codex coding agent an Inkbox identity with a mailbox, phone number, iMessage, and voice-call bridge.",
     "developerName": "Inkbox AI",
     "category": "Productivity",
-    "capabilities": ["Interactive", "Write", "MCP"],
+    "capabilities": [
+      "Interactive",
+      "Write",
+      "MCP"
+    ],
     "websiteURL": "https://inkbox.ai",
     "defaultPrompt": [
       "Text Codex to inspect this repo and report status.",
