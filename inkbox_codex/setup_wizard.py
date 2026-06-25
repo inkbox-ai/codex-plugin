@@ -36,9 +36,9 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 
 # Packages the wizard itself needs to talk to Inkbox during setup. The
 # gateway's Codex CLI dependency is checked by doctor.
-INKBOX_REQUIREMENTS = ("inkbox>=0.4.9", "aiohttp>=3.9")
-# The wizard passes harness="codex" to Inkbox.signup, which needs SDK >= 0.4.9.
-MIN_INKBOX_VERSION = (0, 4, 9)
+INKBOX_REQUIREMENTS = ("inkbox>=0.4.10", "aiohttp>=3.9")
+# The wizard passes harness="codex" to Inkbox.signup, which needs SDK >= 0.4.10.
+MIN_INKBOX_VERSION = (0, 4, 10)
 _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
 
 # Bundled avatar attached to the agent's Inkbox contact card during setup.
