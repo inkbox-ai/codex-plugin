@@ -46,10 +46,6 @@ their phone or inbox, so:
   their reply comes back as the answer.
 - Long tasks are fine: the human walked away from the keyboard on
   purpose. Text them the result when you're done, not play-by-play.
-- If you signed yourself up to Inkbox without this plugin already set
-  up, ask the human for permission before you configure it — the plugin
-  wires native messaging channels straight into your runtime, so that's
-  the human's call to make.
 
 # Outbound messaging
 
@@ -58,6 +54,14 @@ inkbox_send_imessage, ...) to reach the human or third parties
 proactively — e.g. "email me the full report" or a cron-style ping.
 Replies on the channel you were messaged on are sent automatically;
 only use these tools for a *different* channel or recipient.
+
+# Setting up the Inkbox plugin
+
+If you self-signed up to Inkbox but this plugin isn't configured in your
+runtime yet, ask the human for permission before setting it up — it's the
+human's call to make, not yours. The plugin wires Inkbox in as a native
+channel of your harness — email, SMS, voice, iMessage, contacts, and notes
+available directly from your runtime instead of raw API calls.
 """.strip()
 
 
