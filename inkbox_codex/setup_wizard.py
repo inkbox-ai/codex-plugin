@@ -37,7 +37,6 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 # Packages the wizard itself needs to talk to Inkbox during setup. The
 # gateway's Codex CLI dependency is checked by doctor.
 INKBOX_REQUIREMENTS = ("inkbox>=0.4.10", "aiohttp>=3.9")
-# The wizard passes harness="codex" to Inkbox.signup, which needs SDK >= 0.4.10.
 MIN_INKBOX_VERSION = (0, 4, 10)
 _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
 
@@ -379,7 +378,6 @@ def _inkbox_version_too_old() -> bool:
 
         raw = importlib_metadata.version("inkbox")
     except Exception:
-        # Can't determine the version; let the import path decide.
         return False
     try:
         # Prefer packaging when present for PEP 440-correct comparison.
@@ -400,7 +398,6 @@ def _ensure_inkbox_sdk() -> dict[str, Any] | None:
     """
     try:
         symbols = _load_inkbox_symbols()
-        # An importable-but-stale SDK lacks harness="codex"; upgrade like a miss.
         if not _inkbox_version_too_old():
             return symbols
         first_error = (
@@ -1141,7 +1138,7 @@ def _self_signup_flow(base_url: str, Inkbox: Any, InkboxAPIError: Any) -> tuple[
                 note_to_human=note,
                 agent_handle=handle,
                 base_url=base_url,
-                harness="codex",  # tag which harness this agent signed up from
+                harness="codex",
             )
             break
         except InkboxAPIError as exc:
