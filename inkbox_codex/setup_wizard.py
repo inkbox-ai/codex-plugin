@@ -36,7 +36,8 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 
 # Packages the wizard itself needs to talk to Inkbox during setup. The
 # gateway's Codex CLI dependency is checked by doctor.
-INKBOX_REQUIREMENTS = ("inkbox>=0.4.7", "aiohttp>=3.9")
+INKBOX_REQUIREMENTS = ("inkbox>=0.4.10", "aiohttp>=3.9")
+MIN_INKBOX_VERSION = (0, 4, 10)
 _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
 
 # Bundled avatar attached to the agent's Inkbox contact card during setup.
@@ -366,6 +367,29 @@ def _load_inkbox_symbols() -> dict[str, Any]:
     }
 
 
+def _inkbox_version_too_old() -> bool:
+    """Return True when the installed Inkbox SDK predates MIN_INKBOX_VERSION.
+
+    Returns:
+        bool: True if an outdated ``inkbox`` is installed, else False.
+    """
+    try:
+        import importlib.metadata as importlib_metadata
+
+        raw = importlib_metadata.version("inkbox")
+    except Exception:
+        return False
+    try:
+        # Prefer packaging when present for PEP 440-correct comparison.
+        from packaging.version import Version
+
+        return Version(raw) < Version(".".join(str(p) for p in MIN_INKBOX_VERSION))
+    except Exception:
+        # Fall back to a simple numeric-tuple comparison of the leading parts.
+        parts = tuple(int(p) for p in re.findall(r"\d+", raw)[: len(MIN_INKBOX_VERSION)])
+        return parts < MIN_INKBOX_VERSION
+
+
 def _ensure_inkbox_sdk() -> dict[str, Any] | None:
     """Import the Inkbox SDK, offering to install it into this env if missing.
 
@@ -373,7 +397,12 @@ def _ensure_inkbox_sdk() -> dict[str, Any] | None:
         dict[str, Any] | None: SDK symbols on success, None if unavailable.
     """
     try:
-        return _load_inkbox_symbols()
+        symbols = _load_inkbox_symbols()
+        if not _inkbox_version_too_old():
+            return symbols
+        first_error = (
+            f"inkbox SDK is older than {'.'.join(str(p) for p in MIN_INKBOX_VERSION)}"
+        )
     except Exception as exc:
         first_error = exc
 
@@ -1109,6 +1138,7 @@ def _self_signup_flow(base_url: str, Inkbox: Any, InkboxAPIError: Any) -> tuple[
                 note_to_human=note,
                 agent_handle=handle,
                 base_url=base_url,
+                harness="codex",
             )
             break
         except InkboxAPIError as exc:
