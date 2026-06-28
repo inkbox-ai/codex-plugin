@@ -33,6 +33,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 
 JsonSchema = Dict[str, Any]
 
+SMS_MAX_LENGTH = 1600
 IMESSAGE_MAX_LENGTH = 18995
 
 
@@ -100,7 +101,7 @@ TOOL_SPECS: List[ToolSpec] = [
         _schema(
             {
                 "to": _str("E.164 recipient number or an existing text conversation id."),
-                "text": _str("Message body."),
+                "text": _str("Message body, max 1600 chars.", max_length=SMS_MAX_LENGTH),
                 "media_paths": _str_list("Local file paths to upload and attach."),
                 "media_urls": _str_list("Already-hosted media URLs to attach."),
             },
@@ -331,6 +332,16 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
     """Run one Inkbox MCP tool and return an MCP ``tools/call`` result."""
 
     args = dict(args or {})
+
+    if name == "inkbox_send_sms":
+        text = str(args.get("text") or "")
+        if len(text) > SMS_MAX_LENGTH:
+            return _tool_error(
+                _message_too_long_reason("SMS", text, SMS_MAX_LENGTH),
+                error_code="sms_too_long",
+                char_count=len(text),
+                max_chars=SMS_MAX_LENGTH,
+            )
 
     if name == "inkbox_send_imessage":
         text = str(args.get("text") or "")
