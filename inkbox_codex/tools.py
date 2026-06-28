@@ -33,6 +33,8 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 
 JsonSchema = Dict[str, Any]
 
+IMESSAGE_MAX_LENGTH = 18995
+
 
 @dataclass(frozen=True)
 class ToolSpec:
@@ -50,10 +52,12 @@ def _schema(properties: Dict[str, JsonSchema], required: List[str] | None = None
     }
 
 
-def _str(desc: str = "") -> JsonSchema:
+def _str(desc: str = "", *, max_length: int | None = None) -> JsonSchema:
     schema: JsonSchema = {"type": "string"}
     if desc:
         schema["description"] = desc
+    if max_length is not None:
+        schema["maxLength"] = max_length
     return schema
 
 
@@ -109,7 +113,7 @@ TOOL_SPECS: List[ToolSpec] = [
         _schema(
             {
                 "conversation_id": _str("Existing iMessage conversation id."),
-                "text": _str("Message body."),
+                "text": _str("Message body, max 18995 chars.", max_length=IMESSAGE_MAX_LENGTH),
                 "media_path": _str("Optional local file path to upload and attach."),
             },
             ["conversation_id", "text"],
@@ -266,16 +270,25 @@ def _tool_result(data: Any) -> Dict[str, Any]:
     }
 
 
-def _tool_error(message: str) -> Dict[str, Any]:
+def _tool_error(message: str, **fields: Any) -> Dict[str, Any]:
+    payload = {"error": message, **fields}
     return {
         "content": [
             {
                 "type": "text",
-                "text": json.dumps({"error": message}, ensure_ascii=False),
+                "text": json.dumps(_json_safe(payload), ensure_ascii=False),
             }
         ],
         "isError": True,
     }
+
+
+def _message_too_long_reason(channel: str, content: str, max_chars: int) -> str:
+    char_count = len(content or "")
+    return (
+        f"{channel} text is {char_count} characters; maximum is {max_chars}. "
+        f"Shorten it or split it into smaller {channel} messages."
+    )
 
 
 def _upload_media_url(identity: Any, path: str) -> str:
@@ -318,6 +331,16 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
     """Run one Inkbox MCP tool and return an MCP ``tools/call`` result."""
 
     args = dict(args or {})
+
+    if name == "inkbox_send_imessage":
+        text = str(args.get("text") or "")
+        if len(text) > IMESSAGE_MAX_LENGTH:
+            return _tool_error(
+                _message_too_long_reason("iMessage", text, IMESSAGE_MAX_LENGTH),
+                error_code="imessage_too_long",
+                char_count=len(text),
+                max_chars=IMESSAGE_MAX_LENGTH,
+            )
 
     def _identity():
         return client.get_identity(identity_handle)
@@ -362,10 +385,11 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
             return {"sent": True, "id": str(getattr(msg, "id", "")), "media": len(urls)}
 
         if name == "inkbox_send_imessage":
+            text = str(args.get("text") or "")
             identity = _identity()
             kwargs: Dict[str, Any] = {
                 "conversation_id": str(args["conversation_id"]),
-                "text": str(args.get("text") or ""),
+                "text": text,
             }
             media_path = str(args.get("media_path") or "").strip()
             if media_path:
