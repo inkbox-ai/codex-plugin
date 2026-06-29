@@ -82,7 +82,7 @@ inkbox-codex doctor
 inkbox-codex run
 ```
 
-`inkbox-codex setup` walks you through everything and writes `.env`: create a fresh Inkbox agent via self-signup (or bring an existing API key), pick or create the identity, attach the Codex avatar to the agent's contact card (auto for a new self-signup agent; offered for an existing one with no avatar), provision a phone number, wait for your `START` opt-in, optionally enable OpenAI Realtime voice (validating your key), connect iMessage, mint a webhook signing key, choose the project directory, and set up autostart. Rerun it anytime to reconfigure. Prefer to wire `.env` by hand? Copy `.env.example` to `.env` and fill in `INKBOX_API_KEY`, `INKBOX_IDENTITY`, `INKBOX_SIGNING_KEY`, and `CODEX_PROJECT_DIR` yourself.
+`inkbox-codex setup` walks you through everything and writes `.env`: create a fresh Inkbox agent via self-signup (or bring an existing API key), pick or create the identity, attach the Codex avatar to the agent's contact card (auto for a new self-signup agent; offered for an existing one with no avatar), provision a phone number, wait for your `START` opt-in, optionally enable OpenAI Realtime voice (validating your key), connect iMessage, mint a webhook signing key, choose the project directory, choose whether to trust Inkbox MCP tools without repeated allow prompts, and set up autostart. Rerun it anytime to reconfigure. Prefer to wire `.env` by hand? Copy `.env.example` to `.env` and fill in `INKBOX_API_KEY`, `INKBOX_IDENTITY`, `INKBOX_SIGNING_KEY`, and `CODEX_PROJECT_DIR` yourself.
 
 On startup the bridge opens an Inkbox tunnel, wires mail/text/iMessage webhook subscriptions and the incoming-call channel to it, and routes everything into Codex sessions.
 
@@ -199,6 +199,7 @@ Calls have two modes, chosen per call:
 | `INKBOX_ALLOW_ALL_USERS` | no | `false` | Allow all senders admitted by Inkbox contact rules. |
 | `INKBOX_BRIDGE_PORT` | no | `8767` | Local webhook server port. |
 | `INKBOX_PERMISSION_TIMEOUT_S` | no | `600` | Seconds to wait for a permission/poll reply. |
+| `INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS` | no | `false` | Auto-accept Codex MCP prompts for Inkbox tools only. The setup wizard writes `true` when you trust the agent to send through Inkbox without per-call approval. |
 | `CODEX_BIN` | no | `codex` | Codex CLI executable to run. |
 | `CODEX_SANDBOX` | no | `workspace-write` | App-server thread sandbox (`read-only`, `workspace-write`, `danger-full-access`). |
 | `CODEX_APPROVAL_POLICY` | no | `on-request` | Codex approval policy for bridged turns. |

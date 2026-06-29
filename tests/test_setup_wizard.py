@@ -323,6 +323,17 @@ def test_configure_project_dir_persists_choice(tmp_path, monkeypatch):
     assert setup_wizard._env("CODEX_PROJECT_DIR") == str(tmp_path)
 
 
+def test_configure_inkbox_tool_approvals_persists_choice(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    monkeypatch.setenv("INKBOX_CODEX_ENV_FILE", str(env_file))
+    monkeypatch.delenv("INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS", raising=False)
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: True)
+
+    setup_wizard._configure_inkbox_tool_approvals()
+
+    assert setup_wizard._env("INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS") == "true"
+
+
 # ----------------------------------------------------------------------
 # Signing key
 # ----------------------------------------------------------------------

@@ -113,6 +113,22 @@ def _control_command(text: str) -> Optional[str]:
     return None
 
 
+def _is_inkbox_mcp_tool_elicitation(params: Dict[str, Any]) -> bool:
+    """Return true for Codex MCP prompts asking to run Inkbox tools."""
+    message = str(params.get("message") or params.get("prompt") or "").lower()
+    server = str(
+        params.get("serverName")
+        or params.get("server_name")
+        or params.get("mcpServerName")
+        or params.get("server")
+        or ""
+    ).lower()
+    tool = str(params.get("toolName") or params.get("tool_name") or params.get("tool") or "").lower()
+    if server == "inkbox" and tool.startswith("inkbox_"):
+        return True
+    return "run tool" in message and ("inkbox mcp server" in message or "inkbox_" in message)
+
+
 def _send_error_reason(exc: Exception) -> str:
     """Pull a human reason out of a send exception.
 
@@ -715,6 +731,9 @@ class ContactSession:
 
         if method == "mcpServer/elicitation/request":
             message = str(params.get("message") or params.get("prompt") or "Codex needs your input.")
+            if self.cfg.auto_approve_inkbox_tools and _is_inkbox_mcp_tool_elicitation(params):
+                logger.info("[session %s] Auto-approved Inkbox MCP tool elicitation: %s", self.chat_id, message)
+                return {"action": "accept", "content": {"text": "yes"}}
             reply = await self._escalate("poll", message)
             return {"action": "accept", "content": {"text": reply or ""}}
 

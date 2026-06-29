@@ -135,6 +135,44 @@ def test_pending_escalation_consumes_next_inbound():
     asyncio.run(scenario())
 
 
+def test_inkbox_mcp_elicitation_auto_approves_when_trusted():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.cfg.auto_approve_inkbox_tools = True
+
+        result = await session._handle_codex_request(
+            "mcpServer/elicitation/request",
+            {"message": 'Allow the inkbox MCP server to run tool "inkbox_send_email"?'},
+        )
+
+        assert result == {"action": "accept", "content": {"text": "yes"}}
+        assert sent == []
+
+    asyncio.run(scenario())
+
+
+def test_non_inkbox_mcp_elicitation_still_prompts():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.cfg.auto_approve_inkbox_tools = True
+
+        task = asyncio.create_task(
+            session._handle_codex_request(
+                "mcpServer/elicitation/request",
+                {"message": 'Allow the github MCP server to run tool "create_issue"?'},
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert sent and "github MCP server" in sent[0][1]
+
+        await session.handle_inbound("yes", "sms", {"conversation_id": "c1"})
+        assert await task == {"action": "accept", "content": {"text": "yes"}}
+
+    asyncio.run(scenario())
+
+
 def test_escalation_timeout_returns_none():
     async def scenario():
         sent = []

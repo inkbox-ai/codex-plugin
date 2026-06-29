@@ -1607,6 +1607,25 @@ def _configure_project_dir() -> None:
     print_success(f"  Codex will work in {chosen}")
 
 
+def _configure_inkbox_tool_approvals() -> None:
+    """Ask whether Inkbox MCP tools should run without per-call prompts."""
+    print()
+    print(color("  --- Inkbox tool approvals ---", Colors.CYAN))
+    print_info("  Codex uses Inkbox tools to send email, SMS, and iMessage,")
+    print_info("  place calls, inspect call/text history, and manage contacts.")
+    print_info("  Trusting these tools skips repeated Inkbox allow prompts while")
+    print_info("  leaving normal Codex command and file approvals unchanged.")
+
+    current = _env("INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS").strip().lower()
+    default = current not in {"0", "false", "no", "off"} if current else True
+    allow = prompt_yes_no("  Allow this agent to run Inkbox tools without asking each time?", default)
+    _save("INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS", "true" if allow else "false")
+    if allow:
+        print_success("  Inkbox tool prompts will be auto-approved.")
+    else:
+        print_info("  Codex will ask before each Inkbox tool call.")
+
+
 def _configure_autostart() -> None:
     """Offer to keep the gateway running — on boot, or just in the background.
 
@@ -1728,6 +1747,7 @@ def interactive_setup() -> None:
         print()
         print_success(f"Inkbox is already configured for identity '{existing_identity}'.")
         if not prompt_yes_no("  Reconfigure Inkbox?", False):
+            _configure_inkbox_tool_approvals()
             return
 
     base_url = os.getenv("INKBOX_BASE_URL") or _env("INKBOX_BASE_URL") or INKBOX_BASE_URL_DEFAULT
@@ -1785,6 +1805,8 @@ def interactive_setup() -> None:
     _setup_signing_key(api_key, base_url, Inkbox)
 
     _configure_project_dir()
+
+    _configure_inkbox_tool_approvals()
 
     _configure_autostart()
 

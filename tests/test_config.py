@@ -5,7 +5,8 @@ def test_read_config_defaults(monkeypatch):
     for var in (
         "INKBOX_API_KEY", "INKBOX_IDENTITY", "INKBOX_ALLOW_ALL_USERS",
         "INKBOX_ALLOWED_USERS", "CODEX_BIN", "CODEX_SANDBOX",
-        "CODEX_APPROVAL_POLICY", "INKBOX_BASE_URL",
+        "CODEX_APPROVAL_POLICY", "INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS",
+        "INKBOX_BASE_URL",
     ):
         monkeypatch.delenv(var, raising=False)
     cfg = read_config()
@@ -14,6 +15,7 @@ def test_read_config_defaults(monkeypatch):
     assert cfg.codex_bin == "codex"
     assert cfg.codex_sandbox == "workspace-write"
     assert cfg.codex_approval_policy == "on-request"
+    assert cfg.auto_approve_inkbox_tools is False
 
 
 def test_read_config_env(monkeypatch):
@@ -24,6 +26,7 @@ def test_read_config_env(monkeypatch):
     monkeypatch.setenv("CODEX_BIN", "/opt/codex")
     monkeypatch.setenv("CODEX_SANDBOX", "read-only")
     monkeypatch.setenv("CODEX_APPROVAL_POLICY", "never")
+    monkeypatch.setenv("INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS", "true")
     cfg = read_config()
     assert cfg.api_key == "ApiKey_test"
     assert cfg.base_url == "https://proxy.example"
@@ -31,6 +34,7 @@ def test_read_config_env(monkeypatch):
     assert cfg.codex_bin == "/opt/codex"
     assert cfg.codex_sandbox == "read-only"
     assert cfg.codex_approval_policy == "never"
+    assert cfg.auto_approve_inkbox_tools is True
 
 
 def _clear_realtime_env(monkeypatch):
