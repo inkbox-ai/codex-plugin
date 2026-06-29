@@ -91,6 +91,7 @@ def test_instructions_name_the_consult_tool_and_project():
     assert "Ada Lovelace" in text
     assert "ada@example.com" in text
     assert "Do not perform a context lookup before greeting" in text
+    assert "look up contacts" in text
 
 
 def test_outbound_call_context_shapes_realtime_prompt_and_greeting():
@@ -326,6 +327,10 @@ class _FakeOpenAIWS:
             type("Msg", (), {"type": "TEXT", "data": json.dumps(f)})()
             for f in frames
         ]
+        self.sent = []
+
+    async def send_str(self, data):
+        self.sent.append(json.loads(data))
 
     def __aiter__(self):
         async def gen():
@@ -389,3 +394,125 @@ def test_realtime_transcripts_are_mirrored_into_inkbox(monkeypatch):
         ("caller", "hey can you check the build"),
         ("agent", "sure, the build is green"),
     ]
+
+
+def test_openai_pump_dispatches_call_id_keyed_consult_events(monkeypatch):
+    """Match Hermes: GA Realtime may key argument events by call_id."""
+    monkeypatch.setattr(
+        realtime,
+        "aiohttp",
+        types.SimpleNamespace(
+            WSMsgType=types.SimpleNamespace(
+                TEXT="TEXT",
+                CLOSE="CLOSE",
+                CLOSED="CLOSED",
+                ERROR="ERROR",
+            )
+        ),
+    )
+    openai = _FakeOpenAIWS([
+        {
+            "type": "response.output_item.added",
+            "item_id": "item-1",
+            "item": {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": CONSULT_TOOL_NAME,
+            },
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "call_id": "call-1",
+            "name": CONSULT_TOOL_NAME,
+            "delta": '{"query":"who is Alex?"}',
+        },
+        {
+            "type": "response.function_call_arguments.done",
+            "call_id": "call-1",
+            "name": CONSULT_TOOL_NAME,
+        },
+    ])
+    state = _BridgeState()
+    seen = {}
+
+    async def fake_consult(query, transcript):
+        seen["query"] = query
+        seen["transcript"] = transcript
+        return "Alex is in the contact book."
+
+    async def scenario():
+        await _openai_to_inkbox_pump(
+            openai_ws=openai,
+            inkbox_ws=_FakeInkboxWS(),
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            meta=_meta(),
+            on_agent_consult=fake_consult,
+        )
+        if state.consult_tasks:
+            await asyncio.gather(*state.consult_tasks)
+
+    asyncio.run(scenario())
+
+    assert seen["query"] == "who is Alex?"
+    item = next(frame for frame in openai.sent if frame.get("type") == "conversation.item.create")
+    output = json.loads(item["item"]["output"])
+    assert output["status"] == "ok"
+    assert output["answer"] == "Alex is in the contact book."
+
+
+def test_openai_pump_uses_frame_item_id_when_item_has_no_id(monkeypatch):
+    """Match Hermes: output_item.added sometimes carries item_id on the frame."""
+    monkeypatch.setattr(
+        realtime,
+        "aiohttp",
+        types.SimpleNamespace(
+            WSMsgType=types.SimpleNamespace(
+                TEXT="TEXT",
+                CLOSE="CLOSE",
+                CLOSED="CLOSED",
+                ERROR="ERROR",
+            )
+        ),
+    )
+    openai = _FakeOpenAIWS([
+        {
+            "type": "response.output_item.added",
+            "item_id": "item-2",
+            "item": {
+                "type": "function_call",
+                "call_id": "call-2",
+                "name": POST_CALL_ACTION_TOOL_NAME,
+            },
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "item_id": "item-2",
+            "delta": '{"action":"email Dima the summary"}',
+        },
+        {
+            "type": "response.function_call_arguments.done",
+            "item_id": "item-2",
+            "call_id": "call-2",
+        },
+    ])
+    state = _BridgeState()
+
+    async def fake_consult(query, transcript):  # pragma: no cover - must not run
+        raise AssertionError("post-call action should not consult")
+
+    async def scenario():
+        await _openai_to_inkbox_pump(
+            openai_ws=openai,
+            inkbox_ws=_FakeInkboxWS(),
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            meta=_meta(),
+            on_agent_consult=fake_consult,
+        )
+        if state.consult_tasks:
+            await asyncio.gather(*state.consult_tasks)
+
+    asyncio.run(scenario())
+
+    assert state.post_call_actions == [{"action": "email Dima the summary", "details": ""}]
