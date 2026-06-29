@@ -76,18 +76,8 @@ class _FakeIdentity:
         return type("Message", (), {"id": "sms-1"})()
 
 
-class _FakeVcards:
-    def __init__(self):
-        self.exported = []
-
-    def export_vcard(self, contact_id):
-        self.exported.append(contact_id)
-        return "BEGIN:VCARD\nVERSION:4.0\nFN:Ada Lovelace\nEND:VCARD"
-
-
 class _FakeContacts:
     def __init__(self):
-        self.vcards = _FakeVcards()
         self.deleted = []
 
     def get(self, contact_id):
@@ -140,24 +130,20 @@ def test_coding_agent_tool_tier_is_registered():
         "inkbox_get_contact",
         "inkbox_create_contact",
         "inkbox_update_contact",
-        "inkbox_export_contact_vcard",
         "inkbox_delete_contact",
     }
 
     assert names == expected
 
 
-def test_get_export_and_delete_contact_tools():
+def test_get_and_delete_contact_tools():
     client = _FakeClient()
 
     contact = _call(client, "inkbox_get_contact", {"contact_id": "contact-1"})
-    vcard = _call(client, "inkbox_export_contact_vcard", {"contact_id": "contact-1"})
     deleted = _call(client, "inkbox_delete_contact", {"contact_id": "contact-1"})
 
     assert contact["id"] == "contact-1"
-    assert vcard["vcard"].startswith("BEGIN:VCARD")
     assert deleted["deleted"] == "contact-1"
-    assert client.contacts.vcards.exported == ["contact-1"]
     assert client.contacts.deleted == ["contact-1"]
 
 
