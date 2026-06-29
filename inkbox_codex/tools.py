@@ -241,6 +241,11 @@ TOOL_SPECS: List[ToolSpec] = [
         "Export one contact as a vCard 4.0 string by contact id.",
         _schema({"contact_id": _str("Contact id.")}, ["contact_id"]),
     ),
+    ToolSpec(
+        "inkbox_delete_contact",
+        "Remove a contact from the address book by contact id. Look it up first to confirm the target.",
+        _schema({"contact_id": _str("Contact id.")}, ["contact_id"]),
+    ),
 ]
 
 
@@ -534,6 +539,10 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
 
         if name == "inkbox_export_contact_vcard":
             return {"vcard": client.contacts.vcards.export_vcard(str(args["contact_id"]))}
+
+        if name == "inkbox_delete_contact":
+            client.contacts.delete(str(args["contact_id"]))
+            return {"deleted": str(args["contact_id"])}
 
         raise ValueError(f"unknown Inkbox tool: {name}")
 

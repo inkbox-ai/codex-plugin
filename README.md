@@ -140,7 +140,7 @@ Codex never silently runs anything destructive. The bridge starts `codex app-ser
 
 ## Sessions
 
-Sessions are keyed by Inkbox contact, so one person = one conversation across channels. Codex session ids are persisted in `~/.inkbox-codex/sessions.json` and resumed across bridge restarts — your conversation picks up where it left off. Replies go out on the channel you last used (call replies fall back to SMS if you hang up before Codex finishes).
+Sessions are keyed by Inkbox contact, so one person = one conversation across channels. Codex session ids are persisted in `~/.inkbox-codex/sessions.json` and resumed across bridge restarts — your conversation picks up where it left off. Replies go out on the channel you last used. If a voice call ends before Codex finishes a voice reply, that late voice reply is dropped instead of silently switching to SMS or email.
 
 **Typing indicator.** While Codex works on a turn, the bridge keeps a typing indicator alive on your iMessage thread (refreshed every few seconds, since it expires) so you can see it's busy. SMS, email, and voice have no typing indicator, so this is iMessage-only.
 
