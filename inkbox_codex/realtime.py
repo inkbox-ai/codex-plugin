@@ -67,13 +67,26 @@ HANGUP_CLOSE_DELAY_S = 2.0
 TASK_CANCEL_TIMEOUT_S = 2.0
 
 
-# A consult takes (query, recent_transcript) and returns Codex's spoken-
-# friendly answer. The gateway wires this to the caller's ContactSession.
-AgentConsultCallback = Callable[[str, List[Tuple[str, str]]], Awaitable[str]]
-# After the call ends with queued actions: (actions, transcript) → run them.
-PostCallActionsCallback = Callable[[List[Dict[str, str]], List[Tuple[str, str]]], Awaitable[None]]
-# After a call with no queued actions: (transcript) → reflect / follow up.
-CallEndedCallback = Callable[[List[Tuple[str, str]]], Awaitable[None]]
+# A consult takes live-call context plus the realtime model's request and
+# returns Codex's spoken-friendly answer. The gateway wires this to the
+# caller's ContactSession.
+AgentConsultCallback = Callable[
+    [
+        "RealtimeCallMeta",
+        str,
+        List[Tuple[str, str]],
+        List[Dict[str, str]],
+        List["RealtimeConsultResult"],
+    ],
+    Awaitable[str],
+]
+# After the call ends with queued actions: (meta, actions, transcript, consults) → run them.
+PostCallActionsCallback = Callable[
+    ["RealtimeCallMeta", List[Dict[str, str]], List[Tuple[str, str]], List["RealtimeConsultResult"]],
+    Awaitable[None],
+]
+# After a call with no queued actions: (meta, transcript) → reflect / follow up.
+CallEndedCallback = Callable[["RealtimeCallMeta", List[Tuple[str, str]]], Awaitable[None]]
 
 
 # ----------------------------------------------------------------------
@@ -130,10 +143,20 @@ class RealtimeCallMeta:
 
 
 @dataclass
+class RealtimeConsultResult:
+    id: str
+    request: str
+    result: str
+    created_at: float
+    dedupe_key: Optional[str] = None
+
+
+@dataclass
 class _BridgeState:
     transcript: List[Tuple[str, str]] = field(default_factory=list)
     # Work the model asked to run after the call: [{"action", "details"}].
     post_call_actions: List[Dict[str, str]] = field(default_factory=list)
+    consult_results: List[RealtimeConsultResult] = field(default_factory=list)
     closed: bool = False
     greeting_triggered: bool = False
     # Inkbox-assigned stream id from the `start` event; echoed on outbound
@@ -220,12 +243,17 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
         lines.append(
             "For outbound calls, do not open with a generic offer to help. Start by explaining why you are calling, then ask the next specific question or give the requested update.",
         )
+        lines.append(
+            "If the caller asks why you called or whether you know why you are calling, answer from the loaded outbound purpose/context. Never say you only have contact or call info when outbound purpose/context is present.",
+        )
     lines.extend([
         "Do not perform a context lookup before greeting the caller. Do not say you are waiting on a lookup or checking context.",
-        f"To do real work NOW in the project ({meta.project_dir or 'the working directory'}) "
-        f"or Inkbox account - look up contacts, inspect texts/calls, use Inkbox tools, "
-        f"read or edit files, run commands or tests, check git, or search the codebase - "
-        f"call {CONSULT_TOOL_NAME} with a plain-English request. It runs the Codex "
+        "Stay anchored to this live call's loaded purpose and contact context. Do not switch to unrelated prior text-session work.",
+        f"Call {CONSULT_TOOL_NAME} only when the caller asks for work the voice model cannot do by itself: "
+        f"real project work in {meta.project_dir or 'the working directory'}, Inkbox account/tool lookups, "
+        "contact lookup or edits, text/call/email inspection, file edits, commands, tests, git, or code search.",
+        "Do not use consult_agent for ordinary conversation, shopping advice, brainstorming, greetings, hangups, or questions you can answer from the loaded call context.",
+        f"When you do call {CONSULT_TOOL_NAME}, use a plain-English request. It runs the Codex "
         "agent in the caller's ongoing conversation and returns a spoken-friendly answer; read that answer back in your own voice.",
         f"If the caller wants work done AFTER the call (or accepts a deferral), call "
         f"{POST_CALL_ACTION_TOOL_NAME} to queue it. Tell them it's queued for after the "
@@ -240,7 +268,7 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
         f"Do NOT call {CONSULT_TOOL_NAME} for greetings, small talk, or questions you "
         "can answer directly from the loaded call context. Use it whenever the caller wants "
         "something done in code, asks for contact/account context you do not already have, "
-        "or needs an Inkbox tool lookup.",
+        "or needs an Inkbox tool lookup. Do not call it for ordinary advice or brainstorming.",
         "While a tool runs you may say a brief 'one moment' so the caller isn't left in silence.",
     ])
     if additional.strip():
@@ -253,7 +281,7 @@ def build_realtime_greeting(meta: RealtimeCallMeta) -> str:
     first_name = meta.contact_name.split()[0] if meta.contact_known and meta.contact_name else "there"
     if meta.direction == "outbound" and meta.outbound_opening:
         return (
-            "Open the call by saying this naturally as the very first thing, with no greeting before it:\n"
+            "Say exactly this as the very first thing, with no greeting before it and no extra words:\n"
             f"{meta.outbound_opening}"
         )
     if meta.direction == "outbound" and meta.outbound_purpose:
@@ -279,11 +307,13 @@ def _consult_tool_schema() -> Dict[str, Any]:
         "name": CONSULT_TOOL_NAME,
         "description": (
             "Hand a request to the Codex agent working in the project, when "
-            "the caller wants real work done - look up contacts, inspect Inkbox "
-            "texts/calls/email, read/edit files, run commands or tests, check git "
-            "status, search the codebase, etc. The request runs in the caller's "
-            "ongoing conversation and you get back a spoken-friendly "
-            "answer to read aloud. Do NOT use this for greetings or small talk."
+            "the caller wants real work done that the voice model cannot do itself - "
+            "look up contacts, inspect Inkbox texts/calls/email, read/edit files, "
+            "run commands or tests, check git status, search the codebase, etc. "
+            "The request runs in the caller's ongoing conversation and you get "
+            "back a spoken-friendly answer to read aloud. Do NOT use this for "
+            "greetings, hangups, small talk, ordinary conversation, shopping "
+            "advice, or brainstorming."
         ),
         "parameters": {
             "type": "object",
@@ -490,7 +520,7 @@ class OpenedRealtimeBridge:
             await _cancel_consult_tasks(state)
 
         # After teardown: run queued after-call work, or a follow-up reflection.
-        await _dispatch_post_call(state, on_post_call_actions, on_call_ended)
+        await _dispatch_post_call(state, self.meta, on_post_call_actions, on_call_ended)
 
     async def close(self) -> None:
         if self._closed:
@@ -641,6 +671,12 @@ async def _maybe_send_greeting(
             "type": "response.create",
             "response": {"instructions": build_realtime_greeting(meta)},
         }))
+        logger.info(
+            "[realtime] greeting sent call_id=%s direction=%s outbound_context=%s",
+            meta.call_id,
+            meta.direction,
+            bool(meta.outbound_purpose or meta.outbound_opening or meta.outbound_context),
+        )
     except Exception as exc:
         logger.debug("[realtime] greeting send failed: %s", exc)
 
@@ -720,6 +756,7 @@ async def _openai_to_inkbox_pump(
             arguments_json=entry.get("args") or "{}",
             state=state,
             config=config,
+            meta=meta,
             on_agent_consult=on_agent_consult,
         )
         # The consult runs a full Codex turn (seconds). Awaiting it here
@@ -862,6 +899,16 @@ async def _openai_to_inkbox_pump(
 # ----------------------------------------------------------------------
 
 
+def _consult_result_text(output: Dict[str, Any]) -> str:
+    result = output.get("answer") or output.get("result")
+    if isinstance(result, str) and result.strip():
+        return result.strip()
+    error = output.get("error")
+    if isinstance(error, str) and error.strip():
+        return f"ERROR: {error.strip()}"
+    return json.dumps(output)
+
+
 async def _dispatch_tool_call(
     *,
     openai_ws: Any,
@@ -871,6 +918,7 @@ async def _dispatch_tool_call(
     arguments_json: str,
     state: _BridgeState,
     config: RealtimeConfig,
+    meta: RealtimeCallMeta,
     on_agent_consult: AgentConsultCallback,
 ) -> None:
     """Handle a function call from the Realtime model.
@@ -915,28 +963,60 @@ async def _dispatch_tool_call(
 
     try:
         answer = await asyncio.wait_for(
-            on_agent_consult(query, list(state.transcript)),
+            on_agent_consult(
+                meta,
+                query,
+                list(state.transcript),
+                list(state.post_call_actions),
+                list(state.consult_results),
+            ),
             timeout=config.consult_timeout_s,
         )
     except asyncio.TimeoutError:
-        await _submit_tool_result(openai_ws, call_id, {
+        output = {
             "error": "consult timed out",
             "message": "Tell the caller you couldn't finish that right now; offer to follow up.",
-        })
+        }
+        state.consult_results.append(RealtimeConsultResult(
+            id=call_id,
+            request=query,
+            result=_consult_result_text(output),
+            created_at=time.time(),
+        ))
+        await _submit_tool_result(openai_ws, call_id, output)
         return
     except Exception as exc:
         logger.warning("[realtime] consult failed: %s", exc)
-        await _submit_tool_result(openai_ws, call_id, {
+        output = {
             "error": f"consult error: {exc}",
             "message": "Apologize briefly and ask if you can help another way.",
-        })
+        }
+        state.consult_results.append(RealtimeConsultResult(
+            id=call_id,
+            request=query,
+            result=_consult_result_text(output),
+            created_at=time.time(),
+        ))
+        await _submit_tool_result(openai_ws, call_id, output)
         return
 
-    await _submit_tool_result(openai_ws, call_id, {
+    output = {
         "status": "ok",
         "answer": answer,
         "instructions": "Read the answer back to the caller in your own voice. Keep it natural and concise.",
-    })
+    }
+    if state.post_call_actions:
+        output["post_call_action_guidance"] = (
+            "If this result completed, queued, canceled, or superseded a pending after-call action, "
+            "call delete_post_call_action for that action_index before the call ends."
+        )
+    state.consult_results.append(RealtimeConsultResult(
+        id=call_id,
+        request=query,
+        result=_consult_result_text(output),
+        created_at=time.time(),
+    ))
+    await _submit_tool_result(openai_ws, call_id, output)
 
 
 async def _handle_register_action(
@@ -1059,18 +1139,24 @@ def _action_index(args: Dict[str, Any]) -> int:
 
 async def _dispatch_post_call(
     state: _BridgeState,
+    meta: RealtimeCallMeta,
     on_post_call_actions: PostCallActionsCallback,
     on_call_ended: CallEndedCallback,
 ) -> None:
     """Run exactly one follow-up after the call: queued actions, else a reflection."""
     if state.post_call_actions:
         try:
-            await on_post_call_actions(list(state.post_call_actions), list(state.transcript))
+            await on_post_call_actions(
+                meta,
+                list(state.post_call_actions),
+                list(state.transcript),
+                list(state.consult_results),
+            )
         except Exception as exc:
             logger.warning("[realtime] post-call action dispatch failed: %s", exc)
     else:
         try:
-            await on_call_ended(list(state.transcript))
+            await on_call_ended(meta, list(state.transcript))
         except Exception as exc:
             logger.warning("[realtime] call-ended dispatch failed: %s", exc)
 

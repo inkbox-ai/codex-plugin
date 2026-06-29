@@ -91,7 +91,9 @@ def test_instructions_name_the_consult_tool_and_project():
     assert "Ada Lovelace" in text
     assert "ada@example.com" in text
     assert "Do not perform a context lookup before greeting" in text
-    assert "look up contacts" in text
+    assert "contact lookup" in text
+    assert "Do not use consult_agent for ordinary conversation, shopping advice" in text
+    assert "Never say you only have contact or call info" not in text
 
 
 def test_outbound_call_context_shapes_realtime_prompt_and_greeting():
@@ -112,6 +114,7 @@ def test_outbound_call_context_shapes_realtime_prompt_and_greeting():
     assert "outbound call" in text
     assert "tell them the deployment is fixed" in text
     assert "Deployment failed twice before the final fix." in text
+    assert "Never say you only have contact or call info" in text
     assert "Hi, this is Codex calling with the deployment update." in build_realtime_greeting(meta)
 
 
@@ -119,8 +122,11 @@ def test_dispatch_consult_runs_agent_and_speaks_answer():
     ws = _FakeWS()
     state = _BridgeState()
 
-    async def fake_consult(query, transcript):
+    async def fake_consult(_meta, query, transcript, post_call_actions, consult_results):
         assert query == "run the tests"
+        assert transcript == []
+        assert post_call_actions == []
+        assert consult_results == []
         return "tests pass, 42 green"
 
     asyncio.run(_dispatch_tool_call(
@@ -131,6 +137,7 @@ def test_dispatch_consult_runs_agent_and_speaks_answer():
         arguments_json=json.dumps({"query": "run the tests"}),
         state=state,
         config=RealtimeConfig(api_key="sk-x"),
+        meta=_meta(),
         on_agent_consult=fake_consult,
     ))
 
@@ -143,13 +150,15 @@ def test_dispatch_consult_runs_agent_and_speaks_answer():
     output = json.loads(item["item"]["output"])
     assert output["status"] == "ok"
     assert output["answer"] == "tests pass, 42 green"
+    assert state.consult_results[0].request == "run the tests"
+    assert state.consult_results[0].result == "tests pass, 42 green"
     assert ws.types().count("response.create") >= 1
 
 
 def test_dispatch_missing_query_returns_error():
     ws = _FakeWS()
 
-    async def fake_consult(query, transcript):  # pragma: no cover - must not run
+    async def fake_consult(*_args):  # pragma: no cover - must not run
         raise AssertionError("consult should not be called without a query")
 
     asyncio.run(_dispatch_tool_call(
@@ -160,6 +169,7 @@ def test_dispatch_missing_query_returns_error():
         arguments_json="{}",
         state=_BridgeState(),
         config=RealtimeConfig(api_key="sk-x"),
+        meta=_meta(),
         on_agent_consult=fake_consult,
     ))
     item = next(f for f in ws.sent if f.get("type") == "conversation.item.create")
@@ -169,7 +179,7 @@ def test_dispatch_missing_query_returns_error():
 def test_dispatch_unknown_tool_refuses():
     ws = _FakeWS()
 
-    async def fake_consult(query, transcript):  # pragma: no cover
+    async def fake_consult(*_args):  # pragma: no cover
         raise AssertionError("not the consult tool")
 
     asyncio.run(_dispatch_tool_call(
@@ -180,6 +190,7 @@ def test_dispatch_unknown_tool_refuses():
         arguments_json="{}",
         state=_BridgeState(),
         config=RealtimeConfig(api_key="sk-x"),
+        meta=_meta(),
         on_agent_consult=fake_consult,
     ))
     item = next(f for f in ws.sent if f.get("type") == "conversation.item.create")
@@ -189,7 +200,7 @@ def test_dispatch_unknown_tool_refuses():
 def test_consult_timeout_reports_error_not_crash():
     ws = _FakeWS()
 
-    async def slow_consult(query, transcript):
+    async def slow_consult(*_args):
         await asyncio.sleep(1)
         return "too late"
 
@@ -202,6 +213,7 @@ def test_consult_timeout_reports_error_not_crash():
         arguments_json=json.dumps({"query": "x"}),
         state=_BridgeState(),
         config=cfg,
+        meta=_meta(),
         on_agent_consult=slow_consult,
     ))
     item = next(f for f in ws.sent if f.get("type") == "conversation.item.create")
@@ -222,7 +234,8 @@ def _dispatch(ws, name, args, state, inkbox_ws=None):
         arguments_json=json.dumps(args),
         state=state,
         config=RealtimeConfig(api_key="sk-x"),
-        on_agent_consult=lambda q, t: (_ for _ in ()).throw(AssertionError("no consult")),
+        meta=_meta(),
+        on_agent_consult=lambda *_args: (_ for _ in ()).throw(AssertionError("no consult")),
     ))
 
 
@@ -293,15 +306,19 @@ def test_post_call_dispatch_runs_actions_when_queued():
     state.transcript = [("caller", "open a pr please")]
     seen = {}
 
-    async def on_actions(actions, transcript):
+    async def on_actions(meta, actions, transcript, consult_results):
+        seen["meta"] = meta
         seen["actions"] = actions
         seen["transcript"] = transcript
+        seen["consult_results"] = consult_results
 
-    async def on_ended(transcript):  # pragma: no cover - must not run
+    async def on_ended(*_args):  # pragma: no cover - must not run
         raise AssertionError("should not reflect when actions are queued")
 
-    asyncio.run(_dispatch_post_call(state, on_actions, on_ended))
+    asyncio.run(_dispatch_post_call(state, _meta(), on_actions, on_ended))
+    assert seen["meta"].call_id == "c1"
     assert seen["actions"] == [{"action": "open a PR", "details": ""}]
+    assert seen["consult_results"] == []
 
 
 def test_post_call_dispatch_reflects_when_no_actions():
@@ -309,13 +326,15 @@ def test_post_call_dispatch_reflects_when_no_actions():
     state.transcript = [("agent", "bye")]
     seen = {}
 
-    async def on_actions(actions, transcript):  # pragma: no cover - must not run
+    async def on_actions(*_args):  # pragma: no cover - must not run
         raise AssertionError("no actions to run")
 
-    async def on_ended(transcript):
+    async def on_ended(meta, transcript):
+        seen["meta"] = meta
         seen["transcript"] = transcript
 
-    asyncio.run(_dispatch_post_call(state, on_actions, on_ended))
+    asyncio.run(_dispatch_post_call(state, _meta(), on_actions, on_ended))
+    assert seen["meta"].call_id == "c1"
     assert seen["transcript"] == [("agent", "bye")]
 
 
@@ -372,7 +391,7 @@ def test_realtime_transcripts_are_mirrored_into_inkbox(monkeypatch):
         state=state,
         config=RealtimeConfig(api_key="sk-x"),
         meta=_meta(),
-        on_agent_consult=lambda _q, _t: (_ for _ in ()).throw(AssertionError("no consult")),
+        on_agent_consult=lambda *_args: (_ for _ in ()).throw(AssertionError("no consult")),
     ))
 
     transcripts = [frame for frame in ink.sent if frame.get("event") == "transcript"]
@@ -435,9 +454,12 @@ def test_openai_pump_dispatches_call_id_keyed_consult_events(monkeypatch):
     state = _BridgeState()
     seen = {}
 
-    async def fake_consult(query, transcript):
+    async def fake_consult(meta, query, transcript, post_call_actions, consult_results):
+        seen["meta"] = meta
         seen["query"] = query
         seen["transcript"] = transcript
+        seen["post_call_actions"] = post_call_actions
+        seen["consult_results"] = consult_results
         return "Alex is in the contact book."
 
     async def scenario():
@@ -454,7 +476,11 @@ def test_openai_pump_dispatches_call_id_keyed_consult_events(monkeypatch):
 
     asyncio.run(scenario())
 
+    assert seen["meta"].call_id == "c1"
     assert seen["query"] == "who is Alex?"
+    assert seen["post_call_actions"] == []
+    assert seen["consult_results"] == []
+    assert state.consult_results[0].result == "Alex is in the contact book."
     item = next(frame for frame in openai.sent if frame.get("type") == "conversation.item.create")
     output = json.loads(item["item"]["output"])
     assert output["status"] == "ok"
@@ -498,7 +524,7 @@ def test_openai_pump_uses_frame_item_id_when_item_has_no_id(monkeypatch):
     ])
     state = _BridgeState()
 
-    async def fake_consult(query, transcript):  # pragma: no cover - must not run
+    async def fake_consult(*_args):  # pragma: no cover - must not run
         raise AssertionError("post-call action should not consult")
 
     async def scenario():

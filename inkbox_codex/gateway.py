@@ -91,7 +91,18 @@ def _format_transcript(transcript: Any, limit: int = 30) -> str:
     return "\n".join(f"  {role}: {text}" for role, text in rows)
 
 
-def _post_call_prompt(actions: List[Dict[str, str]], transcript: Any) -> str:
+def _format_realtime_consult_results(results: Any) -> str:
+    lines = []
+    for index, result in enumerate(list(results or []), start=1):
+        request = getattr(result, "request", "") or ""
+        answer = getattr(result, "result", "") or ""
+        lines.append(f"{index}. Request: {request}\nResult: {answer}")
+    return "\n\n".join(lines)
+
+
+def _post_call_prompt(
+    actions: List[Dict[str, str]], transcript: Any, consult_results: Any = None
+) -> str:
     """Build the Codex prompt that executes queued after-call work."""
     action_lines = "\n".join(
         f"  {i}. {a.get('action', '')}"
@@ -99,6 +110,7 @@ def _post_call_prompt(actions: List[Dict[str, str]], transcript: Any) -> str:
         for i, a in enumerate(actions or [], start=1)
     )
     convo = _format_transcript(transcript)
+    consults = _format_realtime_consult_results(consult_results)
     parts = [
         "[voice call ended] You were just on a phone call with your operator and "
         "agreed to do this work after the call. Do the actions that are still needed:",
@@ -110,6 +122,13 @@ def _post_call_prompt(actions: List[Dict[str, str]], transcript: Any) -> str:
     ]
     if convo:
         parts += ["", "Recent call transcript:", convo]
+    if consults:
+        parts += [
+            "",
+            "Realtime consults already completed during this call:",
+            consults,
+            "Do not repeat work that was already completed or queued unless the caller explicitly asked for another, repeat, or different action.",
+        ]
     return "\n".join(parts)
 
 
@@ -152,6 +171,59 @@ def _call_ended_prompt(transcript: Any) -> str:
     ]
     if convo:
         parts += ["", "Recent call transcript:", convo]
+    return "\n".join(parts)
+
+
+def _voice_consult_prompt(
+    *,
+    query: str,
+    transcript: Any,
+    outbound: Optional[Dict[str, Any]],
+    contact: Optional[Dict[str, Any]],
+    direction: str,
+    post_call_actions: Optional[List[Dict[str, str]]] = None,
+    consult_results: Any = None,
+) -> str:
+    """Wrap a realtime consult so Codex stays grounded in the live call."""
+    parts = [
+        "Voice call consult from the Inkbox Realtime agent.",
+        "Answer only the current live-call request. Do not continue unrelated prior text/session work.",
+        "Do not run commands, run tests, edit files, or inspect git unless the consult request explicitly asks for project/coding work.",
+        "If the request is ordinary conversation, buying advice, brainstorming, or call-topic discussion, answer directly and briefly.",
+        f"Call direction: {direction or 'unknown'}.",
+    ]
+    outbound = outbound or {}
+    if outbound.get("purpose"):
+        parts.append(f"Outbound call purpose: {outbound['purpose']}")
+    if outbound.get("context"):
+        parts.append(f"Outbound call context: {outbound['context']}")
+    contact = contact or {}
+    if contact.get("name"):
+        parts.append(f"Caller/contact: {contact['name']}")
+
+    if post_call_actions:
+        parts.append("Pending after-call actions already queued by the realtime call agent:")
+        for index, action in enumerate(post_call_actions, start=1):
+            details = f" - {action.get('details')}" if action.get("details") else ""
+            parts.append(f"{index}. {action.get('action', '')}{details}")
+
+    prior_consults = _format_realtime_consult_results(consult_results)
+    if prior_consults:
+        parts += [
+            "",
+            "Previous Codex consult results during this same live call:",
+            prior_consults,
+            "Do not repeat work that was already completed or queued unless the caller explicitly asked for another, repeat, or different action.",
+        ]
+
+    recent = _format_transcript(transcript, limit=8)
+    if recent:
+        parts += ["", "Recent live-call transcript:", recent]
+    parts += [
+        "",
+        f"Consult request: {query.strip()}",
+        "Return a concise spoken-friendly answer for the realtime agent to say on this call.",
+    ]
     return "\n".join(parts)
 
 
@@ -1274,6 +1346,13 @@ class InkboxGateway:
             outbound_conversation_summary=(oc.get("conversation_summary") or None),
         )
         try:
+            logger.info(
+                "[bridge] opening realtime call call_id=%s direction=%s outbound_purpose=%s opening=%s",
+                meta.call_id,
+                meta.direction,
+                str(meta.outbound_purpose or "")[:120],
+                bool(meta.outbound_opening),
+            )
             return await open_inkbox_realtime_bridge(config=self.cfg.realtime, meta=meta)
         except RealtimeBridgeConnectError as exc:
             logger.warning(
@@ -1292,10 +1371,18 @@ class InkboxGateway:
             return None
         path = call_contexts_dir() / f"{token}.json"
         if not path.exists():
+            logger.warning("[bridge] outbound call context token %s not found at %s", token, path)
             return None
         try:
-            return json.loads(path.read_text())
+            data = json.loads(path.read_text())
+            logger.info(
+                "[bridge] loaded outbound call context token=%s purpose=%s",
+                token,
+                str(data.get("purpose") or "")[:120],
+            )
+            return data
         except (OSError, json.JSONDecodeError):
+            logger.warning("[bridge] failed to load outbound call context token=%s", token, exc_info=True)
             return None
 
     async def _handle_call_ws(self, request: "web.Request") -> Any:
@@ -1362,18 +1449,39 @@ class InkboxGateway:
                 self._active_call_ws[chat_id] = ws
                 logger.info("[bridge] realtime call connected: %s", chat_id or call_id)
 
-                async def _consult(query: str, _transcript: Any) -> str:
+                async def _consult(
+                    _meta: RealtimeCallMeta,
+                    query: str,
+                    _transcript: Any,
+                    post_call_actions: List[Dict[str, str]],
+                    consult_results: Any,
+                ) -> str:
                     # Route the model's request into the caller's shared session.
-                    return await self.sessions.get(chat_id).run_consult(query)
+                    logger.info("[bridge] realtime consult for %s: %s", chat_id, query)
+                    prompt = _voice_consult_prompt(
+                        query=query,
+                        transcript=_transcript,
+                        outbound=outbound,
+                        contact=contact,
+                        direction=direction,
+                        post_call_actions=post_call_actions,
+                        consult_results=consult_results,
+                    )
+                    return await self.sessions.get(chat_id).run_consult(prompt)
 
-                async def _post_call(actions: List[Dict[str, str]], transcript: Any) -> None:
+                async def _post_call(
+                    _meta: RealtimeCallMeta,
+                    actions: List[Dict[str, str]],
+                    transcript: Any,
+                    consult_results: Any,
+                ) -> None:
                     # Run the queued after-call work in the caller's session. The
                     # text reply is discarded; side effects (emails, edits, PRs)
                     # happen via Codex's tools during the turn.
-                    prompt = _post_call_prompt(actions, transcript)
+                    prompt = _post_call_prompt(actions, transcript, consult_results)
                     await self.sessions.get(chat_id).run_consult(prompt)
 
-                async def _call_ended(transcript: Any) -> None:
+                async def _call_ended(_meta: RealtimeCallMeta, transcript: Any) -> None:
                     # No queued actions: let Codex reflect and do any follow-up
                     # it committed to on the call. Stays silent if nothing to do.
                     prompt = _call_ended_prompt(transcript)

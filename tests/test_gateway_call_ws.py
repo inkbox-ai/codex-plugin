@@ -3,6 +3,7 @@ import types
 
 from inkbox_codex import gateway
 from inkbox_codex.config import BridgeConfig
+from inkbox_codex.gateway import _voice_consult_prompt
 
 
 class _FakeWS:
@@ -268,9 +269,17 @@ class _FakeBridge:
     def __init__(self):
         self.ran = False
         self.closed = False
+        self.consult_answer = None
 
     async def run(self, *, inkbox_ws, on_agent_consult, on_post_call_actions, on_call_ended):
         self.ran = True
+        self.consult_answer = await on_agent_consult(
+            types.SimpleNamespace(call_id="call-1"),
+            "help Dima choose a mountain bike",
+            [("assistant", "Hi Dima."), ("user", "I want to buy a mountain bike.")],
+            [],
+            [],
+        )
 
     async def close(self):
         self.closed = True
@@ -333,6 +342,63 @@ def test_call_ws_passes_outbound_context_to_realtime(monkeypatch, tmp_path):
     assert seen["meta"].outbound_purpose == "tell them the deploy is fixed"
     assert seen["meta"].outbound_opening == "Hi there"
     assert seen["meta"].outbound_context == "PR 12"
+
+
+def test_voice_consult_prompt_anchors_current_call():
+    prompt = _voice_consult_prompt(
+        query="help Dima choose a mountain bike",
+        transcript=[("assistant", "Hi Dima."), ("user", "I want to buy a mountain bike.")],
+        outbound={
+            "purpose": "Call specifically about figuring out how to buy a mountain bike.",
+            "context": "Discuss hardtail vs full suspension and budget.",
+        },
+        contact={"name": "Dima"},
+        direction="outbound",
+    )
+
+    assert "Do not continue unrelated prior text/session work" in prompt
+    assert "Do not run commands, run tests" in prompt
+    assert "Outbound call purpose: Call specifically about figuring out how to buy a mountain bike." in prompt
+    assert "user: I want to buy a mountain bike." in prompt
+    assert "Consult request: help Dima choose a mountain bike" in prompt
+
+
+def test_realtime_consult_wraps_query_before_codex(monkeypatch, tmp_path):
+    fake_ws = _FakeWS()
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    bridge = _FakeBridge()
+
+    context_dir = tmp_path / "call_contexts"
+    context_dir.mkdir()
+    (context_dir / "tok-bike.json").write_text(
+        '{"purpose":"Call about buying a mountain bike",'
+        '"context":"Budget and riding style","to_number":"+15551234567"}'
+    )
+
+    async def fake_open(*, config, meta):
+        return bridge
+
+    monkeypatch.setattr(gateway, "open_inkbox_realtime_bridge", fake_open)
+
+    from inkbox_codex.realtime import RealtimeConfig
+
+    session = _FakeContactSession()
+    cfg = BridgeConfig(require_signature=False, realtime=RealtimeConfig(enabled=True, api_key="sk-x"))
+    gw = gateway.InkboxGateway(cfg)
+    gw.sessions = _FakeSessions(session)
+    request = _FakeRequest()
+    request.query = {"context_token": "tok-bike"}
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    assert bridge.consult_answer == ""
+    assert session.consults
+    prompt = session.consults[0]
+    assert "Voice call consult from the Inkbox Realtime agent." in prompt
+    assert "Outbound call purpose: Call about buying a mountain bike" in prompt
+    assert "Consult request: help Dima choose a mountain bike" in prompt
+    assert "Do not run commands, run tests" in prompt
 
 
 def test_call_ws_passes_contact_and_identity_context_to_realtime(monkeypatch):
