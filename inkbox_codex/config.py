@@ -68,6 +68,8 @@ class BridgeConfig:
     codex_sandbox: str = "workspace-write"
     codex_approval_policy: str = "on-request"
     permission_timeout_s: float = 600.0
+    codex_turn_timeout_s: float = 1800.0
+    codex_interrupt_timeout_s: float = 10.0
     # OpenAI Realtime voice (off unless the wizard validated a key)
     realtime: RealtimeConfig = field(default_factory=RealtimeConfig)
 
@@ -123,5 +125,7 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
             or "on-request"
         ).strip(),
         permission_timeout_s=float(os.getenv("INKBOX_PERMISSION_TIMEOUT_S") or 600.0),
+        codex_turn_timeout_s=float(os.getenv("CODEX_TURN_TIMEOUT_S") or 1800.0),
+        codex_interrupt_timeout_s=float(os.getenv("CODEX_INTERRUPT_TIMEOUT_S") or 10.0),
         realtime=_read_realtime_config(),
     )

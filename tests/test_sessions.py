@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 from inkbox_codex.config import BridgeConfig
+from inkbox_codex.codex_client import CodexAppServerError
 from inkbox_codex.sessions import (
     ContactSession,
     _Turn,
@@ -130,6 +131,40 @@ def test_pending_escalation_consumes_next_inbound():
         await session.handle_inbound("yes", "sms", {"conversation_id": "c1"})
         assert await task == "yes"
         assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_inkbox_mcp_tool_confirmation_is_auto_approved():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+
+        result = await session._handle_codex_request(
+            "mcpServer/elicitation/request",
+            {"message": 'Allow the inkbox MCP server to run tool "inkbox_place_call"?'},
+        )
+
+        assert result == {"action": "accept", "content": {"text": "yes"}}
+        assert sent == []
+        assert session.pending is None
+
+    asyncio.run(scenario())
+
+
+def test_non_inkbox_mcp_elicitation_still_asks_human():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.cfg.permission_timeout_s = 0.05
+
+        result = await session._handle_codex_request(
+            "mcpServer/elicitation/request",
+            {"message": "Which account should I use?"},
+        )
+
+        assert result == {"action": "accept", "content": {"text": ""}}
+        assert sent and sent[0][1] == "Which account should I use?"
 
     asyncio.run(scenario())
 
@@ -495,5 +530,79 @@ def test_double_text_interrupts_running_turn():
         assert session._queue.get_nowait().text.endswith("do this instead")
 
         session._worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_double_text_restarts_client_when_interrupt_hangs():
+    async def scenario():
+        session = make_session([])
+        session.cfg.codex_interrupt_timeout_s = 0.01
+
+        class StuckClient:
+            def __init__(self):
+                self.disconnects = 0
+
+            async def interrupt(self):
+                await asyncio.sleep(10)
+
+            async def disconnect(self):
+                self.disconnects += 1
+
+        stuck = StuckClient()
+        session._client = stuck
+        session._turn_active = True
+        session._current_turn = _Turn(text="previous message")
+        session._worker = asyncio.create_task(asyncio.sleep(10))
+
+        await session.handle_inbound("do this instead", "imessage", {"conversation_id": "c1"})
+
+        assert stuck.disconnects == 1
+        assert session._client is None
+        assert session._interrupting is True
+        assert session._queue.get_nowait().text.endswith("do this instead")
+
+        session._worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_codex_turn_timeout_restarts_client():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.cfg.codex_turn_timeout_s = 0.01
+
+        class StuckClient:
+            thread_id = "thread-1"
+
+            def __init__(self):
+                self.disconnects = 0
+
+            async def run(self, _text):
+                await asyncio.sleep(10)
+
+            async def disconnect(self):
+                self.disconnects += 1
+
+        stuck = StuckClient()
+
+        async def ensure_client():
+            session._client = stuck
+            return stuck
+
+        session._ensure_client = ensure_client
+
+        raised = False
+        try:
+            await session._run_turn(_Turn(text="slow work"))
+        except CodexAppServerError as exc:
+            raised = True
+            assert "did not finish within" in str(exc)
+
+        assert raised is True
+        assert stuck.disconnects == 1
+        assert session._client is None
+        assert session._turn_active is False
 
     asyncio.run(scenario())

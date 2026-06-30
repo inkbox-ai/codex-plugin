@@ -14,6 +14,18 @@ def test_frame_inbound_tags_channel_and_sender():
     assert "Subject: Deploy?" in framed
     # Voice has no sender tag but flags speech.
     assert frame_inbound("voice", {}, "what's up").startswith("[Spoken live on a phone call")
+    outbound_voice = frame_inbound(
+        "voice",
+        {
+            "outbound_purpose": "talk about soccer and the World Cup",
+            "outbound_context": "Dima asked by iMessage for this call.",
+            "outbound_scheduled_by": "Dima",
+        },
+        "why are you calling?",
+    )
+    assert "Outbound call reason: talk about soccer and the World Cup" in outbound_voice
+    assert "Outbound call scheduled by: Dima" in outbound_voice
+    assert "Outbound call background: Dima asked by iMessage for this call." in outbound_voice
     # The body always survives intact.
     assert frame_inbound("imessage", {"sender": "x"}, "the message").endswith("the message")
 

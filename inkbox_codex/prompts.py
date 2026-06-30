@@ -114,6 +114,15 @@ def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
         header = f"[iMessage{from_part}]"
     elif mode == "voice":
         header = "[Spoken live on a phone call — keep the reply short and speech-friendly]"
+        purpose = str(meta.get("outbound_purpose") or "").strip()
+        context = str(meta.get("outbound_context") or "").strip()
+        scheduled_by = str(meta.get("outbound_scheduled_by") or "").strip()
+        if purpose:
+            header += f"\nOutbound call reason: {purpose}"
+        if scheduled_by:
+            header += f"\nOutbound call scheduled by: {scheduled_by}"
+        if context:
+            header += f"\nOutbound call background: {context}"
     else:
         header = f"[Message via {mode}{from_part}]"
     return f"{header}\n\n{text}"

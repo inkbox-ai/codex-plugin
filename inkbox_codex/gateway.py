@@ -25,6 +25,7 @@ import os
 import shutil
 import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -718,9 +719,57 @@ class InkboxGateway:
         if not path.exists():
             return None
         try:
-            return json.loads(path.read_text())
+            data = json.loads(path.read_text())
+            with suppress(OSError):
+                path.unlink()
+            return data
         except (OSError, json.JSONDecodeError):
             return None
+
+    @staticmethod
+    def _outbound_field(outbound: Optional[Dict[str, Any]], *keys: str) -> str:
+        for key in keys:
+            value = str((outbound or {}).get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    @classmethod
+    def _outbound_remote(cls, outbound: Optional[Dict[str, Any]]) -> str:
+        """Best-effort remote number for an outbound call context."""
+        return cls._outbound_field(outbound, "to_number", "toNumber")
+
+    @classmethod
+    def _call_start_greeting(cls, outbound: Optional[Dict[str, Any]]) -> str:
+        """Opening line for Inkbox STT/TTS calls."""
+        opening = cls._outbound_field(outbound, "opening_message", "opening_line", "openingMessage")
+        if opening:
+            return opening
+        purpose = cls._outbound_field(outbound, "purpose", "reason")
+        if purpose:
+            return f"Hey, it's Codex. I'm calling because: {purpose}"
+        return "Hey, you've reached Codex. What do you need?"
+
+    @classmethod
+    def _voice_turn_meta(cls, call_id: str, remote: str, outbound: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Metadata passed into the Codex voice turn."""
+        meta: Dict[str, Any] = {"call_id": call_id, "sender": remote}
+        to_number = cls._outbound_remote(outbound)
+        if to_number:
+            meta["to"] = to_number
+        purpose = cls._outbound_field(outbound, "purpose", "reason")
+        if purpose:
+            meta["outbound_purpose"] = purpose
+        opening = cls._outbound_field(outbound, "opening_message", "opening_line", "openingMessage")
+        if opening:
+            meta["outbound_opening"] = opening
+        context = cls._outbound_field(outbound, "context", "conversation_summary", "prior_conversation")
+        if context:
+            meta["outbound_context"] = context
+        scheduled_by = cls._outbound_field(outbound, "scheduled_by", "scheduledBy")
+        if scheduled_by:
+            meta["outbound_scheduled_by"] = scheduled_by
+        return meta
 
     async def _handle_call_ws(self, request: "web.Request") -> Any:
         # The tunnel URL is internet-reachable; Inkbox signs the WS upgrade
@@ -741,8 +790,10 @@ class InkboxGateway:
             call_context = {}
         remote = str(call_context.get("remote_phone_number") or "").strip()
         call_id = str(call_context.get("id") or call_context.get("call_id") or "")
-        chat_id = remote or f"call:{call_id}"
         outbound = self._load_outbound_context(request.query.get("context_token"))
+        if not remote:
+            remote = self._outbound_remote(outbound)
+        chat_id = remote or f"call:{call_id}"
 
         ws = web.WebSocketResponse()
 
@@ -818,12 +869,12 @@ class InkboxGateway:
                     continue
                 event = payload.get("event")
                 if event == "start":
-                    await self._speak(ws, "Hey, you've reached Codex. What do you need?", "greeting")
+                    await self._speak(ws, self._call_start_greeting(outbound), "greeting")
                 elif event == "transcript" and payload.get("is_final"):
                     text = str(payload.get("text") or "").strip()
                     if not text:
                         continue
-                    meta = {"call_id": call_id, "sender": remote}
+                    meta = self._voice_turn_meta(call_id, remote, outbound)
                     session = self.sessions.get(chat_id)
                     await session.handle_inbound(text, "voice", meta)
                 elif event == "stop":
