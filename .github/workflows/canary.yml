@@ -1,0 +1,55 @@
+name: Canary — plugin vs Codex main
+
+# Codex main moves fast and ships a prerelease cut (@alpha) near-daily, so the
+# host can break us even when we don't push. Run the host-interface contract
+# tests against the freshest main prerelease twice a day and alert on failure.
+# The live channel suite chains off this run, so the canary leads and live
+# follows on the same cadence.
+on:
+  schedule:
+    # 2x/day at 6 AM and 6 PM America/Los_Angeles (PDT/UTC-7 basis; cron is UTC).
+    - cron: "13 13 * * *"   # 06:13 PT
+    - cron: "13 1 * * *"    # 18:13 PT
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install bridge + test deps
+        run: pip install -e . pytest
+
+      # @alpha is the prerelease channel cut from codex main near-daily — the
+      # freshest main build available without compiling the host from source.
+      - name: Install Codex (freshest main prerelease)
+        run: |
+          npm install -g @openai/codex@alpha
+          codex --version
+
+      - name: Contract tests vs real Codex
+        run: pytest tests/contract -v
+
+      # Alert only when an unattended (scheduled) run fails — no success pings,
+      # and manual dispatch stays silent (you're watching it). Non-blocking
+      # (--retry + || true) so a flaky webhook can't flip the result.
+      - name: Notify Google Chat on scheduled failure
+        if: failure() && github.event_name == 'schedule'
+        run: |
+          curl -sS --max-time 10 --retry 3 -X POST "${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}" \
+            -H 'Content-Type: application/json' \
+            -d '{"text": "⚠️ *FAILED* — Canary: contract suite vs Codex `main` prerelease\n\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' || true
