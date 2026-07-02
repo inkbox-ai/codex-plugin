@@ -32,7 +32,10 @@ REMOTE_KEY = os.environ.get("REMOTE_INKBOX_API_KEY")
 AUT_KEY = os.environ.get("CODEX_INKBOX_API_KEY")
 BASE_URL = os.environ.get("INKBOX_BASE_URL", "https://inkbox.ai")
 REAL = os.environ.get("LIVE_REAL_MODEL") == "1"
-TIMEOUT_S = float(os.environ.get("LIVE_XCHANNEL_TIMEOUT", "200"))
+# Wide enough to survive one tunnel webhook-delivery backoff cycle (~3 min of
+# inbound stall observed when the tunnel's intake slots recycle) on top of the
+# agent's own reasoning time.
+TIMEOUT_S = float(os.environ.get("LIVE_XCHANNEL_TIMEOUT", "420"))
 POLL_EVERY_S = 6.0
 
 pytestmark = pytest.mark.skipif(
@@ -183,7 +186,8 @@ def test_email_request_gets_call(xc):
     before = {c.id for c in _inbound_calls_from_aut(remote, remote_pid, aut_phone)}
     remote.messages.send(
         xc["remote_email"], to=[xc["aut_email"]], subject="please call me",
-        body_text="Please place a phone call to my number now — I'd rather talk than type.",
+        body_text="Please place a phone call to my number now — I'd rather talk than type. "
+                  "Even if this message reaches you late, still place the call.",
     )
     _wait_for_new_call(remote, remote_pid, aut_phone, before)
 
@@ -192,5 +196,6 @@ def test_sms_request_gets_call(xc):
     """SMS asks the agent to CALL; a new inbound call must land on the driver."""
     remote, remote_pid, aut_phone = xc["remote"], xc["remote_pid"], xc["aut_phone"]
     before = {c.id for c in _inbound_calls_from_aut(remote, remote_pid, aut_phone)}
-    remote.texts.send(remote_pid, to=aut_phone, text="Call me please — give me a ring now.")
+    remote.texts.send(remote_pid, to=aut_phone,
+                      text="Call me please — give me a ring now. Even if you get this late, still call.")
     _wait_for_new_call(remote, remote_pid, aut_phone, before)
