@@ -1,0 +1,210 @@
+name: Live — agent channels (email + SMS)
+
+# Boots the agent-under-test (AUT) as a real bridge gateway driving a real Codex
+# app-server, then a remote Inkbox identity emails/texts it and waits for a reply.
+# Two matrix legs:
+#   mock — deterministic mock model; proves the pipe (no token spend).
+#   real — real OpenAI key; proves the agent actually reasons (spends tokens).
+# This suite is expensive (real gateway + tunnel + OpenAI tokens), so on PRs it runs
+# only once the PR is READY (non-draft) — the job `if` gates on draft==false, and
+# `ready_for_review` makes flipping a draft to ready fire it. Also runs on the 2x/day
+# schedule; the repo-wide tunnel lock below serializes them all. Ephemeral runner:
+# gateway + mock torn down on job end.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      timeout_s:
+        description: "Seconds to wait for the reply"
+        default: "150"
+  # Chains off the canary (fires only from the default branch). The job's `if` gates
+  # on a PASSING canary, so live and the host stay in lock-step on the 2x/day cadence.
+  workflow_run:
+    workflows: ["Canary — plugin vs Codex main"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Only ONE client may hold the AUT's Inkbox tunnel at a time, so EVERY live tunnel
+  # workflow (this + any future one) MUST use this exact group → they run one at a
+  # time across all triggers (PRs + the main schedule queue behind each other).
+  group: inkbox-live-aut-tunnel
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Three guards:
+    #  - Skip fork PRs: a public repo doesn't expose secrets to forks → can't auth.
+    #  - Skip DRAFT PRs: this suite is expensive — only spend on ready-for-review PRs.
+    #  - When chained off the canary, only run if that canary PASSED. Never take the
+    #    tunnel or burn tokens against a host we already know is broken.
+    # Ready same-repo PRs + dispatch + a green canary all run (and queue on the lock).
+    if: >-
+      (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false)) &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    strategy:
+      fail-fast: false
+      max-parallel: 1          # legs share the AUT identity → must run one at a time
+      matrix:
+        mode: [mock, real]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up env paths
+        run: |
+          echo "CODEX_HOME=$RUNNER_TEMP/codex-home" >> "$GITHUB_ENV"
+          echo "CODEX_PROJECT_DIR=$RUNNER_TEMP/project" >> "$GITHUB_ENV"
+          echo "GATEWAY_LOG=$RUNNER_TEMP/gateway.log" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/codex-home" "$RUNNER_TEMP/project"
+
+      - name: Install bridge + test deps
+        run: pip install -e . pytest
+
+      # @alpha is the prerelease channel cut from codex main near-daily — the
+      # freshest main build available without compiling the host from source.
+      - name: Install Codex (freshest main prerelease)
+        run: |
+          npm install -g @openai/codex@alpha
+          codex --version
+
+      - name: Configure AUT identity + model (${{ matrix.mode }})
+        env:
+          CODEX_INKBOX_API_KEY: ${{ secrets.CODEX_INKBOX_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          HANDLE="$(python3 - <<'PYEOF'
+          import os
+          from inkbox import Inkbox
+          c = Inkbox(api_key=os.environ["CODEX_INKBOX_API_KEY"], base_url=os.environ.get("INKBOX_BASE_URL", "https://inkbox.ai"))
+          print(c.mailboxes.list()[0].email_address.split("@", 1)[0])
+          PYEOF
+          )"
+          echo "AUT handle: $HANDLE"
+          {
+            echo "INKBOX_IDENTITY=$HANDLE"
+            echo "INKBOX_ALLOW_ALL_USERS=true"
+            echo "INKBOX_REALTIME_ENABLED=false"
+            # Unattended runner: nobody is on the other end to answer an approval
+            # text, so never escalate — and keep the sandbox read-only so a stray
+            # command the model dreams up stays harmless.
+            echo "CODEX_SANDBOX=read-only"
+            echo "CODEX_APPROVAL_POLICY=never"
+          } >> "$GITHUB_ENV"
+          if [ "${{ matrix.mode }}" = "real" ]; then
+            # Real OpenAI via the default provider — authenticate the codex CLI
+            # with the API key (writes auth.json under CODEX_HOME).
+            printenv OPENAI_API_KEY | codex login --with-api-key
+            echo "CODEX_MODEL=gpt-5.5" >> "$GITHUB_ENV"
+          else
+            # Custom provider pointed at the local mock. Codex speaks the
+            # Responses API (wire_api "chat" is gone from the host), and a custom
+            # provider needs no login at all.
+            cat > "$CODEX_HOME/config.toml" <<'TOML'
+          model = "mock-model"
+          model_provider = "mock"
+
+          [model_providers.mock]
+          name = "Mock"
+          base_url = "http://127.0.0.1:8088/v1"
+          wire_api = "responses"
+          TOML
+            echo "CODEX_MODEL=mock-model" >> "$GITHUB_ENV"
+          fi
+
+      - name: Start mock OpenAI model
+        if: matrix.mode == 'mock'
+        run: |
+          nohup python3 "$GITHUB_WORKSPACE/tests/live/mock_openai.py" 8088 > "$RUNNER_TEMP/mock.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/mock.pid"
+          for i in $(seq 1 10); do
+            curl -sf http://127.0.0.1:8088/v1/models >/dev/null && { echo "mock model ready"; exit 0; }
+            sleep 1
+          done
+          echo "::error::mock model did not start"; cat "$RUNNER_TEMP/mock.log"; exit 1
+
+      - name: Start gateway and wait for readiness
+        env:
+          INKBOX_API_KEY: ${{ secrets.CODEX_INKBOX_API_KEY }}
+          INKBOX_SIGNING_KEY: ${{ secrets.CODEX_INKBOX_SIGNING_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          inkbox-codex run > "$GATEWAY_LOG" 2>&1 &
+          echo $! > "$RUNNER_TEMP/gateway.pid"
+          echo "Waiting for the gateway to be ready (tunnel + webhooks)…"
+          for i in $(seq 1 36); do      # up to ~180s
+            if grep -q "tunnel ready" "$GATEWAY_LOG" && grep -q "\[bridge\] phone" "$GATEWAY_LOG"; then
+              echo "Gateway ready."; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::gateway did not become ready"; cat "$GATEWAY_LOG"; exit 1
+
+      - name: Run live test (${{ matrix.mode }})
+        env:
+          REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
+          CODEX_INKBOX_API_KEY: ${{ secrets.CODEX_INKBOX_API_KEY }}
+          LIVE_EMAIL_TIMEOUT: ${{ github.event.inputs.timeout_s || '150' }}
+        run: |
+          if [ "${{ matrix.mode }}" = "real" ]; then
+            LIVE_REAL_MODEL=1 python3 -m pytest tests/live -v
+          else
+            python3 -m pytest tests/live -v
+          fi
+
+      # Failure-only: these logs carry live phone/email/message content and this repo
+      # (and its Action logs/artifacts) is public.
+      - name: Dump logs (on failure only)
+        if: failure()
+        run: |
+          echo "=== gateway.log ==="; cat "$GATEWAY_LOG" || true
+          echo "=== mock model log ==="; cat "$RUNNER_TEMP/mock.log" 2>/dev/null || true
+
+      - name: Tear down (always)
+        if: always()
+        run: |
+          kill "$(cat "$RUNNER_TEMP/gateway.pid" 2>/dev/null)" 2>/dev/null || true
+          kill "$(cat "$RUNNER_TEMP/mock.pid" 2>/dev/null)" 2>/dev/null || true
+
+      - name: Upload artifacts (on failure only)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-logs-${{ matrix.mode }}
+          retention-days: 5
+          path: |
+            ${{ runner.temp }}/gateway.log
+            ${{ runner.temp }}/mock.log
+          if-no-files-found: ignore
+
+  # Alert only when an unattended run fails — no success pings; PRs + manual
+  # dispatch stay silent (the check is visible inline there). This suite has no
+  # direct `schedule` trigger; its unattended cadence arrives as a `workflow_run`
+  # chained off the scheduled canary, so that event is the "scheduled failure"
+  # trigger here. `always()` lets this job run despite the failed `live`
+  # dependency; needs.live.result is 'failure' if any matrix leg failed.
+  notify:
+    needs: [live]
+    if: always() && needs.live.result == 'failure' && github.event_name == 'workflow_run'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Google Chat on scheduled failure
+        # Non-blocking: a flaky webhook must never flip the suite result.
+        run: |
+          curl -sS --max-time 10 --retry 3 -X POST "${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}" \
+            -H 'Content-Type: application/json' \
+            -d '{"text": "⚠️ *FAILED* — Live channels (email + SMS) suite\n\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' || true
