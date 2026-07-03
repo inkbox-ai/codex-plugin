@@ -3,18 +3,19 @@
 Exercises a real third-party provider end to end: the bridge's ``github``
 :class:`WebhookProvider` verifies ``X-Hub-Signature-256`` (HMAC-SHA256 over the
 raw body with ``INKBOX_WEBHOOK_SECRET_GITHUB``). Two events with identical
-content — "a GitHub Action failed, call Jane Doe immediately":
+content — "a GitHub Action failed, call the driver immediately":
 
   * **forged signature** → rejected at the webhook (401), the agent is never
     woken, and no call is placed;
   * **valid signature** → verified, handed to the agent as an external event,
     and the real model reasons "escalation → call this contact" and *places a
-    call* to Jane Doe (the driver).
+    call* to the driver.
 
-Jane Doe is the remote/driver identity, seeded as a contact in the AUT org and
-parked on ``auto_reject`` — we monitor that the agent dialed, not the call
-itself. Skipped unless both identity keys + the GitHub webhook secret +
-``LIVE_REAL_MODEL=1`` are set.
+The driver is the remote identity, addressed by whatever name its contact card
+carries in the AUT org (seeded as ``Jane Doe`` only when no card exists — the
+agent can only dial a name it can resolve) and parked on ``auto_reject`` — we
+monitor that the agent dialed, not the call itself. Skipped unless both
+identity keys + the GitHub webhook secret + ``LIVE_REAL_MODEL=1`` are set.
 """
 
 from __future__ import annotations
@@ -102,10 +103,18 @@ def _accepted(status: int, body: str) -> bool:
         return False
 
 
-def _ensure_driver_contact(aut, driver_phone: str) -> None:
-    """Seed a ``Jane Doe`` contact for the driver number if the AUT lacks one."""
-    if aut.contacts.lookup(phone=driver_phone):
-        return
+def _ensure_driver_contact(aut, driver_phone: str) -> str:
+    """Return the driver's contact name in the AUT org, seeding ``Jane Doe`` if absent.
+
+    The escalation asks the agent to call the driver BY NAME, so the name in the
+    envelope must match the contact card the agent will resolve — an AUT org that
+    already carries a card for this number keeps its existing name.
+    """
+    matches = aut.contacts.lookup(phone=driver_phone)
+    if matches:
+        c = matches[0]
+        return (getattr(c, "preferred_name", None) or getattr(c, "given_name", None)
+                or getattr(c, "family_name", None) or DRIVER_NAME)
     from inkbox.contacts.types import ContactPhone
 
     given, _, family = DRIVER_NAME.partition(" ")
@@ -114,6 +123,7 @@ def _ensure_driver_contact(aut, driver_phone: str) -> None:
         family_name=family or "Driver",
         phones=[ContactPhone(label="mobile", value=driver_phone)],
     )
+    return DRIVER_NAME
 
 
 def _outbound_calls_to(aut, driver_phone: str) -> list:
@@ -126,8 +136,8 @@ def _outbound_calls_to(aut, driver_phone: str) -> list:
     ]
 
 
-def _escalation_envelope() -> dict:
-    """A GitHub Actions failure asking the agent to phone Jane Doe."""
+def _escalation_envelope(driver_name: str) -> dict:
+    """A GitHub Actions failure asking the agent to phone the driver contact."""
     run_id = str(uuid.uuid4().int % 10**17)
     return {
         "event": "workflow_run",
@@ -137,7 +147,7 @@ def _escalation_envelope() -> dict:
         "severity": "prod",
         "summary": "A GitHub Action failed on the backend repo; production deploy is blocked.",
         "requested_action": (
-            f"Call {DRIVER_NAME} immediately by phone (use inkbox_place_call) and tell "
+            f"Call {driver_name} immediately by phone (use inkbox_place_call) and tell "
             "them a GitHub Action failed and the deploy is blocked. This is urgent — "
             "place the call now."
         ),
@@ -159,9 +169,9 @@ def ctx():
     # Driver auto-rejects: the call rings and drops — we never handle media.
     prev_action = getattr(driver_num, "incoming_call_action", None)
     remote.phone_numbers.update(driver_num.id, incoming_call_action="auto_reject")
-    _ensure_driver_contact(aut, driver_num.number)
+    driver_name = _ensure_driver_contact(aut, driver_num.number)
     try:
-        yield {"aut": aut, "driver_phone": driver_num.number}
+        yield {"aut": aut, "driver_phone": driver_num.number, "driver_name": driver_name}
     finally:
         # Leave the driver number as we found it for other suites.
         try:
@@ -175,7 +185,8 @@ def test_forged_github_signature_is_dropped_and_agent_does_nothing(ctx):
     aut, driver_phone = ctx["aut"], ctx["driver_phone"]
     before = {c.id for c in _outbound_calls_to(aut, driver_phone)}
 
-    status, body = _post_github_event(_escalation_envelope(), signature="sha256=deadbeef")
+    envelope = _escalation_envelope(ctx["driver_name"])
+    status, body = _post_github_event(envelope, signature="sha256=deadbeef")
     assert status == 401, f"forged signature should be rejected, got {status} {body!r}"
 
     # Watch briefly: a rejected event must not produce any call to the driver.
@@ -187,11 +198,11 @@ def test_forged_github_signature_is_dropped_and_agent_does_nothing(ctx):
 
 
 def test_valid_github_signature_makes_agent_call_jane(ctx):
-    """A validly-signed GitHub failure → the agent places a call to Jane Doe."""
+    """A validly-signed GitHub failure → the agent places a call to the driver."""
     aut, driver_phone = ctx["aut"], ctx["driver_phone"]
     before = {c.id for c in _outbound_calls_to(aut, driver_phone)}
 
-    envelope = _escalation_envelope()
+    envelope = _escalation_envelope(ctx["driver_name"])
     payload = json.dumps(envelope).encode()
     status, body = _post_github_event(envelope, signature=_sign_github(payload, GITHUB_SECRET))
     assert _accepted(status, body), f"valid webhook not accepted: {status} {body!r}"
@@ -200,6 +211,6 @@ def test_valid_github_signature_makes_agent_call_jane(ctx):
     while time.monotonic() < deadline:
         fresh = [c for c in _outbound_calls_to(aut, driver_phone) if c.id not in before]
         if fresh:
-            return  # the agent escalated by phoning Jane Doe — exactly what we monitor for
+            return  # the agent escalated by phoning the driver — exactly what we monitor for
         time.sleep(POLL_EVERY_S)
-    pytest.fail(f"agent never called {DRIVER_NAME} within {TIMEOUT_S:.0f}s")
+    pytest.fail(f"agent never called {ctx['driver_name']} within {TIMEOUT_S:.0f}s")
