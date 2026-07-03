@@ -1,0 +1,69 @@
+name: PR checks — unit · contract
+
+on:
+  push:
+    branches: [main]
+  pull_request:                     # catches PRs from feature branches → main
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  # Offline unit suite. No codex binary installed → the contract tests auto-skip,
+  # and the live tests skip without API keys. Fast signal on our own code — cheap
+  # enough to run on every push, including draft PRs (the heavy live suite is what
+  # we gate).
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # inkbox is mocked in the unit tests, so install only what they import.
+      - name: Install test deps
+        run: pip install pytest aiohttp segno
+
+      - name: Run unit tests
+        run: pytest -q
+
+  # Contract suite against the REAL Codex host at its freshest main cut. This is
+  # the lane that catches upstream drift in the app-server protocol (a renamed
+  # method, a moved result field, a dropped notification) before it reaches a
+  # user. Same suite the canary runs on a schedule; this is the per-PR gate.
+  contract-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install bridge + test deps
+        run: pip install -e . pytest
+
+      # @alpha is the prerelease channel cut from codex main near-daily — the
+      # freshest main build available without compiling the host from source.
+      - name: Install Codex (freshest main prerelease)
+        run: |
+          npm install -g @openai/codex@alpha
+          codex --version
+
+      - name: Contract tests vs real Codex
+        run: pytest tests/contract -v
