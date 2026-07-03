@@ -104,6 +104,9 @@ jobs:
             # command the model dreams up stays harmless.
             echo "CODEX_SANDBOX=read-only"
             echo "CODEX_APPROVAL_POLICY=never"
+            # MCP tool confirmations are opt-in here: without this flag the
+            # gateway escalates each Inkbox tool prompt as a poll nobody answers.
+            echo "INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS=true"
           } >> "$GITHUB_ENV"
           if [ "${{ matrix.mode }}" = "real" ]; then
             # Real OpenAI via the default provider — authenticate the codex CLI

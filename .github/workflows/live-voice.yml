@@ -95,6 +95,9 @@ jobs:
             # and keep the sandbox read-only so stray commands stay harmless.
             echo "CODEX_SANDBOX=read-only"
             echo "CODEX_APPROVAL_POLICY=never"
+            # MCP tool confirmations are opt-in here: without this flag the
+            # gateway escalates each Inkbox tool prompt as a poll nobody answers.
+            echo "INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS=true"
           } >> "$GITHUB_ENV"
           if [ "${{ matrix.scenario }}" = "outbound_realtime" ]; then
             # Realtime key falls back to OPENAI_API_KEY in the gateway env.
