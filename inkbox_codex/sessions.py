@@ -704,13 +704,16 @@ class ContactSession:
             mcp_server_config=self.mcp_server_config,
             approval_handler=self._handle_codex_request,
         )
-        thread_id = await self._client.connect(self.resume_session_id or None)
+        # Capture what we resumed from before it's overwritten with the new
+        # thread id below — otherwise the log claims every session resumed.
+        resumed_from = self.resume_session_id
+        thread_id = await self._client.connect(resumed_from or None)
         if self.on_session_id:
             self.resume_session_id = thread_id
             self.on_session_id(self.chat_id, thread_id)
         logger.info(
             "[session %s] Codex session started (resume=%s)",
-            self.chat_id, self.resume_session_id or "fresh",
+            self.chat_id, resumed_from or "fresh",
         )
         return self._client
 

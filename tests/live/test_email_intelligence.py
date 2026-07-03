@@ -9,7 +9,8 @@ through the API keys (NO hardcoded expectations):
   * own identity — reports its own handle / email / phone (looked up via the AUT key).
   * sender       — reports who the sender is, from the contact card it can see
                    (looked up via the AUT key).
-  * tools        — names its real Inkbox tools (scraped from the tool sources).
+  * tools        — discovers its contact tools through Codex tool search and
+                   names them (expected names scraped from the tool sources).
   * contact CRUD — with LIVE_CONTACT_CRUD=1, creates/updates a temporary contact
                    through the real agent loop (cleaned up via the SDK — the
                    plugin exposes no delete tool).
@@ -186,7 +187,15 @@ def test_reports_sender_details(ctx):
 
 
 def test_aware_of_inkbox_tools(ctx):
-    """Non-LLM proof the agent is wired with real tools: it names them."""
+    """Non-LLM proof the agent is wired with real tools: it discovers and names them.
+
+    Codex now defers ALL MCP tools behind its built-in tool search
+    (openai/codex#29486) — the full Inkbox tool list is never in the model's
+    context, so asking it to recite every tool from memory only yields the few
+    the bridge prompt happens to mention. Instead, force a discovery pass: the
+    contact tools are never preloaded and never prompt-mentioned, so naming
+    them proves a real tool-search round trip against the live MCP server.
+    """
     tool_names = _plugin_tool_names()
     assert tool_names, "no inkbox_* tool names found in inkbox_codex/tools.py"
     contact_tools = {
@@ -199,13 +208,15 @@ def test_aware_of_inkbox_tools(ctx):
     assert contact_tools <= set(tool_names)
 
     body = _ask(ctx["remote"], ctx["aut_email"], ctx["remote_email"],
-                "List the exact names of ALL the Inkbox tools you have access to, one "
-                "per line. Include every single one — do not omit or group similar-"
+                "Your Inkbox tools are not all preloaded into context — use your "
+                "tool search to find every available Inkbox CONTACT tool (search "
+                "for 'contact'), then reply with the exact name of each contact "
+                "tool you found, one per line. Do not omit or group similar-"
                 "sounding tools.")
     hits = [t for t in tool_names if t.lower() in body]
     assert len(hits) >= 3, f"agent named only {hits} of its tools {tool_names}\n{body[:500]}"
-    # The bridge nudges replies to stay short, so the model sometimes folds
-    # near-duplicate contact tools together — require a majority, not all.
+    # The search surfaces every contact tool, but the model sometimes folds
+    # near-duplicates together in a short reply — require a majority, not all.
     named_contacts = sorted(t for t in contact_tools if t.lower() in body)
     assert len(named_contacts) >= 3, \
         f"agent named only contact tools {named_contacts} of {sorted(contact_tools)}\n{body[:500]}"
