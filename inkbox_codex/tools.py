@@ -134,6 +134,7 @@ TOOL_SPECS: List[ToolSpec] = [
         _schema(
             {
                 "to_number": _str("E.164 recipient number, e.g. +15551234567."),
+                "toNumber": _str("Alias for to_number."),
                 "purpose": _str("Why Codex is placing this call."),
                 "origination": {
                     "type": "string",
@@ -150,9 +151,12 @@ TOOL_SPECS: List[ToolSpec] = [
                     ),
                 },
                 "opening_message": _str("Optional exact first line to say on pickup."),
+                "openingMessage": _str("Alias for opening_message."),
                 "context": _str("Optional extra background for the live call."),
+                "client_websocket_url": _str("Optional override for the call-media WebSocket URL."),
+                "clientWebsocketUrl": _str("Alias for client_websocket_url."),
             },
-            ["to_number", "purpose"],
+            ["purpose"],
         ),
     ),
     ToolSpec(
@@ -529,7 +533,7 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
             return {"sent": True, "id": str(getattr(msg, "id", ""))}
 
         if name == "inkbox_place_call":
-            to_number = str(args.get("to_number") or "").strip()
+            to_number = str(args.get("to_number") or args.get("toNumber") or "").strip()
             if not to_number:
                 raise ValueError("to_number is required (E.164, e.g. +15551234567)")
             purpose = str(args.get("purpose") or "").strip()
@@ -548,7 +552,14 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                     "number and iMessage is not enabled. Provision a number or "
                     "enable iMessage first."
                 )
-            ws_url = _call_ws_url(identity)
+            # An explicit override wins; otherwise resolve from the identity.
+            ws_url = str(
+                args.get("client_websocket_url")
+                or args.get("clientWebsocketUrl")
+                or ""
+            ).strip()
+            if not ws_url:
+                ws_url = _call_ws_url(identity)
             if not ws_url:
                 raise RuntimeError(
                     "no call-media WebSocket URL available; start the Inkbox "
@@ -556,7 +567,9 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 )
             token = _write_call_context(
                 purpose=purpose,
-                opening_message=str(args.get("opening_message") or "").strip(),
+                opening_message=str(
+                    args.get("opening_message") or args.get("openingMessage") or ""
+                ).strip(),
                 context=str(args.get("context") or "").strip(),
                 to_number=to_number,
             )

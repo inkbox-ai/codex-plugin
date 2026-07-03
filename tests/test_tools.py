@@ -176,6 +176,32 @@ def test_place_call_writes_context_and_tags_websocket_url(tmp_path, monkeypatch)
     assert payload["context"] == "The fix landed in PR 12."
 
 
+def test_place_call_accepts_hermes_style_aliases(tmp_path, monkeypatch):
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    client = _FakeClient()
+
+    data = _call(
+        client,
+        "inkbox_place_call",
+        {
+            "toNumber": "+15551112222",
+            "purpose": "tell them the build is fixed",
+            "openingMessage": "Hi, this is Codex with the build update.",
+            "clientWebsocketUrl": "wss://override.inkboxwire.com/phone/media/ws",
+        },
+    )
+
+    assert data["placed"] is True
+    ws_url = client.identity.place_call_kwargs["client_websocket_url"]
+    parsed = urlparse(ws_url)
+    query = parse_qs(parsed.query)
+    assert parsed.netloc == "override.inkboxwire.com"
+    token = query["context_token"][0]
+    payload = json.loads((tmp_path / "call_contexts" / f"{token}.json").read_text())
+    assert payload["to_number"] == "+15551112222"
+    assert payload["opening_message"] == "Hi, this is Codex with the build update."
+
+
 def test_place_call_requires_purpose():
     data = _call(
         _FakeClient(),

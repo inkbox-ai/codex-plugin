@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from inkbox_codex import sessions as sessions_mod
+from inkbox_codex.codex_client import CodexAppServerError
 from inkbox_codex.config import BridgeConfig, channel_hints_path
 from inkbox_codex.sessions import (
     ContactSession,
@@ -156,6 +157,7 @@ def test_inkbox_mcp_elicitation_auto_approves_when_trusted():
 
         assert result == {"action": "accept", "content": {"text": "yes"}}
         assert sent == []
+        assert session.pending is None
 
     asyncio.run(scenario())
 
@@ -177,6 +179,23 @@ def test_non_inkbox_mcp_elicitation_still_prompts():
 
         await session.handle_inbound("yes", "sms", {"conversation_id": "c1"})
         assert await task == {"action": "accept", "content": {"text": "yes"}}
+
+    asyncio.run(scenario())
+
+
+def test_plain_elicitation_question_still_asks_human():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.cfg.permission_timeout_s = 0.05
+
+        result = await session._handle_codex_request(
+            "mcpServer/elicitation/request",
+            {"message": "Which account should I use?"},
+        )
+
+        assert result == {"action": "accept", "content": {"text": ""}}
+        assert sent and sent[0][1] == "Which account should I use?"
 
     asyncio.run(scenario())
 
@@ -599,6 +618,39 @@ def test_handle_inbound_records_channel_hint(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_double_text_restarts_client_when_interrupt_hangs():
+    async def scenario():
+        session = make_session([])
+        session.cfg.codex_interrupt_timeout_s = 0.01
+
+        class StuckClient:
+            def __init__(self):
+                self.disconnects = 0
+
+            async def interrupt(self):
+                await asyncio.sleep(10)
+
+            async def disconnect(self):
+                self.disconnects += 1
+
+        stuck = StuckClient()
+        session._client = stuck
+        session._turn_active = True
+        session._current_turn = _Turn(text="previous message")
+        session._worker = asyncio.create_task(asyncio.sleep(10))
+
+        await session.handle_inbound("do this instead", "imessage", {"conversation_id": "c1"})
+
+        assert stuck.disconnects == 1
+        assert session._client is None
+        assert session._interrupting is True
+        assert session._queue.get_nowait().text.endswith("do this instead")
+
+        session._worker.cancel()
+
+    asyncio.run(scenario())
+
+
 def test_session_stamps_chat_id_into_tool_env():
     # Each session's MCP tool subprocess learns which conversation it serves;
     # the shared config's env must not leak one session's id into another's.
@@ -623,5 +675,46 @@ def test_session_stamps_chat_id_into_tool_env():
         assert second.mcp_server_config["env"]["INKBOX_API_KEY"] == "k"
         # The caller's dict is untouched.
         assert "INKBOX_CODEX_CHAT_ID" not in shared["env"]
+
+    asyncio.run(scenario())
+
+
+def test_codex_turn_timeout_restarts_client():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.cfg.codex_turn_timeout_s = 0.01
+
+        class StuckClient:
+            thread_id = "thread-1"
+
+            def __init__(self):
+                self.disconnects = 0
+
+            async def run(self, _text):
+                await asyncio.sleep(10)
+
+            async def disconnect(self):
+                self.disconnects += 1
+
+        stuck = StuckClient()
+
+        async def ensure_client():
+            session._client = stuck
+            return stuck
+
+        session._ensure_client = ensure_client
+
+        raised = False
+        try:
+            await session._run_turn(_Turn(text="slow work"))
+        except CodexAppServerError as exc:
+            raised = True
+            assert "did not finish within" in str(exc)
+
+        assert raised is True
+        assert stuck.disconnects == 1
+        assert session._client is None
+        assert session._turn_active is False
 
     asyncio.run(scenario())

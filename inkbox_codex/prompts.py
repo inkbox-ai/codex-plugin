@@ -172,6 +172,17 @@ def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
         call_id = str(meta.get("call_id") or "").strip()
         call_part = f" call_id={call_id}" if call_id else ""
         header = f"[inkbox:voice_call{call_part} | {marker}]"
+        # Outbound calls carry the reason they were placed; surface it so the
+        # agent opens with context instead of a generic greeting.
+        purpose = str(meta.get("outbound_purpose") or "").strip()
+        context = str(meta.get("outbound_context") or "").strip()
+        scheduled_by = str(meta.get("outbound_scheduled_by") or "").strip()
+        if purpose:
+            header += f"\nOutbound call reason: {purpose}"
+        if scheduled_by:
+            header += f"\nOutbound call scheduled by: {scheduled_by}"
+        if context:
+            header += f"\nOutbound call background: {context}"
     else:
         header = f"[inkbox:{mode}{from_part} | {marker}]"
     return f"{header}\n{text}"

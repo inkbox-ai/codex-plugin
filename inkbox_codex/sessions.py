@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 try:
-    from .codex_client import CodexAppServerClient
+    from .codex_client import CodexAppServerClient, CodexAppServerError
     from .config import BridgeConfig
     from .escalation import (
         PendingInteraction,
@@ -32,7 +32,7 @@ try:
     )
     from .prompts import build_channel_prompt, frame_inbound
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from codex_client import CodexAppServerClient
+    from codex_client import CodexAppServerClient, CodexAppServerError
     from config import BridgeConfig
     from escalation import (
         PendingInteraction,
@@ -439,10 +439,7 @@ class ContactSession:
         if self._turn_active and self._client is not None and running_normal:
             logger.info("[session %s] new message interrupts the running turn", self.chat_id)
             self._interrupting = True
-            try:
-                await self._client.interrupt()
-            except Exception:
-                logger.debug("[session %s] interrupt failed", self.chat_id, exc_info=True)
+            await self._interrupt_client()
 
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())
@@ -452,7 +449,7 @@ class ContactSession:
             turn = await self._queue.get()
             try:
                 await self._run_turn(turn)
-            except Exception:
+            except Exception as exc:
                 # An interrupt aborts the turn on purpose — the next queued
                 # message takes over, so it is not an error to report.
                 if self._interrupting:
@@ -460,10 +457,14 @@ class ContactSession:
                     continue
                 logger.exception("[session %s] turn failed", self.chat_id)
                 try:
-                    await self._reply(
-                        "Sorry — I hit an error while working on that and had to stop. "
-                        "Try sending it again."
-                    )
+                    message = str(exc)
+                    if "did not finish within" in message:
+                        await self._reply(f"Sorry — {message}")
+                    else:
+                        await self._reply(
+                            "Sorry — I hit an error while working on that and had to stop. "
+                            "Try sending it again."
+                        )
                 except Exception:
                     logger.exception("[session %s] could not send the error notice", self.chat_id)
 
@@ -516,10 +517,7 @@ class ContactSession:
         # Interrupt a turn that's actively running, like pressing Esc.
         if self._turn_active and self._client is not None:
             self._interrupting = True
-            try:
-                await self._client.interrupt()
-            except Exception:
-                logger.debug("[session %s] interrupt failed", self.chat_id, exc_info=True)
+            await self._interrupt_client()
         # Discard messages queued but not yet started. Settle any capture-turn
         # futures (consult / post-call / failure recovery) so their awaiters
         # don't hang waiting on work we just dropped.
@@ -631,7 +629,24 @@ class ContactSession:
             # turn, then always tear it down — even if the turn raises.
             self._turn_active = True
             typing_task = asyncio.create_task(self._typing_loop())
-            reply = (await client.run(turn.text)).strip()
+            timeout = max(0.0, float(self.cfg.codex_turn_timeout_s or 0.0))
+            if timeout:
+                try:
+                    reply_text = await asyncio.wait_for(client.run(turn.text), timeout=timeout)
+                except asyncio.TimeoutError as exc:
+                    logger.warning(
+                        "[session %s] Codex turn exceeded %.0fs; restarting app-server",
+                        self.chat_id,
+                        timeout,
+                    )
+                    await self.close()
+                    raise CodexAppServerError(
+                        f"Codex did not finish within {timeout:.0f}s, so I restarted it. "
+                        "Send the request again or break it into a smaller step."
+                    ) from exc
+            else:
+                reply_text = await client.run(turn.text)
+            reply = reply_text.strip()
             if client.thread_id and self.on_session_id:
                 self.resume_session_id = client.thread_id
                 self.on_session_id(self.chat_id, client.thread_id)
@@ -757,15 +772,42 @@ class ContactSession:
             mcp_server_config=self.mcp_server_config,
             approval_handler=self._handle_codex_request,
         )
-        thread_id = await self._client.connect(self.resume_session_id or None)
+        # Capture what we resumed from before it's overwritten with the new
+        # thread id below — otherwise the log claims every session resumed.
+        resumed_from = self.resume_session_id
+        thread_id = await self._client.connect(resumed_from or None)
         if self.on_session_id:
             self.resume_session_id = thread_id
             self.on_session_id(self.chat_id, thread_id)
         logger.info(
             "[session %s] Codex session started (resume=%s)",
-            self.chat_id, self.resume_session_id or "fresh",
+            self.chat_id, resumed_from or "fresh",
         )
         return self._client
+
+    async def _interrupt_client(self) -> None:
+        """Interrupt the running Codex turn without letting the bridge hang.
+
+        Returns:
+            None
+        """
+        if self._client is None:
+            return
+        timeout = max(0.0, float(self.cfg.codex_interrupt_timeout_s or 0.0))
+        try:
+            if timeout:
+                await asyncio.wait_for(self._client.interrupt(), timeout=timeout)
+            else:
+                await self._client.interrupt()
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[session %s] Codex interrupt exceeded %.0fs; restarting app-server",
+                self.chat_id,
+                timeout,
+            )
+            await self.close()
+        except Exception:
+            logger.debug("[session %s] interrupt failed", self.chat_id, exc_info=True)
 
     # ------------------------------------------------------------------
     # Escalation (app-server approvals + request_user_input polls)

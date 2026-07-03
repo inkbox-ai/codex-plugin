@@ -9,7 +9,7 @@ name: Live — external events (escalation → agent calls driver)
 # and shares the AUT tunnel lock with the other live suites.
 on:
   pull_request:
-    branches: [main, standardization]
+    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:

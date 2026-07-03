@@ -12,7 +12,7 @@ name: Live — agent channels (email + SMS)
 # gateway + mock torn down on job end.
 on:
   pull_request:
-    branches: [main, standardization]
+    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:

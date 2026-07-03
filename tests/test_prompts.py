@@ -13,6 +13,19 @@ def test_frame_inbound_tags_channel_and_sender():
     assert framed.startswith("[inkbox:email from=a@b.com subject='Deploy?'")
     # Voice has no sender tag but flags speech.
     assert frame_inbound("voice", {}, "what's up").startswith("[inkbox:voice_call")
+    outbound_voice = frame_inbound(
+        "voice",
+        {
+            "outbound_purpose": "talk about soccer and the World Cup",
+            "outbound_context": "Dima asked by iMessage for this call.",
+            "outbound_scheduled_by": "Dima",
+        },
+        "why are you calling?",
+    )
+    assert "Outbound call reason: talk about soccer and the World Cup" in outbound_voice
+    assert "Outbound call scheduled by: Dima" in outbound_voice
+    assert "Outbound call background: Dima asked by iMessage for this call." in outbound_voice
+    assert outbound_voice.startswith("[inkbox:voice_call")
     # The body always survives intact.
     assert frame_inbound("imessage", {"sender": "x"}, "the message").endswith("the message")
 

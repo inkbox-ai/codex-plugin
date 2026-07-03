@@ -10,7 +10,7 @@ name: Live — voice calls (Inkbox TTS/STT + realtime)
 # shares the AUT tunnel lock with the other live suites.
 on:
   pull_request:
-    branches: [main, standardization]
+    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
