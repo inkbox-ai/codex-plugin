@@ -12,6 +12,7 @@ import asyncio
 import dataclasses
 import json
 import mimetypes
+import os
 import secrets
 import sys
 import time
@@ -26,12 +27,15 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from media import file_to_email_attachment
 
 try:
-    from .config import INKBOX_WS_PATH, call_contexts_dir
+    from .config import INKBOX_WS_PATH, call_contexts_dir, channel_hints_path
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import INKBOX_WS_PATH, call_contexts_dir
+    from config import INKBOX_WS_PATH, call_contexts_dir, channel_hints_path
 
 
 JsonSchema = Dict[str, Any]
+
+SMS_MAX_LENGTH = 1600
+IMESSAGE_MAX_LENGTH = 18995
 
 
 @dataclass(frozen=True)
@@ -50,10 +54,12 @@ def _schema(properties: Dict[str, JsonSchema], required: List[str] | None = None
     }
 
 
-def _str(desc: str = "") -> JsonSchema:
+def _str(desc: str = "", *, max_length: int | None = None) -> JsonSchema:
     schema: JsonSchema = {"type": "string"}
     if desc:
         schema["description"] = desc
+    if max_length is not None:
+        schema["maxLength"] = max_length
     return schema
 
 
@@ -74,7 +80,8 @@ def _str_list(desc: str = "") -> JsonSchema:
 TOOL_SPECS: List[ToolSpec] = [
     ToolSpec(
         "inkbox_whoami",
-        "Show this agent's Inkbox identity: handle, email address, phone number, and iMessage status.",
+        "Show this agent's Inkbox identity: handle, email address, iMessage status, "
+        "and its two calling lines (dedicated phone number vs shared iMessage line).",
         _schema({}),
     ),
     ToolSpec(
@@ -96,7 +103,7 @@ TOOL_SPECS: List[ToolSpec] = [
         _schema(
             {
                 "to": _str("E.164 recipient number or an existing text conversation id."),
-                "text": _str("Message body."),
+                "text": _str("Message body, max 1600 chars.", max_length=SMS_MAX_LENGTH),
                 "media_paths": _str_list("Local file paths to upload and attach."),
                 "media_urls": _str_list("Already-hosted media URLs to attach."),
             },
@@ -109,7 +116,7 @@ TOOL_SPECS: List[ToolSpec] = [
         _schema(
             {
                 "conversation_id": _str("Existing iMessage conversation id."),
-                "text": _str("Message body."),
+                "text": _str("Message body, max 18995 chars.", max_length=IMESSAGE_MAX_LENGTH),
                 "media_path": _str("Optional local file path to upload and attach."),
             },
             ["conversation_id", "text"],
@@ -117,14 +124,32 @@ TOOL_SPECS: List[ToolSpec] = [
     ),
     ToolSpec(
         "inkbox_place_call",
-        "Place an outbound phone call from this agent's Inkbox number. The call's audio "
-        "bridges to the running gateway. Always pass purpose so the live call opens "
-        "with context; optionally pass opening_message and context.",
+        "Place an outbound voice call. Calls can go out over two lines: your own "
+        "dedicated phone number, or the shared Inkbox iMessage line you are already "
+        "messaging the recipient on. Match the channel you're talking on — call "
+        "SMS/phone contacts from your dedicated number, and call an iMessage contact "
+        "over the shared iMessage line (set `origination` accordingly). The call's "
+        "audio bridges to the running gateway. Always pass purpose so the live call "
+        "opens with context; optionally pass opening_message and context.",
         _schema(
             {
                 "to_number": _str("E.164 recipient number, e.g. +15551234567."),
                 "toNumber": _str("Alias for to_number."),
                 "purpose": _str("Why Codex is placing this call."),
+                "origination": {
+                    "type": "string",
+                    "enum": ["dedicated_number", "shared_imessage_number"],
+                    "description": (
+                        "Which line to call from. Use \"dedicated_number\" to call from "
+                        "your own phone number (the same line SMS/voice conversations "
+                        "use). Use \"shared_imessage_number\" to call someone over the "
+                        "shared iMessage line you are already messaging them on — this "
+                        "only works if they are connected to you over iMessage "
+                        "(otherwise the call is rejected). If omitted, it is resolved "
+                        "automatically: the only available line, or the line matching "
+                        "the current conversation's channel."
+                    ),
+                },
                 "opening_message": _str("Optional exact first line to say on pickup."),
                 "openingMessage": _str("Alias for opening_message."),
                 "context": _str("Optional extra background for the live call."),
@@ -236,8 +261,8 @@ TOOL_SPECS: List[ToolSpec] = [
         }, ["contact_id"]),
     ),
     ToolSpec(
-        "inkbox_export_contact_vcard",
-        "Export one contact as a vCard 4.0 string by contact id.",
+        "inkbox_delete_contact",
+        "Remove a contact from the address book by contact id. Look it up first to confirm the target.",
         _schema({"contact_id": _str("Contact id.")}, ["contact_id"]),
     ),
 ]
@@ -270,16 +295,25 @@ def _tool_result(data: Any) -> Dict[str, Any]:
     }
 
 
-def _tool_error(message: str) -> Dict[str, Any]:
+def _tool_error(message: str, **fields: Any) -> Dict[str, Any]:
+    payload = {"error": message, **fields}
     return {
         "content": [
             {
                 "type": "text",
-                "text": json.dumps({"error": message}, ensure_ascii=False),
+                "text": json.dumps(_json_safe(payload), ensure_ascii=False),
             }
         ],
         "isError": True,
     }
+
+
+def _message_too_long_reason(channel: str, content: str, max_chars: int) -> str:
+    char_count = len(content or "")
+    return (
+        f"{channel} text is {char_count} characters; maximum is {max_chars}. "
+        f"Shorten it or split it into smaller {channel} messages."
+    )
 
 
 def _upload_media_url(identity: Any, path: str) -> str:
@@ -298,6 +332,88 @@ def _append_query_param(raw_url: str, key: str, value: str) -> str:
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query[key] = value
     return urlunparse(parts._replace(query=urlencode(query)))
+
+
+def _current_channel_hint() -> str | None:
+    """Which Inkbox channel is the current conversation happening on?
+
+    The gateway records every session's last inbound modality in the channel
+    hints file and stamps this tool process with the session's
+    ``INKBOX_CODEX_CHAT_ID``, so an outbound call can follow the conversation's
+    channel without the agent having to say so. Returns ``"imessage"`` |
+    ``"dedicated"`` | ``None`` (unknown / not in a bridged session).
+    """
+    chat_id = (os.environ.get("INKBOX_CODEX_CHAT_ID") or "").strip()
+    if not chat_id:
+        return None
+    try:
+        hints = json.loads(channel_hints_path().read_text())
+        mode = str((hints.get(chat_id) or {}).get("mode") or "").strip().lower()
+    except Exception:
+        return None
+    if mode == "imessage":
+        return "imessage"
+    if mode in {"sms", "text", "voice", "phone"}:
+        return "dedicated"
+    return None
+
+
+def _resolve_call_origination(identity: Any, explicit: str) -> str | None:
+    """Pick which line an outbound call originates from.
+
+    Calls can go out over two paths: the agent's own ``dedicated_number`` or
+    the ``shared_imessage_number`` it's already messaging the recipient on.
+    Resolution order:
+
+    1. An explicit choice (from the agent) always wins.
+    2. If only one path exists, use it (dedicated number but no iMessage →
+       dedicated; iMessage enabled but no number → shared).
+    3. If BOTH exist, follow the channel the current conversation is on — an
+       iMessage turn calls over the shared iMessage line, an SMS/phone turn
+       over the dedicated number.  This makes "call me" do the right thing
+       without the agent having to specify the line.
+    4. If both exist but we can't tell the channel, default to the dedicated
+       number (the open line that can reach anyone).
+
+    Returns ``None`` when neither path exists (nothing to call from).
+    """
+    explicit = (explicit or "").strip().lower()
+    if explicit in {"dedicated_number", "shared_imessage_number"}:
+        return explicit
+    has_number = getattr(identity, "phone_number", None) is not None
+    imessage_enabled = bool(getattr(identity, "imessage_enabled", False))
+    if has_number and imessage_enabled:
+        # Both lines available — follow the conversation's channel.
+        return "shared_imessage_number" if _current_channel_hint() == "imessage" else "dedicated_number"
+    if has_number:
+        return "dedicated_number"
+    if imessage_enabled:
+        return "shared_imessage_number"
+    return None
+
+
+def _call_ws_url(identity: Any) -> str:
+    """Find the gateway's call-media WebSocket URL for an outbound call."""
+    # Identity-scoped inbound-call config is the canonical row (one row covers
+    # both lines); older SDKs only stamp the number-scoped shim.
+    get_config = getattr(identity, "get_incoming_call_action", None)
+    if callable(get_config):
+        try:
+            config = get_config()
+            ws_url = str(getattr(config, "client_websocket_url", "") or "").strip()
+            if ws_url:
+                return ws_url
+        except Exception:
+            pass
+    phone = getattr(identity, "phone_number", None)
+    ws_url = str(getattr(phone, "client_websocket_url", "") or "").strip()
+    if ws_url:
+        return ws_url
+    tunnel = getattr(identity, "tunnel", None)
+    host = str(getattr(tunnel, "public_host", "") or "").strip()
+    if host:
+        return f"wss://{host}{INKBOX_WS_PATH}"
+    return ""
 
 
 def _write_call_context(
@@ -323,6 +439,26 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
 
     args = dict(args or {})
 
+    if name == "inkbox_send_sms":
+        text = str(args.get("text") or "")
+        if len(text) > SMS_MAX_LENGTH:
+            return _tool_error(
+                _message_too_long_reason("SMS", text, SMS_MAX_LENGTH),
+                error_code="sms_too_long",
+                char_count=len(text),
+                max_chars=SMS_MAX_LENGTH,
+            )
+
+    if name == "inkbox_send_imessage":
+        text = str(args.get("text") or "")
+        if len(text) > IMESSAGE_MAX_LENGTH:
+            return _tool_error(
+                _message_too_long_reason("iMessage", text, IMESSAGE_MAX_LENGTH),
+                error_code="imessage_too_long",
+                char_count=len(text),
+                max_chars=IMESSAGE_MAX_LENGTH,
+            )
+
     def _identity():
         return client.get_identity(identity_handle)
 
@@ -331,11 +467,29 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
             identity = _identity()
             phone = identity.phone_number
             mailbox = identity.mailbox
+            dedicated_number = getattr(phone, "number", None)
+            imessage_enabled = bool(getattr(identity, "imessage_enabled", False))
             return {
                 "handle": identity.agent_handle,
                 "email": getattr(mailbox, "email_address", None),
-                "phone": getattr(phone, "number", None),
-                "imessage_enabled": getattr(identity, "imessage_enabled", False),
+                "phone": dedicated_number,
+                "imessage_enabled": imessage_enabled,
+                # Explicit labels so the agent describes its two lines
+                # correctly: its OWN dedicated phone line vs the SHARED
+                # iMessage line, whose number is never surfaced.
+                "lines": {
+                    "dedicated_phone_line": dedicated_number or "(none provisioned)",
+                    "dedicated_phone_line_note": (
+                        "Your own phone line for SMS and voice calls. Call from it with "
+                        "origination=dedicated_number."
+                    ),
+                    "shared_imessage_line": "enabled" if imessage_enabled else "disabled",
+                    "shared_imessage_line_note": (
+                        "Voice + iMessage with people connected to you over iMessage. Its "
+                        "number is managed by Inkbox and not shown. Call over it with "
+                        "origination=shared_imessage_number."
+                    ),
+                },
             }
 
         if name == "inkbox_send_email":
@@ -366,10 +520,11 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
             return {"sent": True, "id": str(getattr(msg, "id", "")), "media": len(urls)}
 
         if name == "inkbox_send_imessage":
+            text = str(args.get("text") or "")
             identity = _identity()
             kwargs: Dict[str, Any] = {
                 "conversation_id": str(args["conversation_id"]),
-                "text": str(args.get("text") or ""),
+                "text": text,
             }
             media_path = str(args.get("media_path") or "").strip()
             if media_path:
@@ -387,19 +542,24 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                     "purpose is required so the live call opens with context"
                 )
             identity = _identity()
+            # Resolve the outbound line (dedicated number vs shared iMessage line).
+            origination = _resolve_call_origination(
+                identity, str(args.get("origination") or "")
+            )
+            if origination is None:
+                raise RuntimeError(
+                    "this identity can't place calls: it has no dedicated phone "
+                    "number and iMessage is not enabled. Provision a number or "
+                    "enable iMessage first."
+                )
+            # An explicit override wins; otherwise resolve from the identity.
             ws_url = str(
                 args.get("client_websocket_url")
                 or args.get("clientWebsocketUrl")
                 or ""
             ).strip()
-            phone = getattr(identity, "phone_number", None)
             if not ws_url:
-                ws_url = str(getattr(phone, "client_websocket_url", "") or "").strip()
-            if not ws_url:
-                tunnel = getattr(identity, "tunnel", None)
-                host = str(getattr(tunnel, "public_host", "") or "").strip()
-                if host:
-                    ws_url = f"wss://{host}{INKBOX_WS_PATH}"
+                ws_url = _call_ws_url(identity)
             if not ws_url:
                 raise RuntimeError(
                     "no call-media WebSocket URL available; start the Inkbox "
@@ -414,11 +574,33 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 to_number=to_number,
             )
             ws_url = _append_query_param(ws_url, "context_token", token)
-            call = identity.place_call(to_number=to_number, client_websocket_url=ws_url)
+            try:
+                call = identity.place_call(
+                    to_number=to_number,
+                    origination=origination,
+                    client_websocket_url=ws_url,
+                )
+            except TypeError:
+                # Older SDK without ``origination`` support → dedicated only.
+                call = identity.place_call(
+                    to_number=to_number, client_websocket_url=ws_url
+                )
+            except Exception as exc:
+                if "no_shared_connection" in str(exc):
+                    # Surface a legible reason the agent can act on.
+                    raise RuntimeError(
+                        "Can't place a shared iMessage-line call: this person "
+                        "isn't connected to you over iMessage yet. They need to "
+                        "message your iMessage number first. To call from your "
+                        "own phone number instead, set origination to "
+                        '"dedicated_number".'
+                    ) from exc
+                raise
             return {
                 "placed": True,
                 "id": str(getattr(call, "id", "")),
                 "to": to_number,
+                "origination": origination,
                 "context_token": token,
                 "status": _json_safe(getattr(call, "status", None)),
             }
@@ -509,8 +691,9 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 ]
             return client.contacts.update(str(args["contact_id"]), **kwargs)
 
-        if name == "inkbox_export_contact_vcard":
-            return {"vcard": client.contacts.vcards.export_vcard(str(args["contact_id"]))}
+        if name == "inkbox_delete_contact":
+            client.contacts.delete(str(args["contact_id"]))
+            return {"deleted": str(args["contact_id"])}
 
         raise ValueError(f"unknown Inkbox tool: {name}")
 
@@ -539,6 +722,11 @@ def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]
         "INKBOX_IDENTITY": cfg.identity,
         "INKBOX_BASE_URL": cfg.base_url,
     }
+    # Keep the tool process on the same state dir (call contexts, channel
+    # hints) when the operator moved it.
+    home = os.getenv("INKBOX_CODEX_HOME") or ""
+    if home:
+        env["INKBOX_CODEX_HOME"] = home
     server = {
         "enabled": True,
         "required": True,

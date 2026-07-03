@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 # Appended to the codex system prompt preset for every bridged
 # session. The agent is a full Codex instance with tool access —
@@ -15,10 +15,10 @@ You are NOT in a terminal. You are an Inkbox agent ({identity_line}). The
 human is talking to you over {channels}. Your replies are delivered to
 their phone or inbox, so:
 
-- Each incoming message starts with a small bracketed tag showing how it
-  reached you and from whom — e.g. [iMessage from +15551234567] or
-  [Spoken live on a phone call]. Read it to know which channel you're on
-  right now, but never repeat the tag back in your reply.
+- Each incoming message starts with a small [inkbox:...] metadata tag showing
+  how it reached you, the remote phone/email, and any resolved Inkbox contact.
+  Read it to know who you are talking to and which channel you're on right now,
+  but never repeat the tag back in your reply.
 - Plain text only. No markdown — no **bold**, no backticks, no headers,
   no bullet lists, no code blocks unless they explicitly ask for code.
 - Keep it short and conversational. Think texts, not essays. Lead with
@@ -54,6 +54,38 @@ inkbox_send_imessage, ...) to reach the human or third parties
 proactively — e.g. "email me the full report" or a cron-style ping.
 Replies on the channel you were messaged on are sent automatically;
 only use these tools for a *different* channel or recipient.
+
+# Calling someone
+
+Outbound calls (inkbox_place_call) can go out over two lines; match the
+channel you're already talking on:
+
+- Someone in an SMS/phone conversation: call from your dedicated phone
+  line (origination "dedicated_number") — the same number the
+  conversation is on.
+- Someone connected to you over iMessage: call over the shared iMessage
+  line (origination "shared_imessage_number") — the same line you're
+  already messaging them on. This only works while they stay connected;
+  if the call is refused, ask them to message you over iMessage first,
+  or fall back to your dedicated number. Never state a number for the
+  shared line — Inkbox manages it and it is not yours to give out.
+
+If you omit origination it resolves automatically: the only available
+line, or — when both exist — the line matching the current
+conversation's channel.
+
+# Inkbox contacts
+
+Codex can read and write Inkbox contacts visible to this configured identity.
+
+- Use inkbox_list_contacts for name-based searches like "who is Alex?".
+- Use inkbox_lookup_contact when you have an exact or partial email/phone filter.
+- Use inkbox_get_contact to fetch a full contact by UUID after list/lookup returns one.
+- Use inkbox_create_contact when the user asks you to save a new person or contact card.
+- Use inkbox_update_contact when the user asks you to change an existing contact; look up the contact first if you do not already have its UUID.
+- Use inkbox_delete_contact only after the target contact is explicit and confirmed.
+- There is no vCard export/import, contact access, or contact rule tool in this harness.
+- Contact tools operate only on contacts visible/writable to the configured identity.
 """.strip()
 
 
@@ -85,6 +117,22 @@ def build_channel_prompt(
     )
 
 
+def contact_marker(details: Optional[Dict[str, Any]]) -> str:
+    """Render a one-line Inkbox contact summary for inbound turn tags."""
+    if not details or not details.get("id"):
+        return "contact=unknown_in_inkbox"
+    parts = [f"contact_id={details['id']}"]
+    if details.get("name"):
+        parts.append(f"contact_name={details['name']!r}")
+    if details.get("company"):
+        parts.append(f"contact_company={details['company']!r}")
+    if details.get("emails"):
+        parts.append(f"contact_emails={details['emails']}")
+    if details.get("phones"):
+        parts.append(f"contact_phones={details['phones']}")
+    return " ".join(parts)
+
+
 def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
     """Prefix an inbound message with a tag naming its channel and sender.
 
@@ -100,20 +148,32 @@ def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
     Returns:
         str: ``text`` prefixed with a one-line bracketed channel tag.
     """
+    if text.lstrip().startswith("[inkbox:"):
+        return text
+
     meta = meta or {}
     sender = str(meta.get("sender") or "").strip()
-    from_part = f" from {sender}" if sender else ""
+    from_part = f" from={sender}" if sender else ""
+    marker = contact_marker(meta.get("contact"))
     if mode == "email":
-        header = f"[Email{from_part}]"
         subject = str(meta.get("subject") or "").strip()
-        if subject:
-            header += f"\nSubject: {subject}"
+        subject_part = f" subject={subject!r}" if subject else ""
+        header = f"[inkbox:email{from_part}{subject_part} | {marker}]"
     elif mode == "sms":
-        header = f"[Text message (SMS){from_part}]"
+        conversation_id = str(meta.get("conversation_id") or "").strip()
+        conversation_part = f" conversation_id={conversation_id}" if conversation_id else ""
+        label = "group_sms" if meta.get("conversation_kind") == "group" else "sms"
+        header = f"[inkbox:{label}{from_part}{conversation_part} | {marker}]"
     elif mode == "imessage":
-        header = f"[iMessage{from_part}]"
+        conversation_id = str(meta.get("conversation_id") or "").strip()
+        conversation_part = f" conversation_id={conversation_id}" if conversation_id else ""
+        header = f"[inkbox:imessage{from_part}{conversation_part} | {marker}]"
     elif mode == "voice":
-        header = "[Spoken live on a phone call — keep the reply short and speech-friendly]"
+        call_id = str(meta.get("call_id") or "").strip()
+        call_part = f" call_id={call_id}" if call_id else ""
+        header = f"[inkbox:voice_call{call_part} | {marker}]"
+        # Outbound calls carry the reason they were placed; surface it so the
+        # agent opens with context instead of a generic greeting.
         purpose = str(meta.get("outbound_purpose") or "").strip()
         context = str(meta.get("outbound_context") or "").strip()
         scheduled_by = str(meta.get("outbound_scheduled_by") or "").strip()
@@ -124,8 +184,8 @@ def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
         if context:
             header += f"\nOutbound call background: {context}"
     else:
-        header = f"[Message via {mode}{from_part}]"
-    return f"{header}\n\n{text}"
+        header = f"[inkbox:{mode}{from_part} | {marker}]"
+    return f"{header}\n{text}"
 
 
 _MD_PATTERNS = [

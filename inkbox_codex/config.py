@@ -13,7 +13,8 @@ from .realtime import (
     RealtimeConfig,
 )
 
-INKBOX_BASE_URL_DEFAULT = "https://inkbox.ai"
+# Empty means "do not override"; the Inkbox SDK owns its API default.
+INKBOX_BASE_URL_DEFAULT = ""
 INKBOX_WS_PATH = "/phone/media/ws"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8767
@@ -33,6 +34,21 @@ def call_contexts_dir() -> Path:
     path = root / "call_contexts"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def channel_hints_path() -> Path:
+    """File where the gateway records each session's last inbound channel.
+
+    The gateway writes ``{chat_id: {"mode": ..., "at": ...}}`` on every inbound
+    turn; the tool process reads it so an outbound call can follow the
+    conversation's current channel.
+
+    Returns:
+        Path: ``<home>/channel_hints.json`` (parent directory created).
+    """
+    root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "channel_hints.json"
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -59,6 +75,9 @@ class BridgeConfig:
     allowed_users: List[str] = field(default_factory=list)
     allow_all_users: bool = False
     require_signature: bool = True
+    # Wake the agent on unrecognised (external) webhooks. Off by default;
+    # registered third-party providers bypass it once their secret is set.
+    external_events_enabled: bool = False
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     # Codex side
@@ -67,11 +86,21 @@ class BridgeConfig:
     codex_bin: str = "codex"
     codex_sandbox: str = "workspace-write"
     codex_approval_policy: str = "on-request"
+    auto_approve_inkbox_tools: bool = False
     permission_timeout_s: float = 600.0
     codex_turn_timeout_s: float = 1800.0
     codex_interrupt_timeout_s: float = 10.0
     # OpenAI Realtime voice (off unless the wizard validated a key)
     realtime: RealtimeConfig = field(default_factory=RealtimeConfig)
+
+
+def inkbox_base_url_kwargs(base_url: str | None = None) -> Dict[str, str]:
+    normalized = str(base_url or "").strip()
+    return {"base_url": normalized} if normalized else {}
+
+
+def inkbox_client_kwargs(api_key: str, base_url: str | None = None) -> Dict[str, str]:
+    return {"api_key": api_key, **inkbox_base_url_kwargs(base_url)}
 
 
 def _read_realtime_config() -> RealtimeConfig:
@@ -108,6 +137,7 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         allowed_users=_csv_env("INKBOX_ALLOWED_USERS"),
         allow_all_users=env_flag("INKBOX_ALLOW_ALL_USERS", False),
         require_signature=env_flag("INKBOX_REQUIRE_SIGNATURE", True),
+        external_events_enabled=env_flag("INKBOX_EXTERNAL_EVENTS_ENABLED", False),
         host=str(os.getenv("INKBOX_BRIDGE_HOST") or DEFAULT_HOST).strip(),
         port=int(os.getenv("INKBOX_BRIDGE_PORT") or DEFAULT_PORT),
         project_dir=str(
@@ -124,6 +154,7 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
             or extra.get("codex_approval_policy")
             or "on-request"
         ).strip(),
+        auto_approve_inkbox_tools=env_flag("INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS", False),
         permission_timeout_s=float(os.getenv("INKBOX_PERMISSION_TIMEOUT_S") or 600.0),
         codex_turn_timeout_s=float(os.getenv("CODEX_TURN_TIMEOUT_S") or 1800.0),
         codex_interrupt_timeout_s=float(os.getenv("CODEX_INTERRUPT_TIMEOUT_S") or 10.0),

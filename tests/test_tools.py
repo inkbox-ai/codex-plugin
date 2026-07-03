@@ -49,6 +49,8 @@ class _FakeIdentity:
         self.place_call_kwargs = None
         self.list_calls_kwargs = None
         self.transcript_call_id = None
+        self.sent_texts = []
+        self.sent_imessages = []
 
     def place_call(self, **kwargs):
         self.place_call_kwargs = kwargs
@@ -65,10 +67,30 @@ class _FakeIdentity:
             _FakeTranscript("local", "sure, it's green", 2),
         ]
 
+    def send_imessage(self, **kwargs):
+        self.sent_imessages.append(kwargs)
+        return type("Message", (), {"id": "im-1"})()
+
+    def send_text(self, **kwargs):
+        self.sent_texts.append(kwargs)
+        return type("Message", (), {"id": "sms-1"})()
+
+
+class _FakeContacts:
+    def __init__(self):
+        self.deleted = []
+
+    def get(self, contact_id):
+        return {"id": contact_id, "given_name": "Ada"}
+
+    def delete(self, contact_id):
+        self.deleted.append(contact_id)
+
 
 class _FakeClient:
     def __init__(self):
         self.identity = _FakeIdentity()
+        self.contacts = _FakeContacts()
 
     def get_identity(self, _handle):
         return self.identity
@@ -87,6 +109,42 @@ def test_call_tools_are_registered():
     assert "inkbox_place_call" in names
     assert "inkbox_list_calls" in names
     assert "inkbox_get_call_transcript" in names
+
+
+def test_coding_agent_tool_tier_is_registered():
+    names = {tool["name"] for tool in tools_mod.mcp_tool_list()}
+    expected = {
+        "inkbox_whoami",
+        "inkbox_send_email",
+        "inkbox_send_sms",
+        "inkbox_send_imessage",
+        "inkbox_place_call",
+        "inkbox_list_calls",
+        "inkbox_get_call_transcript",
+        "inkbox_list_text_conversations",
+        "inkbox_get_text_conversation",
+        "inkbox_list_imessage_conversations",
+        "inkbox_get_imessage_conversation",
+        "inkbox_lookup_contact",
+        "inkbox_list_contacts",
+        "inkbox_get_contact",
+        "inkbox_create_contact",
+        "inkbox_update_contact",
+        "inkbox_delete_contact",
+    }
+
+    assert names == expected
+
+
+def test_get_and_delete_contact_tools():
+    client = _FakeClient()
+
+    contact = _call(client, "inkbox_get_contact", {"contact_id": "contact-1"})
+    deleted = _call(client, "inkbox_delete_contact", {"contact_id": "contact-1"})
+
+    assert contact["id"] == "contact-1"
+    assert deleted["deleted"] == "contact-1"
+    assert client.contacts.deleted == ["contact-1"]
 
 
 def test_place_call_writes_context_and_tags_websocket_url(tmp_path, monkeypatch):
@@ -179,3 +237,35 @@ def test_get_call_transcript_requires_call_id():
     data = _call(_FakeClient(), "inkbox_get_call_transcript", {"call_id": "  "})
 
     assert "call_id is required" in data["error"]
+
+
+def test_send_sms_rejects_text_over_limit():
+    client = _FakeClient()
+    data = _call(
+        client,
+        "inkbox_send_sms",
+        {
+            "to": "+15551112222",
+            "text": "x" * (tools_mod.SMS_MAX_LENGTH + 1),
+        },
+    )
+
+    assert data["error_code"] == "sms_too_long"
+    assert data["char_count"] == tools_mod.SMS_MAX_LENGTH + 1
+    assert client.identity.sent_texts == []
+
+
+def test_send_imessage_rejects_text_over_limit():
+    client = _FakeClient()
+    data = _call(
+        client,
+        "inkbox_send_imessage",
+        {
+            "conversation_id": "imconv-123",
+            "text": "x" * (tools_mod.IMESSAGE_MAX_LENGTH + 1),
+        },
+    )
+
+    assert data["error_code"] == "imessage_too_long"
+    assert data["char_count"] == tools_mod.IMESSAGE_MAX_LENGTH + 1
+    assert client.identity.sent_imessages == []

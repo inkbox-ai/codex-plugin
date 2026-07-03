@@ -14,8 +14,10 @@ except ImportError:  # pragma: no cover - surfaced through initialize/tools call
     Inkbox = None  # type: ignore
 
 try:
+    from .config import inkbox_client_kwargs
     from .tools import call_inkbox_tool, mcp_tool_list
 except ImportError:  # pragma: no cover - direct local import/test fallback
+    from config import inkbox_client_kwargs
     from tools import call_inkbox_tool, mcp_tool_list
 
 
@@ -31,7 +33,7 @@ class InkboxMcpServer:
     def __init__(self) -> None:
         self.api_key = os.getenv("INKBOX_API_KEY", "")
         self.identity = os.getenv("INKBOX_IDENTITY", "")
-        self.base_url = os.getenv("INKBOX_BASE_URL") or "https://inkbox.ai"
+        self.base_url = os.getenv("INKBOX_BASE_URL", "").strip()
         self._client: Any = None
 
     def _inkbox(self) -> Any:
@@ -40,7 +42,7 @@ class InkboxMcpServer:
         if not self.api_key or not self.identity:
             raise RuntimeError("INKBOX_API_KEY and INKBOX_IDENTITY are required")
         if self._client is None:
-            self._client = Inkbox(api_key=self.api_key, base_url=self.base_url)
+            self._client = Inkbox(**inkbox_client_kwargs(self.api_key, self.base_url))
         return self._client
 
     async def handle(self, message: Dict[str, Any]) -> Dict[str, Any] | None:
@@ -56,7 +58,7 @@ class InkboxMcpServer:
                     "capabilities": {"tools": {}},
                     "serverInfo": {
                         "name": "inkbox-codex",
-                        "version": "0.1.0",
+                        "version": "0.1.1",
                     },
                 },
             )

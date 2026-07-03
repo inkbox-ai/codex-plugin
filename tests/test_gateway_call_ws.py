@@ -4,6 +4,7 @@ import types
 
 from inkbox_codex import gateway
 from inkbox_codex.config import BridgeConfig
+from inkbox_codex.gateway import _voice_consult_prompt
 
 
 class _FakeWS:
@@ -35,6 +36,27 @@ class _FakeWS:
         return self._messages.pop(0)
 
 
+class _FakeTextMsg:
+    def __init__(self, data):
+        self.type = "text"
+        self.data = data
+
+
+class _ScriptedWS(_FakeWS):
+    def __init__(self, messages):
+        super().__init__()
+        self._messages = list(messages)
+        self.sent = []
+
+    async def __anext__(self):
+        if not self._messages:
+            raise StopAsyncIteration
+        return self._messages.pop(0)
+
+    async def send_str(self, data):
+        self.sent.append(data)
+
+
 class _FakeRequest:
     def __init__(self, *, headers=None, query=None):
         self.headers = headers or {}  # no X-Call-Context; signature check is off
@@ -59,6 +81,54 @@ def _write_context(tmp_path, token="ctx"):
     return token
 
 
+class _NoDeliveryInkbox:
+    def get_identity(self, _identity):
+        raise AssertionError("send_to_contact must not reach Inkbox delivery")
+
+
+class _FakeIdentity:
+    def __init__(self):
+        self.sent_texts = []
+        self.sent_imessages = []
+
+    def send_text(self, **kwargs):
+        self.sent_texts.append(kwargs)
+
+    def send_imessage(self, **kwargs):
+        self.sent_imessages.append(kwargs)
+
+
+class _DeliveryInkbox:
+    def __init__(self, identity):
+        self.identity = identity
+
+    def get_identity(self, _identity):
+        return self.identity
+
+
+class _FakeContactSession:
+    def __init__(self):
+        self.inbound = []
+        self.consults = []
+
+    async def handle_inbound(self, text, mode, meta):
+        self.inbound.append((text, mode, meta))
+
+    async def run_consult(self, prompt):
+        self.consults.append(prompt)
+        return ""
+
+
+class _FakeSessions:
+    def __init__(self, session):
+        self.session = session
+        self.requested_ids = []
+
+    def get(self, chat_id):
+        self.requested_ids.append(chat_id)
+        return self.session
+
+
 def test_call_ws_declares_inkbox_stt_tts_headers(monkeypatch):
     """The WS upgrade must advertise platform-side STT/TTS so Inkbox sends us
     transcripts and speaks our text frames — without these it defaults to raw
@@ -78,13 +148,164 @@ def test_call_ws_declares_inkbox_stt_tts_headers(monkeypatch):
     assert fake_ws.headers.get("x-use-inkbox-text-to-speech") == "true"
 
 
+def test_send_to_contact_suppresses_exact_silent_reply():
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="codex"))
+    gw._inkbox = _NoDeliveryInkbox()
+
+    asyncio.run(gw.send_to_contact("contact-1", "[SILENT]", "sms", {"to": "+15551234567"}))
+
+
+def test_send_to_contact_drops_late_voice_reply_without_channel_fallback():
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="codex"))
+    gw._inkbox = _NoDeliveryInkbox()
+
+    asyncio.run(
+        gw.send_to_contact(
+            "+15551234567",
+            "This answer finished after hangup.",
+            "voice",
+            {"call_id": "call-1", "to": "+15551234567"},
+        )
+    )
+
+
+def test_send_to_contact_rejects_over_limit_sms_without_delivery():
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="codex"))
+    gw._inkbox = _NoDeliveryInkbox()
+
+    try:
+        asyncio.run(
+            gw.send_to_contact(
+                "+15551234567",
+                "x" * (gateway.SMS_MAX_LENGTH + 1),
+                "sms",
+                {"to": "+15551234567"},
+            )
+        )
+    except ValueError as exc:
+        assert "SMS text is 1601 characters" in str(exc)
+    else:
+        raise AssertionError("expected over-limit SMS reply to be rejected")
+
+
+def test_send_to_contact_rejects_over_limit_imessage_without_delivery():
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="codex"))
+    gw._inkbox = _NoDeliveryInkbox()
+
+    try:
+        asyncio.run(
+            gw.send_to_contact(
+                "contact-1",
+                "x" * (gateway.IMESSAGE_MAX_LENGTH + 1),
+                "imessage",
+                {"conversation_id": "imconv-123"},
+            )
+        )
+    except ValueError as exc:
+        assert "iMessage text is 18996 characters" in str(exc)
+    else:
+        raise AssertionError("expected over-limit iMessage reply to be rejected")
+
+
+def test_send_to_contact_uses_prefixed_sms_conversation_chat_id():
+    identity = _FakeIdentity()
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="codex"))
+    gw._inkbox = _DeliveryInkbox(identity)
+
+    asyncio.run(gw.send_to_contact("sms:conv-123", "reply", "sms", {}))
+
+    assert identity.sent_texts == [{"text": "reply", "conversation_id": "conv-123"}]
+
+
+def test_send_to_contact_uses_prefixed_imessage_conversation_chat_id():
+    identity = _FakeIdentity()
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="codex"))
+    gw._inkbox = _DeliveryInkbox(identity)
+
+    asyncio.run(gw.send_to_contact("imessage:imconv-123", "reply", "imessage", {}))
+
+    assert identity.sent_imessages == [{"conversation_id": "imconv-123", "text": "reply"}]
+
+
+def test_call_ws_stt_tts_runs_call_ended_reflection(monkeypatch):
+    fake_ws = _ScriptedWS([
+        _FakeTextMsg('{"event":"start"}'),
+        _FakeTextMsg('{"event":"transcript","text":"Please send the summary after this.","is_final":true}'),
+        _FakeTextMsg('{"event":"stop"}'),
+    ])
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    monkeypatch.setattr(gateway, "WSMsgType", types.SimpleNamespace(TEXT="text"))
+
+    session = _FakeContactSession()
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False))
+    gw.sessions = _FakeSessions(session)
+
+    asyncio.run(gw._handle_call_ws(_FakeRequest()))
+
+    assert session.inbound == [
+        (
+            "Please send the summary after this.",
+            "voice",
+            {
+                "call_id": "",
+                "sender": "",
+                "contact": None,
+                "direction": "inbound",
+            },
+        )
+    ]
+    assert len(session.consults) == 1
+    assert "[voice call ended]" in session.consults[0]
+    assert "do not redo work that was already completed" in session.consults[0]
+    assert "Please send the summary after this." in session.consults[0]
+
+
+def test_call_ws_uses_stored_call_contact_session_for_stt_tts(monkeypatch):
+    fake_ws = _ScriptedWS([
+        _FakeTextMsg('{"event":"transcript","text":"Can you see my earlier texts?","is_final":true}'),
+        _FakeTextMsg('{"event":"stop"}'),
+    ])
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    monkeypatch.setattr(gateway, "WSMsgType", types.SimpleNamespace(TEXT="text"))
+
+    session = _FakeContactSession()
+    sessions = _FakeSessions(session)
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False))
+    gw.sessions = sessions
+    gw._call_meta_by_id["call-1"] = {
+        "id": "call-1",
+        "direction": "inbound",
+        "remotePhoneNumber": "+15551234567",
+        "local_phone_number": "+15550001111",
+        "contacts": [{"bucket": "from", "contactId": "contact-1", "name": "Ada Lovelace"}],
+    }
+    request = _FakeRequest()
+    request.query = {"call_id": "call-1"}
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    assert sessions.requested_ids == ["contact-1", "contact-1"]
+    assert session.inbound[0][2]["sender"] == "+15551234567"
+    assert session.inbound[0][2]["contact"]["id"] == "contact-1"
+    assert session.inbound[0][2]["contact"]["name"] == "Ada Lovelace"
+    assert "call-1" not in gw._call_meta_by_id
+
+
 class _FakeBridge:
     def __init__(self):
         self.ran = False
         self.closed = False
+        self.consult_answer = None
 
     async def run(self, *, inkbox_ws, on_agent_consult, on_post_call_actions, on_call_ended):
         self.ran = True
+        self.consult_answer = await on_agent_consult(
+            types.SimpleNamespace(call_id="call-1"),
+            "help Dima choose a mountain bike",
+            [("assistant", "Hi Dima."), ("user", "I want to buy a mountain bike.")],
+            [],
+            [],
+        )
 
     async def close(self):
         self.closed = True
@@ -111,6 +332,206 @@ def test_call_ws_realtime_path_sets_rawmedia_headers_and_runs_bridge(monkeypatch
     assert fake_ws.headers.get("x-use-inkbox-speech-to-text") == "false"
     assert fake_ws.headers.get("x-use-inkbox-text-to-speech") == "false"
     assert bridge.ran is True and bridge.closed is True
+
+
+def test_call_ws_passes_outbound_context_to_realtime(monkeypatch, tmp_path):
+    fake_ws = _FakeWS()
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    bridge = _FakeBridge()
+    seen = {}
+
+    context_dir = tmp_path / "call_contexts"
+    context_dir.mkdir()
+    (context_dir / "tok-123.json").write_text(
+        '{"purpose":"tell them the deploy is fixed","opening_message":"Hi there",'
+        '"context":"PR 12","to_number":"+15551234567"}'
+    )
+
+    async def fake_open(*, config, meta):
+        seen["meta"] = meta
+        return bridge
+
+    monkeypatch.setattr(gateway, "open_inkbox_realtime_bridge", fake_open)
+
+    from inkbox_codex.realtime import RealtimeConfig
+
+    cfg = BridgeConfig(require_signature=False, realtime=RealtimeConfig(enabled=True, api_key="sk-x"))
+    gw = gateway.InkboxGateway(cfg)
+    request = _FakeRequest()
+    request.query = {"context_token": "tok-123"}
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    assert seen["meta"].direction == "outbound"
+    assert seen["meta"].remote_phone_number == "+15551234567"
+    assert seen["meta"].outbound_purpose == "tell them the deploy is fixed"
+    assert seen["meta"].outbound_opening == "Hi there"
+    assert seen["meta"].outbound_context == "PR 12"
+
+
+def test_voice_consult_prompt_anchors_current_call():
+    prompt = _voice_consult_prompt(
+        query="help Dima choose a mountain bike",
+        transcript=[("assistant", "Hi Dima."), ("user", "I want to buy a mountain bike.")],
+        outbound={
+            "purpose": "Call specifically about figuring out how to buy a mountain bike.",
+            "context": "Discuss hardtail vs full suspension and budget.",
+        },
+        contact={"name": "Dima"},
+        direction="outbound",
+    )
+
+    assert "Do not continue unrelated prior text/session work" in prompt
+    assert "Do not run commands, run tests" in prompt
+    assert "Outbound call purpose: Call specifically about figuring out how to buy a mountain bike." in prompt
+    assert "user: I want to buy a mountain bike." in prompt
+    assert "Consult request: help Dima choose a mountain bike" in prompt
+
+
+def test_realtime_consult_wraps_query_before_codex(monkeypatch, tmp_path):
+    fake_ws = _FakeWS()
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    bridge = _FakeBridge()
+
+    context_dir = tmp_path / "call_contexts"
+    context_dir.mkdir()
+    (context_dir / "tok-bike.json").write_text(
+        '{"purpose":"Call about buying a mountain bike",'
+        '"context":"Budget and riding style","to_number":"+15551234567"}'
+    )
+
+    async def fake_open(*, config, meta):
+        return bridge
+
+    monkeypatch.setattr(gateway, "open_inkbox_realtime_bridge", fake_open)
+
+    from inkbox_codex.realtime import RealtimeConfig
+
+    session = _FakeContactSession()
+    cfg = BridgeConfig(require_signature=False, realtime=RealtimeConfig(enabled=True, api_key="sk-x"))
+    gw = gateway.InkboxGateway(cfg)
+    gw.sessions = _FakeSessions(session)
+    request = _FakeRequest()
+    request.query = {"context_token": "tok-bike"}
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    assert bridge.consult_answer == ""
+    assert session.consults
+    prompt = session.consults[0]
+    assert "Voice call consult from the Inkbox Realtime agent." in prompt
+    assert "Outbound call purpose: Call about buying a mountain bike" in prompt
+    assert "Consult request: help Dima choose a mountain bike" in prompt
+    assert "Do not run commands, run tests" in prompt
+
+
+def test_call_ws_passes_contact_and_identity_context_to_realtime(monkeypatch):
+    fake_ws = _FakeWS()
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    bridge = _FakeBridge()
+    seen = {}
+
+    async def fake_open(*, config, meta):
+        seen["meta"] = meta
+        return bridge
+
+    monkeypatch.setattr(gateway, "open_inkbox_realtime_bridge", fake_open)
+
+    from inkbox_codex.realtime import RealtimeConfig
+
+    cfg = BridgeConfig(require_signature=False, realtime=RealtimeConfig(enabled=True, api_key="sk-x"))
+    gw = gateway.InkboxGateway(cfg)
+    gw._identity = types.SimpleNamespace(
+        agent_handle="codex",
+        mailbox=types.SimpleNamespace(email_address="codex@example.com"),
+        phone_number=types.SimpleNamespace(number="+15550001111"),
+    )
+    request = _FakeRequest()
+    request.headers = {
+        "X-Call-Context": (
+            '{"id":"call-1","remote_phone_number":"+15551234567",'
+            '"contacts":[{"id":"contact-1","name":"Ada Lovelace"}]}'
+        )
+    }
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    assert seen["meta"].agent_identity_handle == "codex"
+    assert seen["meta"].agent_identity_email == "codex@example.com"
+    assert seen["meta"].agent_identity_phone == "+15550001111"
+    assert seen["meta"].agent_imessage_enabled is False
+    assert seen["meta"].contact_known is True
+    assert seen["meta"].contact_id == "contact-1"
+    assert seen["meta"].contact_name == "Ada Lovelace"
+
+
+def test_call_ws_threads_imessage_flag_into_realtime_meta(monkeypatch):
+    # iMessage-enabled identity → the realtime instructions get the shared-line
+    # paragraph, gated by this flag on the call meta.
+    fake_ws = _FakeWS()
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    bridge = _FakeBridge()
+    seen = {}
+
+    async def fake_open(*, config, meta):
+        seen["meta"] = meta
+        return bridge
+
+    monkeypatch.setattr(gateway, "open_inkbox_realtime_bridge", fake_open)
+
+    from inkbox_codex.realtime import RealtimeConfig
+
+    cfg = BridgeConfig(require_signature=False, realtime=RealtimeConfig(enabled=True, api_key="sk-x"))
+    gw = gateway.InkboxGateway(cfg)
+    gw._identity = types.SimpleNamespace(
+        agent_handle="codex",
+        mailbox=None,
+        phone_number=None,
+        imessage_enabled=True,
+    )
+
+    asyncio.run(gw._handle_call_ws(_FakeRequest()))
+
+    assert seen["meta"].agent_imessage_enabled is True
+    assert seen["meta"].agent_identity_phone is None
+
+
+def test_call_ws_backfills_remote_and_direction_from_call_record(monkeypatch):
+    # A shared-line call can connect with a bare call id and no caller metadata
+    # — the identity-centered call read resolves it (no owning number needed).
+    fake_ws = _ScriptedWS([
+        _FakeTextMsg('{"event":"transcript","text":"Hello?","is_final":true}'),
+        _FakeTextMsg('{"event":"stop"}'),
+    ])
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    monkeypatch.setattr(gateway, "WSMsgType", types.SimpleNamespace(TEXT="text"))
+
+    class _Calls:
+        def __init__(self):
+            self.requested = []
+
+        def get(self, call_id):
+            self.requested.append(call_id)
+            return types.SimpleNamespace(
+                remote_phone_number="+15551234567", direction="inbound"
+            )
+
+    calls = _Calls()
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False))
+    gw._inkbox = types.SimpleNamespace(calls=calls, contacts=types.SimpleNamespace(lookup=lambda **_k: []))
+    session = _FakeContactSession()
+    gw.sessions = _FakeSessions(session)
+    request = _FakeRequest()
+    request.query = {"call_id": "call-77"}
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    assert calls.requested == ["call-77"]
+    # The resolved remote number becomes the session key (no contact match).
+    assert gw.sessions.requested_ids[0] == "+15551234567"
+    assert session.inbound[0][2]["sender"] == "+15551234567"
 
 
 def test_call_ws_realtime_falls_back_to_stt_tts_on_connect_failure(monkeypatch):
@@ -157,20 +578,26 @@ def test_call_ws_fallback_uses_outbound_opening_on_start(monkeypatch, tmp_path):
     assert not context_path.exists()
 
 
-class _FakeSession:
+class _RecordingSession:
     def __init__(self):
         self.calls = []
+        self.consults = []
 
     async def handle_inbound(self, text, mode, meta):
         self.calls.append((text, mode, meta))
 
+    async def run_consult(self, prompt):
+        # The fallback path reflects on the transcript once the call ends.
+        self.consults.append(prompt)
+        return ""
 
-class _FakeSessions:
+
+class _RecordingSessions:
     def __init__(self):
         self.by_chat = {}
 
     def get(self, chat_id):
-        session = _FakeSession()
+        session = self.by_chat.get(chat_id) or _RecordingSession()
         self.by_chat[chat_id] = session
         return session
 
@@ -188,7 +615,7 @@ def test_call_ws_fallback_passes_outbound_context_to_voice_turn(monkeypatch, tmp
 
     cfg = BridgeConfig(require_signature=False)
     gw = gateway.InkboxGateway(cfg)
-    gw.sessions = _FakeSessions()
+    gw.sessions = _RecordingSessions()
 
     asyncio.run(gw._handle_call_ws(_FakeRequest(query={"context_token": token})))
 
@@ -203,5 +630,7 @@ def test_call_ws_fallback_passes_outbound_context_to_voice_turn(monkeypatch, tmp
             "outbound_purpose": "talk about soccer and the World Cup",
             "outbound_opening": "Hey Dima, it's Codex calling about soccer and the World Cup.",
             "outbound_context": "The operator asked by iMessage for this call.",
+            "contact": None,
+            "direction": "outbound",
         },
     )]

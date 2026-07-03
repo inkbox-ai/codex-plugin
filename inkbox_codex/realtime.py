@@ -1,6 +1,7 @@
 """Inkbox ↔ OpenAI Realtime API voice bridge for live phone calls.
 
-Ported from hermes-agent-plugin's ``realtime.py``, trimmed to one tool.
+Ported from the reference Inkbox realtime bridge, with the coding-agent tool
+tier kept intact.
 
 When Realtime is configured, the gateway pre-opens an OpenAI Realtime
 WebSocket *before* accepting the Inkbox call in raw-media mode, then runs
@@ -12,8 +13,8 @@ two pumps for the call's duration:
   model's own voice is what the caller hears.
 
 The Realtime model runs the spoken conversation itself. It only reaches
-back to Codex through the single ``consult_agent`` tool — and
-only when the caller asks for real work. The consult runs in the caller's
+back to Codex through the ``consult_agent`` tool — and only when the caller
+asks for real work or account/contact context. The consult runs in the caller's
 shared :class:`~inkbox_codex.sessions.ContactSession` and its text answer
 is handed back to the model, which speaks it. If OpenAI can't be reached
 the gateway falls back to Inkbox STT/TTS (see ``_handle_call_ws``).
@@ -48,7 +49,7 @@ DEFAULT_MODEL = "gpt-realtime-2"
 DEFAULT_VOICE = "cedar"
 # μ-law telephony audio, matching the codec Inkbox bridges from the carrier.
 AUDIO_FORMAT_TELEPHONY = {"type": "audio/pcmu"}
-INPUT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
+INPUT_TRANSCRIPTION_MODEL = "whisper-1"
 
 CONSULT_TOOL_NAME = "consult_agent"
 POST_CALL_ACTION_TOOL_NAME = "register_post_call_action"
@@ -62,15 +63,30 @@ DEFAULT_CONNECT_TIMEOUT_S = 8.0
 HANGUP_CONFIRM_WINDOW_S = 60.0
 # Brief grace so the model's spoken goodbye reaches the caller before we drop.
 HANGUP_CLOSE_DELAY_S = 2.0
+# Never let a cancelled consult/task hold the call WebSocket cleanup forever.
+TASK_CANCEL_TIMEOUT_S = 2.0
 
 
-# A consult takes (query, recent_transcript) and returns Codex's spoken-
-# friendly answer. The gateway wires this to the caller's ContactSession.
-AgentConsultCallback = Callable[[str, List[Tuple[str, str]]], Awaitable[str]]
-# After the call ends with queued actions: (actions, transcript) → run them.
-PostCallActionsCallback = Callable[[List[Dict[str, str]], List[Tuple[str, str]]], Awaitable[None]]
-# After a call with no queued actions: (transcript) → reflect / follow up.
-CallEndedCallback = Callable[[List[Tuple[str, str]]], Awaitable[None]]
+# A consult takes live-call context plus the realtime model's request and
+# returns Codex's spoken-friendly answer. The gateway wires this to the
+# caller's ContactSession.
+AgentConsultCallback = Callable[
+    [
+        "RealtimeCallMeta",
+        str,
+        List[Tuple[str, str]],
+        List[Dict[str, str]],
+        List["RealtimeConsultResult"],
+    ],
+    Awaitable[str],
+]
+# After the call ends with queued actions: (meta, actions, transcript, consults) → run them.
+PostCallActionsCallback = Callable[
+    ["RealtimeCallMeta", List[Dict[str, str]], List[Tuple[str, str]], List["RealtimeConsultResult"]],
+    Awaitable[None],
+]
+# After a call with no queued actions: (meta, transcript) → reflect / follow up.
+CallEndedCallback = Callable[["RealtimeCallMeta", List[Tuple[str, str]]], Awaitable[None]]
 
 
 # ----------------------------------------------------------------------
@@ -103,13 +119,39 @@ class RealtimeCallMeta:
 
     call_id: str
     remote_phone_number: Optional[str]
+    direction: str = "inbound"
+    agent_identity_handle: Optional[str] = None
+    agent_identity_email: Optional[str] = None
     agent_identity_phone: Optional[str] = None
+    # Whether the identity also has the shared iMessage line (calls can run
+    # over it as well as the dedicated number).
+    agent_imessage_enabled: bool = False
     project_dir: Optional[str] = None
+    contact_known: bool = False
+    contact_id: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_emails: List[str] = field(default_factory=list)
+    contact_phones: List[str] = field(default_factory=list)
+    contact_company: Optional[str] = None
+    contact_job_title: Optional[str] = None
+    contact_notes: Optional[str] = None
     # Outbound calls only: why this agent placed the call, threaded from
     # ``inkbox_place_call`` so the live session opens with context, not cold.
     outbound_purpose: Optional[str] = None
     outbound_opening: Optional[str] = None
     outbound_context: Optional[str] = None
+    outbound_reason: Optional[str] = None
+    outbound_scheduled_by: Optional[str] = None
+    outbound_conversation_summary: Optional[str] = None
+
+
+@dataclass
+class RealtimeConsultResult:
+    id: str
+    request: str
+    result: str
+    created_at: float
+    dedupe_key: Optional[str] = None
 
 
 @dataclass
@@ -117,6 +159,7 @@ class _BridgeState:
     transcript: List[Tuple[str, str]] = field(default_factory=list)
     # Work the model asked to run after the call: [{"action", "details"}].
     post_call_actions: List[Dict[str, str]] = field(default_factory=list)
+    consult_results: List[RealtimeConsultResult] = field(default_factory=list)
     closed: bool = False
     greeting_triggered: bool = False
     # Inkbox-assigned stream id from the `start` event; echoed on outbound
@@ -148,15 +191,85 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
         str: The instruction string for the ``session.update``.
     """
     lines = [
-        "You are a Codex agent speaking with your operator on a live phone call.",
-        "Use natural, concise spoken replies — usually one or two short sentences.",
+        "You are the configured Codex Inkbox agent speaking on a live Inkbox phone call.",
+        "Use natural, concise spoken replies. Keep most answers to one or two short sentences.",
         "You are a voice; do not read out code, file paths, diffs, or logs verbatim.",
-        "",
-        f"To do real work NOW in the project ({meta.project_dir or 'the working directory'}) "
-        f"— read or edit files, run commands or tests, check git, search the codebase — "
-        f"call {CONSULT_TOOL_NAME} with a plain-English request. It runs the Codex "
-        "agent in the caller's ongoing conversation and returns a spoken-friendly answer; "
-        "read that answer back in your own voice.",
+        "Do not mention implementation details unless the caller asks.",
+    ]
+    if meta.agent_identity_handle:
+        lines.append(f"Your Inkbox identity handle: {meta.agent_identity_handle}.")
+    if meta.agent_identity_email:
+        lines.append(f"Your Inkbox agent email address: {meta.agent_identity_email}.")
+    if meta.agent_identity_phone:
+        lines.append(
+            f"Your dedicated phone line (your own number, for SMS and voice calls): "
+            f"{meta.agent_identity_phone}.",
+        )
+    if meta.agent_imessage_enabled:
+        lines.append(
+            "You also have a shared Inkbox iMessage line — voice calls and iMessage "
+            "with people connected to you over iMessage. Its number is managed by "
+            "Inkbox: never state or promise a number for it. The current call may be "
+            "running over either line; calls follow the conversation's channel "
+            "(iMessage contacts are called over the shared line, SMS/phone contacts "
+            "over your dedicated number).",
+        )
+    if meta.remote_phone_number:
+        lines.append(f"Remote phone number: {meta.remote_phone_number}.")
+    if meta.contact_known:
+        lines.append(
+            "Known Inkbox contact info is already loaded; do not look them up or ask for details you already have.",
+        )
+        if meta.contact_name:
+            lines.append(f"Contact name: {meta.contact_name}.")
+        if meta.contact_id:
+            lines.append(f"Inkbox contact id: {meta.contact_id}.")
+        if meta.contact_company:
+            lines.append(f"Contact company: {meta.contact_company}.")
+        if meta.contact_job_title:
+            lines.append(f"Contact title: {meta.contact_job_title}.")
+        if meta.contact_emails:
+            lines.append(f"Contact email(s): {', '.join(meta.contact_emails)}.")
+        if meta.contact_phones:
+            lines.append(f"Contact phone(s): {', '.join(meta.contact_phones)}.")
+        if meta.contact_notes:
+            lines.append(f"Contact notes: {meta.contact_notes}")
+    else:
+        lines.append(
+            "No matching Inkbox contact record is loaded; use the phone number or a neutral greeting.",
+        )
+    if meta.direction == "outbound":
+        if meta.outbound_purpose:
+            lines.append(f"This is an outbound call you placed. Purpose: {meta.outbound_purpose}")
+        if meta.outbound_reason:
+            lines.append(f"Reason for the call: {meta.outbound_reason}")
+        if meta.outbound_scheduled_by:
+            lines.append(f"This call was scheduled by: {meta.outbound_scheduled_by}")
+        if meta.outbound_conversation_summary:
+            lines.append(
+                f"Summary of the prior conversation that led to this call:\n{meta.outbound_conversation_summary}",
+            )
+        if meta.outbound_context:
+            lines.append(f"Relevant outbound-call context:\n{meta.outbound_context}")
+        if meta.outbound_opening:
+            lines.append(
+                f"Preferred opening message (say this naturally as your first turn): {meta.outbound_opening}",
+            )
+        lines.append(
+            "For outbound calls, do not open with a generic offer to help. Start by explaining why you are calling, then ask the next specific question or give the requested update.",
+        )
+        lines.append(
+            "If the caller asks why you called or whether you know why you are calling, answer from the loaded outbound purpose/context. Never say you only have contact or call info when outbound purpose/context is present.",
+        )
+    lines.extend([
+        "Do not perform a context lookup before greeting the caller. Do not say you are waiting on a lookup or checking context.",
+        "Stay anchored to this live call's loaded purpose and contact context. Do not switch to unrelated prior text-session work.",
+        f"Call {CONSULT_TOOL_NAME} only when the caller asks for work the voice model cannot do by itself: "
+        f"real project work in {meta.project_dir or 'the working directory'}, Inkbox account/tool lookups, "
+        "contact lookup or edits, text/call/email inspection, file edits, commands, tests, git, or code search.",
+        "Do not use consult_agent for ordinary conversation, shopping advice, brainstorming, greetings, hangups, or questions you can answer from the loaded call context.",
+        f"When you do call {CONSULT_TOOL_NAME}, use a plain-English request. It runs the Codex "
+        "agent in the caller's ongoing conversation and returns a spoken-friendly answer; read that answer back in your own voice.",
         f"If the caller wants work done AFTER the call (or accepts a deferral), call "
         f"{POST_CALL_ACTION_TOOL_NAME} to queue it. Tell them it's queued for after the "
         "call; do not claim it is already done.",
@@ -168,21 +281,11 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
         f"{HANG_UP_CALL_TOOL_NAME}: the first call arms hangup and asks you to say a short "
         "goodbye; after the goodbye, call it once more to actually end the call.",
         f"Do NOT call {CONSULT_TOOL_NAME} for greetings, small talk, or questions you "
-        "can answer directly. Use it whenever the caller wants something done in the code.",
+        "can answer directly from the loaded call context. Use it whenever the caller wants "
+        "something done in code, asks for contact/account context you do not already have, "
+        "or needs an Inkbox tool lookup. Do not call it for ordinary advice or brainstorming.",
         "While a tool runs you may say a brief 'one moment' so the caller isn't left in silence.",
-    ]
-    if meta.outbound_purpose:
-        lines += [
-            "",
-            "This is an OUTBOUND call you placed; the callee did not call you. "
-            f"You are calling because: {meta.outbound_purpose}",
-        ]
-        if meta.outbound_context:
-            lines.append(f"Background: {meta.outbound_context}")
-        lines.append(
-            "Open by greeting them, saying who you are, and stating why you're "
-            "calling in one short sentence, then let them respond."
-        )
+    ])
     if additional.strip():
         lines += ["", additional.strip()]
     return "\n".join(lines)
@@ -190,20 +293,21 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
 
 def build_realtime_greeting(meta: RealtimeCallMeta) -> str:
     """Instructions for the proactive opening line spoken at pickup."""
-    if meta.outbound_opening:
+    first_name = meta.contact_name.split()[0] if meta.contact_known and meta.contact_name else "there"
+    if meta.direction == "outbound" and meta.outbound_opening:
         return (
-            "Open the call by saying, naturally and in one short sentence: "
-            f"\"{meta.outbound_opening}\" Then stop and let them respond."
+            "Say exactly this as the very first thing, with no greeting before it and no extra words:\n"
+            f"{meta.outbound_opening}"
         )
-    if meta.outbound_purpose:
+    if meta.direction == "outbound" and meta.outbound_purpose:
         return (
-            "You placed this call. Open by greeting them, saying you're their "
-            f"Codex agent, and stating why you're calling: {meta.outbound_purpose}. "
-            "Keep it to one short sentence, then stop."
+            f"Greet {first_name} briefly, then immediately explain that you are calling because: "
+            f"{meta.outbound_purpose}. Do not ask a generic how-can-I-help question."
         )
     return (
-        "Greet the caller briefly and naturally, e.g. \"Hey, it's your Codex "
-        "agent — what do you need?\" Keep it to one short sentence and then stop."
+        f"Greet the caller now as the very first thing you say. Say something like "
+        f"'Hi {first_name}, this is your Codex Inkbox agent - how can I help?' "
+        f"Keep it to one short sentence and then wait for them to respond."
     )
 
 
@@ -218,10 +322,13 @@ def _consult_tool_schema() -> Dict[str, Any]:
         "name": CONSULT_TOOL_NAME,
         "description": (
             "Hand a request to the Codex agent working in the project, when "
-            "the caller wants real work done — read/edit files, run commands or "
-            "tests, check git status, search the codebase, etc. The request runs "
-            "in the caller's ongoing conversation and you get back a spoken-friendly "
-            "answer to read aloud. Do NOT use this for greetings or small talk."
+            "the caller wants real work done that the voice model cannot do itself - "
+            "look up contacts, inspect Inkbox texts/calls/email, read/edit files, "
+            "run commands or tests, check git status, search the codebase, etc. "
+            "The request runs in the caller's ongoing conversation and you get "
+            "back a spoken-friendly answer to read aloud. Do NOT use this for "
+            "greetings, hangups, small talk, ordinary conversation, shopping "
+            "advice, or brainstorming."
         ),
         "parameters": {
             "type": "object",
@@ -401,18 +508,34 @@ class OpenedRealtimeBridge:
                 ),
                 name=f"realtime-openai-pump-{self.meta.call_id}",
             )
-            _, pending = await asyncio.wait(
+            done, _pending = await asyncio.wait(
                 {inkbox_task, openai_task}, return_when=asyncio.FIRST_COMPLETED
             )
-            for task in pending:
-                task.cancel()
+            for task in done:
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc:
+                    logger.warning("[realtime] pump %s raised: %s", task.get_name(), exc)
         finally:
             state.closed = True
-            await _cancel_consult_tasks(state)
+            tasks = [
+                task for task in (
+                    locals().get("inkbox_task"),
+                    locals().get("openai_task"),
+                )
+                if task is not None
+            ]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await _maybe_close_ws(inkbox_ws)
             await self.close()
+            await _settle_tasks(tasks, label="pump")
+            await _cancel_consult_tasks(state)
 
         # After teardown: run queued after-call work, or a follow-up reflection.
-        await _dispatch_post_call(state, on_post_call_actions, on_call_ended)
+        await _dispatch_post_call(state, self.meta, on_post_call_actions, on_call_ended)
 
     async def close(self) -> None:
         if self._closed:
@@ -479,11 +602,25 @@ async def _cancel_consult_tasks(state: _BridgeState) -> None:
     """Cancel in-flight consult tasks and let them settle."""
     tasks = list(state.consult_tasks)
     state.consult_tasks.clear()
+    if not tasks:
+        return
     for task in tasks:
         task.cancel()
-    for task in tasks:
-        with suppress(asyncio.CancelledError, Exception):
-            await task
+    await _settle_tasks(tasks, label="consult")
+
+
+async def _settle_tasks(tasks: List["asyncio.Task[Any]"], *, label: str) -> None:
+    """Let cancelled background tasks drain, but never block call teardown."""
+    if not tasks:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=TASK_CANCEL_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        names = ", ".join(task.get_name() for task in tasks)
+        logger.warning("[realtime] timed out waiting for %s task cancellation: %s", label, names)
 
 
 # ----------------------------------------------------------------------
@@ -549,6 +686,12 @@ async def _maybe_send_greeting(
             "type": "response.create",
             "response": {"instructions": build_realtime_greeting(meta)},
         }))
+        logger.info(
+            "[realtime] greeting sent call_id=%s direction=%s outbound_context=%s",
+            meta.call_id,
+            meta.direction,
+            bool(meta.outbound_purpose or meta.outbound_opening or meta.outbound_context),
+        )
     except Exception as exc:
         logger.debug("[realtime] greeting send failed: %s", exc)
 
@@ -615,6 +758,11 @@ async def _openai_to_inkbox_pump(
         if not cid or cid in dispatched:
             return
         dispatched.add(cid)
+        logger.info(
+            "[realtime] dispatching tool call name=%s call_id=%s",
+            entry.get("name") or "",
+            cid,
+        )
         coro = _dispatch_tool_call(
             openai_ws=openai_ws,
             inkbox_ws=inkbox_ws,
@@ -623,6 +771,7 @@ async def _openai_to_inkbox_pump(
             arguments_json=entry.get("args") or "{}",
             state=state,
             config=config,
+            meta=meta,
             on_agent_consult=on_agent_consult,
         )
         # The consult runs a full Codex turn (seconds). Awaiting it here
@@ -631,7 +780,16 @@ async def _openai_to_inkbox_pump(
         # which is exactly the async-tool flow gpt-realtime expects.
         task = asyncio.create_task(coro, name=f"realtime-consult-{cid}")
         state.consult_tasks.add(task)
-        task.add_done_callback(state.consult_tasks.discard)
+        def _done(done_task: "asyncio.Task[None]") -> None:
+            state.consult_tasks.discard(done_task)
+            if done_task.cancelled():
+                logger.info("[realtime] tool call cancelled call_id=%s", cid)
+                return
+            exc = done_task.exception()
+            if exc:
+                logger.warning("[realtime] tool call task failed call_id=%s: %s", cid, exc)
+
+        task.add_done_callback(_done)
 
     async def _relay_transcript(party: str, text: str) -> None:
         # Realtime runs the WS in raw-media mode, so Inkbox does not create its
@@ -711,23 +869,33 @@ async def _openai_to_inkbox_pump(
         elif ftype == "response.output_item.added":
             item = frame.get("item") or {}
             if item.get("type") == "function_call":
-                item_id = item.get("id") or ""
-                fn_calls[item_id] = {
-                    "call_id": item.get("call_id") or "",
-                    "name": item.get("name") or "",
-                    "args": item.get("arguments") or "",
-                }
+                item_id = item.get("id") or frame.get("item_id") or ""
+                if item_id:
+                    fn_calls[item_id] = {
+                        "call_id": item.get("call_id") or "",
+                        "name": item.get("name") or "",
+                        "args": item.get("arguments") or "",
+                    }
         elif ftype == "response.function_call_arguments.delta":
-            item_id = frame.get("item_id") or ""
-            if item_id in fn_calls:
-                fn_calls[item_id]["args"] += frame.get("delta") or ""
+            key = frame.get("item_id") or frame.get("call_id") or ""
+            if not key:
+                continue
+            entry = fn_calls.setdefault(key, {"call_id": "", "name": "", "args": ""})
+            if not entry.get("call_id") and frame.get("call_id"):
+                entry["call_id"] = frame["call_id"]
+            if not entry.get("name") and frame.get("name"):
+                entry["name"] = frame["name"]
+            entry["args"] = (entry.get("args") or "") + (frame.get("delta") or "")
         elif ftype == "response.function_call_arguments.done":
-            item_id = frame.get("item_id") or ""
-            entry = fn_calls.get(item_id)
-            if entry is not None:
-                if frame.get("arguments"):
-                    entry["args"] = frame["arguments"]
-                await _finalize_fn_call(entry)
+            key = frame.get("item_id") or frame.get("call_id") or ""
+            entry = fn_calls.get(key) or fn_calls.get(frame.get("call_id") or "") or {}
+            if frame.get("call_id"):
+                entry["call_id"] = frame["call_id"]
+            if frame.get("name"):
+                entry["name"] = frame["name"]
+            if frame.get("arguments"):
+                entry["args"] = frame["arguments"]
+            await _finalize_fn_call(entry)
         # Fallback: a completed function_call item.
         elif ftype in ("response.output_item.done", "conversation.item.done"):
             item = frame.get("item") or {}
@@ -746,6 +914,16 @@ async def _openai_to_inkbox_pump(
 # ----------------------------------------------------------------------
 
 
+def _consult_result_text(output: Dict[str, Any]) -> str:
+    result = output.get("answer") or output.get("result")
+    if isinstance(result, str) and result.strip():
+        return result.strip()
+    error = output.get("error")
+    if isinstance(error, str) and error.strip():
+        return f"ERROR: {error.strip()}"
+    return json.dumps(output)
+
+
 async def _dispatch_tool_call(
     *,
     openai_ws: Any,
@@ -755,6 +933,7 @@ async def _dispatch_tool_call(
     arguments_json: str,
     state: _BridgeState,
     config: RealtimeConfig,
+    meta: RealtimeCallMeta,
     on_agent_consult: AgentConsultCallback,
 ) -> None:
     """Handle a function call from the Realtime model.
@@ -799,28 +978,60 @@ async def _dispatch_tool_call(
 
     try:
         answer = await asyncio.wait_for(
-            on_agent_consult(query, list(state.transcript)),
+            on_agent_consult(
+                meta,
+                query,
+                list(state.transcript),
+                list(state.post_call_actions),
+                list(state.consult_results),
+            ),
             timeout=config.consult_timeout_s,
         )
     except asyncio.TimeoutError:
-        await _submit_tool_result(openai_ws, call_id, {
+        output = {
             "error": "consult timed out",
             "message": "Tell the caller you couldn't finish that right now; offer to follow up.",
-        })
+        }
+        state.consult_results.append(RealtimeConsultResult(
+            id=call_id,
+            request=query,
+            result=_consult_result_text(output),
+            created_at=time.time(),
+        ))
+        await _submit_tool_result(openai_ws, call_id, output)
         return
     except Exception as exc:
         logger.warning("[realtime] consult failed: %s", exc)
-        await _submit_tool_result(openai_ws, call_id, {
+        output = {
             "error": f"consult error: {exc}",
             "message": "Apologize briefly and ask if you can help another way.",
-        })
+        }
+        state.consult_results.append(RealtimeConsultResult(
+            id=call_id,
+            request=query,
+            result=_consult_result_text(output),
+            created_at=time.time(),
+        ))
+        await _submit_tool_result(openai_ws, call_id, output)
         return
 
-    await _submit_tool_result(openai_ws, call_id, {
+    output = {
         "status": "ok",
         "answer": answer,
         "instructions": "Read the answer back to the caller in your own voice. Keep it natural and concise.",
-    })
+    }
+    if state.post_call_actions:
+        output["post_call_action_guidance"] = (
+            "If this result completed, queued, canceled, or superseded a pending after-call action, "
+            "call delete_post_call_action for that action_index before the call ends."
+        )
+    state.consult_results.append(RealtimeConsultResult(
+        id=call_id,
+        request=query,
+        result=_consult_result_text(output),
+        created_at=time.time(),
+    ))
+    await _submit_tool_result(openai_ws, call_id, output)
 
 
 async def _handle_register_action(
@@ -943,18 +1154,24 @@ def _action_index(args: Dict[str, Any]) -> int:
 
 async def _dispatch_post_call(
     state: _BridgeState,
+    meta: RealtimeCallMeta,
     on_post_call_actions: PostCallActionsCallback,
     on_call_ended: CallEndedCallback,
 ) -> None:
     """Run exactly one follow-up after the call: queued actions, else a reflection."""
     if state.post_call_actions:
         try:
-            await on_post_call_actions(list(state.post_call_actions), list(state.transcript))
+            await on_post_call_actions(
+                meta,
+                list(state.post_call_actions),
+                list(state.transcript),
+                list(state.consult_results),
+            )
         except Exception as exc:
             logger.warning("[realtime] post-call action dispatch failed: %s", exc)
     else:
         try:
-            await on_call_ended(list(state.transcript))
+            await on_call_ended(meta, list(state.transcript))
         except Exception as exc:
             logger.warning("[realtime] call-ended dispatch failed: %s", exc)
 

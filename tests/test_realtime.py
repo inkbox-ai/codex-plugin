@@ -36,7 +36,11 @@ class _FakeWS:
 
 
 def _meta():
-    return RealtimeCallMeta(call_id="c1", remote_phone_number="+15551234567", project_dir="/tmp/proj")
+    return RealtimeCallMeta(
+        call_id="c1",
+        remote_phone_number="+15551234567",
+        project_dir="/tmp/proj",
+    )
 
 
 def test_session_update_configures_telephony_audio_vad_and_all_tools():
@@ -63,16 +67,86 @@ def test_session_update_configures_telephony_audio_vad_and_all_tools():
 
 
 def test_instructions_name_the_consult_tool_and_project():
-    text = build_realtime_instructions(_meta())
+    meta = RealtimeCallMeta(
+        call_id="c1",
+        remote_phone_number="+15551234567",
+        project_dir="/tmp/proj",
+        agent_identity_handle="codex",
+        agent_identity_email="codex@example.com",
+        agent_identity_phone="+15550001111",
+        contact_known=True,
+        contact_id="contact-1",
+        contact_name="Ada Lovelace",
+        contact_emails=["ada@example.com"],
+        contact_phones=["+15551234567"],
+        contact_company="Inkbox",
+        contact_job_title="Engineer",
+        contact_notes="Prefers calls in the morning.",
+    )
+    text = build_realtime_instructions(meta)
     assert CONSULT_TOOL_NAME in text
     assert "/tmp/proj" in text
+    assert "Your Inkbox identity handle: codex." in text
+    assert "codex@example.com" in text
+    assert "Ada Lovelace" in text
+    assert "ada@example.com" in text
+    assert "Do not perform a context lookup before greeting" in text
+    assert "contact lookup" in text
+    assert "Do not use consult_agent for ordinary conversation, shopping advice" in text
+    assert "Never say you only have contact or call info" not in text
+
+
+def test_instructions_name_the_two_lines_when_imessage_enabled():
+    meta = RealtimeCallMeta(
+        call_id="c1",
+        remote_phone_number="+15551234567",
+        agent_identity_phone="+15550001111",
+        agent_imessage_enabled=True,
+    )
+    text = build_realtime_instructions(meta)
+    assert (
+        "Your dedicated phone line (your own number, for SMS and voice calls): "
+        "+15550001111." in text
+    )
+    # The shared line is described but its number is never stated or promised.
+    assert "shared Inkbox iMessage line" in text
+    assert "never state or promise a number for it" in text
+    assert "calls follow the conversation's channel" in text
+
+
+def test_instructions_omit_shared_line_without_imessage():
+    meta = RealtimeCallMeta(
+        call_id="c1",
+        remote_phone_number="+15551234567",
+        agent_identity_phone="+15550001111",
+    )
+    text = build_realtime_instructions(meta)
+    assert "Your dedicated phone line" in text
+    assert "shared Inkbox iMessage line" not in text
+
+
+def test_instructions_shared_line_only_identity_names_no_number():
+    # An iMessage-only identity has no dedicated number to mention, and the
+    # shared line paragraph still must not surface any number.
+    meta = RealtimeCallMeta(
+        call_id="c1",
+        remote_phone_number=None,
+        agent_imessage_enabled=True,
+    )
+    text = build_realtime_instructions(meta)
+    assert "Your dedicated phone line" not in text
+    assert "shared Inkbox iMessage line" in text
+    assert "+1" not in text
 
 
 def test_outbound_call_context_shapes_realtime_prompt_and_greeting():
     meta = RealtimeCallMeta(
         call_id="c1",
         remote_phone_number="+15551234567",
+        direction="outbound",
         project_dir="/tmp/proj",
+        contact_known=True,
+        contact_name="Ada Lovelace",
         outbound_purpose="tell them the deployment is fixed",
         outbound_opening="Hi, this is Codex calling with the deployment update.",
         outbound_context="Deployment failed twice before the final fix.",
@@ -80,9 +154,10 @@ def test_outbound_call_context_shapes_realtime_prompt_and_greeting():
 
     text = build_realtime_instructions(meta)
 
-    assert "OUTBOUND call" in text
+    assert "outbound call" in text
     assert "tell them the deployment is fixed" in text
     assert "Deployment failed twice before the final fix." in text
+    assert "Never say you only have contact or call info" in text
     assert "Hi, this is Codex calling with the deployment update." in build_realtime_greeting(meta)
 
 
@@ -90,8 +165,11 @@ def test_dispatch_consult_runs_agent_and_speaks_answer():
     ws = _FakeWS()
     state = _BridgeState()
 
-    async def fake_consult(query, transcript):
+    async def fake_consult(_meta, query, transcript, post_call_actions, consult_results):
         assert query == "run the tests"
+        assert transcript == []
+        assert post_call_actions == []
+        assert consult_results == []
         return "tests pass, 42 green"
 
     asyncio.run(_dispatch_tool_call(
@@ -102,6 +180,7 @@ def test_dispatch_consult_runs_agent_and_speaks_answer():
         arguments_json=json.dumps({"query": "run the tests"}),
         state=state,
         config=RealtimeConfig(api_key="sk-x"),
+        meta=_meta(),
         on_agent_consult=fake_consult,
     ))
 
@@ -114,13 +193,15 @@ def test_dispatch_consult_runs_agent_and_speaks_answer():
     output = json.loads(item["item"]["output"])
     assert output["status"] == "ok"
     assert output["answer"] == "tests pass, 42 green"
+    assert state.consult_results[0].request == "run the tests"
+    assert state.consult_results[0].result == "tests pass, 42 green"
     assert ws.types().count("response.create") >= 1
 
 
 def test_dispatch_missing_query_returns_error():
     ws = _FakeWS()
 
-    async def fake_consult(query, transcript):  # pragma: no cover - must not run
+    async def fake_consult(*_args):  # pragma: no cover - must not run
         raise AssertionError("consult should not be called without a query")
 
     asyncio.run(_dispatch_tool_call(
@@ -131,6 +212,7 @@ def test_dispatch_missing_query_returns_error():
         arguments_json="{}",
         state=_BridgeState(),
         config=RealtimeConfig(api_key="sk-x"),
+        meta=_meta(),
         on_agent_consult=fake_consult,
     ))
     item = next(f for f in ws.sent if f.get("type") == "conversation.item.create")
@@ -140,7 +222,7 @@ def test_dispatch_missing_query_returns_error():
 def test_dispatch_unknown_tool_refuses():
     ws = _FakeWS()
 
-    async def fake_consult(query, transcript):  # pragma: no cover
+    async def fake_consult(*_args):  # pragma: no cover
         raise AssertionError("not the consult tool")
 
     asyncio.run(_dispatch_tool_call(
@@ -151,6 +233,7 @@ def test_dispatch_unknown_tool_refuses():
         arguments_json="{}",
         state=_BridgeState(),
         config=RealtimeConfig(api_key="sk-x"),
+        meta=_meta(),
         on_agent_consult=fake_consult,
     ))
     item = next(f for f in ws.sent if f.get("type") == "conversation.item.create")
@@ -160,7 +243,7 @@ def test_dispatch_unknown_tool_refuses():
 def test_consult_timeout_reports_error_not_crash():
     ws = _FakeWS()
 
-    async def slow_consult(query, transcript):
+    async def slow_consult(*_args):
         await asyncio.sleep(1)
         return "too late"
 
@@ -173,6 +256,7 @@ def test_consult_timeout_reports_error_not_crash():
         arguments_json=json.dumps({"query": "x"}),
         state=_BridgeState(),
         config=cfg,
+        meta=_meta(),
         on_agent_consult=slow_consult,
     ))
     item = next(f for f in ws.sent if f.get("type") == "conversation.item.create")
@@ -193,7 +277,8 @@ def _dispatch(ws, name, args, state, inkbox_ws=None):
         arguments_json=json.dumps(args),
         state=state,
         config=RealtimeConfig(api_key="sk-x"),
-        on_agent_consult=lambda q, t: (_ for _ in ()).throw(AssertionError("no consult")),
+        meta=_meta(),
+        on_agent_consult=lambda *_args: (_ for _ in ()).throw(AssertionError("no consult")),
     ))
 
 
@@ -264,15 +349,19 @@ def test_post_call_dispatch_runs_actions_when_queued():
     state.transcript = [("caller", "open a pr please")]
     seen = {}
 
-    async def on_actions(actions, transcript):
+    async def on_actions(meta, actions, transcript, consult_results):
+        seen["meta"] = meta
         seen["actions"] = actions
         seen["transcript"] = transcript
+        seen["consult_results"] = consult_results
 
-    async def on_ended(transcript):  # pragma: no cover - must not run
+    async def on_ended(*_args):  # pragma: no cover - must not run
         raise AssertionError("should not reflect when actions are queued")
 
-    asyncio.run(_dispatch_post_call(state, on_actions, on_ended))
+    asyncio.run(_dispatch_post_call(state, _meta(), on_actions, on_ended))
+    assert seen["meta"].call_id == "c1"
     assert seen["actions"] == [{"action": "open a PR", "details": ""}]
+    assert seen["consult_results"] == []
 
 
 def test_post_call_dispatch_reflects_when_no_actions():
@@ -280,13 +369,15 @@ def test_post_call_dispatch_reflects_when_no_actions():
     state.transcript = [("agent", "bye")]
     seen = {}
 
-    async def on_actions(actions, transcript):  # pragma: no cover - must not run
+    async def on_actions(*_args):  # pragma: no cover - must not run
         raise AssertionError("no actions to run")
 
-    async def on_ended(transcript):
+    async def on_ended(meta, transcript):
+        seen["meta"] = meta
         seen["transcript"] = transcript
 
-    asyncio.run(_dispatch_post_call(state, on_actions, on_ended))
+    asyncio.run(_dispatch_post_call(state, _meta(), on_actions, on_ended))
+    assert seen["meta"].call_id == "c1"
     assert seen["transcript"] == [("agent", "bye")]
 
 
@@ -298,6 +389,10 @@ class _FakeOpenAIWS:
             type("Msg", (), {"type": "TEXT", "data": json.dumps(f)})()
             for f in frames
         ]
+        self.sent = []
+
+    async def send_str(self, data):
+        self.sent.append(json.loads(data))
 
     def __aiter__(self):
         async def gen():
@@ -339,7 +434,7 @@ def test_realtime_transcripts_are_mirrored_into_inkbox(monkeypatch):
         state=state,
         config=RealtimeConfig(api_key="sk-x"),
         meta=_meta(),
-        on_agent_consult=lambda _q, _t: (_ for _ in ()).throw(AssertionError("no consult")),
+        on_agent_consult=lambda *_args: (_ for _ in ()).throw(AssertionError("no consult")),
     ))
 
     transcripts = [frame for frame in ink.sent if frame.get("event") == "transcript"]
@@ -361,3 +456,132 @@ def test_realtime_transcripts_are_mirrored_into_inkbox(monkeypatch):
         ("caller", "hey can you check the build"),
         ("agent", "sure, the build is green"),
     ]
+
+
+def test_openai_pump_dispatches_call_id_keyed_consult_events(monkeypatch):
+    """GA Realtime may key argument events by call_id."""
+    monkeypatch.setattr(
+        realtime,
+        "aiohttp",
+        types.SimpleNamespace(
+            WSMsgType=types.SimpleNamespace(
+                TEXT="TEXT",
+                CLOSE="CLOSE",
+                CLOSED="CLOSED",
+                ERROR="ERROR",
+            )
+        ),
+    )
+    openai = _FakeOpenAIWS([
+        {
+            "type": "response.output_item.added",
+            "item_id": "item-1",
+            "item": {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": CONSULT_TOOL_NAME,
+            },
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "call_id": "call-1",
+            "name": CONSULT_TOOL_NAME,
+            "delta": '{"query":"who is Alex?"}',
+        },
+        {
+            "type": "response.function_call_arguments.done",
+            "call_id": "call-1",
+            "name": CONSULT_TOOL_NAME,
+        },
+    ])
+    state = _BridgeState()
+    seen = {}
+
+    async def fake_consult(meta, query, transcript, post_call_actions, consult_results):
+        seen["meta"] = meta
+        seen["query"] = query
+        seen["transcript"] = transcript
+        seen["post_call_actions"] = post_call_actions
+        seen["consult_results"] = consult_results
+        return "Alex is in the contact book."
+
+    async def scenario():
+        await _openai_to_inkbox_pump(
+            openai_ws=openai,
+            inkbox_ws=_FakeInkboxWS(),
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            meta=_meta(),
+            on_agent_consult=fake_consult,
+        )
+        if state.consult_tasks:
+            await asyncio.gather(*state.consult_tasks)
+
+    asyncio.run(scenario())
+
+    assert seen["meta"].call_id == "c1"
+    assert seen["query"] == "who is Alex?"
+    assert seen["post_call_actions"] == []
+    assert seen["consult_results"] == []
+    assert state.consult_results[0].result == "Alex is in the contact book."
+    item = next(frame for frame in openai.sent if frame.get("type") == "conversation.item.create")
+    output = json.loads(item["item"]["output"])
+    assert output["status"] == "ok"
+    assert output["answer"] == "Alex is in the contact book."
+
+
+def test_openai_pump_uses_frame_item_id_when_item_has_no_id(monkeypatch):
+    """output_item.added sometimes carries item_id on the frame."""
+    monkeypatch.setattr(
+        realtime,
+        "aiohttp",
+        types.SimpleNamespace(
+            WSMsgType=types.SimpleNamespace(
+                TEXT="TEXT",
+                CLOSE="CLOSE",
+                CLOSED="CLOSED",
+                ERROR="ERROR",
+            )
+        ),
+    )
+    openai = _FakeOpenAIWS([
+        {
+            "type": "response.output_item.added",
+            "item_id": "item-2",
+            "item": {
+                "type": "function_call",
+                "call_id": "call-2",
+                "name": POST_CALL_ACTION_TOOL_NAME,
+            },
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "item_id": "item-2",
+            "delta": '{"action":"email Dima the summary"}',
+        },
+        {
+            "type": "response.function_call_arguments.done",
+            "item_id": "item-2",
+            "call_id": "call-2",
+        },
+    ])
+    state = _BridgeState()
+
+    async def fake_consult(*_args):  # pragma: no cover - must not run
+        raise AssertionError("post-call action should not consult")
+
+    async def scenario():
+        await _openai_to_inkbox_pump(
+            openai_ws=openai,
+            inkbox_ws=_FakeInkboxWS(),
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            meta=_meta(),
+            on_agent_consult=fake_consult,
+        )
+        if state.consult_tasks:
+            await asyncio.gather(*state.consult_tasks)
+
+    asyncio.run(scenario())
+
+    assert state.post_call_actions == [{"action": "email Dima the summary", "details": ""}]

@@ -1,12 +1,11 @@
 """Interactive setup wizard for the Inkbox Codex bridge.
 
-Ported from the hermes-agent-plugin wizard. Same flow — self-signup or
-bring-your-own API key, identity pick/create, phone provisioning, SMS
-opt-in, iMessage connect walkthrough, and webhook signing-key mint — but
-standalone: this plugin has no Hermes host, so it carries its own
-terminal output helpers and persists everything to a ``.env`` file the
-operator sources before ``inkbox-codex run``. Calls can run over OpenAI
-Realtime (validated here) or fall back to Inkbox STT/TTS.
+Self-signup or bring-your-own API key, identity pick/create, iMessage
+connect walkthrough, standalone dedicated-number provisioning, SMS
+opt-in, and webhook signing-key mint. Standalone: the wizard carries its
+own terminal output helpers and persists everything to a ``.env`` file
+the operator sources before ``inkbox-codex run``. Calls can run over
+OpenAI Realtime (validated here) or fall back to Inkbox STT/TTS.
 """
 
 from __future__ import annotations
@@ -27,21 +26,22 @@ from typing import Any
 from urllib.parse import urlencode
 
 try:
-    from .config import INKBOX_BASE_URL_DEFAULT
+    from .config import INKBOX_BASE_URL_DEFAULT, inkbox_base_url_kwargs, inkbox_client_kwargs
     from .realtime import DEFAULT_MODEL as REALTIME_MODEL, REALTIME_URL
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import INKBOX_BASE_URL_DEFAULT
+    from config import INKBOX_BASE_URL_DEFAULT, inkbox_base_url_kwargs, inkbox_client_kwargs
     from realtime import DEFAULT_MODEL as REALTIME_MODEL, REALTIME_URL
 
 
 # Packages the wizard itself needs to talk to Inkbox during setup. The
 # gateway's Codex CLI dependency is checked by doctor.
-INKBOX_REQUIREMENTS = ("inkbox>=0.4.10", "aiohttp>=3.9")
-MIN_INKBOX_VERSION = (0, 4, 10)
+INKBOX_REQUIREMENTS = ("inkbox>=0.4.15,<1.0.0", "aiohttp>=3.9")
+MIN_INKBOX_VERSION = (0, 4, 15)
 _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
 
 # Bundled avatar attached to the agent's Inkbox contact card during setup.
 _AVATAR_PATH = Path(__file__).resolve().parent / "assets" / "codex_avatar.png"
+_RAW_AVATAR_BASE_URL_DEFAULT = "https://inkbox.ai"
 
 
 # ----------------------------------------------------------------------
@@ -497,7 +497,7 @@ def _setup_signing_key(api_key: str, base_url: str, Inkbox: Any) -> None:
         raise SystemExit(1)
 
     try:
-        new_key = Inkbox(api_key=api_key, base_url=base_url).create_signing_key()
+        new_key = Inkbox(**inkbox_client_kwargs(api_key, base_url)).create_signing_key()
     except Exception as exc:
         print_error(f"  Failed to create signing key: {exc}")
         print_error("  A signing key is required; aborting setup. Retry, or paste an existing key.")
@@ -550,7 +550,7 @@ def _wait_for_sms_opt_in(api_key: str, base_url: str, phone: Any, Inkbox: Any) -
         return None
 
     try:
-        client = Inkbox(api_key=api_key, base_url=base_url)
+        client = Inkbox(**inkbox_client_kwargs(api_key, base_url))
     except Exception:
         return
 
@@ -597,6 +597,10 @@ def _wait_for_sms_opt_in(api_key: str, base_url: str, phone: Any, Inkbox: Any) -
 # ----------------------------------------------------------------------
 
 
+def _avatar_base_url(base_url: str) -> str:
+    return (base_url or _RAW_AVATAR_BASE_URL_DEFAULT).rstrip("/")
+
+
 async def _identity_has_avatar_async(base_url: str, api_key: str, handle: str) -> bool | None:
     """Check whether an identity already has a contact-card avatar.
 
@@ -610,7 +614,7 @@ async def _identity_has_avatar_async(base_url: str, api_key: str, handle: str) -
     """
     import aiohttp
 
-    url = f"{base_url.rstrip('/')}/api/v1/identities/{handle}/avatar"
+    url = f"{_avatar_base_url(base_url)}/api/v1/identities/{handle}/avatar"
     timeout = aiohttp.ClientTimeout(total=10)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -640,7 +644,7 @@ async def _upload_avatar_async(
     """
     import aiohttp
 
-    url = f"{base_url.rstrip('/')}/api/v1/identities/{handle}/avatar"
+    url = f"{_avatar_base_url(base_url)}/api/v1/identities/{handle}/avatar"
     timeout = aiohttp.ClientTimeout(total=30)
     form = aiohttp.FormData()
     form.add_field("file", image, filename="codex_avatar.png", content_type="image/png")
@@ -809,17 +813,21 @@ def _test_openai_realtime_api_key(api_key: str, model: str = REALTIME_MODEL) -> 
         return False, f"Could not run Realtime validation from this setup process: {exc}"
 
 
-def _configure_realtime_calls(identity: Any) -> None:
+def _configure_realtime_calls(identity: Any, *, imessage_enabled: bool = False) -> None:
     """Offer OpenAI Realtime voice for calls, validating the key before enabling.
 
     Args:
-        identity (Any): The configured agent identity (needs a phone number).
+        identity (Any): The configured agent identity.
+        imessage_enabled (bool): Whether iMessage ended up enabled — threaded
+            in explicitly since the local identity object may be stale.
 
     Returns:
         None: Persists INKBOX_REALTIME_* to .env; leaves Realtime off if the
         operator declines or the key fails validation (calls use Inkbox STT/TTS).
     """
-    if getattr(identity, "phone_number", None) is None:
+    # Calls can arrive over the dedicated number OR the shared iMessage line,
+    # so offer realtime whenever either exists.
+    if getattr(identity, "phone_number", None) is None and not imessage_enabled:
         return
 
     print()
@@ -880,7 +888,7 @@ def _configure_realtime_calls(identity: Any) -> None:
 # ----------------------------------------------------------------------
 
 
-def _configure_imessage(api_key: str, base_url: str, handle: str, Inkbox: Any) -> None:
+def _configure_imessage(api_key: str, base_url: str, handle: str, Inkbox: Any) -> bool:
     """Offer to enable iMessage for the agent and walk through connecting.
 
     Args:
@@ -890,39 +898,42 @@ def _configure_imessage(api_key: str, base_url: str, handle: str, Inkbox: Any) -
         Inkbox (Any): The Inkbox SDK client class.
 
     Returns:
-        None: Prints progress; failures degrade to a warning and return.
+        bool: True when iMessage ended up enabled (newly or already), so the
+        caller can gate iMessage-dependent steps like realtime calling.
     """
     print()
     print(color("  --- iMessage ---", Colors.CYAN))
     print_info("  Inkbox can make this agent reachable over iMessage from your iPhone.")
     print_info("  No number to provision — you connect through the Inkbox iMessage router.")
+    print_info("  Once connected, the agent can also make and take voice calls with you")
+    print_info("  over that same shared iMessage line.")
 
     try:
-        client = Inkbox(api_key=api_key, base_url=base_url)
+        client = Inkbox(**inkbox_client_kwargs(api_key, base_url))
         identity = client.get_identity(handle)
     except Exception as exc:
         print_warning(f"  Could not load the identity for iMessage setup: {exc}")
-        return
+        return False
 
     # Old SDKs predate iMessage entirely — detect by surface, not version.
     if not hasattr(client, "imessages") or not hasattr(identity, "imessage_enabled"):
         print_warning("  The installed Inkbox SDK does not support iMessage yet.")
         print_info("  Upgrade it and rerun setup:")
         print_info(f"    {_install_command_text()}")
-        return
+        return False
 
     if identity.imessage_enabled:
         print_success("  iMessage is already enabled for this agent.")
     else:
         if not prompt_yes_no("  Enable iMessage for this agent?", True):
             print_info("  Skipped. Rerun `inkbox-codex setup` anytime to enable iMessage.")
-            return
+            return False
         try:
             identity.update(imessage_enabled=True)
         except Exception as exc:
             print_error(f"  Could not enable iMessage: {exc}")
             print_info("  You can enable it later from the Inkbox console and rerun setup.")
-            return
+            return False
         print_success("  iMessage enabled for this agent.")
         try:
             # Re-fetch so the local object reflects the new flag (the SDK
@@ -930,7 +941,7 @@ def _configure_imessage(api_key: str, base_url: str, handle: str, Inkbox: Any) -
             identity = client.get_identity(handle)
         except Exception as exc:
             print_warning(f"  Could not refresh the identity after enabling: {exc}")
-            return
+            return True
 
     # Surface phones already connected through the router so reruns don't
     # read like a first-time setup, and default the walkthrough off when a
@@ -955,8 +966,9 @@ def _configure_imessage(api_key: str, base_url: str, handle: str, Inkbox: Any) -
     )
     if not prompt_yes_no(question, not connected):
         print_info("  You can connect anytime — rerun `inkbox-codex setup` for the walkthrough.")
-        return
+        return True
     _wait_for_imessage_first_message(client, identity, handle)
+    return True
 
 
 def _wait_for_imessage_first_message(client: Any, identity: Any, handle: str) -> None:
@@ -1102,7 +1114,8 @@ def _self_signup_flow(base_url: str, Inkbox: Any, InkboxAPIError: Any) -> tuple[
 
     Returns:
         tuple[Any | None, str, bool]: (identity-or-None, api_key,
-        did_provision_phone).
+        did_provision_phone — always False now that number provisioning is a
+        standalone later step).
     """
     print()
     print_info("No problem. We will create a fresh agent identity for you.")
@@ -1137,8 +1150,8 @@ def _self_signup_flow(base_url: str, Inkbox: Any, InkboxAPIError: Any) -> tuple[
                 human_email=human_email,
                 note_to_human=note,
                 agent_handle=handle,
-                base_url=base_url,
                 harness="codex",
+                **inkbox_base_url_kwargs(base_url),
             )
             break
         except InkboxAPIError as exc:
@@ -1193,7 +1206,6 @@ def _self_signup_flow(base_url: str, Inkbox: Any, InkboxAPIError: Any) -> tuple[
 
     max_attempts = 3
     attempts_used = 0
-    verified = False
     while True:
         attempts_left = max_attempts - attempts_used
         if attempts_left <= 0:
@@ -1213,9 +1225,12 @@ def _self_signup_flow(base_url: str, Inkbox: Any, InkboxAPIError: Any) -> tuple[
             print_warning("  This code is dead. Type 'resend' before trying another code.")
             continue
         try:
-            verify = Inkbox.verify_signup(api_key=resp.api_key, verification_code=entry, base_url=base_url)
+            verify = Inkbox.verify_signup(
+                api_key=resp.api_key,
+                verification_code=entry,
+                **inkbox_base_url_kwargs(base_url),
+            )
             print_success(f"  Verified - claim status: {verify.claim_status}")
-            verified = True
             break
         except InkboxAPIError as exc:
             attempts_used += 1
@@ -1228,42 +1243,22 @@ def _self_signup_flow(base_url: str, Inkbox: Any, InkboxAPIError: Any) -> tuple[
         except Exception as exc:
             print_error(f"  Verification failed: {exc}")
 
-    provisioned_phone = None
-    if verified:
-        print()
-        print_info("Phone number - optional, but unlocks SMS and voice.")
-        print_info("  We provision a local US number so SMS is supported.")
-        if prompt_yes_no("  Provision a phone number for this agent?", True):
-            try:
-                client = Inkbox(api_key=resp.api_key, base_url=base_url)
-                provisioned_phone = client.phone_numbers.provision(agent_handle=resp.agent_handle, type="local")
-                print_success(f"  Provisioned: {provisioned_phone.number}")
-            except InkboxAPIError as exc:
-                print_warning(f"  Phone provisioning failed: HTTP {_error_status(exc)} {_error_detail(exc)}")
-                print_info("  You can provision a number later in the Inkbox console.")
-            except Exception as exc:
-                print_warning(f"  Phone provisioning failed: {exc}")
-
+    # Phone provisioning is decoupled from signup: the wizard offers a
+    # dedicated number as a standalone step AFTER iMessage setup (see
+    # ``interactive_setup``), so a fresh identity starts with no number here.
     # Lightweight stand-ins so the rest of the wizard can read the new agent's
-    # mailbox/phone the same way it reads a fetched identity object.
+    # mailbox the same way it reads a fetched identity object.
     class MailboxShim:
         email_address = resp.email_address
         display_name = None
-
-    class PhoneShim:
-        def __init__(self, phone: Any):
-            self.number = phone.number
-            self.type = getattr(phone, "type", "local")
-            self.sms_status = getattr(phone, "sms_status", None)
-            self.id = getattr(phone, "id", None)
 
     class SignupIdentityShim:
         agent_handle = resp.agent_handle
         email_address = resp.email_address
         mailbox = MailboxShim()
-        phone_number = PhoneShim(provisioned_phone) if provisioned_phone else None
+        phone_number = None
 
-    return SignupIdentityShim(), resp.api_key, provisioned_phone is not None
+    return SignupIdentityShim(), resp.api_key, False
 
 
 def _retry_or_abort(retry_label: str, *, error_context: str = "") -> bool:
@@ -1283,7 +1278,7 @@ def _retry_or_abort(retry_label: str, *, error_context: str = "") -> bool:
 
 def _try_resend(Inkbox: Any, InkboxAPIError: Any, api_key: str, base_url: str, human_email: str) -> bool:
     try:
-        Inkbox.resend_signup_verification(api_key=api_key, base_url=base_url)
+        Inkbox.resend_signup_verification(api_key=api_key, **inkbox_base_url_kwargs(base_url))
         print_success(f"  Resent. Check {human_email}.")
         return True
     except InkboxAPIError as exc:
@@ -1325,7 +1320,8 @@ def _api_key_flow(
 
     Returns:
         tuple[Any | None, str, bool]: (identity-or-None, api_key,
-        did_provision_phone).
+        did_provision_phone — always False now that number provisioning is a
+        standalone later step).
     """
     print()
     api_key = prompt("  Paste your Inkbox API key (ApiKey_...)", password=True).strip()
@@ -1334,7 +1330,7 @@ def _api_key_flow(
         return None, "", False
 
     try:
-        client = Inkbox(api_key=api_key, base_url=base_url)
+        client = Inkbox(**inkbox_client_kwargs(api_key, base_url))
         info = client.whoami()
     except InkboxAPIError as exc:
         print_error(f"  whoami failed: HTTP {_error_status(exc)} {_error_detail(exc)}")
@@ -1359,9 +1355,9 @@ def _api_key_flow(
     if subtype == _enum_value(ADMIN_SCOPED):
         return _pick_admin_scoped(client, api_key, IdentityPhoneNumberCreateOptions, InkboxAPIError)
 
-    print_warning(f"  Unrecognized API-key subtype: {subtype!r}.")
-    print_info("  Falling back to list_identities().")
-    return _pick_admin_scoped(client, api_key, IdentityPhoneNumberCreateOptions, InkboxAPIError)
+    print_error(f"  Unsupported API-key subtype: {subtype!r}.")
+    print_info("  Use an admin-scoped or agent-scoped Inkbox API key.")
+    return None, "", False
 
 
 def _pick_agent_scoped(client: Any, api_key: str) -> tuple[Any | None, str, bool]:
@@ -1386,8 +1382,7 @@ def _pick_agent_scoped(client: Any, api_key: str) -> tuple[Any | None, str, bool
 
     print()
     print_info(f"  This API key is bound to identity: {identity.agent_handle}")
-    identity, did_provision_phone = _offer_phone_for_existing(client, identity)
-    return identity, api_key, did_provision_phone
+    return identity, api_key, False
 
 
 def _mint_agent_scoped_key(client: Any, identity: Any, InkboxAPIError: Any) -> str | None:
@@ -1452,15 +1447,14 @@ def _pick_admin_scoped(
                 except Exception as exc:
                     print_error(f"  get_identity failed: {exc}")
                     return None, "", False
-            identity, did_provision_phone = _offer_phone_for_existing(client, identity)
             agent_key = _mint_agent_scoped_key(client, identity, InkboxAPIError)
             if agent_key is None:
                 return None, "", False
-            return identity, agent_key, did_provision_phone
+            return identity, agent_key, False
     else:
         print_info("  No identities exist yet under this org. Let's create the first one.")
 
-    identity, _, did_provision_phone = _create_identity(
+    identity, _, _ = _create_identity(
         client,
         api_key,
         IdentityPhoneNumberCreateOptions,
@@ -1471,7 +1465,7 @@ def _pick_admin_scoped(
     agent_key = _mint_agent_scoped_key(client, identity, InkboxAPIError)
     if agent_key is None:
         return None, "", False
-    return identity, agent_key, did_provision_phone
+    return identity, agent_key, False
 
 
 def _create_identity(
@@ -1500,16 +1494,11 @@ def _create_identity(
 
     display_name = prompt("  Display name for the identity (shown to recipients, optional)").strip()
 
-    print()
-    print_info("Phone number - optional, but unlocks SMS and voice.")
-    print_info("  We provision a local US number so SMS is supported.")
-    create_phone = prompt_yes_no("  Provision a phone number for this agent?", True)
-
-    phone_opts = None
-    if create_phone:
-        # Gateway re-patches the call channel to auto_accept on `run`; start
-        # conservative so an unconfigured number never auto-answers.
-        phone_opts = IdentityPhoneNumberCreateOptions(type="local", incoming_call_action="auto_reject")
+    # Phone provisioning is decoupled from creation: the wizard offers a
+    # dedicated number as a standalone step AFTER iMessage setup (see
+    # ``interactive_setup``). ``IdentityPhoneNumberCreateOptions`` is kept in
+    # the signature for call-site compatibility but no longer used here.
+    del IdentityPhoneNumberCreateOptions
 
     print()
     print_info("Creating identity...")
@@ -1518,7 +1507,7 @@ def _create_identity(
             identity = client.create_identity(
                 handle,
                 display_name=display_name or None,
-                phone_number=phone_opts,
+                phone_number=None,
             )
             break
         except HandleUnavailableError as exc:
@@ -1535,26 +1524,41 @@ def _create_identity(
             return None, "", False
 
     print_success(f"  Created identity '{identity.agent_handle}'")
-    did_provision_phone = create_phone and getattr(identity, "phone_number", None) is not None
-    return identity, "", did_provision_phone
+    return identity, "", False
 
 
-def _offer_phone_for_existing(client: Any, identity: Any) -> tuple[Any, bool]:
-    if getattr(identity, "phone_number", None) is not None:
+def _offer_dedicated_number(client: Any, identity: Any) -> tuple[Any, bool]:
+    """Offer to provision a dedicated phone number (SMS + voice).
+
+    Runs as a standalone step AFTER iMessage setup so the wizard walks
+    channels in a natural order: connect over iMessage first, then add a
+    dedicated number. Returns ``(possibly-refreshed identity, provisioned?)``;
+    a no-op when the identity already has a number.
+    """
+    existing = getattr(identity, "phone_number", None)
+    if existing is not None:
+        # Say so instead of silently skipping — otherwise the step looks lost.
+        print()
+        print(color("  --- Dedicated phone number ---", Colors.CYAN))
+        print_success(f"  Already provisioned: {existing.number}")
         return identity, False
 
     print()
-    print_info("  This agent has no phone number attached.")
-    print_info("  A local US number unlocks SMS and voice for this agent.")
-    if not prompt_yes_no("  Provision a local phone number now?", True):
+    print(color("  --- Dedicated phone number ---", Colors.CYAN))
+    print_info("  A local US number gives this agent its own line for SMS and voice.")
+    if not prompt_yes_no("  Provision a dedicated phone number now?", True):
+        print_info("  Skipped. Rerun `inkbox-codex setup` anytime to add a number.")
         return identity, False
 
     try:
         provisioned = client.phone_numbers.provision(agent_handle=identity.agent_handle, type="local")
         print_success(f"  Provisioned: {provisioned.number}")
     except Exception as exc:
-        print_warning(f"  Phone provisioning failed: {exc}")
-        print_info("  You can provision a number later in the Inkbox console.")
+        # Graceful fallback — most rejections here are plan gating. Point at
+        # pricing and keep the wizard moving; nothing downstream needs a number.
+        print_info("  Dedicated phone numbers are available on Inkbox paid tiers —")
+        print_info("  see https://inkbox.ai/pricing for details.")
+        print_info(f"  (provisioning response: {exc})")
         return identity, False
 
     try:
@@ -1596,6 +1600,25 @@ def _configure_project_dir() -> None:
         print_warning(f"  {chosen} is not a directory yet — create it before running the bridge.")
     _save("CODEX_PROJECT_DIR", chosen)
     print_success(f"  Codex will work in {chosen}")
+
+
+def _configure_inkbox_tool_approvals() -> None:
+    """Ask whether Inkbox MCP tools should run without per-call prompts."""
+    print()
+    print(color("  --- Inkbox tool approvals ---", Colors.CYAN))
+    print_info("  Codex uses Inkbox tools to send email, SMS, and iMessage,")
+    print_info("  place calls, inspect call/text history, and manage contacts.")
+    print_info("  Trusting these tools skips repeated Inkbox allow prompts while")
+    print_info("  leaving normal Codex command and file approvals unchanged.")
+
+    current = _env("INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS").strip().lower()
+    default = current not in {"0", "false", "no", "off"} if current else True
+    allow = prompt_yes_no("  Allow this agent to run Inkbox tools without asking each time?", default)
+    _save("INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS", "true" if allow else "false")
+    if allow:
+        print_success("  Inkbox tool prompts will be auto-approved.")
+    else:
+        print_info("  Codex will ask before each Inkbox tool call.")
 
 
 def _configure_autostart() -> None:
@@ -1719,6 +1742,7 @@ def interactive_setup() -> None:
         print()
         print_success(f"Inkbox is already configured for identity '{existing_identity}'.")
         if not prompt_yes_no("  Reconfigure Inkbox?", False):
+            _configure_inkbox_tool_approvals()
             return
 
     base_url = os.getenv("INKBOX_BASE_URL") or _env("INKBOX_BASE_URL") or INKBOX_BASE_URL_DEFAULT
@@ -1729,11 +1753,11 @@ def interactive_setup() -> None:
     has_key = prompt_yes_no("  Do you already have an Inkbox API key?", False)
 
     if not has_key:
-        identity, api_key, did_provision_phone = _self_signup_flow(base_url, Inkbox, InkboxAPIError)
+        identity, api_key, _ = _self_signup_flow(base_url, Inkbox, InkboxAPIError)
         if identity is None:
             return
     else:
-        identity, api_key, did_provision_phone = _api_key_flow(
+        identity, api_key, _ = _api_key_flow(
             base_url,
             Inkbox,
             InkboxAPIError,
@@ -1764,18 +1788,35 @@ def interactive_setup() -> None:
     print_info("  https://inkbox.ai/console/contact-rules")
     print_info("Anyone Inkbox lets through reaches the agent. No second allowlist to maintain.")
 
+    # Channels, in the order we want operators to think about them: connect
+    # over iMessage FIRST (no number to provision — you reach the agent through
+    # the shared Inkbox iMessage router), THEN offer a dedicated phone number
+    # for SMS + voice. Provisioning is decoupled from identity creation so this
+    # ordering holds across every entry path (signup, admin, agent-scoped).
+    imessage_on = _configure_imessage(api_key, base_url, identity.agent_handle, Inkbox)
+
+    did_provision_phone = False
+    try:
+        dedicated_client = Inkbox(**inkbox_client_kwargs(api_key, base_url))
+        identity, did_provision_phone = _offer_dedicated_number(dedicated_client, identity)
+    except Exception as exc:
+        print_warning(f"  Skipping dedicated-number setup: {exc}")
+
     _print_agent_summary(identity)
 
+    # Block on the START text right after the number + QR are shown, before
+    # moving on to realtime — otherwise the "text START" prompt and its
+    # blocking wait get split by the realtime questions and it looks skipped.
     if did_provision_phone:
         _wait_for_sms_opt_in(api_key, base_url, getattr(identity, "phone_number", None), Inkbox)
 
-    _configure_realtime_calls(identity)
-
-    _configure_imessage(api_key, base_url, identity.agent_handle, Inkbox)
+    _configure_realtime_calls(identity, imessage_enabled=imessage_on)
 
     _setup_signing_key(api_key, base_url, Inkbox)
 
     _configure_project_dir()
+
+    _configure_inkbox_tool_approvals()
 
     _configure_autostart()
 

@@ -53,6 +53,7 @@ TypingFn = Callable[[str, str, Dict[str, Any]], Awaitable[Any]]
 HealthFn = Callable[[], Awaitable[str]]
 
 TYPING_REFRESH_SECONDS = 40.0
+TYPING_MAX_SECONDS = 600.0
 
 
 @dataclass
@@ -110,6 +111,22 @@ def _control_command(text: str) -> Optional[str]:
     if token in HEALTH_COMMANDS:
         return "health"
     return None
+
+
+def _is_inkbox_mcp_tool_elicitation(params: Dict[str, Any]) -> bool:
+    """Return true for Codex MCP prompts asking to run Inkbox tools."""
+    message = str(params.get("message") or params.get("prompt") or "").lower()
+    server = str(
+        params.get("serverName")
+        or params.get("server_name")
+        or params.get("mcpServerName")
+        or params.get("server")
+        or ""
+    ).lower()
+    tool = str(params.get("toolName") or params.get("tool_name") or params.get("tool") or "").lower()
+    if server == "inkbox" and tool.startswith("inkbox_"):
+        return True
+    return "run tool" in message and ("inkbox mcp server" in message or "inkbox_" in message)
 
 
 def _send_error_reason(exc: Exception) -> str:
@@ -258,19 +275,58 @@ def _codex_decision(decision: Optional[str]) -> str:
     return "decline"
 
 
-def _is_inkbox_mcp_tool_approval(message: str) -> bool:
-    """True for Codex's MCP confirmation prompt for our Inkbox tools."""
-    normalized = " ".join(str(message or "").lower().split())
-    return (
-        "allow the inkbox mcp server to run tool" in normalized
-        and "inkbox_" in normalized
-    )
-
-
 def _state_path() -> Path:
     root = Path(os.getenv("INKBOX_CODEX_HOME") or Path.home() / ".inkbox-codex")
     root.mkdir(parents=True, exist_ok=True)
     return root / "sessions.json"
+
+
+# Cap on channel-hint entries; oldest are dropped past this.
+_CHANNEL_HINTS_MAX = 200
+
+
+def _record_channel_hint(chat_id: str, mode: str) -> None:
+    """Persist a session's last inbound channel for the tool process.
+
+    ``inkbox_place_call`` runs in a separate MCP subprocess, so it can't see
+    ``ContactSession.mode`` directly; this file is how an outbound call learns
+    which channel the current conversation is on. Best-effort — a write
+    failure must never block inbound routing.
+
+    Args:
+        chat_id (str): Contact-keyed session id.
+        mode (str): The inbound modality (email/sms/imessage/voice/...).
+
+    Returns:
+        None
+    """
+    try:
+        from .config import channel_hints_path
+    except ImportError:  # pragma: no cover - direct local import/test fallback
+        from config import channel_hints_path
+
+    try:
+        path = channel_hints_path()
+        try:
+            hints = json.loads(path.read_text())
+        except Exception:
+            hints = {}
+        if not isinstance(hints, dict):
+            hints = {}
+        now = datetime.now().timestamp()
+        hints[chat_id] = {"mode": mode, "at": now}
+        if len(hints) > _CHANNEL_HINTS_MAX:
+            oldest = sorted(
+                hints.items(), key=lambda item: (item[1] or {}).get("at") or 0
+            )
+            for key, _entry in oldest[: len(hints) - _CHANNEL_HINTS_MAX]:
+                hints.pop(key, None)
+        # Atomic replace so the tool process never reads a half-written file.
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(hints, indent=2) + "\n")
+        os.replace(tmp, path)
+    except Exception:
+        logger.debug("[sessions] channel-hint write failed", exc_info=True)
 
 
 class ContactSession:
@@ -295,6 +351,12 @@ class ContactSession:
         self.typing_fn = typing_fn
         self.health_fn = health_fn
         self.mcp_server_config = dict(mcp_server_config or {})
+        # Stamp this session's id into the tool process env so Inkbox tools
+        # (e.g. place-call line resolution) know which conversation they
+        # serve. Copy the env so sessions never share the mutation.
+        env = dict(self.mcp_server_config.get("env") or {})
+        env["INKBOX_CODEX_CHAT_ID"] = chat_id
+        self.mcp_server_config["env"] = env
         self.identity_info = identity_info
         self.resume_session_id = resume_session_id
         self.on_session_id = on_session_id
@@ -330,6 +392,8 @@ class ContactSession:
         """
         self.mode = mode
         self.reply_meta = dict(meta or {})
+        # Mirror the modality for the tool process (channel-aware calling).
+        _record_channel_hint(self.chat_id, mode)
 
         # Bridge control commands (/clear, /new, /stop) steer the conversation
         # itself — handle them here instead of forwarding them to Codex.
@@ -672,12 +736,15 @@ class ContactSession:
         """Refresh the channel's typing indicator until the turn ends.
 
         Returns:
-            None: Runs until cancelled by :meth:`_run_turn`.
+            None: Runs until cancelled by :meth:`_run_turn` or the safety cap.
         """
         if self.typing_fn is None:
             return
+        if self.reply_meta.get("typing") is False:
+            return
+        elapsed = 0.0
         try:
-            while True:
+            while elapsed < TYPING_MAX_SECONDS:
                 # Only iMessage has a typing bubble; stay quiet while an
                 # escalation is parked waiting on the human to reply.
                 if self.mode == "imessage" and self.pending is None:
@@ -686,6 +753,7 @@ class ContactSession:
                     except Exception:
                         logger.debug("[session %s] typing ping failed", self.chat_id, exc_info=True)
                 await asyncio.sleep(TYPING_REFRESH_SECONDS)
+                elapsed += TYPING_REFRESH_SECONDS
         except asyncio.CancelledError:
             return
 
@@ -761,8 +829,8 @@ class ContactSession:
 
         if method == "mcpServer/elicitation/request":
             message = str(params.get("message") or params.get("prompt") or "Codex needs your input.")
-            if _is_inkbox_mcp_tool_approval(message):
-                logger.info("[session %s] auto-approved Inkbox MCP tool confirmation", self.chat_id)
+            if self.cfg.auto_approve_inkbox_tools and _is_inkbox_mcp_tool_elicitation(params):
+                logger.info("[session %s] Auto-approved Inkbox MCP tool elicitation: %s", self.chat_id, message)
                 return {"action": "accept", "content": {"text": "yes"}}
             reply = await self._escalate("poll", message)
             return {"action": "accept", "content": {"text": reply or ""}}
