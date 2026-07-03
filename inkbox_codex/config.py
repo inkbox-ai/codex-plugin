@@ -36,6 +36,21 @@ def call_contexts_dir() -> Path:
     return path
 
 
+def channel_hints_path() -> Path:
+    """File where the gateway records each session's last inbound channel.
+
+    The gateway writes ``{chat_id: {"mode": ..., "at": ...}}`` on every inbound
+    turn; the tool process reads it so an outbound call can follow the
+    conversation's current channel.
+
+    Returns:
+        Path: ``<home>/channel_hints.json`` (parent directory created).
+    """
+    root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "channel_hints.json"
+
+
 def env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -60,6 +75,9 @@ class BridgeConfig:
     allowed_users: List[str] = field(default_factory=list)
     allow_all_users: bool = False
     require_signature: bool = True
+    # Wake the agent on unrecognised (external) webhooks. Off by default;
+    # registered third-party providers bypass it once their secret is set.
+    external_events_enabled: bool = False
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     # Codex side
@@ -117,6 +135,7 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         allowed_users=_csv_env("INKBOX_ALLOWED_USERS"),
         allow_all_users=env_flag("INKBOX_ALLOW_ALL_USERS", False),
         require_signature=env_flag("INKBOX_REQUIRE_SIGNATURE", True),
+        external_events_enabled=env_flag("INKBOX_EXTERNAL_EVENTS_ENABLED", False),
         host=str(os.getenv("INKBOX_BRIDGE_HOST") or DEFAULT_HOST).strip(),
         port=int(os.getenv("INKBOX_BRIDGE_PORT") or DEFAULT_PORT),
         project_dir=str(

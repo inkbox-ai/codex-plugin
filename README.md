@@ -173,6 +173,24 @@ Calls have two modes, chosen per call:
   When the call ends, queued actions run in your session (and any plain "reflect on the call" follow-up if none were queued) — so "after we hang up, open a PR and text me" actually happens. Enable it in `inkbox-codex setup` (it validates your OpenAI key live) or via the `INKBOX_REALTIME_*` env vars below.
 - **Inkbox STT/TTS** (default / fallback): Inkbox auto-accepts the call and opens a WebSocket to the bridge; finalized transcripts become turns in your same session and Codex's replies are spoken back. The bridge falls back to this automatically if Realtime is off or OpenAI can't be reached (unless `INKBOX_REALTIME_FALLBACK_TO_INKBOX_STT_TTS=false`).
 
+### Two calling lines
+
+Calls — inbound and outbound — can run over either of two lines, and the agent picks the one that matches the channel it's talking on:
+
+- **The dedicated phone number.** The agent's own number (the same line SMS uses). Outbound calls present this number; inbound calls to it ring the agent.
+- **The shared Inkbox iMessage line.** The agent can also place and receive voice calls with a person it's connected to over iMessage, over the same shared line that person already messages. The underlying number is never surfaced — Inkbox resolves it from the iMessage connection — and it only works for people already connected over iMessage (an unknown caller is rejected; an outbound call with no connection is refused).
+
+Inbound answering is configured once per identity (`auto_accept` → open the call bridge WebSocket), so a single setting governs both lines. Outbound, the agent sets `origination` on `inkbox_place_call` (`dedicated_number` / `shared_imessage_number`), or omits it: the bridge then uses the only available line, or — when both exist — the line matching the current conversation's channel. Once someone is connected over iMessage this works even for an agent that has no dedicated phone number.
+
+## External events
+
+Besides Inkbox's own events, the webhook endpoint can inject events from outside systems (e.g. a CI failure) to wake the agent on its own `external:<source>` thread. Routing is by *verified source*, never by the body's claimed event type:
+
+- **Registered providers** (e.g. GitHub via `X-Hub-Signature-256`) are verified with their own secret from `INKBOX_WEBHOOK_SECRET_<NAME>`; registering the provider + setting its secret is the opt-in, and forged signatures are rejected outright.
+- **Everything else** (unknown sources, or Inkbox-signed payloads with no handler) is delivered only when `INKBOX_EXTERNAL_EVENTS_ENABLED=true`, and unverified events carry a cautious directive that forbids irreversible action on their say-so.
+
+No human reads an external thread, so the agent is told to act via its tools rather than reply. Adding a source is drop-in: a new module in `inkbox_codex/webhook_providers/` with a `@register_provider` class.
+
 ## Media
 
 **Inbound.** When someone sends an MMS image, an iMessage attachment, or an email with files, the gateway downloads them to `~/.inkbox-codex/media/` (override with `INKBOX_CODEX_MEDIA_DIR`) and appends the local paths to the message, so Codex can open them with its Read tool — including viewing images. Media-only messages (no text) still wake the agent.
@@ -208,12 +226,16 @@ Calls have two modes, chosen per call:
 | `INKBOX_REALTIME_MODEL` | no | `gpt-realtime-2` | Realtime model id. |
 | `INKBOX_REALTIME_VOICE` | no | `cedar` | Realtime voice name. |
 | `INKBOX_REALTIME_FALLBACK_TO_INKBOX_STT_TTS` | no | `true` | Fall back to Inkbox STT/TTS if OpenAI connect fails. |
+| `INKBOX_EXTERNAL_EVENTS_ENABLED` | no | `false` | Wake the agent on unrecognised (external) webhooks — see [External events](#external-events). |
+| `INKBOX_WEBHOOK_SECRET_<NAME>` | per provider | - | Verification secret for a registered third-party webhook provider (e.g. `INKBOX_WEBHOOK_SECRET_GITHUB`). |
 
 ## Tools exposed to Codex
 
 The agent reaches you (or third parties) through an in-process MCP server:
 
-- `inkbox_whoami` — its own identity: handle, mailbox, phone, iMessage status.
+- `inkbox_whoami` — its own identity: handle, mailbox, iMessage status, and its two calling lines (dedicated number vs shared iMessage line).
+- `inkbox_place_call` — place an outbound voice call over either line (`origination`: `dedicated_number` / `shared_imessage_number`) — see [Two calling lines](#two-calling-lines).
+- `inkbox_list_calls` · `inkbox_get_call_transcript` — browse call history and transcripts.
 - `inkbox_send_email` — send email; attach local files with `attachment_paths`.
 - `inkbox_send_sms` — send SMS/MMS; attach local files with `media_paths` (or hosted `media_urls`).
 - `inkbox_send_imessage` — send into an iMessage conversation; attach a local file with `media_path`.
@@ -241,7 +263,7 @@ python -m pytest
 
 ## Architecture notes
 
-- **Tunnel-first inbound**: with a signing key, the gateway opens an Inkbox tunnel, reconciles mail/text/iMessage webhook subscriptions, and patches the phone number's incoming-call channel (`auto_accept` + call WebSocket) — same shape as hermes-agent-plugin.
+- **Tunnel-first inbound**: with a signing key, the gateway opens an Inkbox tunnel, reconciles mail/text/iMessage webhook subscriptions, and sets the identity's incoming-call action (`auto_accept` + call WebSocket) — one identity-scoped row covering both the dedicated number and the shared iMessage line.
 - **Contact-keyed sessions**: webhook payloads carry resolved contacts; a single resolved contact id becomes the session key, otherwise the raw address/number does. One human, one session, every channel.
 - **Escalation over the active channel**: a pending permission/poll captures the contact's next inbound message as its answer, on whichever text channel they're using.
 - **Codex app-server**: each contact session owns one `codex app-server` subprocess, one Codex thread, app-server approval request handling over Inkbox, and a local stdio MCP server for the Inkbox tools.

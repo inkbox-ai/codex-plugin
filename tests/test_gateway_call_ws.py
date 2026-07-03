@@ -435,9 +435,77 @@ def test_call_ws_passes_contact_and_identity_context_to_realtime(monkeypatch):
     assert seen["meta"].agent_identity_handle == "codex"
     assert seen["meta"].agent_identity_email == "codex@example.com"
     assert seen["meta"].agent_identity_phone == "+15550001111"
+    assert seen["meta"].agent_imessage_enabled is False
     assert seen["meta"].contact_known is True
     assert seen["meta"].contact_id == "contact-1"
     assert seen["meta"].contact_name == "Ada Lovelace"
+
+
+def test_call_ws_threads_imessage_flag_into_realtime_meta(monkeypatch):
+    # iMessage-enabled identity → the realtime instructions get the shared-line
+    # paragraph, gated by this flag on the call meta.
+    fake_ws = _FakeWS()
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    bridge = _FakeBridge()
+    seen = {}
+
+    async def fake_open(*, config, meta):
+        seen["meta"] = meta
+        return bridge
+
+    monkeypatch.setattr(gateway, "open_inkbox_realtime_bridge", fake_open)
+
+    from inkbox_codex.realtime import RealtimeConfig
+
+    cfg = BridgeConfig(require_signature=False, realtime=RealtimeConfig(enabled=True, api_key="sk-x"))
+    gw = gateway.InkboxGateway(cfg)
+    gw._identity = types.SimpleNamespace(
+        agent_handle="codex",
+        mailbox=None,
+        phone_number=None,
+        imessage_enabled=True,
+    )
+
+    asyncio.run(gw._handle_call_ws(_FakeRequest()))
+
+    assert seen["meta"].agent_imessage_enabled is True
+    assert seen["meta"].agent_identity_phone is None
+
+
+def test_call_ws_backfills_remote_and_direction_from_call_record(monkeypatch):
+    # A shared-line call can connect with a bare call id and no caller metadata
+    # — the identity-centered call read resolves it (no owning number needed).
+    fake_ws = _ScriptedWS([
+        _FakeTextMsg('{"event":"transcript","text":"Hello?","is_final":true}'),
+        _FakeTextMsg('{"event":"stop"}'),
+    ])
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    monkeypatch.setattr(gateway, "WSMsgType", types.SimpleNamespace(TEXT="text"))
+
+    class _Calls:
+        def __init__(self):
+            self.requested = []
+
+        def get(self, call_id):
+            self.requested.append(call_id)
+            return types.SimpleNamespace(
+                remote_phone_number="+15551234567", direction="inbound"
+            )
+
+    calls = _Calls()
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False))
+    gw._inkbox = types.SimpleNamespace(calls=calls, contacts=types.SimpleNamespace(lookup=lambda **_k: []))
+    session = _FakeContactSession()
+    gw.sessions = _FakeSessions(session)
+    request = _FakeRequest()
+    request.query = {"call_id": "call-77"}
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    assert calls.requested == ["call-77"]
+    # The resolved remote number becomes the session key (no contact match).
+    assert gw.sessions.requested_ids[0] == "+15551234567"
+    assert session.inbound[0][2]["sender"] == "+15551234567"
 
 
 def test_call_ws_realtime_falls_back_to_stt_tts_on_connect_failure(monkeypatch):

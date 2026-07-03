@@ -2,14 +2,22 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from inkbox_codex import sessions as sessions_mod
-from inkbox_codex.config import BridgeConfig
+from inkbox_codex.config import BridgeConfig, channel_hints_path
 from inkbox_codex.sessions import (
     ContactSession,
     _Turn,
     _parse_index,
     list_recent_sessions,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state_dir(tmp_path, monkeypatch):
+    # Keep session-state and channel-hint writes off the real home dir.
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
 
 
 def make_session(sent, typing=None):
@@ -565,5 +573,55 @@ def test_double_text_interrupts_running_turn():
         assert session._queue.get_nowait().text.endswith("do this instead")
 
         session._worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_handle_inbound_records_channel_hint(tmp_path, monkeypatch):
+    # The tool process resolves outbound-call origination from this file, so
+    # every inbound turn must refresh the session's last channel.
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+
+    async def scenario():
+        session = make_session([])
+        session._worker = asyncio.create_task(asyncio.sleep(10))
+
+        await session.handle_inbound("hi", "imessage", {"conversation_id": "c1"})
+        hints = json.loads(channel_hints_path().read_text())
+        assert hints["contact-1"]["mode"] == "imessage"
+
+        await session.handle_inbound("hi again", "sms", {"conversation_id": "c2"})
+        hints = json.loads(channel_hints_path().read_text())
+        assert hints["contact-1"]["mode"] == "sms"
+
+        session._worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_session_stamps_chat_id_into_tool_env():
+    # Each session's MCP tool subprocess learns which conversation it serves;
+    # the shared config's env must not leak one session's id into another's.
+    async def scenario():
+        shared = {"env": {"INKBOX_API_KEY": "k"}}
+        first = make_session([])
+        assert first.mcp_server_config["env"]["INKBOX_CODEX_CHAT_ID"] == "contact-1"
+
+        cfg = BridgeConfig(permission_timeout_s=2.0, project_dir="/tmp")
+
+        async def send_fn(*_a):
+            pass
+
+        second = ContactSession(
+            chat_id="contact-2",
+            cfg=cfg,
+            send_fn=send_fn,
+            mcp_server_config=shared,
+            identity_info={},
+        )
+        assert second.mcp_server_config["env"]["INKBOX_CODEX_CHAT_ID"] == "contact-2"
+        assert second.mcp_server_config["env"]["INKBOX_API_KEY"] == "k"
+        # The caller's dict is untouched.
+        assert "INKBOX_CODEX_CHAT_ID" not in shared["env"]
 
     asyncio.run(scenario())
