@@ -51,6 +51,10 @@ SendFn = Callable[[str, str, str, Dict[str, Any]], Awaitable[Any]]
 TypingFn = Callable[[str, str, Dict[str, Any]], Awaitable[Any]]
 # gateway.health_report() signature.
 HealthFn = Callable[[], Awaitable[str]]
+# gateway._note_sync_send_failure(chat_id, mode, meta, reply, reason) signature:
+# records the rejection into the shared retry budget and returns the recovery
+# prompt to re-queue, or None once the budget is exhausted.
+SendFailureFn = Callable[[str, str, Dict[str, Any], str, str], Optional[str]]
 
 TYPING_REFRESH_SECONDS = 40.0
 TYPING_MAX_SECONDS = 600.0
@@ -344,12 +348,14 @@ class ContactSession:
         on_clear: Optional[Callable[[str], None]] = None,
         typing_fn: Optional[TypingFn] = None,
         health_fn: Optional[HealthFn] = None,
+        on_send_failure: Optional[SendFailureFn] = None,
     ):
         self.chat_id = chat_id
         self.cfg = cfg
         self.send_fn = send_fn
         self.typing_fn = typing_fn
         self.health_fn = health_fn
+        self.on_send_failure = on_send_failure
         self.mcp_server_config = dict(mcp_server_config or {})
         # Stamp this session's id into the tool process env so Inkbox tools
         # (e.g. place-call line resolution) know which conversation they
@@ -689,6 +695,12 @@ class ContactSession:
         can rephrase or switch channels. A recovery turn that itself fails is
         re-raised (the worker logs it) — never retried, so it can't loop.
 
+        When wired with ``on_send_failure`` the rejection is recorded against
+        the gateway's shared per-conversation retry budget (the same one the
+        async delivery-failure webhooks use), and the recovery turn is skipped
+        once that budget is exhausted so the thread goes quiet instead of
+        looping.
+
         Args:
             turn (_Turn): The turn whose reply is being sent.
             reply (str): Codex's reply text.
@@ -703,6 +715,13 @@ class ContactSession:
             logger.warning("[session %s] reply send rejected: %s", self.chat_id, reason)
             if turn.recovery:
                 raise  # already a recovery attempt — don't spawn another
+            if self.on_send_failure is not None:
+                prompt = self.on_send_failure(
+                    self.chat_id, self.mode, self.reply_meta, reply, reason
+                )
+                if prompt:
+                    await self._queue.put(_Turn(text=prompt, recovery=True))
+                return
             await self._queue.put(
                 _Turn(text=_send_rejected_prompt(reply, reason), recovery=True)
             )
@@ -919,11 +938,13 @@ class SessionManager:
         identity_info: Dict[str, str],
         typing_fn: Optional[TypingFn] = None,
         health_fn: Optional[HealthFn] = None,
+        on_send_failure: Optional[SendFailureFn] = None,
     ):
         self.cfg = cfg
         self.send_fn = send_fn
         self.typing_fn = typing_fn
         self.health_fn = health_fn
+        self.on_send_failure = on_send_failure
         self.mcp_server_config = dict(mcp_server_config or {})
         self.identity_info = identity_info
         self.sessions: Dict[str, ContactSession] = {}
@@ -975,6 +996,7 @@ class SessionManager:
                 on_clear=self._clear_state,
                 typing_fn=self.typing_fn,
                 health_fn=self.health_fn,
+                on_send_failure=self.on_send_failure,
             )
             self.sessions[chat_id] = session
         return session
