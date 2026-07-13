@@ -49,7 +49,7 @@ async def _drain():
 
 def _dispatch(gw, envelope, event_type):
     async def go():
-        if event_type in ("text.delivery_failed", "text.delivery_unconfirmed"):
+        if event_type == "text.delivery_failed":
             r = await gw._on_text_delivery_failed(envelope, event_type)
         elif event_type == "imessage.delivery_failed":
             r = await gw._on_imessage_delivery_failed(envelope)
@@ -58,6 +58,39 @@ def _dispatch(gw, envelope, event_type):
         await _drain()
         return r
     return asyncio.run(go())
+
+
+class _FakeRequest:
+    """Drives the real _handle_webhook (Inkbox-signed; verification off)."""
+
+    def __init__(self, envelope, *, request_id="req-1"):
+        self._body = json.dumps(envelope).encode()
+        self.headers = {
+            "X-Inkbox-Request-Id": request_id,
+            "X-Inkbox-Signature": "sha256=unchecked",
+        }
+        self.url = "https://agent.example/webhook"
+
+    async def read(self):
+        return self._body
+
+
+def test_delivery_unconfirmed_does_not_wake_agent():
+    # text.delivery_unconfirmed is carrier uncertainty, not a hard failure —
+    # the message usually landed. Waking the agent would resend a message that
+    # was likely delivered. Driven through the real _handle_webhook dispatch.
+    gw = _gw()
+    envelope = {"event_type": "text.delivery_unconfirmed", "data": {"text_message": {
+        "id": "u1", "direction": "outbound", "remote_phone_number": "+15551234567",
+        "conversation_id": "conv-u", "text": "your appointment is confirmed for 3pm",
+    }, "contacts": [{"id": "contact-1"}]}}
+
+    resp = asyncio.run(gw._handle_webhook(_FakeRequest(envelope)))
+
+    # Acked and logged, but no session was woken and no retry budget recorded.
+    assert json.loads(resp.text)["ignored"] == "text.delivery_unconfirmed"
+    assert gw.sessions.by_id == {}
+    assert gw._outbound_failure_state == {}
 
 
 def test_sms_delivery_failure_notifies_session():
