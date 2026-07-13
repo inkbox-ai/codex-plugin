@@ -439,6 +439,28 @@ def _tunnel_state_dir() -> Path:
     return root
 
 
+class _ExpectedTunnelIdleFilter(logging.Filter):
+    """Drop the SDK's per-slot warning for a normal idle intake timeout."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Match narrowly (logger + all three substrings) so real tunnel
+        # failures — 401s, disconnects — keep surfacing; if the server's
+        # wording ever changes, the warnings come back instead of being eaten.
+        message = record.getMessage()
+        return not (
+            record.name == "inkbox.tunnels"
+            and "/_system/intake slot=" in message
+            and "status=408" in message
+            and "reason='intake-idle-cap'" in message
+        )
+
+
+def _install_tunnel_log_filter() -> None:
+    tunnel_logger = logging.getLogger("inkbox.tunnels")
+    if not any(isinstance(item, _ExpectedTunnelIdleFilter) for item in tunnel_logger.filters):
+        tunnel_logger.addFilter(_ExpectedTunnelIdleFilter())
+
+
 class InkboxGateway:
     """Routes Inkbox webhooks into contact-keyed Codex sessions."""
 
@@ -548,6 +570,9 @@ class InkboxGateway:
     async def _open_tunnel(self) -> None:
         if not INKBOX_TUNNEL_AVAILABLE:
             raise RuntimeError("inkbox SDK tunnel client unavailable; upgrade: pip install -U inkbox")
+        # A healthy gateway hits one expected 408 per parked intake slot;
+        # filter those before the runtime starts so they don't bury real logs.
+        _install_tunnel_log_filter()
         state_dir = _tunnel_state_dir()
         # Wipe SDK tunnel state so a stale tunnel_id can't wedge reconnects.
         shutil.rmtree(state_dir, ignore_errors=True)
