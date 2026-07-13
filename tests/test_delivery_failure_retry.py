@@ -77,7 +77,7 @@ async def _drain():
 
 def _dispatch(gw, envelope, event_type):
     async def go():
-        if event_type in ("text.delivery_failed", "text.delivery_unconfirmed"):
+        if event_type == "text.delivery_failed":
             r = await gw._on_text_delivery_failed(envelope, event_type)
         elif event_type == "imessage.delivery_failed":
             r = await gw._on_imessage_delivery_failed(envelope)

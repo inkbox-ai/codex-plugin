@@ -117,9 +117,33 @@ def build_channel_prompt(
     )
 
 
-def contact_marker(details: Optional[Dict[str, Any]]) -> str:
-    """Render a one-line Inkbox contact summary for inbound turn tags."""
+def contact_marker(
+    details: Optional[Dict[str, Any]],
+    agent_identity: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Render a one-line Inkbox contact summary for inbound turn tags.
+
+    Args:
+        details (Optional[Dict[str, Any]]): The resolved address-book contact,
+            which always wins when present.
+        agent_identity (Optional[Dict[str, Any]]): The sender's resolved agent
+            identity ({id, handle, name}) — the fallback when there is no
+            contact, so the agent sees who it's talking to instead of
+            ``unknown_in_inkbox``.
+
+    Returns:
+        str: The one-line marker fragment.
+    """
     if not details or not details.get("id"):
+        if agent_identity and agent_identity.get("id"):
+            parts = [f"contact_agent_identity_id={agent_identity['id']}"]
+            # Handle and name are remote-controlled strings — quote both so
+            # they can't smuggle extra marker fields into the tag.
+            if agent_identity.get("handle"):
+                parts.append(f"contact_agent_handle={agent_identity['handle']!r}")
+            if agent_identity.get("name"):
+                parts.append(f"contact_name={agent_identity['name']!r}")
+            return " ".join(parts)
         return "contact=unknown_in_inkbox"
     parts = [f"contact_id={details['id']}"]
     if details.get("name"):
@@ -154,7 +178,7 @@ def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
     meta = meta or {}
     sender = str(meta.get("sender") or "").strip()
     from_part = f" from={sender}" if sender else ""
-    marker = contact_marker(meta.get("contact"))
+    marker = contact_marker(meta.get("contact"), meta.get("agent_identity"))
     if mode == "email":
         subject = str(meta.get("subject") or "").strip()
         subject_part = f" subject={subject!r}" if subject else ""
