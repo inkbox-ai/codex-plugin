@@ -343,6 +343,35 @@ def test_inkbox_signed_external_shaped_event_routes_external(monkeypatch):
     assert len(_inbound(gw)) == 1      # woke the agent as an external event
 
 
+def test_inkbox_signed_external_event_with_generic_id_routes_external(monkeypatch):
+    monkeypatch.setattr(inkbox_provider_mod, "verify_webhook", lambda **k: True)
+    gw = _gateway(require_signature=True, external_events_enabled=True)
+    resp = asyncio.run(
+        gw._handle_webhook(
+            _FakeRequest(
+                b'{"id":"deploy-7","event":"deployment_completed"}',
+                headers={"X-Inkbox-Signature": "sha256=good"},
+            )
+        )
+    )
+    assert resp.status == 200
+    assert len(_inbound(gw)) == 1
+
+
+def test_known_inkbox_call_requires_call_shaped_id():
+    gw = _gateway()
+    assert not gw._is_known_inkbox_event("", {"id": "deploy-7"})
+    assert gw._is_known_inkbox_event(
+        "",
+        {
+            "id": "call-7",
+            "direction": "inbound",
+            "local_phone_number": "+15550001111",
+        },
+    )
+    assert gw._is_known_inkbox_event("", {"call_id": "call-8"})
+
+
 def test_inkbox_signed_unknown_dropped_when_external_events_off(monkeypatch):
     # An Inkbox-signed payload with no handler (e.g. a future Inkbox event
     # family) must NOT wake a session when external events are off — it's gated
