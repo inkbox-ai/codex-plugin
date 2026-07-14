@@ -762,8 +762,21 @@ class InkboxGateway:
         """
         if event_type and event_type.startswith(("message.", "text.", "imessage.")):
             return True
+        explicit_call_id = envelope.get("call_id") or envelope.get("callId")
+        generic_id = envelope.get("id")
+        has_call_field = any(
+            envelope.get(name) not in (None, "")
+            for name in (
+                "direction",
+                "local_phone_number",
+                "remote_phone_number",
+                "from_number",
+                "to_number",
+            )
+        )
         return bool(
-            self._call_context_id(envelope)
+            explicit_call_id
+            or (generic_id and has_call_field)
             or (envelope.get("direction") == "inbound" and envelope.get("local_phone_number"))
         )
 

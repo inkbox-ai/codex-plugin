@@ -21,13 +21,13 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
 
@@ -41,15 +41,23 @@ jobs:
           npm install -g @openai/codex@alpha
           codex --version
 
-      - name: Contract tests vs real Codex
-        run: pytest tests/contract -v
+      # Live tests self-skip without credentials; the complete live stack runs
+      # only after this latest-host canary succeeds.
+      - name: Full offline suite vs real Codex
+        run: pytest -q
 
-      # Alert only when an unattended (scheduled) run fails — no success pings,
-      # and manual dispatch stays silent (you're watching it). Non-blocking
-      # (--retry + || true) so a flaky webhook can't flip the result.
-      - name: Notify Google Chat on scheduled failure
-        if: failure() && github.event_name == 'schedule'
+  notify:
+    needs: canary
+    if: always() && github.event_name == 'schedule' && needs.canary.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Notify Google Chat
+        env:
+          WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
         run: |
-          curl -sS --max-time 10 --retry 3 -X POST "${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}" \
-            -H 'Content-Type: application/json' \
-            -d '{"text": "⚠️ *FAILED* — Canary: contract suite vs Codex `main` prerelease\n\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' || true
+          [ -n "$WEBHOOK_URL" ] || { echo "GOOGLE_CHAT_WEBHOOK_URL is missing"; exit 1; }
+          curl --fail-with-body --retry 3 --retry-all-errors --max-time 20 \
+            -sS -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\": \"🚨 codex-plugin canary FAILED against Codex main: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$WEBHOOK_URL"
