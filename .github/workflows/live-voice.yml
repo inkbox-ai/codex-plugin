@@ -21,11 +21,20 @@ on:
         required: false
         type: boolean
         default: false
+      include_inbound:
+        description: "Run the carrier-dependent inbound PSTN diagnostic"
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       timeout_s:
         description: "Seconds to wait for the call/transcript"
         default: "220"
+      include_inbound:
+        description: "Run the carrier-dependent inbound PSTN diagnostic"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -44,7 +53,7 @@ jobs:
       fail-fast: false
       max-parallel: 1          # legs share the AUT identity → one at a time
       matrix:
-        scenario: [inbound_inkbox, outbound_realtime]
+        scenario: ${{ fromJSON(inputs.include_inbound && '["inbound_inkbox","outbound_realtime"]' || '["outbound_realtime"]') }}
 
     steps:
       - uses: actions/checkout@v7
@@ -97,7 +106,7 @@ jobs:
           {
             echo "INKBOX_IDENTITY=$HANDLE"
             echo "INKBOX_ALLOW_ALL_USERS=true"
-            echo "CODEX_MODEL=gpt-5.5"
+            echo "CODEX_MODEL=gpt-5.4-mini"
             # Unattended runner: nobody answers approval texts → never escalate,
             # and keep the sandbox read-only so stray commands stay harmless.
             echo "CODEX_SANDBOX=read-only"
