@@ -69,6 +69,8 @@ def test_channel_prompt_mentions_identity_and_dir():
     assert "dev-agent@inkbox.ai" in text
     assert "jargon" in text.lower()
     assert "AskUserQuestion" in text
+    assert "NEVER call an Inkbox send tool to answer the current inbound message" in text
+    assert "include the literal requested value" in text
     assert "Codex can read and write Inkbox contacts" in text
     assert "inkbox_create_contact" in text
     assert "inkbox_update_contact" in text
