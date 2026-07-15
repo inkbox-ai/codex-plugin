@@ -97,7 +97,7 @@ jobs:
           {
             echo "INKBOX_IDENTITY=$HANDLE"
             echo "INKBOX_ALLOW_ALL_USERS=true"
-            echo "CODEX_MODEL=gpt-5.5"
+            echo "CODEX_MODEL=gpt-5.4-mini"
             # Unattended runner: nobody answers approval texts → never escalate,
             # and keep the sandbox read-only so stray commands stay harmless.
             echo "CODEX_SANDBOX=read-only"
