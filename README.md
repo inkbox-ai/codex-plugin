@@ -1,4 +1,4 @@
-<h1>Codex Inkbox Bridge</h1>
+<h1>Codex Inkbox Plugin</h1>
 
 <img src="assets/codex_iphone_avatar.png" alt="Codex, now with a phone" width="200" align="left">
 
