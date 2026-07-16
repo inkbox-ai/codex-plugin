@@ -751,6 +751,24 @@ class ContactSession:
             self._worker = asyncio.create_task(self._drain())
         return await future
 
+    async def run_recovery(self, prompt: str, mode: str, meta: Dict[str, Any]) -> None:
+        """Run one Codex turn that auto-replies but is marked as recovery.
+        
+        Used for delivery-failure recovery: acts like a normal inbound message
+        (its text is automatically sent back on the current channel) but with
+        the recovery flag set so we do not loop if the recovery reply also fails.
+        """
+        self.mode = mode
+        self.reply_meta = dict(meta or {})
+        _record_channel_hint(self.chat_id, mode)
+        # Do NOT interrupt a running turn for an async delivery failure. We
+        # want the failure notice to just queue up after whatever Codex is
+        # doing right now.
+        await self._queue.put(_Turn(text=prompt, recovery=True))
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+
+
     async def _typing_loop(self) -> None:
         """Refresh the channel's typing indicator until the turn ends.
 

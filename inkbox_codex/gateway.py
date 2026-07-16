@@ -1940,14 +1940,24 @@ class InkboxGateway:
             "[bridge] Woke agent about failed outbound %s (attempt %d/%d, stage=%s)",
             mode, attempts, OUTBOUND_FAILURE_MAX_ATTEMPTS, stage,
         )
+        meta: Dict[str, Any] = {}
+        if conversation_id:
+            meta["conversation_id"] = conversation_id
+        if target:
+            if mode == "email":
+                meta["to"] = [target]
+            else:
+                meta["to"] = target
+                meta["sender"] = target
+
         # Run in the background so the webhook returns promptly; the turn can
         # take a while (the agent may send on another channel).
-        asyncio.create_task(self._run_failure_turn(chat_id, prompt, channel, recipient))
+        asyncio.create_task(self._run_failure_turn(chat_id, prompt, channel, recipient, mode, meta))
         return web.json_response({"ok": True})
 
-    async def _run_failure_turn(self, chat_id: str, prompt: str, channel: str, recipient: str) -> None:
+    async def _run_failure_turn(self, chat_id: str, prompt: str, channel: str, recipient: str, mode: str, meta: Dict[str, Any]) -> None:
         try:
-            await self.sessions.get(chat_id).run_consult(prompt)
+            await self.sessions.get(chat_id).run_recovery(prompt, mode, meta)
         except Exception:
             logger.exception("[bridge] delivery-failure turn failed: %s → %s", channel, recipient)
 
