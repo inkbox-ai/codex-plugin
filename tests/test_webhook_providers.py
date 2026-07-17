@@ -138,6 +138,39 @@ def test_github_provider_verifies_real_hmac():
     ) is False
 
 
+def test_mock_provider_registered_and_matches():
+    provider = wp.match_provider({"X-Inkbox-Mock-Secret": "test-secret"})
+    assert provider is not None and provider.name == "mock"
+
+
+def test_mock_provider_verifies_direct_shared_secret():
+    from inkbox_codex.webhook_providers.mock import MockProvider
+
+    provider = MockProvider()
+    kwargs = {"body": b'{"event":"test"}', "url": "u"}
+
+    assert provider.verify(
+        **kwargs,
+        headers={"X-Inkbox-Mock-Secret": "expected"},
+        secret="expected",
+    ) is True
+    assert provider.verify(
+        **kwargs,
+        headers={"x-inkbox-mock-secret": "expected"},
+        secret="expected",
+    ) is True
+    assert provider.verify(
+        **kwargs,
+        headers={"X-Inkbox-Mock-Secret": "wrong"},
+        secret="expected",
+    ) is False
+    assert provider.verify(
+        **kwargs,
+        headers={"X-Inkbox-Mock-Secret": "expected"},
+        secret="",
+    ) is False
+
+
 def test_inkbox_provider_delegates_to_sdk(monkeypatch):
     seen = {}
 
@@ -453,6 +486,39 @@ def test_github_forged_signature_is_dropped(monkeypatch):
     )
     assert resp.status == 401
     assert _inbound(gw) == []  # forged → agent never woken
+
+
+def test_mock_shared_secret_reaches_agent_with_passthrough_off(monkeypatch):
+    monkeypatch.setenv("INKBOX_WEBHOOK_SECRET_MOCK", "test-secret")
+    body = b'{"event":"workflow.failed","source":"mock-ci"}'
+    gw = _gateway(require_signature=True, external_events_enabled=False)
+
+    resp = asyncio.run(
+        gw._handle_webhook(
+            _FakeRequest(body, headers={"X-Inkbox-Mock-Secret": "test-secret"})
+        )
+    )
+
+    assert resp.status == 200
+    assert gw.sessions.requested_ids == ["external:mock-ci"]
+    assert _inbound(gw)[0][2]["verified"] is True
+
+
+def test_mock_wrong_shared_secret_is_rejected(monkeypatch):
+    monkeypatch.setenv("INKBOX_WEBHOOK_SECRET_MOCK", "test-secret")
+    gw = _gateway(require_signature=True, external_events_enabled=False)
+
+    resp = asyncio.run(
+        gw._handle_webhook(
+            _FakeRequest(
+                b'{"event":"workflow.failed"}',
+                headers={"X-Inkbox-Mock-Secret": "wrong"},
+            )
+        )
+    )
+
+    assert resp.status == 401
+    assert _inbound(gw) == []
 
 
 def test_verified_third_party_bypasses_passthrough_flag(monkeypatch):
