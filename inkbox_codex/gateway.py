@@ -2207,6 +2207,7 @@ class InkboxGateway:
             call_context["id"] = call_id
         call_id = self._call_context_id(call_context) or call_id
         outbound = self._load_outbound_context(request.query.get("context_token"))
+        has_outbound_context = outbound is not None
         remote = str(
             self._field(
                 call_context,
@@ -2220,9 +2221,16 @@ class InkboxGateway:
             or self._outbound_remote(outbound)
             or ""
         ).strip()
-        direction = str(
-            self._field(call_context, "direction") or ("outbound" if outbound else "inbound")
-        ).strip().lower() or "inbound"
+        # A context token is minted only when this gateway places a call, so it
+        # is authoritative even if the media connection describes its incoming
+        # WebSocket leg as "inbound". Realtime needs the call's human-facing
+        # direction to select the saved purpose and opening message.
+        direction = (
+            "outbound"
+            if has_outbound_context
+            else str(self._field(call_context, "direction") or "inbound").strip().lower()
+            or "inbound"
+        )
         if call_id and not remote and self._inkbox is not None:
             # No caller metadata reached us (shared-line calls have no owning
             # phone number, and the header can arrive empty) — round-trip the
@@ -2234,9 +2242,11 @@ class InkboxGateway:
                 )
                 call = await asyncio.to_thread(calls_res.get, call_id)
                 remote = str(getattr(call, "remote_phone_number", "") or "").strip()
-                direction = (
-                    str(getattr(call, "direction", "") or "").strip().lower() or direction
-                )
+                if not has_outbound_context:
+                    direction = (
+                        str(getattr(call, "direction", "") or "").strip().lower()
+                        or direction
+                    )
             except Exception as exc:
                 logger.warning("[bridge] call lookup failed for call_id=%s: %s", call_id, exc)
         contact = await self._resolve_call_contact(call_context, remote)
