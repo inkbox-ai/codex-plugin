@@ -74,11 +74,13 @@ def test_channel_prompt_mentions_identity_and_dir():
     assert "You MUST call inkbox_place_call in that same turn" in text
     assert "Do not merely text that" in text
     assert "replace the call with an SMS reply" in text
-    assert "Codex can read and write Inkbox contacts" in text
+    assert "organization-wide Inkbox contacts" in text
     assert "inkbox_create_contact" in text
     assert "inkbox_update_contact" in text
     assert "inkbox_delete_contact" in text
     assert "vCard export/import" in text
+    assert "Generated contact facts are separate" in text
+    assert "correspondence remains scoped to this identity" in text
 
 
 def test_strip_markdown():

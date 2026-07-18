@@ -219,7 +219,7 @@ TOOL_SPECS: List[ToolSpec] = [
     ),
     ToolSpec(
         "inkbox_list_contacts",
-        "Search the address book by free text.",
+        "Search the organization-wide address book by free text.",
         _schema({
             "q": _str("Search query."),
             "order": _str("Sort order: recent or name."),
@@ -240,7 +240,7 @@ TOOL_SPECS: List[ToolSpec] = [
             "preferred_name": _str(),
             "company_name": _str(),
             "job_title": _str(),
-            "notes": _str(),
+            "notes": _str("User-managed contact notes, separate from generated contact facts."),
             "emails": _str_list(),
             "phones": _str_list(),
         }),
@@ -255,7 +255,7 @@ TOOL_SPECS: List[ToolSpec] = [
             "preferred_name": _str(),
             "company_name": _str(),
             "job_title": _str(),
-            "notes": _str(),
+            "notes": _str("User-managed contact notes, separate from generated contact facts."),
             "emails": _str_list(),
             "phones": _str_list(),
         }, ["contact_id"]),
