@@ -358,8 +358,15 @@ def test_call_ws_passes_outbound_context_to_realtime(monkeypatch, tmp_path):
 
     cfg = BridgeConfig(require_signature=False, realtime=RealtimeConfig(enabled=True, api_key="sk-x"))
     gw = gateway.InkboxGateway(cfg)
-    request = _FakeRequest()
-    request.query = {"context_token": "tok-123"}
+    request = _FakeRequest(
+        headers={
+            "X-Call-Context": (
+                '{"id":"call-123","direction":"inbound",'
+                '"remote_phone_number":"+15551234567"}'
+            )
+        },
+        query={"context_token": "tok-123"},
+    )
 
     asyncio.run(gw._handle_call_ws(request))
 

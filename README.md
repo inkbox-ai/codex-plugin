@@ -1,4 +1,4 @@
-<h1>Codex Inkbox Bridge</h1>
+<h1>Codex Inkbox Plugin</h1>
 
 <img src="assets/codex_iphone_avatar.png" alt="Codex, now with a phone" width="200" align="left">
 
@@ -187,9 +187,26 @@ Inbound answering is configured once per identity (`auto_accept` → open the ca
 Besides Inkbox's own events, the webhook endpoint can inject events from outside systems (e.g. a CI failure) to wake the agent on its own `external:<source>` thread. Routing is by *verified source*, never by the body's claimed event type:
 
 - **Registered providers** (e.g. GitHub via `X-Hub-Signature-256`) are verified with their own secret from `INKBOX_WEBHOOK_SECRET_<NAME>`; registering the provider + setting its secret is the opt-in, and forged signatures are rejected outright.
+- **Mock provider** accepts a shared secret directly in `X-Inkbox-Mock-Secret`, matched against `INKBOX_WEBHOOK_SECRET_MOCK`. It is intended for manual `curl` probes and test systems that cannot calculate a body signature. A valid secret makes the event verified and wakes the agent even when generic external events are disabled.
 - **Everything else** (unknown sources, or Inkbox-signed payloads with no handler) is delivered only when `INKBOX_EXTERNAL_EVENTS_ENABLED=true`, and unverified events carry a cautious directive that forbids irreversible action on their say-so.
 
 No human reads an external thread, so the agent is told to act via its tools rather than reply. Adding a source is drop-in: a new module in `inkbox_codex/webhook_providers/` with a `@register_provider` class.
+
+Send a mock event with:
+
+```bash
+curl --fail-with-body --request POST 'https://your-agent-host.example/webhook' \
+  --header 'Content-Type: application/json' \
+  --header "X-Inkbox-Mock-Secret: $INKBOX_WEBHOOK_SECRET_MOCK" \
+  --data '{
+    "id": "mock-run-123",
+    "source": "mock-ci",
+    "event": "workflow.failed",
+    "title": "Mock workflow failed",
+    "summary": "Inspect the repository and decide what action is appropriate.",
+    "requested_action": "Investigate the failure and take any safe corrective action."
+  }'
+```
 
 ## Media
 
@@ -228,6 +245,7 @@ No human reads an external thread, so the agent is told to act via its tools rat
 | `INKBOX_REALTIME_FALLBACK_TO_INKBOX_STT_TTS` | no | `true` | Fall back to Inkbox STT/TTS if OpenAI connect fails. |
 | `INKBOX_EXTERNAL_EVENTS_ENABLED` | no | `false` | Wake the agent on unrecognised (external) webhooks — see [External events](#external-events). |
 | `INKBOX_WEBHOOK_SECRET_<NAME>` | per provider | - | Verification secret for a registered third-party webhook provider (e.g. `INKBOX_WEBHOOK_SECRET_GITHUB`). |
+| `INKBOX_WEBHOOK_SECRET_MOCK` | mock provider | - | Expected plaintext value of the `X-Inkbox-Mock-Secret` header. Use a random secret. |
 
 ## Tools exposed to Codex
 
