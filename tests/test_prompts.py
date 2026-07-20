@@ -69,9 +69,14 @@ def test_channel_prompt_mentions_identity_and_dir():
     assert "dev-agent@inkbox.ai" in text
     assert "jargon" in text.lower()
     assert "AskUserQuestion" in text
-    assert "NEVER call an Inkbox send tool to answer the current inbound message" in text
+    assert "NEVER call an Inkbox send tool for that ordinary same-channel reply" in text
+    assert "explicitly asks you to contact them on a *different* channel" in text
+    assert "you MUST\ncall the matching Inkbox send tool in that turn" in text
+    assert "The requested cross-channel\nmessage belongs in the tool call" in text
+    assert "NEVER call an Inkbox send tool to answer the current inbound message" not in text
     assert "include the literal requested value" in text
     assert "You MUST call inkbox_place_call in that same turn" in text
+    assert "regardless of whether the request arrived by email" in text
     assert "Do not merely text that" in text
     assert "replace the call with an SMS reply" in text
     assert "Codex can read and write Inkbox contacts" in text

@@ -24,22 +24,20 @@ import uuid
 import pytest
 
 
-# The agent answers a call request by dialing back, not by texting, so these
-# driver→AUT SMS never get an SMS reply to reset the server's conversation
-# cadence. Two identical no-reply sends to the same number trip the
-# duplicate_body rule (422), so every call request must carry a fresh body.
-_CALL_ME_PHRASINGS = (
-    "Please call me right now by phone — give me a ring.",
-    "Can you ring me on the phone right now?",
-    "Give me a call on my number now, please.",
-    "Please phone me right away — I'd rather talk than text.",
+# This suite owns the call transport and media path; natural-language routing is
+# exercised separately by test_cross_channel.py. Name the required action here so
+# model phrasing variance cannot prevent the telephony smoke test from starting.
+# A unique reference is still required because two identical no-reply SMS sends
+# to the same number trip the server's duplicate_body rule (422).
+_CALL_ME_REQUEST = (
+    "Use the inkbox_place_call tool now to call my phone number from this SMS. "
+    "Do not reply by text."
 )
 
 
 def _call_me_text() -> str:
-    """A fresh call-request body each send (rotating phrasing + unique ref)."""
-    phrasing = _CALL_ME_PHRASINGS[uuid.uuid4().int % len(_CALL_ME_PHRASINGS)]
-    return f"{phrasing} (ref {uuid.uuid4().hex[:6]})"
+    """An explicit call action with a fresh body for every send."""
+    return f"{_CALL_ME_REQUEST} (ref {uuid.uuid4().hex[:6]})"
 
 
 REMOTE_KEY = os.environ.get("REMOTE_INKBOX_API_KEY")
