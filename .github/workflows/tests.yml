@@ -62,7 +62,7 @@ jobs:
       - name: Install bridge + test deps
         run: |
           uv pip install --system \
-            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@b2bb11a45c9f4dc89f3bcfbadbd4de5d66d0e9e5#subdirectory=sdk/python" \
+            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@bcff3526d700c2be6546e7ebdbff60073a6ec7e0#subdirectory=sdk/python" \
             -e . pytest
 
       # @alpha is the prerelease channel cut from codex main near-daily — the
