@@ -124,10 +124,10 @@ def _settle_inbound(sms) -> set:
 
 
 def _wait_new_inbound(sms, before: set, timeout_s: float, context: str) -> str:
-    """Poll for the first inbound not in ``before``; return its body lowercased."""
+    """Poll for the earliest inbound not in ``before``; return its body lowercased."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        for m in _inbound_from_aut(sms):
+        for m in reversed(_inbound_from_aut(sms)):
             if m.id not in before:
                 body = getattr(m, "text", "") or ""
                 bad = [x for x in ERROR_MARKERS if x in body.lower()]
