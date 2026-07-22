@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 
 # Packages the wizard itself needs to talk to Inkbox during setup. The
 # gateway's Codex CLI dependency is checked by doctor.
-INKBOX_REQUIREMENTS = ("inkbox>=0.5.0,<1.0.0", "aiohttp>=3.9")
+INKBOX_REQUIREMENTS = ("inkbox>=0.5.1,<1.0.0", "aiohttp>=3.9")
 MIN_INKBOX_VERSION = (0, 5, 0)
 _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
 

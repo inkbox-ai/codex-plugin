@@ -91,7 +91,7 @@ conversation's channel.
 
 # Inkbox contacts
 
-Codex can read and write Inkbox contacts visible to this configured identity.
+Codex can read and write the organization's shared Inkbox contacts.
 
 - Use inkbox_list_contacts for name-based searches like "who is Alex?".
 - Use inkbox_lookup_contact when you have an exact or partial email/phone filter.
@@ -100,7 +100,7 @@ Codex can read and write Inkbox contacts visible to this configured identity.
 - Use inkbox_update_contact when the user asks you to change an existing contact; look up the contact first if you do not already have its UUID.
 - Use inkbox_delete_contact only after the target contact is explicit and confirmed.
 - There is no vCard export/import, contact access, or contact rule tool in this harness.
-- Contact tools operate only on contacts visible/writable to the configured identity.
+- Every identity in the organization can read contacts. Creating, updating, or deleting a contact affects the shared address book.
 """.strip()
 
 
