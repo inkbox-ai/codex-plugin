@@ -79,7 +79,8 @@ def test_channel_prompt_mentions_identity_and_dir():
     assert "regardless of whether the request arrived by email" in text
     assert "Do not merely text that" in text
     assert "replace the call with an SMS reply" in text
-    assert "Codex can read and write Inkbox contacts" in text
+    assert "shared Inkbox contacts" in text
+    assert "shared address book" in text
     assert "inkbox_create_contact" in text
     assert "inkbox_update_contact" in text
     assert "inkbox_delete_contact" in text
