@@ -265,6 +265,36 @@ TOOL_SPECS: List[ToolSpec] = [
         "Remove a contact from the address book by contact id. Look it up first to confirm the target.",
         _schema({"contact_id": _str("Contact id.")}, ["contact_id"]),
     ),
+    ToolSpec(
+        "inkbox_a2a_call",
+        "Send a task to an A2A 1.0 Agent Card.",
+        _schema({
+            "card_url": _str("Agent Card URL."),
+            "text": _str("Task text."),
+            "context_id": _str("Optional context to continue."),
+            "task_id": _str("Optional task requesting more input."),
+            "message_id": _str("Stable idempotency id."),
+        }, ["card_url", "text"]),
+    ),
+    ToolSpec(
+        "inkbox_a2a_check",
+        "Fetch an A2A task, or wait until it stops.",
+        _schema({
+            "card_url": _str("Agent Card URL."),
+            "task_id": _str("Remote task id."),
+            "wait": {"type": "boolean"},
+        }, ["card_url", "task_id"]),
+    ),
+    ToolSpec(
+        "inkbox_a2a_reply",
+        "Reply to a remote A2A task that requested more input.",
+        _schema({
+            "card_url": _str("Agent Card URL."),
+            "task_id": _str("Remote task id."),
+            "text": _str("Reply text."),
+            "message_id": _str("Stable idempotency id."),
+        }, ["card_url", "task_id", "text"]),
+    ),
 ]
 
 
@@ -694,6 +724,24 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
         if name == "inkbox_delete_contact":
             client.contacts.delete(str(args["contact_id"]))
             return {"deleted": str(args["contact_id"])}
+
+        if name in {"inkbox_a2a_call", "inkbox_a2a_check", "inkbox_a2a_reply"}:
+            a2a = _identity().a2a_client()
+            try:
+                target = a2a.fetch_card(str(args["card_url"]))
+                if name == "inkbox_a2a_check":
+                    if args.get("wait"):
+                        return a2a.wait(target, str(args["task_id"]))
+                    return a2a.get_task(target, str(args["task_id"]))
+                return a2a.send(
+                    target,
+                    text=str(args["text"]),
+                    context_id=args.get("context_id") or None,
+                    task_id=args.get("task_id") or None,
+                    message_id=args.get("message_id") or None,
+                )
+            finally:
+                a2a.close()
 
         raise ValueError(f"unknown Inkbox tool: {name}")
 
