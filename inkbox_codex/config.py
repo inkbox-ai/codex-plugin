@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import hashlib
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -54,6 +55,15 @@ def channel_hints_path() -> Path:
     root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
     root.mkdir(parents=True, exist_ok=True)
     return root / "channel_hints.json"
+
+
+def a2a_turn_context_path(chat_id: str) -> Path:
+    """Return the trusted cross-process context file for one Codex session."""
+    root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
+    path = root / "a2a_turn_contexts"
+    path.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(chat_id.encode()).hexdigest()
+    return path / f"{digest}.json"
 
 
 def env_flag(name: str, default: bool = False) -> bool:

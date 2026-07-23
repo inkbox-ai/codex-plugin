@@ -11,7 +11,8 @@ from inkbox_codex import tools as tools_mod
 
 
 @pytest.fixture(autouse=True)
-def _run_to_thread_inline(monkeypatch):
+def _run_to_thread_inline(monkeypatch, tmp_path):
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
     async def immediate(func, /, *args, **kwargs):
         return func(*args, **kwargs)
 
@@ -40,6 +41,7 @@ class _FakeTranscript:
 
 class _FakeIdentity:
     def __init__(self):
+        self.id = "identity-1"
         self.phone_number = type(
             "Phone",
             (),
@@ -52,6 +54,7 @@ class _FakeIdentity:
         self.sent_texts = []
         self.sent_imessages = []
         self.a2a = _FakeA2AClient()
+        self.a2a_replies = []
 
     def place_call(self, **kwargs):
         self.place_call_kwargs = kwargs
@@ -79,6 +82,10 @@ class _FakeIdentity:
     def a2a_client(self):
         return self.a2a
 
+    def a2a_reply(self, task_id, **kwargs):
+        self.a2a_replies.append((task_id, kwargs))
+        return {"id": task_id, "state": kwargs["intent"]}
+
 
 class _FakeA2AClient:
     def __init__(self):
@@ -91,7 +98,10 @@ class _FakeA2AClient:
 
     def send(self, target, **kwargs):
         self.calls.append(("send", target, kwargs))
-        return {"kind": "task", "task": {"id": "task-1"}}
+        return {
+            "kind": "task",
+            "task": {"id": "task-1", "context_id": "context-1"},
+        }
 
     def get_task(self, target, task_id):
         self.calls.append(("get_task", target, task_id))
@@ -163,6 +173,9 @@ def test_coding_agent_tool_tier_is_registered():
         "inkbox_a2a_call",
         "inkbox_a2a_check",
         "inkbox_a2a_reply",
+        "inkbox_a2a_complete",
+        "inkbox_a2a_ask_caller",
+        "inkbox_a2a_fail",
     }
 
     assert names == expected
@@ -213,6 +226,61 @@ def test_a2a_tools_send_check_and_reply():
         "task-1",
     ) in client.identity.a2a.calls
     assert client.identity.a2a.closed is True
+
+
+def test_a2a_intent_tools_require_trusted_turn_context():
+    client = _FakeClient()
+
+    outside = _call(client, "inkbox_a2a_complete", {"text": "Done."})
+    token = tools_mod.A2A_TURN_CONTEXT.set(
+        {
+            "task_id": "task-1",
+            "message_id": "message-1",
+            "context_id": "context-1",
+            "reply_intent_committed": False,
+        }
+    )
+    try:
+        inside = _call(client, "inkbox_a2a_ask_caller", {"text": "Which region?"})
+        context = tools_mod.A2A_TURN_CONTEXT.get()
+    finally:
+        tools_mod.A2A_TURN_CONTEXT.reset(token)
+
+    assert "only available during an inbound A2A task" in outside["error"]
+    assert inside["state"] == "ask_caller"
+    assert context["reply_intent_committed"] is True
+    assert client.identity.a2a_replies == [
+        ("task-1", {"intent": "ask_caller", "text": "Which region?"})
+    ]
+
+
+def test_a2a_intent_tools_share_context_with_the_mcp_process(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "a2a:identity-1:context-1")
+    context_path = tools_mod.a2a_turn_context_path(
+        "a2a:identity-1:context-1"
+    )
+    context_path.write_text(
+        json.dumps(
+            {
+                "task_id": "task-1",
+                "message_id": "message-1",
+                "context_id": "context-1",
+                "reply_intent_committed": False,
+            }
+        )
+    )
+    client = _FakeClient()
+
+    result = _call(client, "inkbox_a2a_complete", {"text": "Done."})
+
+    assert result["state"] == "complete"
+    assert json.loads(context_path.read_text())[
+        "reply_intent_committed"
+    ] is True
 
 
 def test_place_call_writes_context_and_tags_websocket_url(tmp_path, monkeypatch):

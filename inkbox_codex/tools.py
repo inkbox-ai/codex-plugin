@@ -16,6 +16,8 @@ import os
 import secrets
 import sys
 import time
+import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -27,15 +29,39 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from media import file_to_email_attachment
 
 try:
-    from .config import INKBOX_WS_PATH, call_contexts_dir, channel_hints_path
+    from .config import (
+        INKBOX_WS_PATH,
+        a2a_turn_context_path,
+        call_contexts_dir,
+        channel_hints_path,
+    )
+    from .a2a_delegations import (
+        find_by_task,
+        promote_after_send,
+        record_before_send,
+    )
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import INKBOX_WS_PATH, call_contexts_dir, channel_hints_path
+    from config import (
+        INKBOX_WS_PATH,
+        a2a_turn_context_path,
+        call_contexts_dir,
+        channel_hints_path,
+    )
+    from a2a_delegations import (
+        find_by_task,
+        promote_after_send,
+        record_before_send,
+    )
 
 
 JsonSchema = Dict[str, Any]
 
 SMS_MAX_LENGTH = 1600
 IMESSAGE_MAX_LENGTH = 18995
+A2A_TURN_CONTEXT: ContextVar[Dict[str, Any] | None] = ContextVar(
+    "inkbox_codex_a2a_turn",
+    default=None,
+)
 
 
 @dataclass(frozen=True)
@@ -294,6 +320,21 @@ TOOL_SPECS: List[ToolSpec] = [
             "text": _str("Reply text."),
             "message_id": _str("Stable idempotency id."),
         }, ["card_url", "task_id", "text"]),
+    ),
+    ToolSpec(
+        "inkbox_a2a_complete",
+        "Complete the active inbound A2A task with a final answer.",
+        _schema({"text": _str("Final answer.")}, ["text"]),
+    ),
+    ToolSpec(
+        "inkbox_a2a_ask_caller",
+        "Ask the caller for more input on the active inbound A2A task.",
+        _schema({"text": _str("Question for the caller.")}, ["text"]),
+    ),
+    ToolSpec(
+        "inkbox_a2a_fail",
+        "Fail the active inbound A2A task with a reason.",
+        _schema({"reason": _str("Failure reason.")}, ["reason"]),
     ),
 ]
 
@@ -726,22 +767,101 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
             return {"deleted": str(args["contact_id"])}
 
         if name in {"inkbox_a2a_call", "inkbox_a2a_check", "inkbox_a2a_reply"}:
-            a2a = _identity().a2a_client()
+            identity = _identity()
+            a2a = identity.a2a_client()
             try:
                 target = a2a.fetch_card(str(args["card_url"]))
                 if name == "inkbox_a2a_check":
                     if args.get("wait"):
                         return a2a.wait(target, str(args["task_id"]))
                     return a2a.get_task(target, str(args["task_id"]))
-                return a2a.send(
+                task_id = str(args.get("task_id") or "") or None
+                existing = find_by_task(task_id) if task_id else None
+                message_id = str(args.get("message_id") or uuid.uuid4())
+                pending_key = record_before_send(
+                    identity_id=str(identity.id),
+                    rpc_url=str(
+                        getattr(target, "rpc_url", None)
+                        or target["rpc_url"]
+                    ),
+                    card_url=str(args["card_url"]),
+                    message_id=message_id,
+                    context_id=(
+                        args.get("context_id")
+                        or (existing or {}).get("context_id")
+                        or None
+                    ),
+                    task_id=task_id,
+                    session_key=(
+                        os.environ.get("INKBOX_CODEX_CHAT_ID")
+                        or (existing or {}).get("session_key")
+                        or None
+                    ),
+                )
+                result = a2a.send(
                     target,
                     text=str(args["text"]),
                     context_id=args.get("context_id") or None,
-                    task_id=args.get("task_id") or None,
-                    message_id=args.get("message_id") or None,
+                    task_id=task_id,
+                    message_id=message_id,
                 )
+                task = getattr(result, "task", None)
+                if task is None and isinstance(result, dict):
+                    task = result.get("task")
+                result_task_id = getattr(task, "id", None)
+                context_id = getattr(task, "context_id", None)
+                if isinstance(task, dict):
+                    result_task_id = task.get("id")
+                    context_id = task.get("context_id") or task.get("contextId")
+                if result_task_id and context_id:
+                    promote_after_send(
+                        pending_key,
+                        context_id=str(context_id),
+                        task_id=str(result_task_id),
+                    )
+                return result
             finally:
                 a2a.close()
+
+        if name in {
+            "inkbox_a2a_complete",
+            "inkbox_a2a_ask_caller",
+            "inkbox_a2a_fail",
+        }:
+            context = A2A_TURN_CONTEXT.get()
+            context_path = None
+            if context is None:
+                chat_id = (os.environ.get("INKBOX_CODEX_CHAT_ID") or "").strip()
+                if chat_id:
+                    context_path = a2a_turn_context_path(chat_id)
+                    try:
+                        loaded = json.loads(context_path.read_text())
+                        context = loaded if isinstance(loaded, dict) else None
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        context = None
+            if context is None:
+                raise RuntimeError(
+                    "This tool is only available during an inbound A2A task"
+                )
+            intent = {
+                "inkbox_a2a_complete": "complete",
+                "inkbox_a2a_ask_caller": "ask_caller",
+                "inkbox_a2a_fail": "fail",
+            }[name]
+            text = str(args["reason"] if name == "inkbox_a2a_fail" else args["text"])
+            result = _identity().a2a_reply(
+                context["task_id"],
+                intent=intent,
+                text=text,
+            )
+            context["reply_intent_committed"] = True
+            if context_path is not None:
+                tmp = context_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(context, sort_keys=True) + "\n")
+                tmp.chmod(0o600)
+                os.replace(tmp, context_path)
+                context_path.chmod(0o600)
+            return result
 
         raise ValueError(f"unknown Inkbox tool: {name}")
 
