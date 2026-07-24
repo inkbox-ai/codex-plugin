@@ -10,18 +10,20 @@ from inkbox_codex.gateway import InkboxGateway
 
 
 class _FakeSubscriptions:
-    def __init__(self):
+    def __init__(self, existing=()):
         self.created = []
+        self.existing = list(existing)
+        self.deleted = []
 
     def list(self, **_kwargs):
-        return []
+        return list(self.existing)
 
     def create(self, **kwargs):
         self.created.append(kwargs)
         return None
 
-    def delete(self, _sub_id):
-        return None
+    def delete(self, sub_id):
+        self.deleted.append(sub_id)
 
 
 class _UnsupportedA2ASubscriptions(_FakeSubscriptions):
@@ -169,6 +171,22 @@ def test_a2a_and_imessage_use_channel_coherent_subscriptions():
         "https://agent.inkboxwire.com/webhook?channel=a2a",
         "https://agent.inkboxwire.com/webhook",
     ]
+
+
+def test_imessage_reconcile_preserves_existing_a2a_channel_subscription():
+    a2a = types.SimpleNamespace(
+        id="sub-a2a",
+        url="https://agent.inkboxwire.com/webhook?channel=a2a",
+        event_types=gateway_mod.A2A_EVENTS,
+    )
+    subscriptions = _FakeSubscriptions([a2a])
+    _patched_gateway(
+        _Identity(phone=False, imessage=True),
+        subscriptions=subscriptions,
+    )
+
+    assert subscriptions.deleted == []
+    assert subscriptions.created[-1]["event_types"] == gateway_mod.IMESSAGE_EVENTS
 
 
 def test_a2a_only_subscription_is_skipped_on_older_api():
