@@ -10,14 +10,28 @@ from inkbox_codex.gateway import InkboxGateway
 
 
 class _FakeSubscriptions:
+    def __init__(self):
+        self.created = []
+
     def list(self, **_kwargs):
         return []
 
-    def create(self, **_kwargs):
+    def create(self, **kwargs):
+        self.created.append(kwargs)
         return None
 
     def delete(self, _sub_id):
         return None
+
+
+class _UnsupportedA2ASubscriptions(_FakeSubscriptions):
+    def create(self, **kwargs):
+        if any(event.startswith("a2a.") for event in kwargs["event_types"]):
+            error = RuntimeError("unsupported A2A events")
+            error.status_code = 422
+            error.detail = "a2a.task.created is not a valid event type"
+            raise error
+        return super().create(**kwargs)
 
 
 class _FakePhoneNumbers:
@@ -29,9 +43,11 @@ class _FakePhoneNumbers:
 
 
 class _FakeInkbox:
-    def __init__(self, identity):
+    def __init__(self, identity, subscriptions=None):
         self._identity = identity
-        self.webhooks = types.SimpleNamespace(subscriptions=_FakeSubscriptions())
+        self.webhooks = types.SimpleNamespace(
+            subscriptions=subscriptions or _FakeSubscriptions()
+        )
         self.phone_numbers = _FakePhoneNumbers()
 
     def get_identity(self, _handle):
@@ -68,9 +84,9 @@ def _legacy_identity(**kwargs):
     return legacy
 
 
-def _patched_gateway(identity):
+def _patched_gateway(identity, subscriptions=None):
     gw = InkboxGateway(BridgeConfig(identity="codex-agent", allow_all_users=True))
-    gw._inkbox = _FakeInkbox(identity)
+    gw._inkbox = _FakeInkbox(identity, subscriptions)
     gw._public_url = "https://agent.inkboxwire.com"
     gw._public_host = "agent.inkboxwire.com"
     gw._patch_identity_objects()
@@ -126,3 +142,23 @@ def test_legacy_sdk_without_number_cannot_configure_and_skips():
     gw = _patched_gateway(identity)
 
     assert gw._inkbox.phone_numbers.updates == []
+
+
+def test_a2a_subscription_falls_back_to_imessage_on_older_api():
+    subscriptions = _UnsupportedA2ASubscriptions()
+    _patched_gateway(
+        _Identity(phone=False, imessage=True),
+        subscriptions=subscriptions,
+    )
+
+    assert subscriptions.created[-1]["event_types"] == gateway_mod.IMESSAGE_EVENTS
+
+
+def test_a2a_only_subscription_is_skipped_on_older_api():
+    subscriptions = _UnsupportedA2ASubscriptions()
+    _patched_gateway(
+        _Identity(phone=False, imessage=False),
+        subscriptions=subscriptions,
+    )
+
+    assert subscriptions.created == []
