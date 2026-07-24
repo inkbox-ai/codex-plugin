@@ -96,6 +96,20 @@ def _int(desc: str = "") -> JsonSchema:
     return schema
 
 
+def _enum(values: List[str], desc: str = "") -> JsonSchema:
+    schema = _str(desc)
+    schema["enum"] = values
+    return schema
+
+
+def _bounded_int(minimum: int, maximum: int, desc: str = "") -> JsonSchema:
+    schema = _int(desc)
+    schema["minimum"] = minimum
+    schema["maximum"] = maximum
+    schema["default"] = 50
+    return schema
+
+
 def _str_list(desc: str = "") -> JsonSchema:
     schema: JsonSchema = {"type": "array", "items": {"type": "string"}}
     if desc:
@@ -320,6 +334,59 @@ TOOL_SPECS: List[ToolSpec] = [
             "text": _str("Reply text."),
             "message_id": _str("Stable idempotency id."),
         }, ["card_url", "task_id", "text"]),
+    ),
+    ToolSpec(
+        "inkbox_list_a2a_tasks",
+        "List this identity's A2A task history. Direction defaults to inbound; "
+        "use the optional participant, state, context, keyword, timestamp, and "
+        "cursor filters to narrow or continue the result.",
+        _schema({
+            "direction": _enum(
+                ["inbound", "outbound", "both"],
+                "Optional history direction.",
+            ),
+            "requester_handle": _str("Optional requester identity handle."),
+            "worker_handle": _str("Optional worker identity handle."),
+            "state": _enum(
+                [
+                    "submitted",
+                    "working",
+                    "input_required",
+                    "auth_required",
+                    "completed",
+                    "failed",
+                    "canceled",
+                    "rejected",
+                ],
+                "Optional task lifecycle state.",
+            ),
+            "context_id": _str("Optional A2A context id."),
+            "query": _str("Optional keyword search across task messages."),
+            "since": _str("Optional ISO 8601 lower timestamp bound."),
+            "cursor": _str("Opaque next_cursor from the previous page."),
+            "limit": _bounded_int(1, 100, "Page size from 1 to 100."),
+        }),
+    ),
+    ToolSpec(
+        "inkbox_list_a2a_messages",
+        "List messages from this identity's inbound and outbound A2A history. "
+        "Use the optional participant, task, context, role, keyword, timestamp, "
+        "and cursor filters to narrow or continue the result.",
+        _schema({
+            "direction": _enum(
+                ["inbound", "outbound", "both"],
+                "Optional history direction.",
+            ),
+            "requester_handle": _str("Optional requester identity handle."),
+            "worker_handle": _str("Optional worker identity handle."),
+            "task_id": _str("Optional A2A task id."),
+            "context_id": _str("Optional A2A context id."),
+            "role": _enum(["caller", "agent"], "Optional A2A message role."),
+            "query": _str("Optional keyword search across message text."),
+            "since": _str("Optional ISO 8601 lower timestamp bound."),
+            "cursor": _str("Opaque next_cursor from the previous page."),
+            "limit": _bounded_int(1, 100, "Page size from 1 to 100."),
+        }),
     ),
     ToolSpec(
         "inkbox_a2a_complete",
@@ -765,6 +832,32 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
         if name == "inkbox_delete_contact":
             client.contacts.delete(str(args["contact_id"]))
             return {"deleted": str(args["contact_id"])}
+
+        if name in {"inkbox_list_a2a_tasks", "inkbox_list_a2a_messages"}:
+            limit = int(args.get("limit") or 50)
+            if not 1 <= limit <= 100:
+                raise ValueError("limit must be between 1 and 100")
+            options: Dict[str, Any] = {
+                "direction": str(args.get("direction") or "").strip() or None,
+                "requester_handle": (
+                    str(args.get("requester_handle") or "").strip() or None
+                ),
+                "worker_handle": (
+                    str(args.get("worker_handle") or "").strip() or None
+                ),
+                "context_id": str(args.get("context_id") or "").strip() or None,
+                "q": str(args.get("query") or "").strip() or None,
+                "since": str(args.get("since") or "").strip() or None,
+                "cursor": str(args.get("cursor") or "").strip() or None,
+                "limit": limit,
+            }
+            identity = _identity()
+            if name == "inkbox_list_a2a_tasks":
+                options["state"] = str(args.get("state") or "").strip() or None
+                return identity.a2a_tasks(**options)
+            options["task_id"] = str(args.get("task_id") or "").strip() or None
+            options["role"] = str(args.get("role") or "").strip() or None
+            return identity.a2a_messages(**options)
 
         if name in {"inkbox_a2a_call", "inkbox_a2a_check", "inkbox_a2a_reply"}:
             identity = _identity()
