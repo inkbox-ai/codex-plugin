@@ -45,7 +45,7 @@ PORT = int(os.environ.get("VOICE_DRIVER_PORT", "8090"))
 STATE_FILE = os.environ.get("VOICE_DRIVER_STATE", "/tmp/voice_driver_state.json")
 LINE = os.environ.get(
     "VOICE_DRIVER_LINE",
-    "Hi, this is a quick test call. Please reply out loud with one short sentence, then say goodbye.",
+    "Hello? Please reply with one short sentence.",
 )
 # Speak shortly after the pipeline is ready so the agent's greeting lands first.
 SPEAK_AFTER_S = float(os.environ.get("VOICE_DRIVER_SPEAK_AFTER", "3"))
