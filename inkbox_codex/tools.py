@@ -16,6 +16,8 @@ import os
 import secrets
 import sys
 import time
+import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -27,15 +29,39 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from media import file_to_email_attachment
 
 try:
-    from .config import INKBOX_WS_PATH, call_contexts_dir, channel_hints_path
+    from .config import (
+        INKBOX_WS_PATH,
+        a2a_turn_context_path,
+        call_contexts_dir,
+        channel_hints_path,
+    )
+    from .a2a_delegations import (
+        find_by_task,
+        promote_after_send,
+        record_before_send,
+    )
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import INKBOX_WS_PATH, call_contexts_dir, channel_hints_path
+    from config import (
+        INKBOX_WS_PATH,
+        a2a_turn_context_path,
+        call_contexts_dir,
+        channel_hints_path,
+    )
+    from a2a_delegations import (
+        find_by_task,
+        promote_after_send,
+        record_before_send,
+    )
 
 
 JsonSchema = Dict[str, Any]
 
 SMS_MAX_LENGTH = 1600
 IMESSAGE_MAX_LENGTH = 18995
+A2A_TURN_CONTEXT: ContextVar[Dict[str, Any] | None] = ContextVar(
+    "inkbox_codex_a2a_turn",
+    default=None,
+)
 
 
 @dataclass(frozen=True)
@@ -67,6 +93,20 @@ def _int(desc: str = "") -> JsonSchema:
     schema: JsonSchema = {"type": "integer"}
     if desc:
         schema["description"] = desc
+    return schema
+
+
+def _enum(values: List[str], desc: str = "") -> JsonSchema:
+    schema = _str(desc)
+    schema["enum"] = values
+    return schema
+
+
+def _bounded_int(minimum: int, maximum: int, desc: str = "") -> JsonSchema:
+    schema = _int(desc)
+    schema["minimum"] = minimum
+    schema["maximum"] = maximum
+    schema["default"] = 50
     return schema
 
 
@@ -264,6 +304,104 @@ TOOL_SPECS: List[ToolSpec] = [
         "inkbox_delete_contact",
         "Remove a contact from the address book by contact id. Look it up first to confirm the target.",
         _schema({"contact_id": _str("Contact id.")}, ["contact_id"]),
+    ),
+    ToolSpec(
+        "inkbox_a2a_call",
+        "Send a task to an A2A 1.0 Agent Card.",
+        _schema({
+            "card_url": _str("Agent Card URL."),
+            "text": _str("Task text."),
+            "context_id": _str("Optional context to continue."),
+            "task_id": _str("Optional task requesting more input."),
+            "message_id": _str("Stable idempotency id."),
+        }, ["card_url", "text"]),
+    ),
+    ToolSpec(
+        "inkbox_a2a_check",
+        "Fetch an A2A task, or wait until it stops.",
+        _schema({
+            "card_url": _str("Agent Card URL."),
+            "task_id": _str("Remote task id."),
+            "wait": {"type": "boolean"},
+        }, ["card_url", "task_id"]),
+    ),
+    ToolSpec(
+        "inkbox_a2a_reply",
+        "Reply to a remote A2A task that requested more input.",
+        _schema({
+            "card_url": _str("Agent Card URL."),
+            "task_id": _str("Remote task id."),
+            "text": _str("Reply text."),
+            "message_id": _str("Stable idempotency id."),
+        }, ["card_url", "task_id", "text"]),
+    ),
+    ToolSpec(
+        "inkbox_list_a2a_tasks",
+        "List this identity's A2A task history. Direction defaults to inbound; "
+        "use the optional participant, state, context, keyword, timestamp, and "
+        "cursor filters to narrow or continue the result.",
+        _schema({
+            "direction": _enum(
+                ["inbound", "outbound", "both"],
+                "Optional history direction.",
+            ),
+            "requester_handle": _str("Optional requester identity handle."),
+            "worker_handle": _str("Optional worker identity handle."),
+            "state": _enum(
+                [
+                    "submitted",
+                    "working",
+                    "input_required",
+                    "auth_required",
+                    "completed",
+                    "failed",
+                    "canceled",
+                    "rejected",
+                ],
+                "Optional task lifecycle state.",
+            ),
+            "context_id": _str("Optional A2A context id."),
+            "query": _str("Optional keyword search across task messages."),
+            "since": _str("Optional ISO 8601 lower timestamp bound."),
+            "cursor": _str("Opaque next_cursor from the previous page."),
+            "limit": _bounded_int(1, 100, "Page size from 1 to 100."),
+        }),
+    ),
+    ToolSpec(
+        "inkbox_list_a2a_messages",
+        "List messages from this identity's inbound and outbound A2A history. "
+        "Use the optional participant, task, context, role, keyword, timestamp, "
+        "and cursor filters to narrow or continue the result.",
+        _schema({
+            "direction": _enum(
+                ["inbound", "outbound", "both"],
+                "Optional history direction.",
+            ),
+            "requester_handle": _str("Optional requester identity handle."),
+            "worker_handle": _str("Optional worker identity handle."),
+            "task_id": _str("Optional A2A task id."),
+            "context_id": _str("Optional A2A context id."),
+            "role": _enum(["caller", "agent"], "Optional A2A message role."),
+            "query": _str("Optional keyword search across message text."),
+            "since": _str("Optional ISO 8601 lower timestamp bound."),
+            "cursor": _str("Opaque next_cursor from the previous page."),
+            "limit": _bounded_int(1, 100, "Page size from 1 to 100."),
+        }),
+    ),
+    ToolSpec(
+        "inkbox_a2a_complete",
+        "Complete the active inbound A2A task with a final answer.",
+        _schema({"text": _str("Final answer.")}, ["text"]),
+    ),
+    ToolSpec(
+        "inkbox_a2a_ask_caller",
+        "Ask the caller for more input on the active inbound A2A task.",
+        _schema({"text": _str("Question for the caller.")}, ["text"]),
+    ),
+    ToolSpec(
+        "inkbox_a2a_fail",
+        "Fail the active inbound A2A task with a reason.",
+        _schema({"reason": _str("Failure reason.")}, ["reason"]),
     ),
 ]
 
@@ -694,6 +832,129 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
         if name == "inkbox_delete_contact":
             client.contacts.delete(str(args["contact_id"]))
             return {"deleted": str(args["contact_id"])}
+
+        if name in {"inkbox_list_a2a_tasks", "inkbox_list_a2a_messages"}:
+            limit = int(args.get("limit") or 50)
+            if not 1 <= limit <= 100:
+                raise ValueError("limit must be between 1 and 100")
+            options: Dict[str, Any] = {
+                "direction": str(args.get("direction") or "").strip() or None,
+                "requester_handle": (
+                    str(args.get("requester_handle") or "").strip() or None
+                ),
+                "worker_handle": (
+                    str(args.get("worker_handle") or "").strip() or None
+                ),
+                "context_id": str(args.get("context_id") or "").strip() or None,
+                "q": str(args.get("query") or "").strip() or None,
+                "since": str(args.get("since") or "").strip() or None,
+                "cursor": str(args.get("cursor") or "").strip() or None,
+                "limit": limit,
+            }
+            identity = _identity()
+            if name == "inkbox_list_a2a_tasks":
+                options["state"] = str(args.get("state") or "").strip() or None
+                return identity.a2a_tasks(**options)
+            options["task_id"] = str(args.get("task_id") or "").strip() or None
+            options["role"] = str(args.get("role") or "").strip() or None
+            return identity.a2a_messages(**options)
+
+        if name in {"inkbox_a2a_call", "inkbox_a2a_check", "inkbox_a2a_reply"}:
+            identity = _identity()
+            a2a = identity.a2a_client()
+            try:
+                target = a2a.fetch_card(str(args["card_url"]))
+                if name == "inkbox_a2a_check":
+                    if args.get("wait"):
+                        return a2a.wait(target, str(args["task_id"]))
+                    return a2a.get_task(target, str(args["task_id"]))
+                task_id = str(args.get("task_id") or "") or None
+                existing = find_by_task(task_id) if task_id else None
+                message_id = str(args.get("message_id") or uuid.uuid4())
+                pending_key = record_before_send(
+                    identity_id=str(identity.id),
+                    rpc_url=str(
+                        getattr(target, "rpc_url", None)
+                        or target["rpc_url"]
+                    ),
+                    card_url=str(args["card_url"]),
+                    message_id=message_id,
+                    context_id=(
+                        args.get("context_id")
+                        or (existing or {}).get("context_id")
+                        or None
+                    ),
+                    task_id=task_id,
+                    session_key=(
+                        os.environ.get("INKBOX_CODEX_CHAT_ID")
+                        or (existing or {}).get("session_key")
+                        or None
+                    ),
+                )
+                result = a2a.send(
+                    target,
+                    text=str(args["text"]),
+                    context_id=args.get("context_id") or None,
+                    task_id=task_id,
+                    message_id=message_id,
+                )
+                task = getattr(result, "task", None)
+                if task is None and isinstance(result, dict):
+                    task = result.get("task")
+                result_task_id = getattr(task, "id", None)
+                context_id = getattr(task, "context_id", None)
+                if isinstance(task, dict):
+                    result_task_id = task.get("id")
+                    context_id = task.get("context_id") or task.get("contextId")
+                if result_task_id and context_id:
+                    promote_after_send(
+                        pending_key,
+                        context_id=str(context_id),
+                        task_id=str(result_task_id),
+                    )
+                return result
+            finally:
+                a2a.close()
+
+        if name in {
+            "inkbox_a2a_complete",
+            "inkbox_a2a_ask_caller",
+            "inkbox_a2a_fail",
+        }:
+            context = A2A_TURN_CONTEXT.get()
+            context_path = None
+            if context is None:
+                chat_id = (os.environ.get("INKBOX_CODEX_CHAT_ID") or "").strip()
+                if chat_id:
+                    context_path = a2a_turn_context_path(chat_id)
+                    try:
+                        loaded = json.loads(context_path.read_text())
+                        context = loaded if isinstance(loaded, dict) else None
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        context = None
+            if context is None:
+                raise RuntimeError(
+                    "This tool is only available during an inbound A2A task"
+                )
+            intent = {
+                "inkbox_a2a_complete": "complete",
+                "inkbox_a2a_ask_caller": "ask_caller",
+                "inkbox_a2a_fail": "fail",
+            }[name]
+            text = str(args["reason"] if name == "inkbox_a2a_fail" else args["text"])
+            result = _identity().a2a_reply(
+                context["task_id"],
+                intent=intent,
+                text=text,
+            )
+            context["reply_intent_committed"] = True
+            if context_path is not None:
+                tmp = context_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(context, sort_keys=True) + "\n")
+                tmp.chmod(0o600)
+                os.replace(tmp, context_path)
+                context_path.chmod(0o600)
+            return result
 
         raise ValueError(f"unknown Inkbox tool: {name}")
 

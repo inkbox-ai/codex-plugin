@@ -1,0 +1,131 @@
+name: Live — Agent2Agent
+
+# Four real protocol legs cover both roles and conversation lengths:
+# inbound/outbound × single-turn/multi-turn. The plugin and remote identities
+# are preconfigured to allow one another in both directions.
+on:
+  workflow_call:
+    inputs:
+      timeout_s:
+        description: "Seconds to wait for each A2A transition"
+        required: false
+        type: string
+        default: "300"
+      orchestrated:
+        description: "True when the full-stack workflow owns the shared live lock"
+        required: false
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      timeout_s:
+        description: "Seconds to wait for each A2A transition"
+        required: false
+        default: "300"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ inputs.orchestrated && format('inkbox-live-child-{0}', github.run_id) || 'inkbox-live-aut-tunnel' }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  a2a:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        scenario:
+          - inbound-single
+          - inbound-multi
+          - outbound-single
+          - outbound-multi
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Set up runtime paths
+        run: |
+          echo "CODEX_HOME=$RUNNER_TEMP/codex-home" >> "$GITHUB_ENV"
+          echo "CODEX_PROJECT_DIR=$RUNNER_TEMP/project" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/codex-home" "$RUNNER_TEMP/project"
+
+      - name: Install bridge and protocol driver
+        run: pip install -e .
+
+      - name: Install Codex
+        run: |
+          npm install -g @openai/codex@alpha
+          codex --version
+
+      - name: Configure the real model and AUT identity
+        env:
+          CODEX_INKBOX_API_KEY: ${{ secrets.CODEX_INKBOX_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          HANDLE="$(python3 - <<'PY'
+          import os
+          from inkbox import Inkbox
+          client = Inkbox(api_key=os.environ["CODEX_INKBOX_API_KEY"])
+          print(client.mailboxes.list()[0].email_address.split("@", 1)[0])
+          PY
+          )"
+          {
+            echo "INKBOX_IDENTITY=$HANDLE"
+            echo "INKBOX_ALLOW_ALL_USERS=true"
+            echo "CODEX_SANDBOX=read-only"
+            echo "CODEX_APPROVAL_POLICY=never"
+            echo "INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS=true"
+            echo "CODEX_MODEL=gpt-5.4-mini"
+          } >> "$GITHUB_ENV"
+          printenv OPENAI_API_KEY | codex login --with-api-key
+
+      - name: Start gateway
+        env:
+          INKBOX_API_KEY: ${{ secrets.CODEX_INKBOX_API_KEY }}
+          INKBOX_SIGNING_KEY: ${{ secrets.CODEX_INKBOX_SIGNING_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          inkbox-codex run > "$RUNNER_TEMP/gateway.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/gateway.pid"
+          for _ in $(seq 1 36); do
+            if grep -q "tunnel ready" "$RUNNER_TEMP/gateway.log"; then
+              exit 0
+            fi
+            if ! kill -0 "$(cat "$RUNNER_TEMP/gateway.pid")" 2>/dev/null; then
+              echo "::error::gateway exited during startup"
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "::error::gateway did not become ready"
+          exit 1
+
+      - name: Run ${{ matrix.scenario }}
+        env:
+          A2A_SCENARIO: ${{ matrix.scenario }}
+          A2A_TIMEOUT_S: ${{ inputs.timeout_s || '300' }}
+          AUT_INKBOX_API_KEY: ${{ secrets.CODEX_INKBOX_API_KEY }}
+          REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
+        run: python3 tests/live/a2a_driver.py
+
+      - name: Dump gateway log on failure
+        if: failure()
+        run: tail -n 300 "$RUNNER_TEMP/gateway.log" 2>/dev/null || true
+
+      - name: Stop gateway
+        if: always()
+        run: |
+          kill "$(cat "$RUNNER_TEMP/gateway.pid" 2>/dev/null)" 2>/dev/null || true
