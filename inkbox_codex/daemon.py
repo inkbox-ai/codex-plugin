@@ -32,6 +32,18 @@ def _state_dir() -> Path:
     return root
 
 
+def state_dir() -> Path:
+    """Return the bridge's state directory, creating it if needed.
+
+    Public wrapper so the setup wizard can resolve the same ``.env`` the daemon
+    falls back to, instead of keeping its own copy of the path rule.
+
+    Returns:
+        Path: ``$INKBOX_CODEX_HOME`` or ``~/.inkbox-codex``.
+    """
+    return _state_dir()
+
+
 def _state_dir_path() -> Path:
     return Path(os.getenv("INKBOX_CODEX_HOME") or Path.home() / ".inkbox-codex")
 
