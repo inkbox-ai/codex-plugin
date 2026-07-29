@@ -32,6 +32,7 @@ import shutil
 import threading
 import time
 from contextlib import suppress
+from email.utils import parseaddr
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -69,7 +70,7 @@ try:
     )
     from .a2a_delegations import find_by_task as find_a2a_delegation
     from .media import download_media, inbound_media_note
-    from .prompts import contact_marker, strip_markdown
+    from .prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
     from .realtime import (
         RealtimeBridgeConnectError,
         RealtimeCallMeta,
@@ -82,7 +83,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, call_contexts_dir, inkbox_client_kwargs
     from a2a_delegations import find_by_task as find_a2a_delegation
     from media import download_media, inbound_media_note
-    from prompts import contact_marker, strip_markdown
+    from prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
     from realtime import (
         RealtimeBridgeConnectError,
         RealtimeCallMeta,
@@ -132,7 +133,8 @@ def _format_realtime_consult_results(results: Any) -> str:
 
 
 def _post_call_prompt(
-    actions: List[Dict[str, str]], transcript: Any, consult_results: Any = None
+    actions: List[Dict[str, str]], transcript: Any, consult_results: Any = None,
+    *, contact: Optional[Dict[str, Any]] = None, memories: Any = None,
 ) -> str:
     """Build the Codex prompt that executes queued after-call work."""
     action_lines = "\n".join(
@@ -143,6 +145,7 @@ def _post_call_prompt(
     convo = _format_transcript(transcript)
     consults = _format_realtime_consult_results(consult_results)
     parts = [
+        f"[inkbox:voice_call_ended | {contact_marker(contact)}]",
         "[voice call ended] You were just on a phone call with your operator and "
         "agreed to do this work after the call. Do the actions that are still needed:",
         action_lines or "  (none)",
@@ -160,7 +163,7 @@ def _post_call_prompt(
             consults,
             "Do not repeat work that was already completed or queued unless the caller explicitly asked for another, repeat, or different action.",
         ]
-    return "\n".join(parts)
+    return inject_contact_memories("\n".join(parts), memories)
 
 
 def _delivery_failure_prompt(
@@ -216,10 +219,13 @@ def _delivery_failure_prompt(
     ])
 
 
-def _call_ended_prompt(transcript: Any) -> str:
+def _call_ended_prompt(
+    transcript: Any, *, contact: Optional[Dict[str, Any]] = None, memories: Any = None
+) -> str:
     """Build the Codex prompt for a no-actions post-call reflection."""
     convo = _format_transcript(transcript)
     parts = [
+        f"[inkbox:voice_call_ended | {contact_marker(contact)}]",
         "[voice call ended] Your phone call with the operator just ended. If you "
         "committed to anything during it (open a PR, run a task, send a summary), "
         "do that now with your tools. First reconcile against the transcript: do "
@@ -228,7 +234,7 @@ def _call_ended_prompt(transcript: Any) -> str:
     ]
     if convo:
         parts += ["", "Recent call transcript:", convo]
-    return "\n".join(parts)
+    return inject_contact_memories("\n".join(parts), memories)
 
 
 def _voice_consult_prompt(
@@ -240,9 +246,11 @@ def _voice_consult_prompt(
     direction: str,
     post_call_actions: Optional[List[Dict[str, str]]] = None,
     consult_results: Any = None,
+    memories: Any = None,
 ) -> str:
     """Wrap a realtime consult so Codex stays grounded in the live call."""
     parts = [
+        f"[inkbox:voice_call_consult | {contact_marker(contact)}]",
         "Voice call consult from the Inkbox Realtime agent.",
         "Answer only the current live-call request. Do not continue unrelated prior text/session work.",
         "Do not run commands, run tests, edit files, or inspect git unless the consult request explicitly asks for project/coding work.",
@@ -281,7 +289,7 @@ def _voice_consult_prompt(
         f"Consult request: {query.strip()}",
         "Return a concise spoken-friendly answer for the realtime agent to say on this call.",
     ]
-    return "\n".join(parts)
+    return inject_contact_memories("\n".join(parts), memories)
 
 
 WEBHOOK_DEDUP_TTL_SECONDS = 300
@@ -1535,13 +1543,67 @@ class InkboxGateway:
             return summary
         return None
 
+    @classmethod
+    def _contact_id(cls, contact: Any) -> str:
+        return str(cls._field(contact, "id", "contact_id", "contactId") or "").strip()
+
+    @classmethod
+    def _contact_memories(cls, contact: Any) -> List[str]:
+        return normalize_contact_memories(
+            contact.get("memories") if isinstance(contact, dict) else getattr(contact, "memories", None)
+        )
+
+    @classmethod
+    def _matched_payload_contact(
+        cls,
+        contacts: List[Any],
+        *,
+        resolved_id: str = "",
+        sender: str = "",
+        mail: bool = False,
+    ) -> Optional[Any]:
+        """Select one sender contact from the verified webhook payload."""
+        candidates = list(contacts or [])
+        if mail:
+            sender_address = (parseaddr(sender)[1] or sender).strip().lower()
+            candidates = [
+                entry for entry in candidates
+                if str(cls._field(entry, "bucket") or "").strip().lower() == "from"
+            ]
+            if resolved_id:
+                id_matches = [entry for entry in candidates if cls._contact_id(entry) == resolved_id]
+                if len(id_matches) == 1:
+                    return id_matches[0]
+            address_matches = []
+            for entry in candidates:
+                raw_address = str(
+                    cls._field(entry, "address", "email", "email_address", "emailAddress") or ""
+                )
+                address = (parseaddr(raw_address)[1] or raw_address).strip().lower()
+                if address and address == sender_address:
+                    address_matches.append(entry)
+            return address_matches[0] if len(address_matches) == 1 else None
+
+        if resolved_id:
+            id_matches = [entry for entry in candidates if cls._contact_id(entry) == resolved_id]
+            if len(id_matches) == 1:
+                return id_matches[0]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _webhook_contact_memories(self, contact: Any) -> List[str]:
+        if not self.cfg.contact_memories_enabled:
+            return []
+        return self._contact_memories(contact)
+
     async def _hydrate_contact(self, contact: Any) -> Optional[Dict[str, Any]]:
         summary = self._contact_summary(contact)
         contact_id = (summary or {}).get("id")
         if not contact_id or self._inkbox is None:
             return summary
         try:
-            return self._contact_summary(await asyncio.to_thread(self._inkbox.contacts.get, contact_id)) or summary
+            return self._contact_summary(
+                await asyncio.to_thread(self._inkbox.contacts.get, contact_id)
+            ) or summary
         except Exception:
             return summary
 
@@ -1638,6 +1700,13 @@ class InkboxGateway:
             body_text = (body_text + inbound_media_note(saved)).strip()
         thread_key = self._thread_key("email", message.get("thread_id"))
         contact = await self._resolve_contact_full(kind="email", value=sender)
+        payload_contact = self._matched_payload_contact(
+            self._webhook_list(data, "contacts", "contact_list"),
+            resolved_id=self._contact_id(contact),
+            sender=sender,
+            mail=True,
+        )
+        contact_memories = self._webhook_contact_memories(payload_contact)
         # No address-book contact → fall back to the sender's resolved agent
         # identity (mail scopes identities per bucket, so match the sender).
         agent_identity = (
@@ -1662,6 +1731,7 @@ class InkboxGateway:
             "thread_id": message.get("thread_id"),
             "contact": contact,
             "agent_identity": agent_identity,
+            "contact_memories": contact_memories,
         }
         # A fresh inbound starts a fresh logical reply — reset its failed-send budget.
         self._clear_outbound_failures("email", None, sender, chat_id=chat_id)
@@ -1943,6 +2013,10 @@ class InkboxGateway:
             or len(agent_identities) > 1
         )
         contact = await self._resolve_contact_full(kind="phone", value=sender)
+        payload_contact = self._matched_payload_contact(
+            contacts, resolved_id=self._contact_id(contact)
+        )
+        contact_memories = self._webhook_contact_memories(payload_contact)
         # 1:1 only — a group resolves multiple identities, so a single sender
         # marker doesn't apply; an address-book contact always wins.
         agent_identity = (
@@ -1972,6 +2046,7 @@ class InkboxGateway:
             "conversation_kind": "group" if is_group else "direct",
             "contact": contact,
             "agent_identity": agent_identity,
+            "contact_memories": contact_memories,
         }
         # A fresh inbound starts a fresh logical reply — reset its failed-send budget.
         self._clear_outbound_failures("sms", conversation_id, sender, chat_id=chat_id)
@@ -2024,6 +2099,11 @@ class InkboxGateway:
             or len(participants) > 1
         )
         contact = await self._resolve_contact_full(kind="phone", value=sender)
+        payload_contact = self._matched_payload_contact(
+            self._webhook_list(data, "contacts", "contact_list"),
+            resolved_id=self._contact_id(contact),
+        )
+        contact_memories = self._webhook_contact_memories(payload_contact)
         # The sender's resolved agent identity — used only when there's no
         # address-book contact to prefer.
         agent_identity = (
@@ -2060,6 +2140,7 @@ class InkboxGateway:
             "sender": sender,
             "contact": contact,
             "agent_identity": agent_identity,
+            "contact_memories": contact_memories,
             "conversation_kind": "group" if is_group else "direct",
         }
         # A fresh inbound starts a fresh logical reply — reset its failed-send budget.
@@ -2095,6 +2176,11 @@ class InkboxGateway:
                         else reaction_type
                     ) or "unknown"
                     contact = await self._resolve_contact_full(kind="phone", value=sender)
+                    payload_contact = self._matched_payload_contact(
+                        self._webhook_list(data, "contacts", "contact_list"),
+                        resolved_id=self._contact_id(contact),
+                    )
+                    contact_memories = self._webhook_contact_memories(payload_contact)
                     # No address-book contact → fall back to the sender's
                     # resolved agent identity, when exactly one.
                     agent_identity = (
@@ -2129,6 +2215,7 @@ class InkboxGateway:
                         "reaction": reaction_label,
                         "typing": reaction_label == "question",
                         "contact": contact,
+                        "contact_memories": contact_memories,
                     }
                     await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
                     response = web.json_response({"ok": True})
@@ -2431,6 +2518,7 @@ class InkboxGateway:
         outbound: Optional[Dict[str, Any]] = None,
         contact: Optional[Dict[str, Any]] = None,
         direction: str = "inbound",
+        memories: Any = None,
     ) -> Any:
         """Preflight an OpenAI Realtime session for an incoming call.
 
@@ -2476,6 +2564,7 @@ class InkboxGateway:
             contact_company=contact.get("company"),
             contact_job_title=contact.get("job_title"),
             contact_notes=contact.get("notes"),
+            contact_memories=normalize_contact_memories(memories),
             outbound_purpose=(oc.get("purpose") or None),
             outbound_opening=(oc.get("opening_message") or None),
             outbound_context=(oc.get("context") or None),
@@ -2639,6 +2728,27 @@ class InkboxGateway:
             except Exception as exc:
                 logger.warning("[bridge] call lookup failed for call_id=%s: %s", call_id, exc)
         contact = await self._resolve_call_contact(call_context, remote)
+        call_contacts = call_context.get("contacts") or call_context.get("contact_list") or []
+        if isinstance(call_contacts, dict):
+            call_contacts = [call_contacts]
+        direct_contact = (
+            call_context.get("contact")
+            or call_context.get("remote_contact")
+            or call_context.get("remoteContact")
+        )
+        payload_contacts = []
+        seen_contact_ids = set()
+        for entry in ([direct_contact] if direct_contact else []) + list(call_contacts):
+            entry_id = self._contact_id(entry)
+            if entry_id and entry_id in seen_contact_ids:
+                continue
+            if entry_id:
+                seen_contact_ids.add(entry_id)
+            payload_contacts.append(entry)
+        payload_call_contact = self._matched_payload_contact(
+            payload_contacts, resolved_id=self._contact_id(contact)
+        )
+        contact_memories = self._webhook_contact_memories(payload_call_contact)
         chat_id = (contact or {}).get("id") or remote or f"call:{call_id}"
 
         ws = web.WebSocketResponse()
@@ -2649,7 +2759,9 @@ class InkboxGateway:
         # via run_consult. If the preflight fails, fall through to Inkbox
         # STT/TTS below (unless fallback is disabled, then refuse the call).
         if self.cfg.realtime.enabled:
-            bridge = await self._open_realtime_bridge(remote, call_id, outbound, contact, direction)
+            bridge = await self._open_realtime_bridge(
+                remote, call_id, outbound, contact, direction, contact_memories
+            )
             if bridge is None and not self.cfg.realtime.fallback_to_inkbox_stt_tts:
                 return web.Response(status=503, text="realtime bridge unavailable")
             if bridge is not None:
@@ -2678,6 +2790,7 @@ class InkboxGateway:
                         direction=direction,
                         post_call_actions=post_call_actions,
                         consult_results=consult_results,
+                        memories=contact_memories,
                     )
                     return await self.sessions.get(chat_id).run_consult(prompt)
 
@@ -2690,13 +2803,21 @@ class InkboxGateway:
                     # Run the queued after-call work in the caller's session. The
                     # text reply is discarded; side effects (emails, edits, PRs)
                     # happen via Codex's tools during the turn.
-                    prompt = _post_call_prompt(actions, transcript, consult_results)
+                    prompt = _post_call_prompt(
+                        actions,
+                        transcript,
+                        consult_results,
+                        contact=contact,
+                        memories=contact_memories,
+                    )
                     await self.sessions.get(chat_id).run_consult(prompt)
 
                 async def _call_ended(_meta: RealtimeCallMeta, transcript: Any) -> None:
                     # No queued actions: let Codex reflect and do any follow-up
                     # it committed to on the call. Stays silent if nothing to do.
-                    prompt = _call_ended_prompt(transcript)
+                    prompt = _call_ended_prompt(
+                        transcript, contact=contact, memories=contact_memories
+                    )
                     await self.sessions.get(chat_id).run_consult(prompt)
 
                 try:
@@ -2747,6 +2868,7 @@ class InkboxGateway:
                     # turn meta so frame_inbound can surface why we called.
                     meta = self._voice_turn_meta(call_id, remote, outbound)
                     meta["contact"] = contact
+                    meta["contact_memories"] = contact_memories
                     meta["direction"] = direction
                     session = self.sessions.get(chat_id)
                     await session.handle_inbound(text, "voice", meta)
@@ -2755,7 +2877,9 @@ class InkboxGateway:
         finally:
             self._active_call_ws.pop(chat_id, None)
             if transcript:
-                prompt = _call_ended_prompt(transcript)
+                prompt = _call_ended_prompt(
+                    transcript, contact=contact, memories=contact_memories
+                )
                 await self.sessions.get(chat_id).run_consult(prompt)
             logger.info("[bridge] call ended: %s", chat_id or call_id)
         return ws

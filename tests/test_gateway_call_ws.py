@@ -238,18 +238,38 @@ def test_call_ws_stt_tts_runs_call_ended_reflection(monkeypatch):
 
     session = _FakeContactSession()
     gw = gateway.InkboxGateway(BridgeConfig(require_signature=False))
+    gw._inkbox = types.SimpleNamespace(calls=types.SimpleNamespace(get=lambda _call_id: types.SimpleNamespace(
+        remote_phone_number="+15551234567",
+        direction="inbound",
+    )))
     gw.sessions = _FakeSessions(session)
+    request = _FakeRequest(headers={
+        "X-Call-Context": (
+            '{"call_id":"call-1","phone_number":"+15551234567","direction":"inbound",'
+            '"contacts":[{"id":"contact-1","name":"Ada Lovelace",'
+            '"memories":["Prefers concise calls"]}]}'
+        )
+    })
 
-    asyncio.run(gw._handle_call_ws(_FakeRequest()))
+    asyncio.run(gw._handle_call_ws(request))
 
     assert session.inbound == [
         (
             "Please send the summary after this.",
             "voice",
             {
-                "call_id": "",
-                "sender": "",
-                "contact": None,
+                "call_id": "call-1",
+                "sender": "+15551234567",
+                "contact": {
+                    "id": "contact-1",
+                    "name": "Ada Lovelace",
+                    "emails": [],
+                    "phones": [],
+                    "company": None,
+                    "job_title": None,
+                    "notes": None,
+                },
+                "contact_memories": ["Prefers concise calls"],
                 "direction": "inbound",
             },
         )
@@ -258,6 +278,8 @@ def test_call_ws_stt_tts_runs_call_ended_reflection(monkeypatch):
     assert "[voice call ended]" in session.consults[0]
     assert "do not redo work that was already completed" in session.consults[0]
     assert "Please send the summary after this." in session.consults[0]
+    assert session.consults[0].count("[inkbox:contact_memories]") == 1
+    assert '"Prefers concise calls"' in session.consults[0]
 
 
 def test_call_ws_uses_stored_call_contact_session_for_stt_tts(monkeypatch):
@@ -387,6 +409,7 @@ def test_voice_consult_prompt_anchors_current_call():
         },
         contact={"name": "Dima"},
         direction="outbound",
+        memories=["Likes mountain biking"],
     )
 
     assert "Do not continue unrelated prior text/session work" in prompt
@@ -394,6 +417,8 @@ def test_voice_consult_prompt_anchors_current_call():
     assert "Outbound call purpose: Call specifically about figuring out how to buy a mountain bike." in prompt
     assert "user: I want to buy a mountain bike." in prompt
     assert "Consult request: help Dima choose a mountain bike" in prompt
+    assert prompt.splitlines()[1] == "[inkbox:contact_memories]"
+    assert '"Likes mountain biking"' in prompt
 
 
 def test_realtime_consult_wraps_query_before_codex(monkeypatch, tmp_path):
@@ -458,8 +483,9 @@ def test_call_ws_passes_contact_and_identity_context_to_realtime(monkeypatch):
     request = _FakeRequest()
     request.headers = {
         "X-Call-Context": (
-            '{"id":"call-1","remote_phone_number":"+15551234567",'
-            '"contacts":[{"id":"contact-1","name":"Ada Lovelace"}]}'
+            '{"call_id":"call-1","phone_number":"+15551234567","direction":"inbound",'
+            '"contacts":[{"id":"contact-1","name":"Ada Lovelace",'
+            '"memories":["Prefers concise calls"]}]}'
         )
     }
 
@@ -472,6 +498,56 @@ def test_call_ws_passes_contact_and_identity_context_to_realtime(monkeypatch):
     assert seen["meta"].contact_known is True
     assert seen["meta"].contact_id == "contact-1"
     assert seen["meta"].contact_name == "Ada Lovelace"
+    assert seen["meta"].contact_memories == ["Prefers concise calls"]
+
+
+def test_call_ws_passes_full_contact_notes_and_payload_memories_to_realtime(monkeypatch):
+    fake_ws = _FakeWS()
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    bridge = _FakeBridge()
+    seen = {}
+
+    async def fake_open(*, config, meta):
+        seen["meta"] = meta
+        return bridge
+
+    monkeypatch.setattr(gateway, "open_inkbox_realtime_bridge", fake_open)
+
+    from inkbox_codex.realtime import RealtimeConfig, build_realtime_instructions
+
+    gw = gateway.InkboxGateway(BridgeConfig(
+        require_signature=False,
+        realtime=RealtimeConfig(enabled=True, api_key="sk-x"),
+    ))
+    gw._inkbox = types.SimpleNamespace(contacts=types.SimpleNamespace(
+        get=lambda _contact_id: {
+            "id": "contact-1",
+            "preferred_name": "Ada Full",
+            "notes": "Authoritative contact note",
+            "phones": [{"value": "+15551234567"}],
+        }
+    ))
+    session = _FakeContactSession()
+    gw.sessions = _FakeSessions(session)
+    request = _FakeRequest(headers={
+        "X-Call-Context": (
+            '{"call_id":"call-1","phone_number":"+15551234567","direction":"inbound",'
+            '"contacts":[{"id":"contact-1","name":"Ada",'
+            '"memories":["Prefers concise calls"]}]}'
+        )
+    })
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    instructions = build_realtime_instructions(seen["meta"])
+    assert seen["meta"].contact_name == "Ada Full"
+    assert seen["meta"].contact_notes == "Authoritative contact note"
+    assert seen["meta"].contact_memories == ["Prefers concise calls"]
+    assert "Contact notes: Authoritative contact note" in instructions
+    assert '"Prefers concise calls"' in instructions
+    assert "Contact notes: Do not use" not in instructions
+    assert session.consults[0].count("[inkbox:contact_memories]") == 1
+    assert '"Prefers concise calls"' in session.consults[0]
 
 
 def test_call_ws_threads_imessage_flag_into_realtime_meta(monkeypatch):
@@ -638,6 +714,7 @@ def test_call_ws_fallback_passes_outbound_context_to_voice_turn(monkeypatch, tmp
             "outbound_opening": "Hey Dima, it's Codex calling about soccer and the World Cup.",
             "outbound_context": "The operator asked by iMessage for this call.",
             "contact": None,
+            "contact_memories": [],
             "direction": "outbound",
         },
     )]

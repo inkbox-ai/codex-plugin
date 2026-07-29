@@ -7,6 +7,7 @@ def test_read_config_defaults(monkeypatch):
         "INKBOX_ALLOWED_USERS", "CODEX_BIN", "CODEX_SANDBOX",
         "CODEX_APPROVAL_POLICY", "INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS",
         "INKBOX_BASE_URL", "CODEX_TURN_TIMEOUT_S", "CODEX_INTERRUPT_TIMEOUT_S",
+        "INKBOX_CONTACT_MEMORIES_ENABLED",
     ):
         monkeypatch.delenv(var, raising=False)
     cfg = read_config()
@@ -18,6 +19,7 @@ def test_read_config_defaults(monkeypatch):
     assert cfg.auto_approve_inkbox_tools is False
     assert cfg.codex_turn_timeout_s == 1800.0
     assert cfg.codex_interrupt_timeout_s == 10.0
+    assert cfg.contact_memories_enabled is True
 
 
 def test_read_config_env(monkeypatch):
@@ -41,6 +43,11 @@ def test_read_config_env(monkeypatch):
     assert cfg.auto_approve_inkbox_tools is True
     assert cfg.codex_turn_timeout_s == 42.0
     assert cfg.codex_interrupt_timeout_s == 3.0
+
+
+def test_contact_memories_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("INKBOX_CONTACT_MEMORIES_ENABLED", "false")
+    assert read_config().contact_memories_enabled is False
 
 
 def _clear_realtime_env(monkeypatch):
