@@ -216,16 +216,21 @@ def contact_memories_block(memories: Any) -> str:
     ])
 
 
+def _escape_contact_memory_tags(text: str) -> str:
+    return (
+        text.replace("[inkbox:contact_memories]", "\\u005binkbox:contact_memories\\u005d")
+        .replace("[/inkbox:contact_memories]", "\\u005b/inkbox:contact_memories\\u005d")
+    )
+
+
 def inject_contact_memories(text: str, memories: Any) -> str:
     """Insert one delimited memory block after the first routing marker."""
     first, separator, rest = text.partition("\n")
+    first = _escape_contact_memory_tags(first)
+    rest = _escape_contact_memory_tags(rest)
     block = contact_memories_block(memories)
-    if (
-        not block
-        or not first.startswith("[inkbox:")
-        or rest.startswith("[inkbox:contact_memories]\n")
-    ):
-        return text
+    if not block or not first.startswith("[inkbox:"):
+        return f"{first}{separator}{rest}"
     return f"{first}\n{block}{separator}{rest}"
 
 
@@ -246,7 +251,14 @@ def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
     """
     meta = meta or {}
     memories = meta.get("contact_memories")
-    if text.startswith("[inkbox:"):
+    is_preframed_group = (
+        meta.get("conversation_kind") == "group"
+        and text.startswith("[inkbox:group_sms ")
+    )
+    is_preframed_reaction = bool(meta.get("reaction")) and text.startswith(
+        "[inkbox:imessage_reaction "
+    )
+    if is_preframed_group or is_preframed_reaction:
         return inject_contact_memories(text, memories)
 
     sender = str(meta.get("sender") or "").strip()

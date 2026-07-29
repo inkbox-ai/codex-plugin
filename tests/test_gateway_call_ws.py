@@ -238,19 +238,38 @@ def test_call_ws_stt_tts_runs_call_ended_reflection(monkeypatch):
 
     session = _FakeContactSession()
     gw = gateway.InkboxGateway(BridgeConfig(require_signature=False))
+    gw._inkbox = types.SimpleNamespace(calls=types.SimpleNamespace(get=lambda _call_id: types.SimpleNamespace(
+        remote_phone_number="+15551234567",
+        direction="inbound",
+    )))
     gw.sessions = _FakeSessions(session)
+    request = _FakeRequest(headers={
+        "X-Call-Context": (
+            '{"call_id":"call-1","phone_number":"+15551234567","direction":"inbound",'
+            '"contacts":[{"id":"contact-1","name":"Ada Lovelace",'
+            '"memories":["Prefers concise calls"]}]}'
+        )
+    })
 
-    asyncio.run(gw._handle_call_ws(_FakeRequest()))
+    asyncio.run(gw._handle_call_ws(request))
 
     assert session.inbound == [
         (
             "Please send the summary after this.",
             "voice",
             {
-                "call_id": "",
-                "sender": "",
-                "contact": None,
-                "contact_memories": [],
+                "call_id": "call-1",
+                "sender": "+15551234567",
+                "contact": {
+                    "id": "contact-1",
+                    "name": "Ada Lovelace",
+                    "emails": [],
+                    "phones": [],
+                    "company": None,
+                    "job_title": None,
+                    "notes": None,
+                },
+                "contact_memories": ["Prefers concise calls"],
                 "direction": "inbound",
             },
         )
@@ -259,6 +278,8 @@ def test_call_ws_stt_tts_runs_call_ended_reflection(monkeypatch):
     assert "[voice call ended]" in session.consults[0]
     assert "do not redo work that was already completed" in session.consults[0]
     assert "Please send the summary after this." in session.consults[0]
+    assert session.consults[0].count("[inkbox:contact_memories]") == 1
+    assert '"Prefers concise calls"' in session.consults[0]
 
 
 def test_call_ws_uses_stored_call_contact_session_for_stt_tts(monkeypatch):
@@ -462,8 +483,9 @@ def test_call_ws_passes_contact_and_identity_context_to_realtime(monkeypatch):
     request = _FakeRequest()
     request.headers = {
         "X-Call-Context": (
-            '{"id":"call-1","remote_phone_number":"+15551234567",'
-            '"contacts":[{"id":"contact-1","name":"Ada Lovelace"}]}'
+            '{"call_id":"call-1","phone_number":"+15551234567","direction":"inbound",'
+            '"contacts":[{"id":"contact-1","name":"Ada Lovelace",'
+            '"memories":["Prefers concise calls"]}]}'
         )
     }
 
@@ -476,6 +498,7 @@ def test_call_ws_passes_contact_and_identity_context_to_realtime(monkeypatch):
     assert seen["meta"].contact_known is True
     assert seen["meta"].contact_id == "contact-1"
     assert seen["meta"].contact_name == "Ada Lovelace"
+    assert seen["meta"].contact_memories == ["Prefers concise calls"]
 
 
 def test_call_ws_passes_full_contact_notes_and_payload_memories_to_realtime(monkeypatch):
@@ -504,12 +527,12 @@ def test_call_ws_passes_full_contact_notes_and_payload_memories_to_realtime(monk
             "phones": [{"value": "+15551234567"}],
         }
     ))
-    gw.sessions = _FakeSessions(_FakeContactSession())
+    session = _FakeContactSession()
+    gw.sessions = _FakeSessions(session)
     request = _FakeRequest(headers={
         "X-Call-Context": (
-            '{"id":"call-1","remote_phone_number":"+15551234567",'
-            '"contact_id":"contact-1","contacts":[{'
-            '"id":"contact-1","name":"Ada","notes":"Do not use",'
+            '{"call_id":"call-1","phone_number":"+15551234567","direction":"inbound",'
+            '"contacts":[{"id":"contact-1","name":"Ada",'
             '"memories":["Prefers concise calls"]}]}'
         )
     })
@@ -523,6 +546,8 @@ def test_call_ws_passes_full_contact_notes_and_payload_memories_to_realtime(monk
     assert "Contact notes: Authoritative contact note" in instructions
     assert '"Prefers concise calls"' in instructions
     assert "Contact notes: Do not use" not in instructions
+    assert session.consults[0].count("[inkbox:contact_memories]") == 1
+    assert '"Prefers concise calls"' in session.consults[0]
 
 
 def test_call_ws_threads_imessage_flag_into_realtime_meta(monkeypatch):
