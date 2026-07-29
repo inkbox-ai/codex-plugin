@@ -485,3 +485,51 @@ def test_send_imessage_rejects_text_over_limit():
     assert data["error_code"] == "imessage_too_long"
     assert data["char_count"] == tools_mod.IMESSAGE_MAX_LENGTH + 1
     assert client.identity.sent_imessages == []
+
+
+def test_send_imessage_group_requires_dedicated_outbound_line():
+    client = _FakeClient()
+    data = _call(
+        client,
+        "inkbox_send_imessage",
+        {"to": ["+15550000001", "+15550000002"], "text": "hi both"},
+    )
+
+    assert "dedicated outbound iMessage" in str(data)
+    assert client.identity.sent_imessages == []
+
+
+def test_send_imessage_rejects_both_target_and_conversation():
+    client = _FakeClient()
+    data = _call(
+        client,
+        "inkbox_send_imessage",
+        {"conversation_id": "imconv-1", "to": ["+15550000001"], "text": "hi"},
+    )
+
+    assert "exactly one" in str(data)
+    assert client.identity.sent_imessages == []
+
+
+def test_send_imessage_rejects_too_many_recipients():
+    client = _FakeClient()
+    data = _call(
+        client,
+        "inkbox_send_imessage",
+        {"to": [f"+1555000000{i}" for i in range(9)], "text": "hi"},
+    )
+
+    assert "at most 8" in str(data)
+    assert client.identity.sent_imessages == []
+
+
+def test_send_imessage_rejects_duplicate_recipients():
+    client = _FakeClient()
+    data = _call(
+        client,
+        "inkbox_send_imessage",
+        {"to": ["+15550000001", "+15550000001"], "text": "hi"},
+    )
+
+    assert "distinct" in str(data)
+    assert client.identity.sent_imessages == []

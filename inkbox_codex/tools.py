@@ -20,7 +20,7 @@ import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 try:
@@ -58,6 +58,34 @@ JsonSchema = Dict[str, Any]
 
 SMS_MAX_LENGTH = 1600
 IMESSAGE_MAX_LENGTH = 18995
+IMESSAGE_MAX_GROUP_RECIPIENTS = 8
+
+
+def _normalize_imessage_recipients(value: Any) -> Optional[List[str]]:
+    """`to` as a list of E.164 strings, or None when the caller omitted it."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        entry = value.strip()
+        return [entry] if entry else []
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return []
+
+
+def _identity_can_start_imessage_conversations(identity: Any) -> bool:
+    """Whether the identity holds a dedicated outbound iMessage line."""
+    number = getattr(identity, "imessage_number", None) or getattr(identity, "imessageNumber", None)
+    if number is None:
+        return False
+    can_start = getattr(number, "can_start_conversations", None)
+    if can_start is None:
+        can_start = getattr(number, "canStartConversations", None)
+    if isinstance(can_start, bool):
+        return can_start
+    number_type = number.get("type") if isinstance(number, dict) else getattr(number, "type", None)
+    number_type = getattr(number_type, "value", number_type)
+    return str(number_type or "").strip().lower() == "dedicated_outbound"
 A2A_TURN_CONTEXT: ContextVar[Dict[str, Any] | None] = ContextVar(
     "inkbox_codex_a2a_turn",
     default=None,
@@ -152,14 +180,28 @@ TOOL_SPECS: List[ToolSpec] = [
     ),
     ToolSpec(
         "inkbox_send_imessage",
-        "Send an iMessage to an existing iMessage conversation.",
+        "Send an iMessage. Reply into an existing 1:1 or group conversation with "
+        "conversation_id. A dedicated outbound iMessage line may instead start one "
+        "with to: a single E.164 recipient, or 2-8 to open a group; shared and "
+        "dedicated inbound lines stay recipient-first.",
         _schema(
             {
-                "conversation_id": _str("Existing iMessage conversation id."),
+                "conversation_id": _str("Existing iMessage conversation id. Mutually exclusive with to."),
+                "to": {
+                    "description": (
+                        "One E.164 recipient, or 1-8 distinct recipients. Two or more "
+                        "starts a group and needs a dedicated outbound iMessage line. "
+                        "Mutually exclusive with conversation_id."
+                    ),
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 8},
+                    ],
+                },
                 "text": _str("Message body, max 18995 chars.", max_length=IMESSAGE_MAX_LENGTH),
                 "media_path": _str("Optional local file path to upload and attach."),
             },
-            ["conversation_id", "text"],
+            ["text"],
         ),
     ),
     ToolSpec(
@@ -660,10 +702,28 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
         if name == "inkbox_send_imessage":
             text = str(args.get("text") or "")
             identity = _identity()
-            kwargs: Dict[str, Any] = {
-                "conversation_id": str(args["conversation_id"]),
-                "text": text,
-            }
+            conversation_id = str(args.get("conversation_id") or "").strip()
+            to_list = _normalize_imessage_recipients(args.get("to"))
+            if bool(to_list) == bool(conversation_id):
+                raise ValueError("Specify exactly one of `to` or `conversation_id`.")
+            if to_list is not None and not to_list:
+                raise ValueError("`to` must include at least one recipient.")
+            if to_list and len(to_list) > IMESSAGE_MAX_GROUP_RECIPIENTS:
+                raise ValueError(
+                    f"Inkbox iMessage groups support at most {IMESSAGE_MAX_GROUP_RECIPIENTS} recipients."
+                )
+            if to_list and len(set(to_list)) != len(to_list):
+                raise ValueError("iMessage recipients must be distinct.")
+            if len(to_list or []) > 1 and not _identity_can_start_imessage_conversations(identity):
+                raise ValueError(
+                    "Starting an iMessage group requires a dedicated outbound iMessage "
+                    "line. Reply to an existing group with conversation_id."
+                )
+            kwargs: Dict[str, Any] = {"text": text}
+            if conversation_id:
+                kwargs["conversation_id"] = conversation_id
+            else:
+                kwargs["to"] = to_list[0] if len(to_list) == 1 else to_list
             media_path = str(args.get("media_path") or "").strip()
             if media_path:
                 kwargs["media_urls"] = [_upload_media_url(identity, media_path)]
