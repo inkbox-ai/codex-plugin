@@ -82,6 +82,7 @@ def test_instructions_name_the_consult_tool_and_project():
         contact_company="Inkbox",
         contact_job_title="Engineer",
         contact_notes="Prefers calls in the morning.",
+        contact_memories=["Prefers calls in the morning."],
     )
     text = build_realtime_instructions(meta)
     assert CONSULT_TOOL_NAME in text
@@ -94,6 +95,10 @@ def test_instructions_name_the_consult_tool_and_project():
     assert "contact lookup" in text
     assert "Do not use consult_agent for ordinary conversation, shopping advice" in text
     assert "Never say you only have contact or call info" not in text
+    assert text.splitlines()[0].startswith("[inkbox:voice_call")
+    assert "[inkbox:contact_memories]" in text
+    assert '"Prefers calls in the morning."' in text
+    assert "Contact notes: Prefers calls in the morning." in text
 
 
 def test_instructions_name_the_two_lines_when_imessage_enabled():

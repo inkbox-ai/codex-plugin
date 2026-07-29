@@ -250,6 +250,7 @@ def test_call_ws_stt_tts_runs_call_ended_reflection(monkeypatch):
                 "call_id": "",
                 "sender": "",
                 "contact": None,
+                "contact_memories": [],
                 "direction": "inbound",
             },
         )
@@ -387,6 +388,7 @@ def test_voice_consult_prompt_anchors_current_call():
         },
         contact={"name": "Dima"},
         direction="outbound",
+        memories=["Likes mountain biking"],
     )
 
     assert "Do not continue unrelated prior text/session work" in prompt
@@ -394,6 +396,8 @@ def test_voice_consult_prompt_anchors_current_call():
     assert "Outbound call purpose: Call specifically about figuring out how to buy a mountain bike." in prompt
     assert "user: I want to buy a mountain bike." in prompt
     assert "Consult request: help Dima choose a mountain bike" in prompt
+    assert prompt.splitlines()[1] == "[inkbox:contact_memories]"
+    assert '"Likes mountain biking"' in prompt
 
 
 def test_realtime_consult_wraps_query_before_codex(monkeypatch, tmp_path):
@@ -472,6 +476,53 @@ def test_call_ws_passes_contact_and_identity_context_to_realtime(monkeypatch):
     assert seen["meta"].contact_known is True
     assert seen["meta"].contact_id == "contact-1"
     assert seen["meta"].contact_name == "Ada Lovelace"
+
+
+def test_call_ws_passes_full_contact_notes_and_payload_memories_to_realtime(monkeypatch):
+    fake_ws = _FakeWS()
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    bridge = _FakeBridge()
+    seen = {}
+
+    async def fake_open(*, config, meta):
+        seen["meta"] = meta
+        return bridge
+
+    monkeypatch.setattr(gateway, "open_inkbox_realtime_bridge", fake_open)
+
+    from inkbox_codex.realtime import RealtimeConfig, build_realtime_instructions
+
+    gw = gateway.InkboxGateway(BridgeConfig(
+        require_signature=False,
+        realtime=RealtimeConfig(enabled=True, api_key="sk-x"),
+    ))
+    gw._inkbox = types.SimpleNamespace(contacts=types.SimpleNamespace(
+        get=lambda _contact_id: {
+            "id": "contact-1",
+            "preferred_name": "Ada Full",
+            "notes": "Authoritative contact note",
+            "phones": [{"value": "+15551234567"}],
+        }
+    ))
+    gw.sessions = _FakeSessions(_FakeContactSession())
+    request = _FakeRequest(headers={
+        "X-Call-Context": (
+            '{"id":"call-1","remote_phone_number":"+15551234567",'
+            '"contact_id":"contact-1","contacts":[{'
+            '"id":"contact-1","name":"Ada","notes":"Do not use",'
+            '"memories":["Prefers concise calls"]}]}'
+        )
+    })
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    instructions = build_realtime_instructions(seen["meta"])
+    assert seen["meta"].contact_name == "Ada Full"
+    assert seen["meta"].contact_notes == "Authoritative contact note"
+    assert seen["meta"].contact_memories == ["Prefers concise calls"]
+    assert "Contact notes: Authoritative contact note" in instructions
+    assert '"Prefers concise calls"' in instructions
+    assert "Contact notes: Do not use" not in instructions
 
 
 def test_call_ws_threads_imessage_flag_into_realtime_meta(monkeypatch):
@@ -638,6 +689,7 @@ def test_call_ws_fallback_passes_outbound_context_to_voice_turn(monkeypatch, tmp
             "outbound_opening": "Hey Dima, it's Codex calling about soccer and the World Cup.",
             "outbound_context": "The operator asked by iMessage for this call.",
             "contact": None,
+            "contact_memories": [],
             "direction": "outbound",
         },
     )]

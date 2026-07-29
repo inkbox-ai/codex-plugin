@@ -37,6 +37,11 @@ try:
 except ImportError:  # pragma: no cover - aiohttp is a runtime dep
     aiohttp = None  # type: ignore
 
+try:
+    from .prompts import contact_marker, inject_contact_memories
+except ImportError:  # pragma: no cover - direct local import/test fallback
+    from prompts import contact_marker, inject_contact_memories
+
 logger = logging.getLogger("inkbox_codex.realtime")
 
 
@@ -135,6 +140,7 @@ class RealtimeCallMeta:
     contact_company: Optional[str] = None
     contact_job_title: Optional[str] = None
     contact_notes: Optional[str] = None
+    contact_memories: List[str] = field(default_factory=list)
     # Outbound calls only: why this agent placed the call, threaded from
     # ``inkbox_place_call`` so the live session opens with context, not cold.
     outbound_purpose: Optional[str] = None
@@ -190,7 +196,15 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
     Returns:
         str: The instruction string for the ``session.update``.
     """
+    marker_contact = {
+        "id": meta.contact_id,
+        "name": meta.contact_name,
+        "emails": meta.contact_emails,
+        "phones": meta.contact_phones,
+        "company": meta.contact_company,
+    } if meta.contact_known else None
     lines = [
+        f"[inkbox:voice_call call_id={meta.call_id} | {contact_marker(marker_contact)}]",
         "You are the configured Codex Inkbox agent speaking on a live Inkbox phone call.",
         "Use natural, concise spoken replies. Keep most answers to one or two short sentences.",
         "You are a voice; do not read out code, file paths, diffs, or logs verbatim.",
@@ -288,7 +302,7 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
     ])
     if additional.strip():
         lines += ["", additional.strip()]
-    return "\n".join(lines)
+    return inject_contact_memories("\n".join(lines), meta.contact_memories)
 
 
 def build_realtime_greeting(meta: RealtimeCallMeta) -> str:

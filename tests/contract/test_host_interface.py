@@ -97,7 +97,7 @@ def raw(tmp_path, monkeypatch):
     import os
     session = _RawAppServer(env=dict(os.environ))
     session.request("initialize", {
-        "clientInfo": {"name": "inkbox_codex", "title": "Inkbox Codex Bridge", "version": "0.1.0"},
+        "clientInfo": {"name": "inkbox_codex", "title": "Inkbox Codex Bridge", "version": "0.2.7"},
         "capabilities": {"experimentalApi": True},
     })
     session.notify("initialized", {})
