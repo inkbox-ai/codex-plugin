@@ -42,6 +42,12 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
         not bool(cfg.voice_stack_invalid_value),
         cfg.voice_stack.value if not cfg.voice_stack_invalid_value else f"invalid: {cfg.voice_stack_invalid_value}",
     ))
+    if cfg.voice_stack is VoiceStack.OPENAI_REALTIME:
+        checks.append((
+            "OpenAI Realtime API key",
+            cfg.realtime.enabled and bool(cfg.realtime.api_key),
+            "set" if cfg.realtime.api_key else "missing (required by openai_realtime)",
+        ))
     checks.append((
         "voicemail detection",
         cfg.voicemail_detection in {"enabled", "disabled"},

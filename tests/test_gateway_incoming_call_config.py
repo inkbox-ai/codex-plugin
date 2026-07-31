@@ -232,8 +232,4 @@ def test_a2a_only_subscription_is_skipped_on_older_api():
         subscriptions=subscriptions,
     )
 
-    assert subscriptions.created == [{
-        "agent_identity_id": "identity-1",
-        "url": "https://agent.inkboxwire.com/webhook",
-        "event_types": gateway_mod.CALL_EVENTS,
-    }]
+    assert subscriptions.created == []

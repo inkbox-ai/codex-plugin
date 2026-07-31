@@ -1032,7 +1032,11 @@ def _configure_voice_ai(
     hosted_changed = authority_changed = incoming_changed = False
     try:
         hosted_changed = True
-        identity.set_hosted_agent_config(voice=None, model=None, instructions=None)
+        identity.set_hosted_agent_config(
+            voice=getattr(hosted_before, "voice", None),
+            model=getattr(hosted_before, "model", None),
+            instructions=getattr(hosted_before, "instructions", None),
+        )
         if authority_mode != authority_before:
             authority_changed = True
             selected_authority_identity.set_hosted_agent_authority_mode(authority_mode)
@@ -1069,6 +1073,7 @@ def _save_voice_stack(
         _save("INKBOX_REALTIME_MODEL", REALTIME_MODEL)
         _save("INKBOX_REALTIME_ENABLED", "true")
     else:
+        _save("INKBOX_REALTIME_API_KEY", "")
         _save("INKBOX_REALTIME_ENABLED", "false")
         if authority_mode:
             _save("INKBOX_VOICE_AI_AUTHORITY_MODE", authority_mode)
@@ -1153,76 +1158,6 @@ def _configure_phone_call_voice_stack(
             continue
         _save_voice_stack(stack)
         print_success("  Inkbox TTS/STT is configured for phone calls.")
-        return
-
-
-def _configure_realtime_calls(identity: Any, *, imessage_enabled: bool = False) -> None:
-    """Offer OpenAI Realtime voice for calls, validating the key before enabling.
-
-    Args:
-        identity (Any): The configured agent identity.
-        imessage_enabled (bool): Whether iMessage ended up enabled — threaded
-            in explicitly since the local identity object may be stale.
-
-    Returns:
-        None: Persists INKBOX_REALTIME_* to .env; leaves Realtime off if the
-        operator declines or the key fails validation (calls use Inkbox STT/TTS).
-    """
-    # Calls can arrive over the dedicated number OR the shared iMessage line,
-    # so offer realtime whenever either exists.
-    if getattr(identity, "phone_number", None) is None and not imessage_enabled:
-        return
-
-    print()
-    print(color("  --- OpenAI Realtime calls ---", Colors.CYAN))
-    print_info("  Realtime sends raw phone audio to OpenAI for a natural, low-latency")
-    print_info("  voice. The model talks to you and calls Codex when you ask for")
-    print_info("  real work. Needs an OpenAI API key with /v1/realtime access.")
-    print_info("  Skip this to use Inkbox's built-in STT/TTS instead.")
-
-    detected = _detect_openai_realtime_key()
-    detected_key = ""
-    default_opt_in = False
-    prompt_for_key = False
-    if detected is not None:
-        key_source, detected_key = detected
-        default_opt_in = True
-        print_success(f"  Found an OpenAI API key in {key_source}.")
-    else:
-        print_warning("  No OpenAI API key detected for Realtime.")
-
-    while True:
-        if not prompt_yes_no("  Use OpenAI Realtime for phone calls?", default_opt_in):
-            _save("INKBOX_REALTIME_ENABLED", "false")
-            print_info("  Realtime disabled. Calls will use Inkbox STT/TTS.")
-            return
-
-        if prompt_for_key or not detected_key:
-            api_key = prompt("  Paste your OpenAI API key for Realtime calls", password=True).strip()
-        else:
-            api_key = detected_key
-        if not api_key:
-            _save("INKBOX_REALTIME_ENABLED", "false")
-            print_warning("  No key entered. Realtime disabled; calls will use Inkbox STT/TTS.")
-            return
-
-        print_info(f"  Testing OpenAI Realtime access with {REALTIME_MODEL}...")
-        ok, detail = _test_openai_realtime_api_key(api_key, REALTIME_MODEL)
-        if not ok:
-            _save("INKBOX_REALTIME_ENABLED", "false")
-            print_error("  OpenAI Realtime validation failed.")
-            print_info(f"  {detail}")
-            print_info("  Try another key, or answer no to use Inkbox STT/TTS.")
-            default_opt_in = True
-            prompt_for_key = True
-            continue
-
-        _save("INKBOX_REALTIME_ENABLED", "true")
-        _save("INKBOX_REALTIME_MODEL", REALTIME_MODEL)
-        # Persist the validated key under the plugin-specific var so the gateway
-        # doesn't depend on the operator's shell exporting OPENAI_API_KEY.
-        _save("INKBOX_REALTIME_API_KEY", api_key)
-        print_success("  OpenAI Realtime validation succeeded — enabled for calls.")
         return
 
 

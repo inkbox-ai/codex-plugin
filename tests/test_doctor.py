@@ -6,7 +6,7 @@ import sys
 import types
 
 from inkbox_codex import daemon, doctor
-from inkbox_codex.config import BridgeConfig, VoiceStack
+from inkbox_codex.config import BridgeConfig, RealtimeConfig, VoiceStack
 
 
 def test_voice_config_probe_failures_do_not_mark_identity_unreachable(
@@ -50,3 +50,30 @@ def test_voice_config_probe_failures_do_not_mark_identity_unreachable(
     assert reachable == [("identity reachable", True, "agent@example.com, +15551234567")]
     assert by_name["incoming call action"] == (False, "incoming config unavailable")
     assert by_name["Voice AI authority"] == (False, "authority config unavailable")
+
+
+def test_realtime_stack_reports_missing_api_key(monkeypatch, tmp_path):
+    monkeypatch.setattr(daemon, "_maybe_load_env_file", lambda: None)
+    monkeypatch.setattr(doctor.shutil, "which", lambda _name: "/usr/bin/codex")
+    monkeypatch.setattr(
+        doctor,
+        "read_config",
+        lambda: BridgeConfig(
+            identity="agent",
+            signing_key="whsec_test",
+            project_dir=str(tmp_path),
+            voice_stack=VoiceStack.OPENAI_REALTIME,
+            realtime=RealtimeConfig(enabled=False, api_key=""),
+        ),
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only")
+
+    by_name = {
+        name: (ok, detail)
+        for name, ok, detail in doctor.run_doctor()
+    }
+
+    assert by_name["OpenAI Realtime API key"] == (
+        False,
+        "missing (required by openai_realtime)",
+    )

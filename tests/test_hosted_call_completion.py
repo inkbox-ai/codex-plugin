@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import types
 
 from inkbox_codex.config import BridgeConfig
@@ -193,6 +194,23 @@ def test_hosted_completion_registry_bounds_private_replay_data(tmp_path, monkeyp
         assert "payload" not in entry
 
     asyncio.run(scenario())
+
+
+def test_private_registry_mode_is_set_before_content_write(tmp_path, monkeypatch):
+    original_fdopen = os.fdopen
+    observed_modes = []
+
+    def checked_fdopen(fd, *args, **kwargs):
+        observed_modes.append(os.fstat(fd).st_mode & 0o777)
+        return original_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", checked_fdopen)
+    path = tmp_path / "private.json"
+    InkboxGateway._write_private_json(path, {"secret": "bounded"})
+
+    assert observed_modes == [0o600]
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert json.loads(path.read_text()) == {"secret": "bounded"}
 
 
 def test_recovery_retries_when_authoritative_transcript_is_unavailable(

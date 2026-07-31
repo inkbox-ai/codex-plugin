@@ -605,56 +605,6 @@ def test_detect_realtime_key_none_when_unset(tmp_path, monkeypatch):
     assert setup_wizard._detect_openai_realtime_key() is None
 
 
-def test_configure_realtime_declined_writes_disabled(tmp_path, monkeypatch):
-    env_file = tmp_path / ".env"
-    monkeypatch.setenv("INKBOX_CODEX_ENV_FILE", str(env_file))
-    monkeypatch.delenv("INKBOX_REALTIME_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **k: False)
-
-    identity = types.SimpleNamespace(phone_number=types.SimpleNamespace(number="+16614031457"))
-    setup_wizard._configure_realtime_calls(identity)
-    assert setup_wizard._env("INKBOX_REALTIME_ENABLED") == "false"
-
-
-def test_configure_realtime_enables_on_valid_key(tmp_path, monkeypatch):
-    env_file = tmp_path / ".env"
-    monkeypatch.setenv("INKBOX_CODEX_ENV_FILE", str(env_file))
-    monkeypatch.setenv("INKBOX_REALTIME_API_KEY", "sk-rt")
-    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **k: True)
-    # Validation passes without hitting the network.
-    monkeypatch.setattr(setup_wizard, "_test_openai_realtime_api_key", lambda *a, **k: (True, "ok"))
-
-    identity = types.SimpleNamespace(phone_number=types.SimpleNamespace(number="+16614031457"))
-    setup_wizard._configure_realtime_calls(identity)
-    assert setup_wizard._env("INKBOX_REALTIME_ENABLED") == "true"
-    assert setup_wizard._env("INKBOX_REALTIME_API_KEY") == "sk-rt"
-
-
-def test_configure_realtime_skips_without_phone(tmp_path, monkeypatch):
-    env_file = tmp_path / ".env"
-    monkeypatch.setenv("INKBOX_CODEX_ENV_FILE", str(env_file))
-    setup_wizard._configure_realtime_calls(types.SimpleNamespace(phone_number=None))
-    # No phone and no iMessage → returns before writing to this run's .env file.
-    assert not env_file.exists()
-
-
-def test_configure_realtime_offered_for_imessage_only_identity(tmp_path, monkeypatch):
-    # Calls can arrive over the shared iMessage line alone, so realtime is
-    # offered even without a dedicated number. The flag is threaded in
-    # explicitly because the local identity object may be stale.
-    env_file = tmp_path / ".env"
-    monkeypatch.setenv("INKBOX_CODEX_ENV_FILE", str(env_file))
-    monkeypatch.setenv("INKBOX_REALTIME_API_KEY", "sk-rt")
-    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **k: True)
-    monkeypatch.setattr(setup_wizard, "_test_openai_realtime_api_key", lambda *a, **k: (True, "ok"))
-
-    setup_wizard._configure_realtime_calls(
-        types.SimpleNamespace(phone_number=None), imessage_enabled=True
-    )
-    assert setup_wizard._env("INKBOX_REALTIME_ENABLED") == "true"
-
-
 class _FakeVoiceIdentity:
     def __init__(self, authority_mode="contact_scoped"):
         self.agent_handle = "voice-agent"
@@ -731,6 +681,7 @@ def test_phone_voice_stack_offers_three_choices_and_configures_tts(monkeypatch):
         "incoming_call_webhook_url": None,
     }]
     assert saved == [
+        ("INKBOX_REALTIME_API_KEY", ""),
         ("INKBOX_REALTIME_ENABLED", "false"),
         ("INKBOX_VOICE_STACK", "inkbox_tts_stt"),
     ]
@@ -753,6 +704,7 @@ def test_realtime_failure_loops_back_without_partial_save(monkeypatch):
     setup_wizard._configure_phone_call_voice_stack(identity, **_voice_kwargs())
 
     assert saved == [
+        ("INKBOX_REALTIME_API_KEY", ""),
         ("INKBOX_REALTIME_ENABLED", "false"),
         ("INKBOX_VOICE_STACK", "inkbox_tts_stt"),
     ]
@@ -773,7 +725,9 @@ def test_voice_ai_contact_scope_does_not_prompt_for_admin(monkeypatch):
 
     setup_wizard._configure_phone_call_voice_stack(identity, **_voice_kwargs())
 
-    assert identity.hosted_updates == [{"voice": None, "model": None, "instructions": None}]
+    assert identity.hosted_updates == [{
+        "voice": "custom", "model": "custom", "instructions": "custom",
+    }]
     assert identity.incoming_updates == [{
         "incoming_call_action": "hosted_agent",
         "client_websocket_url": None,

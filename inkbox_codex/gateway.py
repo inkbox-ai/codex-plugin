@@ -629,6 +629,13 @@ class InkboxGateway:
             raise RuntimeError(
                 f"invalid INKBOX_VOICE_STACK={self.cfg.voice_stack_invalid_value!r}; rerun setup"
             )
+        if (
+            self.cfg.voice_stack is VoiceStack.OPENAI_REALTIME
+            and not self.cfg.realtime.enabled
+        ):
+            raise RuntimeError(
+                "INKBOX_VOICE_STACK=openai_realtime requires INKBOX_REALTIME_API_KEY"
+            )
         if self.cfg.voicemail_detection not in {"enabled", "disabled"}:
             raise RuntimeError("INKBOX_VOICEMAIL_DETECTION must be enabled or disabled")
         if (
@@ -836,7 +843,8 @@ class InkboxGateway:
         # The SDK and API require each subscription to contain one event
         # family. Calls and iMessage share an identity owner and URL, but must
         # remain separate rows.
-        _reconcile({"agent_identity_id": identity.id}, CALL_EVENTS)
+        if identity.phone_number is not None or getattr(identity, "imessage_enabled", False):
+            _reconcile({"agent_identity_id": identity.id}, CALL_EVENTS)
         logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
     async def _cleanup(self) -> None:
@@ -909,6 +917,23 @@ class InkboxGateway:
             return {}
         return loaded if isinstance(loaded, dict) else {}
 
+    @staticmethod
+    def _write_private_json(path: Path, value: Dict[str, Any]) -> None:
+        """Atomically write JSON without a world-readable creation window."""
+        tmp = path.with_suffix(".tmp")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(tmp, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                fd = -1
+                handle.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        os.replace(tmp, path)
+
     def _write_hosted_call_registry(
         self,
         call_id: str,
@@ -953,11 +978,7 @@ class InkboxGateway:
                 reverse=True,
             )[:1000])
         self._hosted_call_registry_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._hosted_call_registry_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n")
-        tmp.chmod(0o600)
-        os.replace(tmp, self._hosted_call_registry_path)
-        self._hosted_call_registry_path.chmod(0o600)
+        self._write_private_json(self._hosted_call_registry_path, current)
 
     @staticmethod
     def _hosted_call_replay_payload(
@@ -1077,11 +1098,7 @@ class InkboxGateway:
             return
         current.pop(call_id, None)
         self._hosted_call_registry_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._hosted_call_registry_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n")
-        tmp.chmod(0o600)
-        os.replace(tmp, self._hosted_call_registry_path)
-        self._hosted_call_registry_path.chmod(0o600)
+        self._write_private_json(self._hosted_call_registry_path, current)
 
     def _sender_allowed(self, *candidates: str) -> bool:
         if self.cfg.allow_all_users or not self.cfg.allowed_users:
@@ -1581,11 +1598,7 @@ class InkboxGateway:
             "updated_at": time.time(),
         }
         self._a2a_registry_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._a2a_registry_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n")
-        tmp.chmod(0o600)
-        os.replace(tmp, self._a2a_registry_path)
-        self._a2a_registry_path.chmod(0o600)
+        self._write_private_json(self._a2a_registry_path, current)
 
     def _track_a2a_job(
         self,
