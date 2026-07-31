@@ -18,6 +18,7 @@ COPY . .
 RUN python -m pip install --no-cache-dir --editable .
 
 ENV INKBOX_CODEX_HOME="/root/.inkbox-codex"
+RUN mkdir -p /root/.codex /root/.inkbox-codex /workspace
 WORKDIR /workspace
 
 CMD ["bash"]

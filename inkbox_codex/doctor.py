@@ -94,6 +94,9 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
             from inkbox import Inkbox
 
             identity = Inkbox(**inkbox_client_kwargs(cfg.api_key, cfg.base_url)).get_identity(cfg.identity)
+        except Exception as exc:
+            checks.append(("identity reachable", False, str(exc)))
+        else:
             mailbox = getattr(identity, "mailbox", None)
             phone = getattr(identity, "phone_number", None)
             detail = ", ".join(filter(None, [
@@ -103,28 +106,34 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
             ])) or "no channels provisioned"
             checks.append(("identity reachable", True, detail))
             if getattr(identity, "phone_number", None) is not None or getattr(identity, "imessage_enabled", False):
-                incoming = identity.get_incoming_call_action()
-                actual_action = str(getattr(getattr(incoming, "incoming_call_action", ""), "value", getattr(incoming, "incoming_call_action", "")))
                 expected_action = (
                     "hosted_agent"
                     if cfg.voice_stack is VoiceStack.INKBOX_VOICE_AI
                     else "auto_accept"
                 )
-                checks.append((
-                    "incoming call action",
-                    actual_action == expected_action,
-                    f"{actual_action or 'unset'} (expected {expected_action})",
-                ))
-                if cfg.voice_stack is VoiceStack.INKBOX_VOICE_AI:
-                    hosted = identity.get_hosted_agent_config()
-                    actual_authority = str(getattr(getattr(hosted, "authority_mode", ""), "value", getattr(hosted, "authority_mode", "")))
+                try:
+                    incoming = identity.get_incoming_call_action()
+                    actual_action = str(getattr(getattr(incoming, "incoming_call_action", ""), "value", getattr(incoming, "incoming_call_action", "")))
+                except Exception as exc:
+                    checks.append(("incoming call action", False, str(exc)))
+                else:
                     checks.append((
-                        "Voice AI authority",
-                        actual_authority == cfg.voice_ai_authority_mode,
-                        f"{actual_authority or 'unset'} (expected {cfg.voice_ai_authority_mode})",
+                        "incoming call action",
+                        actual_action == expected_action,
+                        f"{actual_action or 'unset'} (expected {expected_action})",
                     ))
-        except Exception as exc:
-            checks.append(("identity reachable", False, str(exc)))
+                if cfg.voice_stack is VoiceStack.INKBOX_VOICE_AI:
+                    try:
+                        hosted = identity.get_hosted_agent_config()
+                        actual_authority = str(getattr(getattr(hosted, "authority_mode", ""), "value", getattr(hosted, "authority_mode", "")))
+                    except Exception as exc:
+                        checks.append(("Voice AI authority", False, str(exc)))
+                    else:
+                        checks.append((
+                            "Voice AI authority",
+                            actual_authority == cfg.voice_ai_authority_mode,
+                            f"{actual_authority or 'unset'} (expected {cfg.voice_ai_authority_mode})",
+                        ))
 
     return checks
 

@@ -63,6 +63,11 @@ def _payload():
                 "id": "contact-1",
                 "preferred_name": "Dima",
                 "phone_numbers": ["+19999999999"],
+                "memories": [
+                    "  Prefers concise release updates.  ",
+                    "",
+                    "Prefers concise release updates.",
+                ],
             }],
         },
     }
@@ -75,7 +80,9 @@ def _gateway(tmp_path, monkeypatch, session):
     gateway.sessions = _Sessions(session)
 
     async def resolve(_call, _remote):
-        return {"id": "contact-1", "name": "Dima", "memories": []}
+        return gateway._contact_summary({
+            "id": "contact-1", "preferred_name": "Dima",
+        })
 
     gateway._resolve_call_contact = resolve
     return gateway
@@ -99,6 +106,8 @@ def test_hosted_completion_fetches_transcript_and_suppresses_plaintext(tmp_path,
         assert "+19999999999" not in prompt
         assert "Please text me the result." in prompt
         assert "Send the requested release update" in prompt
+        assert "Prefers concise release updates." in prompt
+        assert prompt.count("Prefers concise release updates.") == 1
         registry = json.loads(gateway._hosted_call_registry_path.read_text())
         assert registry["call-1"]["state"] == "completed"
         assert registry["call-1"]["payload"]["event_type"] == "call.ended"

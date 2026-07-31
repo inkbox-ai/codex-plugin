@@ -1243,7 +1243,20 @@ class InkboxGateway:
                 contact = self._contact_summary(contacts[0])
             contact = contact or {}
             chat_id = str(contact.get("id") or remote_phone or f"call:{call_id}")
-            memories = contact.get("memories") or []
+            payload_contact = contacts[0] if contacts and isinstance(contacts[0], dict) else {}
+            memories = self._contact_memories(payload_contact)
+            if not memories and contact.get("id"):
+                try:
+                    full_contact = await asyncio.to_thread(
+                        self._inkbox.contacts.get, contact["id"]
+                    )
+                    memories = self._contact_memories(full_contact)
+                except Exception:
+                    logger.debug(
+                        "[bridge] hosted contact memory hydration failed for %s",
+                        contact["id"],
+                        exc_info=True,
+                    )
 
             transcript: List[Tuple[str, str]] = []
             try:

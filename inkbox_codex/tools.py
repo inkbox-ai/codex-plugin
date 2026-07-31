@@ -112,6 +112,22 @@ def _schema(properties: Dict[str, JsonSchema], required: List[str] | None = None
     }
 
 
+def _schema_with_exactly_one_alias(
+    properties: Dict[str, JsonSchema],
+    *,
+    required: List[str],
+    left: str,
+    right: str,
+) -> JsonSchema:
+    """Require one spelling of an aliased field, never neither or both."""
+    schema = _schema(properties, required)
+    schema["oneOf"] = [
+        {"required": [left], "not": {"required": [right]}},
+        {"required": [right], "not": {"required": [left]}},
+    ]
+    return schema
+
+
 def _str(desc: str = "", *, max_length: int | None = None) -> JsonSchema:
     schema: JsonSchema = {"type": "string"}
     if desc:
@@ -217,7 +233,7 @@ TOOL_SPECS: List[ToolSpec] = [
         "over the shared iMessage line (set `origination` accordingly). The selected "
         "phone voice stack handles the call. Always pass purpose so the call starts "
         "with a concrete task; voicemail behavior comes from gateway configuration.",
-        _schema(
+        _schema_with_exactly_one_alias(
             {
                 "to_number": _str("E.164 recipient number, e.g. +15551234567."),
                 "toNumber": _str("Alias for to_number."),
@@ -242,7 +258,9 @@ TOOL_SPECS: List[ToolSpec] = [
                 "client_websocket_url": _str("Optional override for the call-media WebSocket URL."),
                 "clientWebsocketUrl": _str("Alias for client_websocket_url."),
             },
-            ["to_number", "purpose"],
+            required=["purpose"],
+            left="to_number",
+            right="toNumber",
         ),
     ),
     ToolSpec(
@@ -747,9 +765,14 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
             return {"sent": True, "id": str(getattr(msg, "id", ""))}
 
         if name == "inkbox_place_call":
-            to_number = str(args.get("to_number") or args.get("toNumber") or "").strip()
-            if not to_number:
-                raise ValueError("to_number is required (E.164, e.g. +15551234567)")
+            snake_to_number = str(args.get("to_number") or "").strip()
+            camel_to_number = str(args.get("toNumber") or "").strip()
+            if bool(snake_to_number) == bool(camel_to_number):
+                raise ValueError(
+                    "Specify exactly one of to_number or toNumber "
+                    "(E.164, e.g. +15551234567)"
+                )
+            to_number = snake_to_number or camel_to_number
             purpose = str(args.get("purpose") or "").strip()
             if not purpose:
                 raise ValueError(
@@ -1122,7 +1145,12 @@ def _place_call_tool_entry(voice_stack: VoiceStack) -> Dict[str, Any]:
             "Place an outbound voice call over either of the identity's two lines, "
             "handled by this Codex agent through the configured local voice stack."
         ),
-        "inputSchema": _schema(properties, ["to_number", "purpose"]),
+        "inputSchema": _schema_with_exactly_one_alias(
+            properties,
+            required=["purpose"],
+            left="to_number",
+            right="toNumber",
+        ),
     }
 
 

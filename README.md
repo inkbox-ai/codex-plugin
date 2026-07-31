@@ -87,12 +87,13 @@ inkbox-codex run
 ### Local Docker test image
 
 The repository includes a manual-test image with Codex, the plugin, and the
-Inkbox SDK preinstalled. Supply credentials only when the container starts:
+Inkbox SDK preinstalled. It reuses the host's native Codex login and keeps
+Inkbox plugin state in a named volume; neither is copied into the image:
 
 ```bash
 docker build -t inkbox-codex-local .
 docker run -dit --name inkbox-codex-local \
-  -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+  -v "${CODEX_HOME:-$HOME/.codex}:/root/.codex" \
   -v "$PWD:/workspace" \
   -v inkbox-codex-state:/root/.inkbox-codex \
   inkbox-codex-local
@@ -107,8 +108,9 @@ inkbox-codex run
 docker rm -f inkbox-codex-local
 ```
 
-The image contains no credentials. `OPENAI_API_KEY` and Inkbox credentials are
-provided at runtime or entered into the setup wizard.
+The image contains no credentials. If you use API-key authentication instead
+of `codex login`, add `-e OPENAI_API_KEY="$OPENAI_API_KEY"` to `docker run`.
+Inkbox credentials are entered into setup or supplied only at runtime.
 
 On startup the bridge opens an Inkbox tunnel, wires mail/text/iMessage webhook subscriptions and the incoming-call channel to it, and routes everything into Codex sessions.
 

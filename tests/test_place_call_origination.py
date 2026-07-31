@@ -147,6 +147,41 @@ def test_place_call_passes_resolved_origination_and_echoes_it(monkeypatch, tmp_p
     assert identity.place_call_kwargs["origination"] == "dedicated_number"
 
 
+def test_place_call_accepts_camel_case_recipient_alias(monkeypatch, tmp_path):
+    identity = _PlacingIdentity(has_number=True, imessage=False)
+    data = _place(
+        identity,
+        {"toNumber": "+15551112222", "purpose": "build update"},
+        monkeypatch,
+        tmp_path,
+    )
+
+    assert data["placed"] is True
+    assert identity.place_call_kwargs["to_number"] == "+15551112222"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"purpose": "build update"},
+        {
+            "to_number": "+15551112222",
+            "toNumber": "+15553334444",
+            "purpose": "build update",
+        },
+    ],
+)
+def test_place_call_requires_exactly_one_recipient_spelling(
+    args, monkeypatch, tmp_path,
+):
+    identity = _PlacingIdentity(has_number=True, imessage=False)
+
+    data = _place(identity, args, monkeypatch, tmp_path)
+
+    assert "exactly one of to_number or toNumber" in data["error"]
+    assert identity.place_call_kwargs is None
+
+
 def test_local_call_uses_gateway_voicemail_policy(monkeypatch, tmp_path):
     monkeypatch.setenv("INKBOX_VOICE_STACK", "inkbox_tts_stt")
     monkeypatch.setenv("INKBOX_VOICEMAIL_DETECTION", "disabled")
@@ -357,4 +392,8 @@ def test_hosted_place_call_schema_exposes_task_fields_not_websocket(monkeypatch)
     assert "Inkbox Voice AI" in spec["description"]
     assert "client_websocket_url" not in properties
     assert "purpose" in properties
-    assert spec["inputSchema"]["required"] == ["to_number", "purpose"]
+    assert spec["inputSchema"]["required"] == ["purpose"]
+    assert spec["inputSchema"]["oneOf"] == [
+        {"required": ["to_number"], "not": {"required": ["toNumber"]}},
+        {"required": ["toNumber"], "not": {"required": ["to_number"]}},
+    ]
