@@ -1,4 +1,4 @@
-from inkbox_codex.config import read_config
+from inkbox_codex.config import VoiceStack, read_config
 
 
 def test_read_config_defaults(monkeypatch):
@@ -64,6 +64,14 @@ def test_realtime_disabled_by_default(monkeypatch):
     assert read_config().realtime.enabled is False
 
 
+def test_openai_key_alone_does_not_enable_legacy_realtime(monkeypatch):
+    _clear_realtime_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    cfg = read_config()
+    assert cfg.voice_stack is VoiceStack.INKBOX_TTS_STT
+    assert cfg.realtime.enabled is False
+
+
 def test_realtime_needs_both_flag_and_key(monkeypatch):
     # Flag on but no key → still disabled (gateway would have nothing to dial).
     _clear_realtime_env(monkeypatch)
@@ -84,3 +92,25 @@ def test_realtime_key_falls_back_to_openai_env(monkeypatch):
     cfg = read_config()
     assert cfg.realtime.enabled is True
     assert cfg.realtime.api_key == "sk-openai"
+
+
+def test_explicit_voice_stack_is_canonical(monkeypatch):
+    monkeypatch.setenv("INKBOX_VOICE_STACK", "inkbox_voice_ai")
+    monkeypatch.setenv("INKBOX_REALTIME_ENABLED", "true")
+    monkeypatch.setenv("INKBOX_REALTIME_API_KEY", "sk-realtime")
+    monkeypatch.setenv("INKBOX_VOICE_AI_AUTHORITY_MODE", "yolo")
+    monkeypatch.setenv("INKBOX_VOICEMAIL_DETECTION", "disabled")
+
+    cfg = read_config()
+
+    assert cfg.voice_stack is VoiceStack.INKBOX_VOICE_AI
+    assert cfg.realtime.enabled is False
+    assert cfg.voice_ai_authority_mode == "yolo"
+    assert cfg.voicemail_detection == "disabled"
+
+
+def test_invalid_voice_stack_fails_closed_to_tts(monkeypatch):
+    monkeypatch.setenv("INKBOX_VOICE_STACK", "made_up")
+    cfg = read_config()
+    assert cfg.voice_stack is VoiceStack.INKBOX_TTS_STT
+    assert cfg.voice_stack_invalid_value == "made_up"

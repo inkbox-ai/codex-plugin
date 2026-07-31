@@ -147,6 +147,64 @@ def test_place_call_passes_resolved_origination_and_echoes_it(monkeypatch, tmp_p
     assert identity.place_call_kwargs["origination"] == "dedicated_number"
 
 
+def test_local_call_uses_gateway_voicemail_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("INKBOX_VOICE_STACK", "inkbox_tts_stt")
+    monkeypatch.setenv("INKBOX_VOICEMAIL_DETECTION", "disabled")
+    identity = _PlacingIdentity(has_number=True, imessage=False)
+
+    data = _place(
+        identity,
+        {"to_number": "+15551112222", "purpose": "build update"},
+        monkeypatch,
+        tmp_path,
+    )
+
+    assert data["voicemail_detection"] == "disabled"
+    assert identity.place_call_kwargs["mode"] == "client_websocket"
+    assert identity.place_call_kwargs["voicemail_detection"] == "disabled"
+
+
+def test_hosted_call_uses_reason_and_inherits_saved_authority(monkeypatch, tmp_path):
+    monkeypatch.setenv("INKBOX_VOICE_STACK", "inkbox_voice_ai")
+    monkeypatch.setenv("INKBOX_VOICEMAIL_DETECTION", "disabled")
+    identity = _PlacingIdentity(has_number=True, imessage=False)
+    identity.place_call = lambda **kwargs: (
+        setattr(identity, "place_call_kwargs", kwargs)
+        or types.SimpleNamespace(
+            id="call-hosted", status="queued", mode="hosted_agent",
+            hosted_agent_authority_mode="yolo", voicemail_detection="disabled",
+        )
+    )
+
+    data = _place(
+        identity,
+        {
+            "to_number": "+15551112222",
+            "purpose": "Confirm the release timing",
+            "opening_message": "Hi, this is Codex.",
+            "context": "The release is planned for Friday.",
+        },
+        monkeypatch,
+        tmp_path,
+    )
+
+    assert data["placed"] is True
+    assert data["mode"] == "hosted_agent"
+    assert data["hosted_agent_authority_mode"] == "yolo"
+    assert identity.place_call_kwargs == {
+        "to_number": "+15551112222",
+        "origination": "dedicated_number",
+        "mode": "hosted_agent",
+        "reason": (
+            "Confirm the release timing\n\nOpening guidance: Hi, this is Codex."
+            "\n\nContext: The release is planned for Friday."
+        ),
+        "voicemail_detection": "disabled",
+    }
+    assert "hosted_agent_authority_mode" not in identity.place_call_kwargs
+    assert list((tmp_path / "call_contexts").glob("*.json")) == []
+
+
 def test_place_call_follows_imessage_channel_when_both_lines(monkeypatch, tmp_path):
     monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact-1")
     (tmp_path / "channel_hints.json").write_text(
@@ -212,7 +270,7 @@ def test_place_call_no_shared_connection_error_is_legible(monkeypatch, tmp_path)
     assert "dedicated_number" in data["error"]
 
 
-def test_place_call_falls_back_when_sdk_lacks_origination(monkeypatch, tmp_path):
+def test_place_call_requires_current_sdk_call_contract(monkeypatch, tmp_path):
     class _LegacyIdentity(_PlacingIdentity):
         def place_call(self, *, to_number, client_websocket_url):
             # Signature without ``origination`` — the first attempt raises
@@ -230,8 +288,7 @@ def test_place_call_falls_back_when_sdk_lacks_origination(monkeypatch, tmp_path)
         monkeypatch,
         tmp_path,
     )
-    assert data["placed"] is True
-    assert "origination" not in identity.place_call_kwargs
+    assert "SDK 0.5.9 or newer" in data["error"]
 
 
 def test_place_call_prefers_identity_scoped_ws_url(monkeypatch, tmp_path):
@@ -290,3 +347,14 @@ def test_place_call_schema_names_the_two_lines():
     origination = spec["inputSchema"]["properties"]["origination"]
     assert origination["enum"] == ["dedicated_number", "shared_imessage_number"]
     assert "origination" not in spec["inputSchema"]["required"]
+    assert "voicemail_detection" not in spec["inputSchema"]["properties"]
+
+
+def test_hosted_place_call_schema_exposes_task_fields_not_websocket(monkeypatch):
+    monkeypatch.setenv("INKBOX_VOICE_STACK", "inkbox_voice_ai")
+    spec = next(t for t in tools_mod.mcp_tool_list() if t["name"] == "inkbox_place_call")
+    properties = spec["inputSchema"]["properties"]
+    assert "Inkbox Voice AI" in spec["description"]
+    assert "client_websocket_url" not in properties
+    assert "purpose" in properties
+    assert spec["inputSchema"]["required"] == ["to_number", "purpose"]

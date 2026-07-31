@@ -82,7 +82,33 @@ inkbox-codex doctor
 inkbox-codex run
 ```
 
-`inkbox-codex setup` walks you through everything and writes `.env`: create a fresh Inkbox agent via self-signup (or bring an existing API key), pick or create the identity, attach the Codex avatar to the agent's contact card (auto for a new self-signup agent; offered for an existing one with no avatar), provision a phone number, wait for your `START` opt-in, optionally enable OpenAI Realtime voice (validating your key), connect iMessage, mint a webhook signing key, choose the project directory, choose whether to trust Inkbox MCP tools without repeated allow prompts, and set up autostart. Rerun it anytime to reconfigure. Prefer to wire `.env` by hand? Copy `.env.example` to `.env` and fill in `INKBOX_API_KEY`, `INKBOX_IDENTITY`, `INKBOX_SIGNING_KEY`, and `CODEX_PROJECT_DIR` yourself.
+`inkbox-codex setup` walks you through everything and writes `.env`: create a fresh Inkbox agent via self-signup (or bring an existing API key), pick or create the identity, attach the Codex avatar, provision a phone number, wait for your `START` opt-in, choose a phone-call voice stack, connect iMessage, mint a webhook signing key, choose the project directory, choose whether to trust Inkbox MCP tools without repeated allow prompts, and set up autostart. Realtime keys are validated before selection is saved. An admin key used to change Voice AI authority is held only for that setup run and is never written to `.env`. Rerun setup anytime to reconfigure.
+
+### Local Docker test image
+
+The repository includes a manual-test image with Codex, the plugin, and the
+Inkbox SDK preinstalled. Supply credentials only when the container starts:
+
+```bash
+docker build -t inkbox-codex-local .
+docker run -dit --name inkbox-codex-local \
+  -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+  -v "$PWD:/workspace" \
+  -v inkbox-codex-state:/root/.inkbox-codex \
+  inkbox-codex-local
+docker exec -it inkbox-codex-local bash
+
+# inside the container
+inkbox-codex setup
+inkbox-codex doctor
+inkbox-codex run
+
+# after leaving the container
+docker rm -f inkbox-codex-local
+```
+
+The image contains no credentials. `OPENAI_API_KEY` and Inkbox credentials are
+provided at runtime or entered into the setup wizard.
 
 On startup the bridge opens an Inkbox tunnel, wires mail/text/iMessage webhook subscriptions and the incoming-call channel to it, and routes everything into Codex sessions.
 
@@ -163,7 +189,9 @@ These match only when the whole message is exactly the command, so "please /clea
 
 ## Voice
 
-Calls have two modes, chosen per call:
+The setup wizard has a **Phone call voice stack** section with three choices:
+
+- **Inkbox Voice AI**: Inkbox handles the audio and conversation on Codex's behalf. Choose contact-scoped or YOLO authority during setup. Hosted outbound calls carry a task reason, inherit that saved authority by omitting a per-call override, and notify Codex through a signed `call.ended` event. Codex then fetches the authoritative transcript and executes any remaining post-call commitments in a side-effect-only turn; its plain model prose is never sent after hangup.
 
 - **OpenAI Realtime** (when configured): the bridge pre-opens an OpenAI Realtime session and accepts the call in raw-media mode, so a natural, low-latency voice handles the conversation. It runs the call itself and has these tools:
   - `consult_agent` — do real work *now* in the project; runs in the *same* contact-keyed session as your SMS/iMessage and its answer is spoken back.
@@ -171,7 +199,7 @@ Calls have two modes, chosen per call:
   - `hang_up_call` — two-step (say goodbye, then end the call).
 
   When the call ends, queued actions run in your session (and any plain "reflect on the call" follow-up if none were queued) — so "after we hang up, open a PR and text me" actually happens. Enable it in `inkbox-codex setup` (it validates your OpenAI key live) or via the `INKBOX_REALTIME_*` env vars below.
-- **Inkbox STT/TTS** (default / fallback): Inkbox auto-accepts the call and opens a WebSocket to the bridge; finalized transcripts become turns in your same session and Codex's replies are spoken back. The bridge falls back to this automatically if Realtime is off or OpenAI can't be reached (unless `INKBOX_REALTIME_FALLBACK_TO_INKBOX_STT_TTS=false`).
+- **Inkbox STT/TTS** (default): Inkbox auto-accepts the call and opens a WebSocket to the bridge; finalized transcripts become turns in your same session and Codex's replies are spoken back. Realtime may fall back to this if OpenAI cannot be reached (unless `INKBOX_REALTIME_FALLBACK_TO_INKBOX_STT_TTS=false`).
 
 ### Two calling lines
 
@@ -180,7 +208,7 @@ Calls — inbound and outbound — can run over either of two lines, and the age
 - **The dedicated phone number.** The agent's own number (the same line SMS uses). Outbound calls present this number; inbound calls to it ring the agent.
 - **The shared Inkbox iMessage line.** The agent can also place and receive voice calls with a person it's connected to over iMessage, over the same shared line that person already messages. The underlying number is never surfaced — Inkbox resolves it from the iMessage connection — and it only works for people already connected over iMessage (an unknown caller is rejected; an outbound call with no connection is refused).
 
-Inbound answering is configured once per identity (`auto_accept` → open the call bridge WebSocket), so a single setting governs both lines. Outbound, the agent sets `origination` on `inkbox_place_call` (`dedicated_number` / `shared_imessage_number`), or omits it: the bridge then uses the only available line, or — when both exist — the line matching the current conversation's channel. Once someone is connected over iMessage this works even for an agent that has no dedicated phone number.
+Inbound answering is configured once per identity: Voice AI uses `hosted_agent`; local Realtime and TTS/STT use `auto_accept` plus the bridge WebSocket. Outbound, the agent sets `origination` on `inkbox_place_call` (`dedicated_number` / `shared_imessage_number`), or omits it: the bridge then uses the only available line, or — when both exist — the line matching the current conversation's channel.
 
 ## External events
 
@@ -236,6 +264,9 @@ curl --fail-with-body --request POST 'https://your-agent-host.example/webhook' \
 | `INKBOX_BRIDGE_PORT` | no | `8767` | Local webhook server port. |
 | `INKBOX_PERMISSION_TIMEOUT_S` | no | `600` | Seconds to wait for a permission/poll reply. |
 | `INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS` | no | `false` | Auto-accept Codex MCP prompts for Inkbox tools only. The setup wizard writes `true` when you trust the agent to send through Inkbox without per-call approval. |
+| `INKBOX_VOICE_STACK` | no | `inkbox_tts_stt` | `inkbox_voice_ai`, `openai_realtime`, or `inkbox_tts_stt`. When absent, legacy Realtime settings remain compatible. |
+| `INKBOX_VOICE_AI_AUTHORITY_MODE` | Voice AI | `contact_scoped` | Saved Voice AI authority selected during setup: `contact_scoped` or `yolo`. |
+| `INKBOX_VOICEMAIL_DETECTION` | no | `enabled` | Outbound-call voicemail policy: `enabled` or `disabled`. Live CI uses `disabled`. |
 | `CODEX_BIN` | no | `codex` | Codex CLI executable to run. |
 | `CODEX_SANDBOX` | no | `workspace-write` | App-server thread sandbox (`read-only`, `workspace-write`, `danger-full-access`). |
 | `CODEX_APPROVAL_POLICY` | no | `on-request` | Codex approval policy for bridged turns. |
@@ -266,7 +297,7 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_list_a2a_tasks` · `inkbox_list_a2a_messages` — page and search this identity's inbound and outbound A2A history, with participant, task, context, role, state, and timestamp filters.
 - `inkbox_a2a_complete` · `inkbox_a2a_ask_caller` · `inkbox_a2a_fail` — commit the outcome of a verified inbound A2A task. These tools are rejected outside that task's isolated session.
 
-The bridge requires Inkbox SDK 0.5.8 or newer.
+The bridge requires Inkbox SDK 0.5.9 or newer.
 
 On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 
@@ -287,7 +318,7 @@ python -m pytest
 
 ## Architecture notes
 
-- **Tunnel-first inbound**: with a signing key, the gateway opens an Inkbox tunnel, reconciles mail/text/iMessage webhook subscriptions, and sets the identity's incoming-call action (`auto_accept` + call WebSocket) — one identity-scoped row covering both the dedicated number and the shared iMessage line.
+- **Tunnel-first inbound**: with a signing key, the gateway opens an Inkbox tunnel, reconciles mail/text/iMessage plus `call.ended` subscriptions, and sets the identity's incoming-call action from the selected stack — `hosted_agent` for Voice AI or `auto_accept` plus the call WebSocket for local stacks.
 - **Contact-keyed sessions**: webhook payloads carry resolved contacts; a single resolved contact id becomes the session key, otherwise the raw address/number does. One human, one session, every channel.
 - **Escalation over the active channel**: a pending permission/poll captures the contact's next inbound message as its answer, on whichever text channel they're using.
 - **Codex app-server**: each contact session owns one `codex app-server` subprocess, one Codex thread, app-server approval request handling over Inkbox, and a local stdio MCP server for the Inkbox tools.

@@ -184,7 +184,7 @@ class CodexAppServerClient:
                 "clientInfo": {
                     "name": "inkbox_codex",
                     "title": "Inkbox Codex Bridge",
-                    "version": "0.2.7",
+                    "version": "0.2.8",
                 },
                 "capabilities": {"experimentalApi": True},
             },

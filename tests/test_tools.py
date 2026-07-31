@@ -430,6 +430,7 @@ def test_place_call_requires_purpose():
 
 def test_place_call_forwards_disabled_voicemail_detection(tmp_path, monkeypatch):
     monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    monkeypatch.setenv("INKBOX_VOICEMAIL_DETECTION", "disabled")
     client = _FakeClient()
 
     data = _call(
@@ -438,7 +439,6 @@ def test_place_call_forwards_disabled_voicemail_detection(tmp_path, monkeypatch)
         {
             "to_number": "+15551112222",
             "purpose": "run the CI voice check",
-            "voicemail_detection": "disabled",
         },
     )
 

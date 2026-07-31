@@ -71,7 +71,7 @@ jobs:
       - name: Install bridge + test deps
         run: |
           pip install \
-            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@a4dd76b534e33c0a8352148d8f0e9ab25199f05b#subdirectory=sdk/python" \
+            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@73f18a2b8c0e9dc6887c5663e6e904d54869927e#subdirectory=sdk/python" \
             -e . pytest
 
       # @alpha is the prerelease channel cut from codex main near-daily — the
@@ -98,6 +98,8 @@ jobs:
             echo "INKBOX_IDENTITY=$HANDLE"
             echo "INKBOX_ALLOW_ALL_USERS=true"
             echo "INKBOX_REALTIME_ENABLED=false"
+            echo "INKBOX_VOICE_STACK=inkbox_tts_stt"
+            echo "INKBOX_VOICEMAIL_DETECTION=disabled"
             # Unattended runner: nobody is on the other end to answer an approval
             # text, so never escalate — and keep the sandbox read-only so a stray
             # command the model dreams up stays harmless.

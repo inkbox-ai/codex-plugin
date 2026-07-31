@@ -1,12 +1,14 @@
 """Live voice-call suite — real phone calls, real model, transcript-verified.
 
-Two scenarios, each run against a gateway booted in the matching speech mode (the
+Three scenarios, each run against a gateway booted in the matching speech mode (the
 workflow sets that up and selects the scenario via VOICE_SCENARIO):
 
   * inbound_inkbox   — the driver calls the agent; the agent answers with Inkbox
                        STT/TTS and holds a turn.
   * outbound_realtime — the driver texts "call me"; the agent places a call back,
                        powered by the realtime API, and holds a turn.
+  * outbound_hosted — the driver texts "call me"; Inkbox Voice AI runs the call,
+                      then Codex executes one post-call commitment.
 
 A companion driver process (voice_driver.py) bridges the driver's side of the call
 over an Inkbox tunnel and speaks one line. We then read the stored call transcript
@@ -31,7 +33,7 @@ import pytest
 # to the same number trip the server's duplicate_body rule (422).
 _CALL_ME_REQUEST = (
     "Use the inkbox_place_call tool now to call my phone number from this SMS. "
-    "Set voicemail_detection to disabled. Do not reply by text."
+    "Do not reply by text."
 )
 
 
@@ -46,6 +48,8 @@ BASE_URL = os.environ.get("INKBOX_BASE_URL", "https://inkbox.ai")
 REAL = os.environ.get("LIVE_REAL_MODEL") == "1"
 SCENARIO = os.environ.get("VOICE_SCENARIO", "")
 STATE_FILE = os.environ.get("VOICE_DRIVER_STATE", "/tmp/voice_driver_state.json")
+GATEWAY_LOG = os.environ.get("GATEWAY_LOG", "/tmp/gateway.log")
+HOSTED_POST_CALL_MARKER = os.environ.get("HOSTED_POST_CALL_MARKER", "")
 TIMEOUT_S = float(os.environ.get("LIVE_VOICE_TIMEOUT", "220"))
 POLL_EVERY_S = 6.0
 
@@ -127,7 +131,7 @@ def _call_state(remote, call_id) -> tuple[str, str]:
     return status, " ".join(fields)
 
 
-def _wait_for_two_way_call(remote, number_id, call_id):
+def _wait_for_two_way_call(remote, number_id, call_id, agent_turns=1):
     """Block until the call transcript shows BOTH the agent and the driver spoke."""
     deadline = time.monotonic() + TIMEOUT_S
     last = ""
@@ -139,7 +143,7 @@ def _wait_for_two_way_call(remote, number_id, call_id):
         except Exception as exc:  # transcripts may 404 until the call is set up
             rem, loc = [], []
             transcript_state = f"transcripts not ready: {exc!r}"
-        if not transcript_state and rem and loc:
+        if not transcript_state and len(rem) >= agent_turns and loc:
             agent_said = " | ".join(s.text.strip() for s in rem)
             return agent_said  # the agent reached the caller out loud, in a two-way call
         try:
@@ -158,6 +162,14 @@ def _wait_for_two_way_call(remote, number_id, call_id):
                 pytest.fail(f"call ended without a two-way conversation ({last})")
         time.sleep(POLL_EVERY_S)
     pytest.fail(f"agent never held a two-way call within {TIMEOUT_S:.0f}s ({last})")
+
+
+def _gateway_log_text() -> str:
+    try:
+        with open(GATEWAY_LOG) as fh:
+            return fh.read()
+    except OSError:
+        return ""
 
 
 def _aut_speech_mode(aut, direction, driver_number):
@@ -262,3 +274,82 @@ def test_outbound_call_realtime():
             f"outbound call must be powered by the realtime API (Inkbox speech off), got tts={tts} stt={stt}"
     finally:
         _hangup_call(remote, call_id)
+
+
+@pytest.mark.skipif(SCENARIO != "outbound_hosted", reason="outbound Voice AI leg only")
+def test_outbound_call_voice_ai_and_post_call_completion():
+    """Voice AI calls back, then Codex executes exactly one post-call SMS."""
+    st = _driver_state()
+    remote, aut = _client(REMOTE_KEY), _client(AUT_KEY)
+    aut_phone = _aut_phone(aut)
+    aut_tail = _digits(aut_phone)[-10:]
+    driver_tail = _digits(st["number"])[-10:]
+
+    def driver_calls():
+        return [
+            call for call in remote.calls.list(limit=30)
+            if (getattr(call, "direction", "") or "").lower() == "inbound"
+            and _digits(getattr(call, "remote_phone_number", "") or "")[-10:] == aut_tail
+        ]
+
+    def aut_calls():
+        return [
+            call for call in aut.calls.list(limit=30)
+            if (getattr(call, "direction", "") or "").lower() == "outbound"
+            and _digits(getattr(call, "remote_phone_number", "") or "")[-10:] == driver_tail
+        ]
+
+    def driver_sms():
+        return [
+            message for message in remote.texts.list(st["number_id"], limit=30)
+            if (getattr(message, "direction", "") or "").lower() == "inbound"
+            and _digits(getattr(message, "remote_phone_number", "") or "")[-10:] == aut_tail
+        ]
+
+    assert HOSTED_POST_CALL_MARKER
+    before_driver = {call.id for call in driver_calls()}
+    before_aut = {call.id for call in aut_calls()}
+    before_sms = {message.id for message in driver_sms()}
+    remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
+
+    driver_call_id = None
+    aut_call = None
+    try:
+        deadline = time.monotonic() + TIMEOUT_S
+        while time.monotonic() < deadline:
+            fresh_driver = [call for call in driver_calls() if call.id not in before_driver]
+            fresh_aut = [call for call in aut_calls() if call.id not in before_aut]
+            if fresh_driver:
+                driver_call_id = fresh_driver[0].id
+            if fresh_aut:
+                aut_call = fresh_aut[0]
+            if driver_call_id and aut_call is not None:
+                break
+            time.sleep(POLL_EVERY_S)
+        assert driver_call_id and aut_call is not None
+        assert str(getattr(getattr(aut_call, "mode", ""), "value", getattr(aut_call, "mode", ""))) == "hosted_agent"
+        assert str(getattr(getattr(aut_call, "voicemail_detection", ""), "value", getattr(aut_call, "voicemail_detection", ""))) == "disabled"
+        assert getattr(aut_call, "reason", None)
+        assert getattr(aut_call, "hosted_agent_authority_mode", None) is not None
+        _wait_for_two_way_call(remote, st["number_id"], driver_call_id, agent_turns=2)
+    finally:
+        _hangup_call(remote, driver_call_id)
+
+    deadline = time.monotonic() + 90
+    delivered = []
+    while time.monotonic() < deadline:
+        delivered = [
+            message for message in driver_sms()
+            if message.id not in before_sms
+            and HOSTED_POST_CALL_MARKER in (getattr(message, "text", "") or "")
+        ]
+        if f"hosted post-call reconciliation completed: {aut_call.id}" in _gateway_log_text() and delivered:
+            break
+        time.sleep(3)
+    assert delivered, "Codex did not execute the Voice AI post-call commitment"
+    time.sleep(2 * POLL_EVERY_S)
+    new_sms = [message for message in driver_sms() if message.id not in before_sms]
+    assert len(new_sms) == 1, (
+        "post-call processing leaked model prose or duplicated the commitment: "
+        f"{[getattr(message, 'text', '') for message in new_sms]}"
+    )
