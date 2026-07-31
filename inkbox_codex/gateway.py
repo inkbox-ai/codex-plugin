@@ -201,23 +201,24 @@ def _delivery_failure_prompt(
     guidance = _DELIVERY_FAILURE_CHANNEL_GUIDANCE.get(
         mode, _DELIVERY_FAILURE_CHANNEL_GUIDANCE["sms"]
     )
+    reply_instruction = _delivery_failure_reply_instruction(
+        mode=mode,
+        reason=reason,
+        attempt=attempt,
+    )
     return "\n".join([
         f"[delivery failed] Your {channel} message to {recipient} was NOT delivered "
         f"(attempt {attempt}/{max_attempts}, stage {stage}).",
         f"Reason: {reason or 'unknown'}.{quoted}",
         "",
-        "This matters — the person did not get what you sent. Decide how to recover:",
-        f"- If it looks transient, retry once on {channel} using your Inkbox tools.",
-        f"- If {channel} seems broken for them (or already failed on retry), reach "
-        "them another way — try a different channel you have for them (SMS, iMessage, "
-        "email), and only as a last resort place a call.",
+        "This matters — the person did not get what you sent.",
         guidance,
+        reply_instruction,
         f"This reply has now failed {attempt} of {max_attempts} allowed sends; "
         f"{remaining} left before the thread goes quiet.",
-        "Act now via your Inkbox messaging tools. Do not just acknowledge this; the "
-        "original channel may be down, so a plain reply here may not reach them. Do "
-        "not mention this delivery problem to the recipient. If there is nothing "
-        "sensible to send, reply exactly [SILENT].",
+        "If retrying, act via your Inkbox messaging tools. Do not just acknowledge "
+        "this; the original channel may be down, so a plain reply here may not "
+        "reach them. Do not mention this delivery problem to the recipient.",
     ])
 
 
@@ -382,7 +383,7 @@ _DELIVERY_FAILURE_CHANNEL_GUIDANCE: Dict[str, str] = {
         "Rewrite the message so it no longer trips the stated rule and it reads "
         "like a human text: plain conversational prose, no markdown (**bold**, "
         "# headers, ``` fences), at most one emoji, no profanity, no test/probe "
-        "phrasing. Then send the corrected reply now with your Inkbox tools."
+        "phrasing."
     ),
     "imessage": (
         "Rewrite the message so it no longer trips the stated rule and it reads "
@@ -398,6 +399,101 @@ _DELIVERY_FAILURE_CHANNEL_GUIDANCE: Dict[str, str] = {
         "have reason to think it will now deliver."
     ),
 }
+
+_DELIVERY_FAILURE_TERMINAL_CODES = frozenset({
+    "recipient_not_opted_in",
+    "recipient_opted_out",
+    "recipient_blocked",
+    "invalid_phone_number",
+    "carrier_rejected",
+    "sender_sms_pending",
+    "sender_sms_assignment_failed",
+    "sender_not_registered",
+    "sender_registration_required",
+    "messaging_profile_disabled",
+    "toll_free_sms_unsupported",
+})
+_DELIVERY_FAILURE_TERMINAL_MARKERS = (
+    "opted out",
+    "opt-out",
+    "not opted in",
+    "invalid number",
+    "invalid phone",
+    "unreachable",
+    "unknown subscriber",
+    "cannot receive",
+    "unsafe",
+    "harmful",
+    "abusive",
+    "harassment",
+    "threatening",
+    "illegal content",
+)
+_DELIVERY_FAILURE_RETRY_MARKERS = (
+    "40002",
+    "spam",
+    "content",
+    "too_long",
+    "too long",
+    "maximum is",
+    "markdown",
+    "emoji",
+    "profanity",
+    "temporar",
+    "carrier_unavailable",
+)
+
+
+def _sms_delivery_failure_policy(reason: Optional[str]) -> str:
+    """Classify whether an SMS failure requires retry, stop, or judgment."""
+    normalized = str(reason or "").strip().lower()
+    if any(code in normalized for code in _DELIVERY_FAILURE_TERMINAL_CODES) or any(
+        marker in normalized for marker in _DELIVERY_FAILURE_TERMINAL_MARKERS
+    ):
+        return "stop"
+    if any(marker in normalized for marker in _DELIVERY_FAILURE_RETRY_MARKERS):
+        return "retry"
+    return "conditional"
+
+
+def _delivery_failure_reply_instruction(
+    *,
+    mode: str,
+    reason: Optional[str],
+    attempt: int,
+) -> str:
+    """Give the model one non-contradictory action for this failure class."""
+    if mode != "sms":
+        return (
+            "Send a corrected message only when it is safe, permitted, and likely "
+            "to deliver. Otherwise reply exactly [SILENT]."
+        )
+    policy = _sms_delivery_failure_policy(reason)
+    if policy == "retry":
+        if attempt == 1:
+            return (
+                "SMS failure classification: FIRST SAFE RETRY REQUIRED. This "
+                "is the first failure and it is retryable. You MUST now send "
+                "exactly one safe, materially rephrased SMS in plain "
+                "conversational prose; do not reuse the failed wording."
+            )
+        return (
+            "SMS failure classification: RETRY OPTIONAL. A safe, materially "
+            "rephrased SMS may use the remaining retry budget, but the first "
+            "retry has already failed. You may instead reply exactly [SILENT]."
+        )
+    if policy == "stop":
+        return (
+            "SMS failure classification: DO NOT RETRY. The recipient has not "
+            "consented, the destination is invalid or unreachable, or the "
+            "content is unsafe or harmful. Do not resend this message; reply "
+            "exactly [SILENT]."
+        )
+    return (
+        "SMS failure classification: REVIEW BEFORE RETRY. Send one corrected "
+        "SMS only if it is safe, permitted, and likely to deliver. Otherwise "
+        "reply exactly [SILENT]."
+    )
 
 # Inbound plus the outbound delivery lifecycle. text.delivered /
 # imessage.delivered clear the retry budget; the *.delivery_failed events feed
@@ -2902,8 +2998,14 @@ class InkboxGateway:
             return web.json_response({"ok": True, "deduped": True})
         recipient = str(message.get("remote_phone_number") or "").strip()
         body = str(message.get("text") or "").strip()
-        # Prefer the human detail; fall back to the carrier code, then event.
-        reason = str(message.get("error_detail") or message.get("error_code") or "").strip()
+        error_code = str(message.get("error_code") or "").strip()
+        error_detail = str(message.get("error_detail") or "").strip()
+        reason = " ".join(
+            part for part in (
+                f"[{error_code}]" if error_code else "",
+                error_detail,
+            ) if part
+        )
         conversation_id = str(message.get("conversation_id") or message.get("conversationId") or "").strip()
         chat_id = self._chat_key(data, recipient, self._thread_key("sms", conversation_id))
         logger.info("[bridge] SMS delivery failed to %s: %s", recipient, reason or event_type)

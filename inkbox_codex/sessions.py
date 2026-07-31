@@ -149,9 +149,12 @@ def _send_error_reason(exc: Exception) -> str:
     """
     detail = getattr(exc, "detail", None)
     if isinstance(detail, dict):
-        message = detail.get("message") or detail.get("error")
-        if message:
-            return str(message)
+        code = str(detail.get("error") or "").strip()
+        message = str(detail.get("message") or "").strip()
+        if code and message and code != message:
+            return f"[{code}] {message}"
+        if message or code:
+            return message or code
     return str(exc)
 
 
@@ -710,14 +713,11 @@ class ContactSession:
         A synchronous send rejection (carrier spam filter, opt-out, invalid
         recipient) comes back as an API error, not a webhook. Rather than
         surfacing a generic failure, hand the reason back to Codex once so it
-        can rephrase or switch channels. A recovery turn that itself fails is
-        re-raised (the worker logs it) — never retried, so it can't loop.
-
-        When wired with ``on_send_failure`` the rejection is recorded against
-        the gateway's shared per-conversation retry budget (the same one the
-        async delivery-failure webhooks use), and the recovery turn is skipped
-        once that budget is exhausted so the thread goes quiet instead of
-        looping.
+        can rephrase or switch channels. When wired with ``on_send_failure``,
+        every rejected send is recorded against the gateway's shared
+        per-conversation retry budget (the same one the async delivery-failure
+        webhooks use). A failed first recovery can therefore receive the
+        attempt-2 stop-or-retry instruction; the hard cap prevents a loop.
 
         Args:
             turn (_Turn): The turn whose reply is being sent.
@@ -731,8 +731,6 @@ class ContactSession:
         except Exception as exc:
             reason = _send_error_reason(exc)
             logger.warning("[session %s] reply send rejected: %s", self.chat_id, reason)
-            if turn.recovery:
-                raise  # already a recovery attempt — don't spawn another
             if self.on_send_failure is not None:
                 prompt = self.on_send_failure(
                     self.chat_id, self.mode, self.reply_meta, reply, reason
@@ -740,6 +738,8 @@ class ContactSession:
                 if prompt:
                     await self._queue.put(_Turn(text=prompt, recovery=True))
                 return
+            if turn.recovery:
+                raise  # no shared budget is available to cap another attempt
             await self._queue.put(
                 _Turn(text=_send_rejected_prompt(reply, reason), recovery=True)
             )

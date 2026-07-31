@@ -27,6 +27,36 @@ from inkbox_codex.sessions import ContactSession, _Turn
 MAX = gateway.OUTBOUND_FAILURE_MAX_ATTEMPTS
 
 
+@pytest.mark.parametrize(
+    ("attempt", "reason", "required", "forbidden"),
+    [
+        (1, "40002 Temporary spam filter rejection", "FIRST SAFE RETRY REQUIRED", "[SILENT]"),
+        (2, "40002 Temporary spam filter rejection", "RETRY OPTIONAL", "FIRST SAFE RETRY REQUIRED"),
+        (1, "[recipient_opted_out] Provider rejected", "DO NOT RETRY", "FIRST SAFE RETRY REQUIRED"),
+        (2, "[invalid_phone_number] Bad destination", "DO NOT RETRY", "RETRY OPTIONAL"),
+        (1, "Provider rejected the message", "REVIEW BEFORE RETRY", "FIRST SAFE RETRY REQUIRED"),
+        (2, "Provider rejected the message", "REVIEW BEFORE RETRY", "RETRY OPTIONAL"),
+    ],
+)
+def test_delivery_failure_instruction_uses_attempt_and_classification(
+    attempt,
+    reason,
+    required,
+    forbidden,
+):
+    instruction = gateway._delivery_failure_reply_instruction(
+        mode="sms",
+        reason=reason,
+        attempt=attempt,
+    )
+    assert required in instruction
+    assert forbidden not in instruction
+    if "DO NOT RETRY" in required or "REVIEW BEFORE RETRY" in required:
+        assert "[SILENT]" in instruction
+    if required == "RETRY OPTIONAL":
+        assert "[SILENT]" in instruction
+
+
 @pytest.fixture(autouse=True)
 def fake_web(monkeypatch):
     """aiohttp isn't installed in tests; stub the json_response the handlers use."""
@@ -96,7 +126,7 @@ def _sms_fail(text_id="m1", conversation_id="conv-1", remote="+15551234567",
               text="build passed", reason="Message filtered by carrier"):
     return {"data": {"text_message": {
         "id": text_id, "remote_phone_number": remote, "conversation_id": conversation_id,
-        "text": text, "error_detail": reason,
+        "text": text, "error_code": "40002", "error_detail": reason,
     }, "contacts": [{"id": "contact-9"}]}}
 
 
@@ -147,7 +177,8 @@ def test_sync_rejection_wakes_with_rule_and_attempt():
         assert "stage send_rejected" in recovery.text
         assert "Markdown formatting reads as bot traffic in SMS." in recovery.text
         assert "**Jane Doe** is on file." in recovery.text
-        assert "[SILENT]" in recovery.text
+        assert "SMS failure classification: FIRST SAFE RETRY REQUIRED" in recovery.text
+        assert "[SILENT]" not in recovery.text
 
     asyncio.run(scenario())
 
@@ -170,6 +201,37 @@ def test_sync_retry_budget_caps_total_sends():
         assert len(queued) == MAX - 1
         assert "attempt 1/%d" % MAX in queued[0].text
         assert "attempt 2/%d" % MAX in queued[1].text
+        assert "FIRST SAFE RETRY REQUIRED" in queued[0].text
+        assert "[SILENT]" not in queued[0].text
+        assert "RETRY OPTIONAL" in queued[1].text
+        assert "[SILENT]" in queued[1].text
+
+    asyncio.run(scenario())
+
+
+def test_failed_first_recovery_gets_optional_second_instruction_then_caps():
+    async def scenario():
+        gw = _gw()
+        session = _wired_session(gw)
+
+        async def boom(_text):
+            raise _Blocked()
+        session._reply = boom
+
+        await session._deliver_reply(_Turn(text="orig"), "blocked body")
+        first_recovery = session._queue.get_nowait()
+        assert "FIRST SAFE RETRY REQUIRED" in first_recovery.text
+
+        await session._deliver_reply(first_recovery, "first safe rephrase")
+        second_recovery = session._queue.get_nowait()
+        assert "RETRY OPTIONAL" in second_recovery.text
+        assert "[SILENT]" in second_recovery.text
+
+        await session._deliver_reply(second_recovery, "optional final rephrase")
+        assert session._queue.empty()
+        assert max(
+            entry["attempts"] for entry in gw._outbound_failure_state.values()
+        ) == MAX
 
     asyncio.run(scenario())
 
@@ -188,6 +250,8 @@ def test_sync_too_long_reason_flows_through():
 
         recovery = session._queue.get_nowait()
         assert "maximum is %d" % gateway.SMS_MAX_LENGTH in recovery.text
+        assert "SMS failure classification: FIRST SAFE RETRY REQUIRED" in recovery.text
+        assert "[SILENT]" not in recovery.text
 
     asyncio.run(scenario())
 
@@ -223,6 +287,8 @@ def test_carrier_delivery_failed_wakes_agent():
     assert "attempt 1/%d" % MAX in prompt
     assert "Message filtered by carrier" in prompt
     assert "build passed" in prompt
+    assert "SMS failure classification: FIRST SAFE RETRY REQUIRED" in prompt
+    assert "[SILENT]" not in prompt
 
 
 def test_carrier_delivery_failed_replay_is_deduped():
@@ -247,6 +313,10 @@ def test_webhook_budget_caps_total_sends():
     assert len(prompts) == MAX - 1
     assert "attempt 1/%d" % MAX in prompts[0]
     assert "attempt 2/%d" % MAX in prompts[1]
+    assert "FIRST SAFE RETRY REQUIRED" in prompts[0]
+    assert "[SILENT]" not in prompts[0]
+    assert "RETRY OPTIONAL" in prompts[1]
+    assert "[SILENT]" in prompts[1]
 
 
 def test_imessage_delivery_failed_wakes_agent():
