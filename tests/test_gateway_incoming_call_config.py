@@ -168,7 +168,7 @@ def test_a2a_and_imessage_use_channel_coherent_subscriptions():
         gateway_mod.IMESSAGE_EVENTS,
     ]
     assert [created["url"] for created in subscriptions.created] == [
-        "https://agent.inkboxwire.com/webhook?channel=a2a",
+        "https://agent.inkboxwire.com/webhook",
         "https://agent.inkboxwire.com/webhook",
     ]
 
@@ -176,7 +176,7 @@ def test_a2a_and_imessage_use_channel_coherent_subscriptions():
 def test_imessage_reconcile_preserves_existing_a2a_channel_subscription():
     a2a = types.SimpleNamespace(
         id="sub-a2a",
-        url="https://agent.inkboxwire.com/webhook?channel=a2a",
+        url="https://agent.inkboxwire.com/webhook",
         event_types=gateway_mod.A2A_EVENTS,
     )
     subscriptions = _FakeSubscriptions([a2a])
@@ -186,7 +186,11 @@ def test_imessage_reconcile_preserves_existing_a2a_channel_subscription():
     )
 
     assert subscriptions.deleted == []
-    assert subscriptions.created[-1]["event_types"] == gateway_mod.IMESSAGE_EVENTS
+    assert subscriptions.created == [{
+        "agent_identity_id": "identity-1",
+        "url": "https://agent.inkboxwire.com/webhook",
+        "event_types": gateway_mod.IMESSAGE_EVENTS,
+    }]
 
 
 def test_a2a_only_subscription_is_skipped_on_older_api():
