@@ -110,7 +110,7 @@ def test_hosted_completion_fetches_transcript_and_suppresses_plaintext(tmp_path,
         assert prompt.count("Prefers concise release updates.") == 1
         registry = json.loads(gateway._hosted_call_registry_path.read_text())
         assert registry["call-1"]["state"] == "completed"
-        assert registry["call-1"]["payload"]["event_type"] == "call.ended"
+        assert "payload" not in registry["call-1"]
         assert gateway._hosted_call_registry_path.stat().st_mode & 0o777 == 0o600
 
     asyncio.run(scenario())
@@ -152,6 +152,83 @@ def test_hosted_completion_recovers_after_restart_without_redelivery(tmp_path, m
         assert len(restarted_session.prompts) == 1
         registry = json.loads(restarted._hosted_call_registry_path.read_text())
         assert registry["call-1"]["state"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_hosted_completion_registry_bounds_private_replay_data(tmp_path, monkeypatch):
+    async def scenario():
+        gate = asyncio.Event()
+        gateway = _gateway(tmp_path, monkeypatch, _Session(gate=gate))
+        payload = _payload()
+        payload["data"]["contacts"][0]["memories"] = ["private" * 20_000]
+        payload["data"]["transcript"] = {
+            "entries": [{"party": "remote", "text": "secret" * 100_000}],
+        }
+        payload["data"]["post_call_action_items"] = [
+            {
+                "id": f"action-{index}",
+                "action": "a" * 10_000,
+                "details": "d" * 20_000,
+                "status": "open",
+            }
+            for index in range(150)
+        ]
+
+        await gateway._on_hosted_call_ended(payload)
+        await asyncio.sleep(0)
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        replay = entry["payload"]["data"]
+        assert "transcript" not in replay
+        assert "memories" not in replay["contacts"][0]
+        assert len(replay["post_call_action_items"]) == 100
+        assert len(replay["post_call_action_items"][0]["action"]) == 4_000
+        assert len(replay["post_call_action_items"][0]["details"]) == 8_000
+        assert gateway._hosted_call_registry_path.stat().st_mode & 0o777 == 0o600
+
+        gate.set()
+        await _drain(gateway)
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "completed"
+        assert "payload" not in entry
+
+    asyncio.run(scenario())
+
+
+def test_recovery_retries_when_authoritative_transcript_is_unavailable(
+    tmp_path, monkeypatch,
+):
+    class _TranscriptFailureIdentity:
+        def list_transcripts(self, _call_id):
+            raise RuntimeError("transcript endpoint not settled")
+
+    async def scenario():
+        first = _gateway(
+            tmp_path,
+            monkeypatch,
+            _Session(error=RuntimeError("Codex unavailable")),
+        )
+        await first._on_hosted_call_ended(_payload())
+        await _drain(first)
+
+        unsettled_session = _Session()
+        unsettled = _gateway(tmp_path, monkeypatch, unsettled_session)
+        unsettled._inkbox = types.SimpleNamespace(
+            get_identity=lambda _handle: _TranscriptFailureIdentity(),
+        )
+        await unsettled._recover_hosted_call_completions()
+        await _drain(unsettled)
+        entry = json.loads(unsettled._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert unsettled_session.prompts == []
+
+        settled_session = _Session()
+        settled = _gateway(tmp_path, monkeypatch, settled_session)
+        await settled._recover_hosted_call_completions()
+        await _drain(settled)
+        entry = json.loads(settled._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "completed"
+        assert len(settled_session.prompts) == 1
 
     asyncio.run(scenario())
 
