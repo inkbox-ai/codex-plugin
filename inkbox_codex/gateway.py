@@ -831,10 +831,12 @@ class InkboxGateway:
                 "[bridge] Inkbox API does not support A2A webhook events yet; "
                 "continuing without A2A delivery until the backend is upgraded"
             )
-        identity_events = list(CALL_EVENTS)
         if getattr(identity, "imessage_enabled", False):
-            identity_events = [*IMESSAGE_EVENTS, *CALL_EVENTS]
-        _reconcile({"agent_identity_id": identity.id}, identity_events)
+            _reconcile({"agent_identity_id": identity.id}, IMESSAGE_EVENTS)
+        # The SDK and API require each subscription to contain one event
+        # family. Calls and iMessage share an identity owner and URL, but must
+        # remain separate rows.
+        _reconcile({"agent_identity_id": identity.id}, CALL_EVENTS)
         logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
     async def _cleanup(self) -> None:
