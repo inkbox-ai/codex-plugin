@@ -212,7 +212,8 @@ TOOL_SPECS: List[ToolSpec] = [
         "SMS/phone contacts from your dedicated number, and call an iMessage contact "
         "over the shared iMessage line (set `origination` accordingly). The call's "
         "audio bridges to the running gateway. Always pass purpose so the live call "
-        "opens with context; optionally pass opening_message and context.",
+        "opens with context; optionally pass opening_message, context, and "
+        "voicemail_detection (enabled or disabled).",
         _schema(
             {
                 "to_number": _str("E.164 recipient number, e.g. +15551234567."),
@@ -237,6 +238,15 @@ TOOL_SPECS: List[ToolSpec] = [
                 "context": _str("Optional extra background for the live call."),
                 "client_websocket_url": _str("Optional override for the call-media WebSocket URL."),
                 "clientWebsocketUrl": _str("Alias for client_websocket_url."),
+                "voicemail_detection": {
+                    "type": "string",
+                    "enum": ["enabled", "disabled"],
+                    "description": (
+                        "Whether the call should end when voicemail is detected. "
+                        "Omit to keep detection enabled."
+                    ),
+                },
+                "voicemailDetection": _str("Alias for voicemail_detection."),
             },
             ["purpose"],
         ),
@@ -739,6 +749,15 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 raise ValueError(
                     "purpose is required so the live call opens with context"
                 )
+            voicemail_detection = str(
+                args.get("voicemail_detection")
+                or args.get("voicemailDetection")
+                or ""
+            ).strip().lower()
+            if voicemail_detection not in {"", "enabled", "disabled"}:
+                raise ValueError(
+                    "voicemail_detection must be enabled or disabled"
+                )
             identity = _identity()
             # Resolve the outbound line (dedicated number vs shared iMessage line).
             origination = _resolve_call_origination(
@@ -772,13 +791,20 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 to_number=to_number,
             )
             ws_url = _append_query_param(ws_url, "context_token", token)
+            call_kwargs = {
+                "to_number": to_number,
+                "origination": origination,
+                "client_websocket_url": ws_url,
+            }
+            if voicemail_detection:
+                call_kwargs["voicemail_detection"] = voicemail_detection
             try:
-                call = identity.place_call(
-                    to_number=to_number,
-                    origination=origination,
-                    client_websocket_url=ws_url,
-                )
+                call = identity.place_call(**call_kwargs)
             except TypeError:
+                if voicemail_detection:
+                    raise RuntimeError(
+                        "voicemail_detection requires inkbox SDK 0.5.8 or newer"
+                    )
                 # Older SDK without ``origination`` support → dedicated only.
                 call = identity.place_call(
                     to_number=to_number, client_websocket_url=ws_url

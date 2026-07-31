@@ -31,7 +31,7 @@ import pytest
 # to the same number trip the server's duplicate_body rule (422).
 _CALL_ME_REQUEST = (
     "Use the inkbox_place_call tool now to call my phone number from this SMS. "
-    "Do not reply by text."
+    "Set voicemail_detection to disabled. Do not reply by text."
 )
 
 
@@ -211,7 +211,10 @@ def test_inbound_call_inkbox_tts_stt():
 
     # Place the call to the agent, handing Inkbox the driver's own media WS.
     call = remote.calls.place(
-        from_number=st["number"], to_number=aut_phone, client_websocket_url=st["ws_url"],
+        from_number=st["number"],
+        to_number=aut_phone,
+        client_websocket_url=st["ws_url"],
+        voicemail_detection="disabled",
     )
     try:
         agent_said = _wait_for_two_way_call(remote, st["number_id"], call.id)
