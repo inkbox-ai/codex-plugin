@@ -706,11 +706,16 @@ def test_restart_resumes_only_recoverable_sms_correction(tmp_path, monkeypatch):
     async def scenario():
         session = _Session()
         gateway = _gateway(tmp_path, monkeypatch, session)
+        payload = _payload()
+        payload["data"]["post_call_action_items"].append({
+            "status": "open",
+            "action": "Update the release checklist",
+        })
         gateway._write_hosted_call_registry(
             "call-1",
             event_id="event-1",
             state="running",
-            payload=_payload(),
+            payload=payload,
             outcome="completed",
         )
         assert reserve_hosted_sms_attempt(
@@ -724,6 +729,8 @@ def test_restart_resumes_only_recoverable_sms_correction(tmp_path, monkeypatch):
         assert len(session.prompts) == 1
         assert "[hosted_post_call_sms_correction]" in session.prompts[0]
         assert "Review the outcome, transcript" not in session.prompts[0]
+        assert "send me one SMS with the result" in session.prompts[0]
+        assert "Update the release checklist" not in session.prompts[0]
         assert session.hosted_contexts == [{
             "call_id": "call-1",
             "attempt": 2,

@@ -655,14 +655,20 @@ class ContactSession:
             tmp.chmod(0o600)
             os.replace(tmp, a2a_context_path)
             a2a_context_path.chmod(0o600)
-        if turn.hosted_sms_context is not None:
-            hosted_sms_context_path = hosted_sms_turn_context_path(self.chat_id)
-            tmp = hosted_sms_context_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(turn.hosted_sms_context, sort_keys=True) + "\n")
-            tmp.chmod(0o600)
-            os.replace(tmp, hosted_sms_context_path)
-            hosted_sms_context_path.chmod(0o600)
         try:
+            if turn.hosted_sms_context is not None:
+                hosted_sms_context_path = hosted_sms_turn_context_path(self.chat_id)
+                tmp = hosted_sms_context_path.with_suffix(".tmp")
+                try:
+                    tmp.write_text(
+                        json.dumps(turn.hosted_sms_context, sort_keys=True) + "\n"
+                    )
+                    tmp.chmod(0o600)
+                    os.replace(tmp, hosted_sms_context_path)
+                    hosted_sms_context_path.chmod(0o600)
+                except Exception:
+                    tmp.unlink(missing_ok=True)
+                    raise
             client = await self._ensure_client()
             # Keep a typing indicator alive on the human's channel for the whole
             # turn, then always tear it down — even if the turn raises.
