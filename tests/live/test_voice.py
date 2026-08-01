@@ -284,6 +284,7 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     aut_numbers = aut.phone_numbers.list()
     assert aut_numbers, "AUT identity has no phone number"
     aut_phone = aut_numbers[0].number
+    aut_number_id = str(aut_numbers[0].id)
     aut_tail = _digits(aut_phone)[-10:]
     driver_tail = _digits(st["number"])[-10:]
 
@@ -301,17 +302,17 @@ def test_outbound_call_voice_ai_and_post_call_completion():
             and _digits(getattr(call, "remote_phone_number", "") or "")[-10:] == driver_tail
         ]
 
-    def driver_inbound_sms():
+    def aut_outbound_sms():
         return [
-            message for message in remote.texts.list(st["number_id"], limit=200)
-            if (getattr(message, "direction", "") or "").lower() == "inbound"
-            and _digits(getattr(message, "remote_phone_number", "") or "")[-10:] == aut_tail
+            message for message in aut.texts.list(aut_number_id, limit=200)
+            if (getattr(message, "direction", "") or "").lower() == "outbound"
+            and _digits(getattr(message, "remote_phone_number", "") or "")[-10:] == driver_tail
         ]
 
     assert HOSTED_POST_CALL_MARKER
     before_driver = {call.id for call in driver_calls()}
     before_aut = {call.id for call in aut_calls()}
-    before_sms = {message.id for message in driver_inbound_sms()}
+    before_sms = {message.id for message in aut_outbound_sms()}
     remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
 
     driver_call_id = None
@@ -341,7 +342,7 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     delivered = []
     while time.monotonic() < deadline:
         delivered = [
-            message for message in driver_inbound_sms()
+            message for message in aut_outbound_sms()
             if message.id not in before_sms
             and HOSTED_POST_CALL_MARKER in (getattr(message, "text", "") or "")
         ]
@@ -351,10 +352,11 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     assert delivered, "Codex did not execute the Voice AI post-call commitment"
     time.sleep(2 * POLL_EVERY_S)
     new_sms = [
-        message for message in driver_inbound_sms()
+        message for message in aut_outbound_sms()
         if message.id not in before_sms
     ]
     assert len(new_sms) == 1, (
         "post-call processing leaked model prose or duplicated the commitment: "
         f"{[getattr(message, 'text', '') for message in new_sms]}"
     )
+    assert HOSTED_POST_CALL_MARKER in (getattr(new_sms[0], "text", "") or "")
