@@ -107,7 +107,10 @@ def test_hosted_completion_fetches_transcript_and_suppresses_plaintext(tmp_path,
         assert "+19999999999" not in prompt
         assert "inkbox_send_sms" in prompt
         assert "`to` set to that exact remote number" in prompt
-        assert "Do not finish until each required tool reports success" in prompt
+        assert "Every safe, still-needed commitment must be attempted" in prompt
+        assert "Mark it complete only after the required tool reports success" in prompt
+        assert "After a terminal error or a failed second attempt" in prompt
+        assert "stop without claiming success or duplicating the send" in prompt
         assert "Please text me the result." in prompt
         assert "Send the requested release update" in prompt
         assert "Prefers concise release updates." in prompt

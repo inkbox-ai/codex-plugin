@@ -289,8 +289,11 @@ def _hosted_call_ended_prompt(
         "Review the outcome, transcript, and open actions in one pass. Execute "
         "every still-needed commitment with your tools. Do not repeat work already "
         "completed, canceled, superseded, or performed during the call.",
-        "Do not finish until each required tool reports success. If a tool rejects "
-        "a recoverable argument or format mistake, correct it and try once more.",
+        "Every safe, still-needed commitment must be attempted. Mark it complete "
+        "only after the required tool reports success. If the first tool call "
+        "rejects a recoverable argument or format mistake, correct it and try once "
+        "more. After a terminal error or a failed second attempt, stop without "
+        "claiming success or duplicating the send.",
         "Any plain-text reply is discarded because the call has ended; side "
         "effects must come from tool calls. If nothing remains, stop.",
     ])
