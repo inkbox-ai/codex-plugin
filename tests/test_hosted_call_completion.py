@@ -7,7 +7,10 @@ from inkbox_codex import gateway as gateway_module
 from inkbox_codex.codex_client import CodexTurnResult, McpToolCallResult
 from inkbox_codex.config import BridgeConfig
 from inkbox_codex.gateway import InkboxGateway
-from inkbox_codex.hosted_sms_guard import reserve_hosted_sms_attempt
+from inkbox_codex.hosted_sms_guard import (
+    reserve_hosted_sms_attempt,
+    settle_hosted_sms_attempt,
+)
 
 
 class _Identity:
@@ -243,6 +246,7 @@ def test_hosted_sms_failed_twice_stays_terminally_failed(tmp_path, monkeypatch):
         entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
         assert entry["state"] == "failed"
         assert entry["retryable"] is False
+        assert "payload" not in entry
 
         restarted = _gateway(tmp_path, monkeypatch, _Session())
         await restarted._recover_hosted_call_completions()
@@ -264,6 +268,7 @@ def test_hosted_sms_turn_exception_is_terminal_and_not_replayed(
         entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
         assert entry["state"] == "failed"
         assert entry["retryable"] is False
+        assert "payload" not in entry
 
         restarted_session = _Session()
         restarted = _gateway(tmp_path, monkeypatch, restarted_session)
@@ -554,6 +559,12 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
         [],
         [("remote", "Don't text me now; after this call ends, text me the code.")],
     )
+    assert gateway_module._hosted_requires_sms(
+        [], [("remote", "After this call ends; text me release-ready.")]
+    )
+    assert gateway_module._hosted_requires_sms(
+        [], [("remote", "Text me release-ready. Do it once this call is over.")]
+    )
     assert not gateway_module._hosted_requires_sms(
         [],
         [
@@ -687,6 +698,40 @@ def test_hosted_reserved_sms_attempt_is_not_replayed_after_restart(
         )["call-1"]
         assert entry["state"] == "failed"
         assert entry["retryable"] is False
+
+    asyncio.run(scenario())
+
+
+def test_restart_resumes_only_recoverable_sms_correction(tmp_path, monkeypatch):
+    async def scenario():
+        session = _Session()
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        gateway._write_hosted_call_registry(
+            "call-1",
+            event_id="event-1",
+            state="running",
+            payload=_payload(),
+            outcome="completed",
+        )
+        assert reserve_hosted_sms_attempt(
+            "call-1", 1, "+15167251294"
+        ) is True
+        settle_hosted_sms_attempt("call-1", 1, "recoverable")
+
+        await gateway._recover_hosted_call_completions()
+        await _drain(gateway)
+
+        assert len(session.prompts) == 1
+        assert "[hosted_post_call_sms_correction]" in session.prompts[0]
+        assert "Review the outcome, transcript" not in session.prompts[0]
+        assert session.hosted_contexts == [{
+            "call_id": "call-1",
+            "attempt": 2,
+            "remote_phone": "+15167251294",
+        }]
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "completed"
+        assert "payload" not in entry
 
     asyncio.run(scenario())
 
