@@ -163,6 +163,28 @@ def _wait_for_two_way_call(remote, number_id, call_id, agent_turns=1):
     pytest.fail(f"agent never held a two-way call within {TIMEOUT_S:.0f}s ({last})")
 
 
+def _wait_for_local_transcript_text(remote, number_id, call_id, *needles):
+    """Wait until the caller's persisted transcript contains every phrase."""
+    expected = tuple(needle.casefold() for needle in needles if needle)
+    assert expected
+    deadline = time.monotonic() + TIMEOUT_S
+    last = ""
+    while time.monotonic() < deadline:
+        try:
+            _all, _rem, loc = _segments(remote, number_id, call_id)
+            text = " ".join(segment.text.strip() for segment in loc).casefold()
+            if all(needle in text for needle in expected):
+                return
+            last = f"local transcript so far: {text!r}"
+        except Exception as exc:  # transcripts may 404 until the call is set up
+            last = f"transcripts not ready: {exc!r}"
+        time.sleep(POLL_EVERY_S)
+    pytest.fail(
+        "call ended before the scripted caller instruction was persisted "
+        f"({last})"
+    )
+
+
 def _gateway_log_text() -> str:
     try:
         with open(GATEWAY_LOG) as fh:
@@ -283,6 +305,7 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     aut_numbers = aut.phone_numbers.list()
     assert aut_numbers, "AUT identity has no phone number"
     aut_phone = aut_numbers[0].number
+    aut_number_id = aut_numbers[0].id
     aut_tail = _digits(aut_phone)[-10:]
     driver_tail = _digits(st["number"])[-10:]
 
@@ -300,9 +323,19 @@ def test_outbound_call_voice_ai_and_post_call_completion():
             and _digits(getattr(call, "remote_phone_number", "") or "")[-10:] == driver_tail
         ]
 
+    def aut_outbound_sms():
+        return [
+            message for message in aut.texts.list(aut_number_id, limit=200)
+            if (getattr(message, "direction", "") or "").lower() == "outbound"
+            and _digits(
+                getattr(message, "remote_phone_number", "") or ""
+            )[-10:] == driver_tail
+        ]
+
     assert HOSTED_POST_CALL_MARKER
     before_driver = {call.id for call in driver_calls()}
     before_aut = {call.id for call in aut_calls()}
+    before_sms = {message.id for message in aut_outbound_sms()}
     remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
 
     driver_call_id = None
@@ -325,6 +358,17 @@ def test_outbound_call_voice_ai_and_post_call_completion():
         assert getattr(aut_call, "reason", None)
         assert getattr(aut_call, "hosted_agent_authority_mode", None) is not None
         _wait_for_two_way_call(remote, st["number_id"], driver_call_id, agent_turns=2)
+        # The initial "Hello?" is itself a local transcript row. Do not let
+        # that row plus two quick agent greetings satisfy the conversation
+        # gate before the driver's actual post-call commitment is persisted.
+        _wait_for_local_transcript_text(
+            remote,
+            st["number_id"],
+            driver_call_id,
+            "after we hang up",
+            "send me one sms",
+            HOSTED_POST_CALL_MARKER,
+        )
     finally:
         _hangup_call(remote, driver_call_id)
 
@@ -334,17 +378,34 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     # inbox rows. The reconciliation log is emitted only after the captured
     # tool result passes the one-call, exact-target and `sent: true` checks.
     completion = f"hosted post-call reconciliation completed: {aut_call.id}"
-    sms_approval = 'tool "inkbox_send_sms"'
     deadline = time.monotonic() + 90
+    sent = []
     while time.monotonic() < deadline:
         gateway_log = _gateway_log_text()
-        if completion in gateway_log:
+        sent = [
+            message for message in aut_outbound_sms()
+            if message.id not in before_sms
+            and (getattr(message, "text", "") or "").strip()
+            == HOSTED_POST_CALL_MARKER
+        ]
+        if completion in gateway_log and sent:
             break
         time.sleep(3)
     gateway_log = _gateway_log_text()
     assert completion in gateway_log, (
         "Codex did not settle the Voice AI post-call commitment"
     )
-    assert gateway_log.count(sms_approval) == 1, (
-        "post-call processing did not execute exactly one SMS tool call"
+    # Approval-elicitation logs are an implementation detail: a pre-approved
+    # MCP tool may execute without emitting one. The sender-side message rows
+    # are the authoritative record of the accepted side effect.
+    time.sleep(2 * POLL_EVERY_S)
+    sent = [
+        message for message in aut_outbound_sms()
+        if message.id not in before_sms
+        and (getattr(message, "text", "") or "").strip()
+        == HOSTED_POST_CALL_MARKER
+    ]
+    assert len(sent) == 1, (
+        "post-call processing did not send exactly one marker SMS to the "
+        f"authoritative caller: {[getattr(message, 'text', '') for message in sent]}"
     )
