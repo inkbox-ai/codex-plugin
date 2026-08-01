@@ -105,7 +105,11 @@ def test_mcp_failed_item_reduces_raw_error_to_recoverable_kind():
     [
         ("message_blocked_spam_filter", "emoji_overload", 422, "recoverable"),
         ("message_blocked_spam_filter", "profanity", 422, "recoverable"),
-        ("carrier_unavailable", "", 502, "recoverable"),
+        ("carrier_unavailable", "", 502, "terminal"),
+        ("carrier_rate_limit", "", 429, "terminal"),
+        ("inkbox_duplicate_body", "", 422, "terminal"),
+        ("request_timeout", "", 408, "terminal"),
+        ("upstream_failure", "", 503, "terminal"),
         ("recipient_opted_out", "", 403, "terminal"),
         ("invalid_phone_number", "", 422, "terminal"),
     ],

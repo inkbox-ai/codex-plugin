@@ -19,6 +19,11 @@ _TERMINAL_CODES = frozenset({
     "unauthorized",
     "forbidden",
     "insufficient_authority",
+    "carrier_rate_limit",
+    "carrier_unavailable",
+    "carrier_temporarily_unavailable",
+    "inkbox_duplicate_body",
+    "inkbox_carrier_backoff",
 })
 _RECOVERABLE_CODES = frozenset({
     "sms_too_long",
@@ -27,13 +32,8 @@ _RECOVERABLE_CODES = frozenset({
     "content_flagged_as_spam",
     "content_rejected_by_carrier",
     "content_blocked_by_policy",
-    "carrier_rate_limit",
-    "carrier_unavailable",
-    "carrier_temporarily_unavailable",
-    "inkbox_duplicate_body",
-    "inkbox_carrier_backoff",
 })
-_TRANSIENT_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_COMMIT_AMBIGUOUS_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _TERMINAL_MARKERS = (
     "opted out",
     "opt-out",
@@ -52,26 +52,30 @@ _TERMINAL_MARKERS = (
     "harassment",
     "threatening",
     "illegal content",
+    "duplicate_body",
+    "carrier_backoff",
+    "carrier_unavailable",
+    "carrier temporarily unavailable",
+    "rate limit",
+    "timed out",
+    "timeout",
 )
 _RECOVERABLE_MARKERS = (
     "invalid argument",
     "invalid params",
-    "argument",
-    "required",
-    "missing",
+    "required property",
+    "missing required",
     "schema",
     "format",
     "e.164",
     "maximum is",
     "too long",
     "must be",
-    "specify",
-    "spam",
-    "content",
-    "markdown",
-    "emoji",
-    "profanity",
-    "temporar",
+    "specify exactly one",
+    "message_blocked_spam_filter",
+    "content_flagged_as_spam",
+    "content_rejected_by_carrier",
+    "content_blocked_by_policy",
 )
 
 
@@ -94,11 +98,14 @@ def sms_tool_failure_kind(
     except (TypeError, ValueError):
         status = None
 
-    if code in _TERMINAL_CODES or any(marker in detail for marker in _TERMINAL_MARKERS):
+    if (
+        code in _TERMINAL_CODES
+        or status in _COMMIT_AMBIGUOUS_STATUSES
+        or any(marker in detail for marker in _TERMINAL_MARKERS)
+    ):
         return "terminal"
     if (
         code in _RECOVERABLE_CODES
-        or status in _TRANSIENT_STATUSES
         or any(marker in detail for marker in _RECOVERABLE_MARKERS)
     ):
         return "recoverable"
