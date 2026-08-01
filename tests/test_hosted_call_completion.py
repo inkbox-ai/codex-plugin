@@ -105,6 +105,9 @@ def test_hosted_completion_fetches_transcript_and_suppresses_plaintext(tmp_path,
         prompt = session.prompts[0]
         assert "+15167251294" in prompt
         assert "+19999999999" not in prompt
+        assert "inkbox_send_sms" in prompt
+        assert "`to` set to that exact remote number" in prompt
+        assert "Do not finish until each required tool reports success" in prompt
         assert "Please text me the result." in prompt
         assert "Send the requested release update" in prompt
         assert "Prefers concise release updates." in prompt

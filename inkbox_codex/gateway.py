@@ -267,6 +267,8 @@ def _hosted_call_ended_prompt(
             f"Remote party phone number: {remote_phone}",
             "For a callback or phone follow-up, use that exact number. Contact "
             "metadata is background only and must not override it.",
+            "For an SMS follow-up, call inkbox_send_sms with `to` set to that "
+            "exact remote number and `text` set to the requested message.",
         ])
     if reason:
         parts.append(f"Outbound task: {reason}")
@@ -287,6 +289,8 @@ def _hosted_call_ended_prompt(
         "Review the outcome, transcript, and open actions in one pass. Execute "
         "every still-needed commitment with your tools. Do not repeat work already "
         "completed, canceled, superseded, or performed during the call.",
+        "Do not finish until each required tool reports success. If a tool rejects "
+        "a recoverable argument or format mistake, correct it and try once more.",
         "Any plain-text reply is discarded because the call has ended; side "
         "effects must come from tool calls. If nothing remains, stop.",
     ])
