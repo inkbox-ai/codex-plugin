@@ -322,25 +322,25 @@ def _hosted_sms_settlement(
     remote_phone: str,
 ) -> str:
     """Classify a required SMS as success, recoverable, missing, or terminal."""
+    if result.aborted:
+        return "aborted"
     calls = [
         call for call in result.mcp_tool_calls
         if call.server.lower() == "inkbox" and call.tool == "inkbox_send_sms"
     ]
-    completed = [call for call in calls if call.status == "completed"]
-    if completed:
-        if len(completed) != 1:
-            return "terminal"
-        call = completed[0]
+    if not calls:
+        return "missing"
+    if len(calls) != 1:
+        return "terminal"
+    call = calls[0]
+    if call.status == "completed":
         target = str(call.arguments.get("to") or "").strip()
         if target != remote_phone or not call.sent:
             # A completed call may already have produced an external side
             # effect. Never retry an ambiguous, duplicate, or wrong-target send.
             return "terminal"
         return "success"
-    failed = [call for call in calls if call.status == "failed"]
-    if not calls:
-        return "missing"
-    if failed and all(call.error_kind == "recoverable" for call in failed):
+    if call.status == "failed" and call.error_kind == "recoverable":
         return "recoverable"
     return "terminal"
 

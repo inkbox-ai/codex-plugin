@@ -538,7 +538,14 @@ class ContactSession:
             except asyncio.QueueEmpty:
                 break
             if turn.future is not None and not turn.future.done():
-                turn.future.set_result("")
+                if turn.capture_tools:
+                    turn.future.set_result(CodexTurnResult(
+                        text="",
+                        mcp_tool_calls=(),
+                        aborted=True,
+                    ))
+                else:
+                    turn.future.set_result("")
 
     async def _begin_resume(self) -> None:
         """List recent sessions and let the human pick one to reopen.
@@ -679,7 +686,14 @@ class ContactSession:
             # A capture turn must always settle its waiter — surface the error
             # there. A normal turn re-raises so _drain shows the human a notice.
             if turn.future is not None and not turn.future.done():
-                turn.future.set_exception(exc)
+                if turn.capture_tools and self._interrupting:
+                    turn.future.set_result(CodexTurnResult(
+                        text="",
+                        mcp_tool_calls=(),
+                        aborted=True,
+                    ))
+                else:
+                    turn.future.set_exception(exc)
                 return
             raise
         finally:
@@ -708,7 +722,11 @@ class ContactSession:
         if turn.future is not None:
             if not turn.future.done():
                 if turn.capture_tools:
-                    turn.future.set_result(turn_result)
+                    turn.future.set_result(CodexTurnResult(
+                        text=turn_result.text,
+                        mcp_tool_calls=turn_result.mcp_tool_calls,
+                        aborted=self._interrupting or turn_result.aborted,
+                    ))
                 else:
                     turn.future.set_result(
                         reply or "I finished that, but didn't have anything to say back."

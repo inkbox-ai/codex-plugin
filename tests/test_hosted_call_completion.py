@@ -3,8 +3,8 @@ import json
 import os
 import types
 
-from inkbox_codex.config import BridgeConfig
 from inkbox_codex.codex_client import CodexTurnResult, McpToolCallResult
+from inkbox_codex.config import BridgeConfig
 from inkbox_codex.gateway import InkboxGateway
 
 
@@ -23,6 +23,7 @@ def _sms_result(
     to="+15167251294",
     sent=True,
     error_kind="unknown",
+    aborted=False,
 ):
     return CodexTurnResult(
         text="This plaintext must not be delivered.",
@@ -34,6 +35,7 @@ def _sms_result(
             sent=sent,
             error_kind=error_kind,
         ),),
+        aborted=aborted,
     )
 
 
@@ -287,6 +289,82 @@ def test_hosted_sms_duplicate_completed_side_effects_are_not_retried(tmp_path, m
         await _drain(gateway)
 
         assert len(session.prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_failure_then_success_in_one_turn_is_terminal(tmp_path, monkeypatch):
+    async def scenario():
+        mixed = CodexTurnResult(
+            text="",
+            mcp_tool_calls=(
+                _sms_result(
+                    status="failed",
+                    sent=False,
+                    error_kind="recoverable",
+                ).mcp_tool_calls[0],
+                _sms_result().mcp_tool_calls[0],
+            ),
+        )
+        session = _Session(results=[mixed])
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(session.prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_aborted_capture_is_terminal_without_replay(tmp_path, monkeypatch):
+    async def scenario():
+        session = _Session(results=[_sms_result(aborted=True)])
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(session.prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+        restarted_session = _Session()
+        restarted = _gateway(tmp_path, monkeypatch, restarted_session)
+        await restarted._recover_hosted_call_completions()
+        assert restarted._hosted_call_jobs == {}
+        assert restarted_session.prompts == []
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_correction_requires_one_clean_success(tmp_path, monkeypatch):
+    async def scenario():
+        mixed = CodexTurnResult(
+            text="",
+            mcp_tool_calls=(
+                _sms_result().mcp_tool_calls[0],
+                _sms_result(
+                    status="failed",
+                    sent=False,
+                    error_kind="recoverable",
+                ).mcp_tool_calls[0],
+            ),
+        )
+        session = _Session(results=[
+            _sms_result(status="failed", sent=False, error_kind="recoverable"),
+            mixed,
+        ])
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(session.prompts) == 2
         entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
         assert entry["state"] == "failed"
         assert entry["retryable"] is False

@@ -11,8 +11,10 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 try:
     from .config import BridgeConfig
+    from .delivery_policy import sms_tool_failure_kind
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import BridgeConfig
+    from delivery_policy import sms_tool_failure_kind
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,7 @@ class CodexTurnResult:
 
     text: str
     mcp_tool_calls: tuple[McpToolCallResult, ...]
+    aborted: bool = False
 
 
 class CodexAppServerClient:
@@ -369,10 +372,23 @@ def _mcp_tool_call_result(item: Dict[str, Any]) -> McpToolCallResult:
     result = item.get("result")
     sent = False
     error_fragments: list[str] = []
+    error_code: Any = None
+    error_rule: Any = None
+    status_code: Any = None
+
+    def capture_error_metadata(payload: Dict[str, Any]) -> None:
+        nonlocal error_code, error_rule, status_code
+        error_code = payload.get("error_code") or payload.get("code") or error_code
+        error_rule = payload.get("rule") or error_rule
+        status_code = payload.get("status_code") or status_code
+        if payload.get("error"):
+            error_fragments.append(str(payload["error"]))
+
     if isinstance(result, dict):
         structured = result.get("structuredContent") or result.get("structured_content")
         if isinstance(structured, dict):
             sent = structured.get("sent") is True
+            capture_error_metadata(structured)
         content = result.get("content")
         for block in content if isinstance(content, list) else []:
             if not isinstance(block, dict):
@@ -384,8 +400,7 @@ def _mcp_tool_call_result(item: Dict[str, Any]) -> McpToolCallResult:
                 payload = None
             if isinstance(payload, dict):
                 sent = sent or payload.get("sent") is True
-                if payload.get("error"):
-                    error_fragments.append(str(payload["error"]))
+                capture_error_metadata(payload)
 
     error = item.get("error")
     if isinstance(error, dict) and error.get("message"):
@@ -405,42 +420,10 @@ def _mcp_tool_call_result(item: Dict[str, Any]) -> McpToolCallResult:
         status=str(item.get("status") or ""),
         arguments=safe_arguments,
         sent=sent,
-        error_kind=_mcp_error_kind(" ".join(error_fragments)),
+        error_kind=sms_tool_failure_kind(
+            error_code=error_code,
+            rule=error_rule,
+            status_code=status_code,
+            message=" ".join(error_fragments),
+        ),
     )
-
-
-def _mcp_error_kind(message: str) -> str:
-    """Classify an MCP failure while discarding its potentially sensitive text."""
-    normalized = " ".join(str(message or "").lower().split())
-    if not normalized:
-        return "unknown"
-    terminal = (
-        "opted out",
-        "unsubscribe",
-        "not authorized",
-        "unauthorized",
-        "forbidden",
-        "blocked recipient",
-        "invalid phone number",
-        "invalid recipient",
-        "recipient unavailable",
-    )
-    if any(marker in normalized for marker in terminal):
-        return "terminal"
-    recoverable = (
-        "invalid argument",
-        "invalid params",
-        "argument",
-        "required",
-        "missing",
-        "schema",
-        "format",
-        "e.164",
-        "maximum is",
-        "too long",
-        "must be",
-        "specify",
-    )
-    if any(marker in normalized for marker in recoverable):
-        return "recoverable"
-    return "unknown"

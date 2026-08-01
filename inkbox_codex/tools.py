@@ -29,6 +29,11 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from media import file_to_email_attachment
 
 try:
+    from .a2a_delegations import (
+        find_by_task,
+        promote_after_send,
+        record_before_send,
+    )
     from .config import (
         INKBOX_WS_PATH,
         VoiceStack,
@@ -37,12 +42,12 @@ try:
         channel_hints_path,
         read_config,
     )
-    from .a2a_delegations import (
+except ImportError:  # pragma: no cover - direct local import/test fallback
+    from a2a_delegations import (
         find_by_task,
         promote_after_send,
         record_before_send,
     )
-except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import (
         INKBOX_WS_PATH,
         VoiceStack,
@@ -50,11 +55,6 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
         call_contexts_dir,
         channel_hints_path,
         read_config,
-    )
-    from a2a_delegations import (
-        find_by_task,
-        promote_after_send,
-        record_before_send,
     )
 
 
@@ -508,6 +508,23 @@ def _tool_error(message: str, **fields: Any) -> Dict[str, Any]:
         ],
         "isError": True,
     }
+
+
+def _tool_exception_fields(exc: Exception) -> Dict[str, Any]:
+    """Project canonical SDK failure metadata without duplicating raw payloads."""
+    fields: Dict[str, Any] = {}
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        fields["status_code"] = status
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict):
+        code = detail.get("error") or detail.get("error_code") or detail.get("code")
+        rule = detail.get("rule")
+        if code:
+            fields["error_code"] = str(code)
+        if rule:
+            fields["rule"] = str(rule)
+    return fields
 
 
 def _message_too_long_reason(channel: str, content: str, max_chars: int) -> str:
@@ -1099,7 +1116,7 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
     try:
         return _tool_result(await asyncio.to_thread(_run))
     except Exception as exc:
-        return _tool_error(str(exc))
+        return _tool_error(str(exc), **_tool_exception_fields(exc))
 
 
 def _place_call_tool_entry(voice_stack: VoiceStack) -> Dict[str, Any]:

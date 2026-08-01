@@ -489,6 +489,35 @@ def test_send_sms_rejects_text_over_limit():
     assert client.identity.sent_texts == []
 
 
+def test_send_sms_projects_structured_sdk_failure_metadata():
+    client = _FakeClient()
+
+    class Rejected(Exception):
+        def __init__(self):
+            super().__init__("private provider response")
+            self.status_code = 422
+            self.detail = {
+                "error": "message_blocked_spam_filter",
+                "rule": "emoji_overload",
+                "provider_id": "private-provider-id",
+            }
+
+    def reject(**_kwargs):
+        raise Rejected()
+
+    client.identity.send_text = reject
+    data = _call(
+        client,
+        "inkbox_send_sms",
+        {"to": "+15551112222", "text": "release update"},
+    )
+
+    assert data["error_code"] == "message_blocked_spam_filter"
+    assert data["rule"] == "emoji_overload"
+    assert data["status_code"] == 422
+    assert "provider_id" not in data
+
+
 def test_send_imessage_rejects_text_over_limit():
     client = _FakeClient()
     data = _call(
