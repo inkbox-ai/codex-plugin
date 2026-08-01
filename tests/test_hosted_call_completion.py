@@ -3,6 +3,7 @@ import json
 import os
 import types
 
+from inkbox_codex import gateway as gateway_module
 from inkbox_codex.codex_client import CodexTurnResult, McpToolCallResult
 from inkbox_codex.config import BridgeConfig
 from inkbox_codex.gateway import InkboxGateway
@@ -372,10 +373,97 @@ def test_hosted_sms_correction_requires_one_clean_success(tmp_path, monkeypatch)
     asyncio.run(scenario())
 
 
+def test_hosted_transcript_sms_commitment_requires_settlement(tmp_path, monkeypatch):
+    async def scenario():
+        empty = CodexTurnResult(text="", mcp_tool_calls=())
+        session = _Session(results=[empty, _sms_result()])
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        payload = _payload()
+        payload["data"]["post_call_action_items"] = []
+
+        await gateway._on_hosted_call_ended(payload)
+        await _drain(gateway)
+
+        assert len(session.prompts) == 2
+        assert "tool was not called" in session.prompts[1]
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_hosted_transcript_generic_text_references_do_not_require_sms(
+    tmp_path, monkeypatch,
+):
+    class _ReferenceOnlyIdentity:
+        def list_transcripts(self, _call_id):
+            return [
+                types.SimpleNamespace(party="remote", text="I got your text yesterday."),
+                types.SimpleNamespace(
+                    party="remote", text="Can you see my earlier SMS messages?",
+                ),
+                types.SimpleNamespace(
+                    party="local", text="We discussed texting during the call.",
+                ),
+            ]
+
+    async def scenario():
+        session = _Session()
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        gateway._inkbox = types.SimpleNamespace(
+            get_identity=lambda _handle: _ReferenceOnlyIdentity(),
+        )
+        payload = _payload()
+        payload["data"]["post_call_action_items"] = []
+
+        await gateway._on_hosted_call_ended(payload)
+        await _drain(gateway)
+
+        assert len(session.prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_hosted_transcript_sms_commitment_classifier_is_narrow():
+    assert gateway_module._hosted_requires_sms(
+        [], [("remote", "After we hang up, text Alex with the release status.")]
+    )
+    assert gateway_module._hosted_requires_sms(
+        [], [("remote", "Could you text her the confirmation?")]
+    )
+    assert gateway_module._hosted_requires_sms(
+        [], [("remote", "Please text Alex the confirmation.")]
+    )
+    assert gateway_module._hosted_requires_sms(
+        [], [("local", "I'll text you the final result.")]
+    )
+    assert not gateway_module._hosted_requires_sms(
+        [],
+        [
+            ("remote", "I got your text yesterday."),
+            ("remote", "Can you see my earlier SMS messages?"),
+            ("local", "We discussed texting during the call."),
+            ("local", "I will send her the confirmation."),
+            ("remote", "After we hang up, send me the summary."),
+        ],
+    )
+
+
 def test_hosted_non_sms_action_does_not_require_sms_tool(tmp_path, monkeypatch):
     async def scenario():
         session = _Session()
         gateway = _gateway(tmp_path, monkeypatch, session)
+        gateway._inkbox = types.SimpleNamespace(
+            get_identity=lambda _handle: types.SimpleNamespace(
+                list_transcripts=lambda _call_id: [
+                    types.SimpleNamespace(
+                        party="remote", text="Please update the release checklist.",
+                    ),
+                ],
+            ),
+        )
         payload = _payload()
         payload["data"]["post_call_action_items"] = [{
             "status": "open",
