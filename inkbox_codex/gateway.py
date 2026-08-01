@@ -319,6 +319,11 @@ _TRANSCRIPT_TEXT_CLAUSE_PREFIX = (
     r"(?:i|we)\s*(?:will|'ll|’ll|am\s+going\s+to|are\s+going\s+to))\s+)"
 )
 _TRANSCRIPT_SEND_SMS = r"send\b.{0,80}\b(?:an?\s+)?(?:sms|text\s+message)\b"
+_TRANSCRIPT_NEGATED_SMS_ACTION = re.compile(
+    r"\b(?:do\s+not|don['’]?t|never)\s+(?:(?:ever|again)\s+)?"
+    r"(?:text\b|send\b.{0,80}\b(?:sms|text\s+message)\b)",
+    re.IGNORECASE,
+)
 _TRANSCRIPT_SMS_COMMITMENT_PATTERNS = (
     re.compile(
         rf"\b{_TRANSCRIPT_POST_CALL_TIMING}\b[\s,;:!—-]*"
@@ -355,7 +360,8 @@ def _transcript_requires_sms_commitment(transcript: Any) -> bool:
         if text:
             turns.append(text)
     return any(
-        pattern.search(turn)
+        not _TRANSCRIPT_NEGATED_SMS_ACTION.search(turn)
+        and pattern.search(turn)
         for turn in turns
         for pattern in _TRANSCRIPT_SMS_COMMITMENT_PATTERNS
     )
@@ -365,15 +371,20 @@ def _hosted_requires_sms(
     actions: List[Dict[str, Any]], transcript: Any = None,
 ) -> bool:
     """Return true for an open SMS action or explicit transcript commitment."""
-    text = " ".join(
-        str(action.get(field) or "")
+    open_action_texts = (
+        " ".join(
+            str(action.get(field) or "")
+            for field in ("action", "description", "details")
+        )
         for action in actions
         if str(action.get("status") or "open").strip().lower() == "open"
-        for field in ("action", "description", "details")
-    ).lower()
-    return bool(re.search(r"\b(?:sms|text|texted|texting)\b", text)) or (
-        _transcript_requires_sms_commitment(transcript)
     )
+    action_requires_sms = any(
+        re.search(r"\b(?:sms|text|texted|texting)\b", text, re.IGNORECASE)
+        and not _TRANSCRIPT_NEGATED_SMS_ACTION.search(text)
+        for text in open_action_texts
+    )
+    return action_requires_sms or _transcript_requires_sms_commitment(transcript)
 
 
 def _hosted_sms_settlement(
@@ -1573,6 +1584,7 @@ class InkboxGateway:
             payload=envelope,
             outcome=outcome,
         )
+        required_sms_turn_started = False
         try:
             remote_phone = str(call.get("remote_phone_number") or "").strip()
             contact = await self._resolve_call_contact(call, remote_phone)
@@ -1657,6 +1669,10 @@ class InkboxGateway:
                 raise RuntimeError("session manager is not ready")
             session = self.sessions.get(chat_id)
             if remote_phone and _hosted_requires_sms(actions, transcript):
+                # Once this capture turn starts, an exception is
+                # commit-ambiguous: the app server may have completed a tool
+                # call before the failed turn returned its detailed result.
+                required_sms_turn_started = True
                 result = await session.run_consult_detailed(prompt)
                 settlement = _hosted_sms_settlement(result, remote_phone)
                 if settlement in {"missing", "recoverable"}:
@@ -1680,6 +1696,15 @@ class InkboxGateway:
             )
             logger.info("[bridge] hosted post-call reconciliation completed: %s", call_id)
         except asyncio.CancelledError:
+            if required_sms_turn_started:
+                self._write_hosted_call_registry(
+                    call_id,
+                    event_id=event_id,
+                    state="failed",
+                    payload=envelope,
+                    outcome=outcome,
+                    retryable=False,
+                )
             raise
         except Exception as exc:
             self._write_hosted_call_registry(
@@ -1688,7 +1713,10 @@ class InkboxGateway:
                 state="failed",
                 payload=envelope,
                 outcome=outcome,
-                retryable=not isinstance(exc, _HostedToolSettlementError),
+                retryable=(
+                    not required_sms_turn_started
+                    and not isinstance(exc, _HostedToolSettlementError)
+                ),
             )
             logger.exception("[bridge] hosted post-call reconciliation failed: %s", call_id)
 

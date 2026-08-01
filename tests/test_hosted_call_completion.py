@@ -21,6 +21,15 @@ class _Identity:
         ]
 
 
+class _NonSmsIdentity:
+    def list_transcripts(self, _call_id):
+        return [
+            types.SimpleNamespace(
+                party="remote", text="Please update the release checklist.",
+            ),
+        ]
+
+
 def _sms_result(
     *,
     status="completed",
@@ -108,6 +117,15 @@ def _payload():
             }],
         },
     }
+
+
+def _non_sms_payload():
+    payload = _payload()
+    payload["data"]["post_call_action_items"] = [{
+        "status": "open",
+        "action": "Update the release checklist",
+    }]
+    return payload
 
 
 def _gateway(tmp_path, monkeypatch, session):
@@ -213,6 +231,56 @@ def test_hosted_sms_failed_twice_stays_terminally_failed(tmp_path, monkeypatch):
         restarted = _gateway(tmp_path, monkeypatch, _Session())
         await restarted._recover_hosted_call_completions()
         assert restarted._hosted_call_jobs == {}
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_turn_exception_is_terminal_and_not_replayed(
+    tmp_path, monkeypatch,
+):
+    async def scenario():
+        session = _Session(error=RuntimeError("capture transport failed"))
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(session.prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+        restarted_session = _Session()
+        restarted = _gateway(tmp_path, monkeypatch, restarted_session)
+        await restarted._recover_hosted_call_completions()
+        assert restarted._hosted_call_jobs == {}
+        assert restarted_session.prompts == []
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_turn_cancellation_is_terminal_and_not_replayed(
+    tmp_path, monkeypatch,
+):
+    async def scenario():
+        gate = asyncio.Event()
+        session = _Session(gate=gate)
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        await gateway._on_hosted_call_ended(_payload())
+        while not session.prompts:
+            await asyncio.sleep(0)
+        task = next(iter(gateway._hosted_call_jobs.values()))
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+        restarted_session = _Session()
+        restarted = _gateway(tmp_path, monkeypatch, restarted_session)
+        await restarted._recover_hosted_call_completions()
+        assert restarted._hosted_call_jobs == {}
+        assert restarted_session.prompts == []
 
     asyncio.run(scenario())
 
@@ -457,7 +525,20 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
             ("local", "I'll text you the final result."),
             ("remote", "After we hang up, review the text conversation."),
             ("remote", "Review the text exchange after we hang up."),
+            ("remote", "After we hang up, do not send me an SMS."),
+            ("remote", "After the call ends, don't text me."),
+            ("remote", "Never text me after the call is over."),
         ],
+    )
+    assert not gateway_module._hosted_requires_sms(
+        [{"status": "open", "action": "Do not send me an SMS."}], []
+    )
+    assert gateway_module._hosted_requires_sms(
+        [
+            {"status": "open", "action": "Do not send me an SMS."},
+            {"status": "open", "action": "Text the operator by SMS."},
+        ],
+        [],
     )
 
 
@@ -496,13 +577,19 @@ def test_hosted_completion_recovers_after_restart_without_redelivery(tmp_path, m
             monkeypatch,
             _Session(error=RuntimeError("Codex unavailable")),
         )
-        await original._on_hosted_call_ended(_payload())
+        original._inkbox = types.SimpleNamespace(
+            get_identity=lambda _handle: _NonSmsIdentity(),
+        )
+        await original._on_hosted_call_ended(_non_sms_payload())
         await _drain(original)
         registry = json.loads(original._hosted_call_registry_path.read_text())
         assert registry["call-1"]["state"] == "failed"
 
         restarted_session = _Session()
         restarted = _gateway(tmp_path, monkeypatch, restarted_session)
+        restarted._inkbox = types.SimpleNamespace(
+            get_identity=lambda _handle: _NonSmsIdentity(),
+        )
         await restarted._recover_hosted_call_completions()
         await _drain(restarted)
         assert len(restarted_session.prompts) == 1
@@ -581,7 +668,10 @@ def test_recovery_retries_when_authoritative_transcript_is_unavailable(
             monkeypatch,
             _Session(error=RuntimeError("Codex unavailable")),
         )
-        await first._on_hosted_call_ended(_payload())
+        first._inkbox = types.SimpleNamespace(
+            get_identity=lambda _handle: _NonSmsIdentity(),
+        )
+        await first._on_hosted_call_ended(_non_sms_payload())
         await _drain(first)
 
         unsettled_session = _Session()
