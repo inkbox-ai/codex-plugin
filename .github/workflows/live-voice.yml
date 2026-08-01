@@ -163,10 +163,10 @@ jobs:
               uniform victor whiskey xray yankee zulu
             )
             marker_value=$((GITHUB_RUN_ID * 10 + GITHUB_RUN_ATTEMPT))
-            HOSTED_MARKER="codex"
+            HOSTED_MARKER=""
             for _ in 1 2 3 4 5; do
               marker_index=$((marker_value % ${#RADIO_WORDS[@]}))
-              HOSTED_MARKER="$HOSTED_MARKER ${RADIO_WORDS[$marker_index]}"
+              HOSTED_MARKER="${HOSTED_MARKER:+$HOSTED_MARKER }${RADIO_WORDS[$marker_index]}"
               marker_value=$((marker_value / ${#RADIO_WORDS[@]}))
             done
             echo "HOSTED_POST_CALL_MARKER=$HOSTED_MARKER" >> "$GITHUB_ENV"
