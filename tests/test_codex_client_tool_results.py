@@ -30,7 +30,7 @@ def test_mcp_completed_item_captures_only_settlement_fields():
                     "server": "inkbox",
                     "tool": "inkbox_send_sms",
                     "status": "completed",
-                    "arguments": {"to": "+15167251294", "text": "private body"},
+                    "arguments": {"to": "+12025550141", "text": "private body"},
                     "result": {
                         "content": [{
                             "type": "text",
@@ -52,7 +52,7 @@ def test_mcp_completed_item_captures_only_settlement_fields():
         assert call.server == "inkbox"
         assert call.tool == "inkbox_send_sms"
         assert call.status == "completed"
-        assert call.arguments["to"] == "+15167251294"
+        assert call.arguments["to"] == "+12025550141"
         assert call.sent is True
         assert call.error_kind == "unknown"
         assert not hasattr(call, "result")
@@ -79,7 +79,7 @@ def test_mcp_failed_item_reduces_raw_error_to_recoverable_kind():
                     "server": "inkbox",
                     "tool": "inkbox_send_sms",
                     "status": "failed",
-                    "arguments": '{"to_number":"+15167251294"}',
+                    "arguments": '{"to_number":"+12025550141"}',
                     "error": {
                         "message": "Invalid arguments: required property `to` is missing; private payload",
                     },
@@ -92,7 +92,7 @@ def test_mcp_failed_item_reduces_raw_error_to_recoverable_kind():
         })
 
         call = (await capture.future).mcp_tool_calls[0]
-        assert call.arguments == {"to_number": "+15167251294"}
+        assert call.arguments == {"to_number": "+12025550141"}
         assert call.sent is False
         assert call.error_kind == "recoverable"
         assert "private" not in repr(call)
@@ -143,7 +143,7 @@ def test_mcp_failed_item_uses_structured_sms_error_metadata(
                     "server": "inkbox",
                     "tool": "inkbox_send_sms",
                     "status": "failed",
-                    "arguments": {"to": "+15167251294", "text": "private body"},
+                    "arguments": {"to": "+12025550141", "text": "private body"},
                     "result": {
                         "content": [{"type": "text", "text": json.dumps(payload)}],
                     },

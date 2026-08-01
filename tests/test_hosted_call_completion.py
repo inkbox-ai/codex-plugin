@@ -37,7 +37,7 @@ class _NonSmsIdentity:
 def _sms_result(
     *,
     status="completed",
-    to="+15167251294",
+    to="+12025550142",
     sent=True,
     error_kind="unknown",
     aborted=False,
@@ -100,7 +100,7 @@ def _payload():
                 "id": "call-1",
                 "mode": "hosted_agent",
                 "direction": "outbound",
-                "remote_phone_number": "+15167251294",
+                "remote_phone_number": "+12025550142",
                 "status": "completed",
                 "hangup_reason": "remote_hangup",
                 "reason": "Confirm the release timing",
@@ -113,7 +113,7 @@ def _payload():
             }],
             "contacts": [{
                 "id": "contact-1",
-                "preferred_name": "Dima",
+                "preferred_name": "Ada",
                 "phone_numbers": ["+19999999999"],
                 "memories": [
                     "  Prefers concise release updates.  ",
@@ -142,7 +142,7 @@ def _gateway(tmp_path, monkeypatch, session):
 
     async def resolve(_call, _remote):
         return gateway._contact_summary({
-            "id": "contact-1", "preferred_name": "Dima",
+            "id": "contact-1", "preferred_name": "Ada",
         })
 
     gateway._resolve_call_contact = resolve
@@ -163,7 +163,7 @@ def test_hosted_completion_fetches_transcript_and_suppresses_plaintext(tmp_path,
         await _drain(gateway)
         assert len(session.prompts) == 1
         prompt = session.prompts[0]
-        assert "+15167251294" in prompt
+        assert "+12025550142" in prompt
         assert "+19999999999" not in prompt
         assert "inkbox_send_sms" in prompt
         assert "`to` set to that exact remote number" in prompt
@@ -213,19 +213,19 @@ def test_hosted_sms_recoverable_failure_gets_one_correction(tmp_path, monkeypatc
         assert len(session.prompts) == 2
         assert "only correction attempt" in session.prompts[1]
         assert "Do not return [SILENT], skip, or defer" in session.prompts[1]
-        assert "+15167251294" in session.prompts[1]
+        assert "+12025550142" in session.prompts[1]
         entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
         assert entry["state"] == "completed"
         assert session.hosted_contexts == [
             {
                 "call_id": "call-1",
                 "attempt": 1,
-                "remote_phone": "+15167251294",
+                "remote_phone": "+12025550142",
             },
             {
                 "call_id": "call-1",
                 "attempt": 2,
-                "remote_phone": "+15167251294",
+                "remote_phone": "+12025550142",
             },
         ]
 
@@ -398,7 +398,7 @@ def test_hosted_sms_blocked_duplicate_preserves_single_success():
                 server="inkbox",
                 tool="inkbox_send_sms",
                 status="failed",
-                arguments={"to": "+15167251294"},
+                arguments={"to": "+12025550142"},
                 sent=False,
                 error_kind="duplicate_blocked",
             ),
@@ -406,7 +406,7 @@ def test_hosted_sms_blocked_duplicate_preserves_single_success():
     )
 
     assert gateway_module._hosted_sms_settlement(
-        result, "+15167251294"
+        result, "+12025550142"
     ) == "success"
 
 
@@ -553,7 +553,7 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
         [], [("local", "I'll send you a text message after we hang up.")]
     )
     assert gateway_module._hosted_requires_sms(
-        [], [("local", "After I hang up, text the release status to Dima.")]
+        [], [("local", "After I hang up, text the release status to Ada.")]
     )
     assert gateway_module._hosted_requires_sms(
         [],
@@ -658,7 +658,7 @@ def test_hosted_callback_prompt_anchors_authoritative_caller_over_contact_memory
         await _drain(gateway)
 
         prompt = session.prompts[0]
-        assert "+15167251294" in prompt
+        assert "+12025550142" in prompt
         assert "+19999999999" not in prompt
 
     asyncio.run(scenario())
@@ -706,7 +706,7 @@ def test_hosted_reserved_sms_attempt_is_not_replayed_after_restart(
             outcome="completed",
         )
         assert reserve_hosted_sms_attempt(
-            "call-1", 1, "+15167251294"
+            "call-1", 1, "+12025550142"
         ) is True
 
         restarted_session = _Session()
@@ -741,7 +741,7 @@ def test_restart_resumes_only_recoverable_sms_correction(tmp_path, monkeypatch):
             outcome="completed",
         )
         assert reserve_hosted_sms_attempt(
-            "call-1", 1, "+15167251294"
+            "call-1", 1, "+12025550142"
         ) is True
         settle_hosted_sms_attempt("call-1", 1, "recoverable")
 
@@ -756,7 +756,7 @@ def test_restart_resumes_only_recoverable_sms_correction(tmp_path, monkeypatch):
         assert session.hosted_contexts == [{
             "call_id": "call-1",
             "attempt": 2,
-            "remote_phone": "+15167251294",
+            "remote_phone": "+12025550142",
         }]
         entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
         assert entry["state"] == "completed"
