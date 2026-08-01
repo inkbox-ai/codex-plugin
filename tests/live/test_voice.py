@@ -22,7 +22,7 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -63,23 +63,49 @@ def _digits(s: str) -> str:
     return re.sub(r"\D", "", s or "")
 
 
+def _spoken_tokens(value: str | None) -> list[str]:
+    return re.findall(r"[a-z0-9]+", (value or "").casefold())
+
+
 def _voice_marker_key(value: str) -> str:
     """Normalize punctuation/case that may change across TTS/PSTN/STT."""
-    return re.sub(r"\W+", "", value or "").casefold()
+    return "".join(_spoken_tokens(value))
 
 
-def _message_created_at(message):
-    """Return an aware timestamp from an SDK SMS row."""
-    value = getattr(message, "created_at", None)
+def _record_created_at(record):
+    """Return an aware server timestamp from an SDK record."""
+    value = getattr(record, "created_at", None)
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
     text = str(value or "").strip()
     if not text:
         return None
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return datetime.fromisoformat(text)
     except ValueError:
         return None
+
+
+def _sms_target_numbers(message) -> set[str]:
+    """All authoritative targets represented by an outbound SMS row."""
+    values = [getattr(message, "remote_phone_number", "") or ""]
+    values.extend(
+        getattr(recipient, "recipient_phone_number", "") or ""
+        for recipient in (getattr(message, "recipients", None) or [])
+    )
+    return {digits for value in values if (digits := _digits(value))}
+
+
+def _has_after_call_sms_intent(value: str | None) -> bool:
+    tokens = _spoken_tokens(value)
+    token_set = set(tokens)
+    joined = " ".join(tokens)
+    after_call = "after" in token_set and bool(
+        token_set & {"call", "hangup", "hang", "hung"}
+    )
+    send = bool(token_set & {"send", "text"})
+    sms = bool(token_set & {"sms", "text", "message"}) or "s m s" in joined
+    return after_call and send and sms
 
 
 def _client(key):
@@ -150,7 +176,7 @@ def _call_state(remote, call_id) -> tuple[str, str]:
     return status, " ".join(fields)
 
 
-def _wait_for_two_way_call(remote, number_id, call_id, agent_turns=1):
+def _wait_for_two_way_call(remote, number_id, call_id):
     """Block until the call transcript shows BOTH the agent and the driver spoke."""
     deadline = time.monotonic() + TIMEOUT_S
     last = ""
@@ -162,7 +188,7 @@ def _wait_for_two_way_call(remote, number_id, call_id, agent_turns=1):
         except Exception as exc:  # transcripts may 404 until the call is set up
             rem, loc = [], []
             transcript_state = f"transcripts not ready: {exc!r}"
-        if not transcript_state and len(rem) >= agent_turns and loc:
+        if not transcript_state and rem and loc:
             agent_said = " | ".join(s.text.strip() for s in rem)
             return agent_said  # the agent reached the caller out loud, in a two-way call
         try:
@@ -183,24 +209,27 @@ def _wait_for_two_way_call(remote, number_id, call_id, agent_turns=1):
     pytest.fail(f"agent never held a two-way call within {TIMEOUT_S:.0f}s ({last})")
 
 
-def _wait_for_local_transcript_text(remote, number_id, call_id, *needles):
-    """Wait until the caller's persisted transcript contains every phrase."""
-    expected = tuple(needle.casefold() for needle in needles if needle)
-    assert expected
+def _wait_for_persisted_hosted_request(remote, number_id, call_id, marker):
+    """Wait for the current after-call SMS request in the caller transcript."""
+    marker_key = _voice_marker_key(marker)
+    assert marker_key
     deadline = time.monotonic() + TIMEOUT_S
     last = ""
     while time.monotonic() < deadline:
         try:
             _all, _rem, loc = _segments(remote, number_id, call_id)
-            text = " ".join(segment.text.strip() for segment in loc).casefold()
-            if all(needle in text for needle in expected):
+            text = " ".join(segment.text.strip() for segment in loc)
+            if (
+                marker_key in _voice_marker_key(text)
+                and _has_after_call_sms_intent(text)
+            ):
                 return
             last = f"local transcript so far: {text!r}"
         except Exception as exc:  # transcripts may 404 until the call is set up
             last = f"transcripts not ready: {exc!r}"
         time.sleep(POLL_EVERY_S)
     pytest.fail(
-        "call ended before the scripted caller instruction was persisted "
+        "call ended before the current after-call SMS request was persisted "
         f"({last})"
     )
 
@@ -327,7 +356,8 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     aut_phone = aut_numbers[0].number
     aut_number_id = aut_numbers[0].id
     aut_tail = _digits(aut_phone)[-10:]
-    driver_tail = _digits(st["number"])[-10:]
+    driver_number = _digits(st["number"])
+    driver_tail = driver_number[-10:]
 
     def driver_calls():
         return [
@@ -347,21 +377,37 @@ def test_outbound_call_voice_ai_and_post_call_completion():
         return [
             message for message in aut.texts.list(aut_number_id, limit=200)
             if (getattr(message, "direction", "") or "").lower() == "outbound"
-            and _digits(
-                getattr(message, "remote_phone_number", "") or ""
-            )[-10:] == driver_tail
+            and driver_number in _sms_target_numbers(message)
         ]
 
     assert HOSTED_POST_CALL_MARKER
-    before_driver = {call.id for call in driver_calls()}
-    before_aut = {call.id for call in aut_calls()}
+    baseline_driver_calls = driver_calls()
+    baseline_aut_calls = aut_calls()
+    before_driver = {call.id for call in baseline_driver_calls}
+    before_aut = {call.id for call in baseline_aut_calls}
+    driver_call_watermark = max(
+        (
+            created_at
+            for call in baseline_driver_calls
+            if (created_at := _record_created_at(call)) is not None
+        ),
+        default=datetime.min.replace(tzinfo=UTC),
+    )
+    aut_call_watermark = max(
+        (
+            created_at
+            for call in baseline_aut_calls
+            if (created_at := _record_created_at(call)) is not None
+        ),
+        default=datetime.min.replace(tzinfo=UTC),
+    )
     baseline_sms = aut_outbound_sms()
     before_sms = {message.id for message in baseline_sms}
     baseline_times = [
         created_at for message in baseline_sms
-        if (created_at := _message_created_at(message)) is not None
+        if (created_at := _record_created_at(message)) is not None
     ]
-    sms_watermark = max(baseline_times, default=datetime.min.replace(tzinfo=timezone.utc))
+    sms_watermark = max(baseline_times, default=datetime.min.replace(tzinfo=UTC))
     remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
 
     driver_call_id = None
@@ -369,12 +415,27 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     try:
         deadline = time.monotonic() + TIMEOUT_S
         while time.monotonic() < deadline:
-            fresh_driver = [call for call in driver_calls() if call.id not in before_driver]
-            fresh_aut = [call for call in aut_calls() if call.id not in before_aut]
+            fresh_driver = [
+                call
+                for call in driver_calls()
+                if call.id not in before_driver
+                and (created_at := _record_created_at(call)) is not None
+                and created_at >= driver_call_watermark
+            ]
+            fresh_aut = [
+                call
+                for call in aut_calls()
+                if call.id not in before_aut
+                and (created_at := _record_created_at(call)) is not None
+                and created_at >= aut_call_watermark
+            ]
             if fresh_driver:
-                driver_call_id = fresh_driver[0].id
+                driver_call_id = max(
+                    fresh_driver,
+                    key=_record_created_at,
+                ).id
             if fresh_aut:
-                aut_call = fresh_aut[0]
+                aut_call = max(fresh_aut, key=_record_created_at)
             if driver_call_id and aut_call is not None:
                 break
             time.sleep(POLL_EVERY_S)
@@ -383,16 +444,23 @@ def test_outbound_call_voice_ai_and_post_call_completion():
         assert str(getattr(getattr(aut_call, "voicemail_detection", ""), "value", getattr(aut_call, "voicemail_detection", ""))) == "disabled"
         assert getattr(aut_call, "reason", None)
         assert getattr(aut_call, "hosted_agent_authority_mode", None) is not None
-        _wait_for_two_way_call(remote, st["number_id"], driver_call_id, agent_turns=2)
-        # The initial "Hello?" is itself a local transcript row. Do not let
-        # that row plus two quick agent greetings satisfy the conversation
-        # gate before the driver's actual post-call commitment is persisted.
-        _wait_for_local_transcript_text(
+        driver_call = remote.calls.get(driver_call_id)
+        driver_created_at = _record_created_at(driver_call)
+        aut_created_at = _record_created_at(aut_call)
+        assert driver_created_at is not None and aut_created_at is not None
+        assert abs((driver_created_at - aut_created_at).total_seconds()) <= 60, (
+            "fresh driver and AUT records are not the same hosted call: "
+            f"driver_created_at={driver_created_at!r} "
+            f"aut_created_at={aut_created_at!r}"
+        )
+        _wait_for_two_way_call(remote, st["number_id"], driver_call_id)
+        # Greeting/filler turns do not prove the actual request reached the
+        # server. Require the current marker and after-call SMS intent in the
+        # caller's persisted transcript before ending the call.
+        _wait_for_persisted_hosted_request(
             remote,
             st["number_id"],
             driver_call_id,
-            "after we hang up",
-            "send me one sms",
             HOSTED_POST_CALL_MARKER,
         )
     finally:
@@ -411,7 +479,7 @@ def test_outbound_call_voice_ai_and_post_call_completion():
         marker_sms = [
             message for message in aut_outbound_sms()
             if message.id not in before_sms
-            and (created_at := _message_created_at(message)) is not None
+            and (created_at := _record_created_at(message)) is not None
             and created_at >= sms_watermark
             and _voice_marker_key(HOSTED_POST_CALL_MARKER)
             in _voice_marker_key(getattr(message, "text", "") or "")
@@ -430,7 +498,7 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     marker_sms = [
         message for message in aut_outbound_sms()
         if message.id not in before_sms
-        and (created_at := _message_created_at(message)) is not None
+        and (created_at := _record_created_at(message)) is not None
         and created_at >= sms_watermark
         and _voice_marker_key(HOSTED_POST_CALL_MARKER)
         in _voice_marker_key(getattr(message, "text", "") or "")
