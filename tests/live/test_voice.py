@@ -62,6 +62,11 @@ def _digits(s: str) -> str:
     return re.sub(r"\D", "", s or "")
 
 
+def _voice_marker_key(value: str) -> str:
+    """Normalize punctuation/case that may change across TTS/PSTN/STT."""
+    return re.sub(r"\W+", "", value or "").casefold()
+
+
 def _client(key):
     from inkbox import Inkbox
 
@@ -379,16 +384,14 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     # tool result passes the one-call, exact-target and `sent: true` checks.
     completion = f"hosted post-call reconciliation completed: {aut_call.id}"
     deadline = time.monotonic() + 90
-    sent = []
+    new_sms = []
     while time.monotonic() < deadline:
         gateway_log = _gateway_log_text()
-        sent = [
+        new_sms = [
             message for message in aut_outbound_sms()
             if message.id not in before_sms
-            and HOSTED_POST_CALL_MARKER
-            in (getattr(message, "text", "") or "")
         ]
-        if completion in gateway_log and sent:
+        if completion in gateway_log and new_sms:
             break
         time.sleep(3)
     gateway_log = _gateway_log_text()
@@ -399,13 +402,16 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     # MCP tool may execute without emitting one. The sender-side message rows
     # are the authoritative record of the accepted side effect.
     time.sleep(2 * POLL_EVERY_S)
-    sent = [
+    new_sms = [
         message for message in aut_outbound_sms()
         if message.id not in before_sms
-        and HOSTED_POST_CALL_MARKER
-        in (getattr(message, "text", "") or "")
     ]
-    assert len(sent) == 1, (
-        "post-call processing did not send exactly one marker SMS to the "
-        f"authoritative caller: {[getattr(message, 'text', '') for message in sent]}"
+    assert len(new_sms) == 1, (
+        "post-call processing did not send exactly one SMS to the authoritative "
+        f"caller: {[getattr(message, 'text', '') for message in new_sms]}"
+    )
+    body = getattr(new_sms[0], "text", "") or ""
+    assert _voice_marker_key(HOSTED_POST_CALL_MARKER) in _voice_marker_key(body), (
+        "post-call SMS did not preserve the unique spoken marker: "
+        f"{body!r}"
     )
