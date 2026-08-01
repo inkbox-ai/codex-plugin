@@ -28,9 +28,34 @@ class CodexAppServerError(RuntimeError):
 class _TurnCapture:
     thread_id: str
     turn_id: str
-    future: "asyncio.Future[str]"
+    future: "asyncio.Future[CodexTurnResult]"
     messages: list[Dict[str, Any]] = field(default_factory=list)
     deltas: list[str] = field(default_factory=list)
+    mcp_tool_calls: list["McpToolCallResult"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class McpToolCallResult:
+    """Sanitized final state for one MCP tool item.
+
+    Tool result bodies and raw errors can contain message content or provider
+    payloads. Keep only the fields needed to settle a required side effect.
+    """
+
+    server: str
+    tool: str
+    status: str
+    arguments: Dict[str, Any]
+    sent: bool
+    error_kind: str
+
+
+@dataclass(frozen=True)
+class CodexTurnResult:
+    """Final reply plus sanitized MCP outcomes for one app-server turn."""
+
+    text: str
+    mcp_tool_calls: tuple[McpToolCallResult, ...]
 
 
 class CodexAppServerClient:
@@ -80,6 +105,10 @@ class CodexAppServerClient:
 
     async def run(self, text: str) -> str:
         """Run one turn in the current thread and return the final reply text."""
+        return (await self.run_detailed(text)).text
+
+    async def run_detailed(self, text: str) -> CodexTurnResult:
+        """Run one turn and return its final reply and sanitized MCP outcomes."""
         if not self.thread_id:
             await self.connect()
         assert self.thread_id is not None
@@ -285,6 +314,8 @@ class CodexAppServerClient:
             item = params.get("item") or {}
             if capture is not None and item.get("type") == "agentMessage":
                 capture.messages.append(item)
+            if capture is not None and item.get("type") == "mcpToolCall":
+                capture.mcp_tool_calls.append(_mcp_tool_call_result(item))
             return
 
         if method == "turn/completed":
@@ -297,7 +328,10 @@ class CodexAppServerClient:
                 error = turn.get("error") or turn.get("codexErrorInfo") or "turn failed"
                 capture.future.set_exception(CodexAppServerError(str(error)))
                 return
-            capture.future.set_result(_final_message(capture))
+            capture.future.set_result(CodexTurnResult(
+                text=_final_message(capture),
+                mcp_tool_calls=tuple(capture.mcp_tool_calls),
+            ))
 
     def _fail_all(self, exc: Exception) -> None:
         for future in list(self._pending.values()):
@@ -319,3 +353,94 @@ def _final_message(capture: _TurnCapture) -> str:
     if text:
         return text
     return "".join(capture.deltas).strip()
+
+
+def _mcp_tool_call_result(item: Dict[str, Any]) -> McpToolCallResult:
+    """Reduce a final MCP item without retaining result or error payloads."""
+    arguments = item.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    result = item.get("result")
+    sent = False
+    error_fragments: list[str] = []
+    if isinstance(result, dict):
+        structured = result.get("structuredContent") or result.get("structured_content")
+        if isinstance(structured, dict):
+            sent = structured.get("sent") is True
+        content = result.get("content")
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            text = str(block.get("text") or "")
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                sent = sent or payload.get("sent") is True
+                if payload.get("error"):
+                    error_fragments.append(str(payload["error"]))
+
+    error = item.get("error")
+    if isinstance(error, dict) and error.get("message"):
+        error_fragments.append(str(error["message"]))
+    elif error:
+        error_fragments.append(str(error))
+
+    safe_arguments = {
+        key: value
+        for key in ("to", "to_number", "toNumber", "conversation_id")
+        if (value := arguments.get(key)) is not None
+        and isinstance(value, (str, int, float, bool))
+    }
+    return McpToolCallResult(
+        server=str(item.get("server") or ""),
+        tool=str(item.get("tool") or ""),
+        status=str(item.get("status") or ""),
+        arguments=safe_arguments,
+        sent=sent,
+        error_kind=_mcp_error_kind(" ".join(error_fragments)),
+    )
+
+
+def _mcp_error_kind(message: str) -> str:
+    """Classify an MCP failure while discarding its potentially sensitive text."""
+    normalized = " ".join(str(message or "").lower().split())
+    if not normalized:
+        return "unknown"
+    terminal = (
+        "opted out",
+        "unsubscribe",
+        "not authorized",
+        "unauthorized",
+        "forbidden",
+        "blocked recipient",
+        "invalid phone number",
+        "invalid recipient",
+        "recipient unavailable",
+    )
+    if any(marker in normalized for marker in terminal):
+        return "terminal"
+    recoverable = (
+        "invalid argument",
+        "invalid params",
+        "argument",
+        "required",
+        "missing",
+        "schema",
+        "format",
+        "e.164",
+        "maximum is",
+        "too long",
+        "must be",
+        "specify",
+    )
+    if any(marker in normalized for marker in recoverable):
+        return "recoverable"
+    return "unknown"

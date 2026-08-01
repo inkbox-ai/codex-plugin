@@ -70,6 +70,7 @@ try:
         call_contexts_dir,
         inkbox_client_kwargs,
     )
+    from .codex_client import CodexTurnResult
     from .a2a_delegations import find_by_task as find_a2a_delegation
     from .media import download_media, inbound_media_note
     from .prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
@@ -83,6 +84,7 @@ try:
     from .webhook_providers import match_provider
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, VoiceStack, call_contexts_dir, inkbox_client_kwargs
+    from codex_client import CodexTurnResult
     from a2a_delegations import find_by_task as find_a2a_delegation
     from media import download_media, inbound_media_note
     from prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
@@ -96,6 +98,10 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from webhook_providers import match_provider
 
 logger = logging.getLogger(__name__)
+
+
+class _HostedToolSettlementError(RuntimeError):
+    """A required hosted-call side effect reached a bounded terminal state."""
 
 
 def _webhook_mail_body(message: Dict[str, Any]) -> str:
@@ -298,6 +304,62 @@ def _hosted_call_ended_prompt(
         "effects must come from tool calls. If nothing remains, stop.",
     ])
     return inject_contact_memories("\n".join(parts), memories)
+
+
+def _hosted_requires_sms(actions: List[Dict[str, Any]]) -> bool:
+    """Return true when an open server-recorded action explicitly requires SMS."""
+    text = " ".join(
+        str(action.get(field) or "")
+        for action in actions
+        if str(action.get("status") or "open") == "open"
+        for field in ("action", "description", "details")
+    ).lower()
+    return bool(re.search(r"\b(?:sms|text|texted|texting)\b", text))
+
+
+def _hosted_sms_settlement(
+    result: CodexTurnResult,
+    remote_phone: str,
+) -> str:
+    """Classify a required SMS as success, recoverable, missing, or terminal."""
+    calls = [
+        call for call in result.mcp_tool_calls
+        if call.server.lower() == "inkbox" and call.tool == "inkbox_send_sms"
+    ]
+    completed = [call for call in calls if call.status == "completed"]
+    if completed:
+        if len(completed) != 1:
+            return "terminal"
+        call = completed[0]
+        target = str(call.arguments.get("to") or "").strip()
+        if target != remote_phone or not call.sent:
+            # A completed call may already have produced an external side
+            # effect. Never retry an ambiguous, duplicate, or wrong-target send.
+            return "terminal"
+        return "success"
+    failed = [call for call in calls if call.status == "failed"]
+    if not calls:
+        return "missing"
+    if failed and all(call.error_kind == "recoverable" for call in failed):
+        return "recoverable"
+    return "terminal"
+
+
+def _hosted_sms_correction_prompt(remote_phone: str, *, missing: bool) -> str:
+    reason = (
+        "The required SMS tool was not called"
+        if missing
+        else "The required SMS tool had a recoverable argument or format error"
+    )
+    return "\n".join([
+        "[hosted_post_call_sms_correction]",
+        f"{reason}. This is the only correction attempt.",
+        "Call inkbox_send_sms exactly once now with `to` set to the exact "
+        f"authoritative remote number {remote_phone} and `text` set to the "
+        "still-needed message from the prior hosted-call reconciliation.",
+        "Do not use another recipient, do not repeat any completed action, and "
+        "do not answer with prose. Stop after the tool result.",
+    ])
 
 
 def _voice_consult_prompt(
@@ -1045,6 +1107,7 @@ class InkboxGateway:
         state: str,
         payload: Optional[Dict[str, Any]] = None,
         outcome: str = "",
+        retryable: bool = True,
     ) -> None:
         """Persist completion state atomically before acknowledging a webhook."""
         now = time.time()
@@ -1071,6 +1134,8 @@ class InkboxGateway:
             "owner_id": self._hosted_call_registry_owner,
             "updated_at": now,
         }
+        if state == "failed":
+            entry["retryable"] = retryable
         if state in {"queued", "running", "failed"} and replay_payload is not None:
             entry["payload"] = replay_payload
         current[call_id] = entry
@@ -1181,6 +1246,8 @@ class InkboxGateway:
         """Requeue unfinished Voice AI completions from an earlier process."""
         for call_id, entry in self._read_hosted_call_registry().items():
             if not isinstance(entry, dict) or entry.get("state") == "completed":
+                continue
+            if entry.get("state") == "failed" and entry.get("retryable") is False:
                 continue
             payload = entry.get("payload")
             if not isinstance(payload, dict) or call_id in self._hosted_call_jobs:
@@ -1407,7 +1474,12 @@ class InkboxGateway:
             and state in {"queued", "running"}
             and existing.get("owner_id") == self._hosted_call_registry_owner
         )
-        if state == "completed" or same_owner_inflight:
+        terminal_failure = (
+            state == "failed"
+            and isinstance(existing, dict)
+            and existing.get("retryable") is False
+        )
+        if state == "completed" or terminal_failure or same_owner_inflight:
             return web.json_response({"ok": True, "deduped": True})
 
         event_id = str(envelope.get("id") or "").strip()
@@ -1506,6 +1578,10 @@ class InkboxGateway:
                     raise RuntimeError(
                         "authoritative transcript unavailable for recovered hosted call"
                     )
+            actions = [
+                action for action in (data.get("post_call_action_items") or [])
+                if isinstance(action, dict)
+            ]
             prompt = _hosted_call_ended_prompt(
                 call_id=call_id,
                 direction=str(call.get("direction") or "inbound"),
@@ -1514,16 +1590,29 @@ class InkboxGateway:
                 hangup_reason=str(call.get("hangup_reason") or ""),
                 reason=str(call.get("reason") or ""),
                 transcript=transcript,
-                actions=[
-                    action for action in (data.get("post_call_action_items") or [])
-                    if isinstance(action, dict)
-                ],
+                actions=actions,
                 contact=contact,
                 memories=memories,
             )
             if self.sessions is None:
                 raise RuntimeError("session manager is not ready")
-            await self.sessions.get(chat_id).run_consult(prompt)
+            session = self.sessions.get(chat_id)
+            if remote_phone and _hosted_requires_sms(actions):
+                result = await session.run_consult_detailed(prompt)
+                settlement = _hosted_sms_settlement(result, remote_phone)
+                if settlement in {"missing", "recoverable"}:
+                    correction = _hosted_sms_correction_prompt(
+                        remote_phone,
+                        missing=settlement == "missing",
+                    )
+                    corrected = await session.run_consult_detailed(correction)
+                    settlement = _hosted_sms_settlement(corrected, remote_phone)
+                if settlement != "success":
+                    raise _HostedToolSettlementError(
+                        "required hosted SMS did not reach a confirmed safe completion"
+                    )
+            else:
+                await session.run_consult(prompt)
             self._write_hosted_call_registry(
                 call_id,
                 event_id=event_id,
@@ -1533,13 +1622,14 @@ class InkboxGateway:
             logger.info("[bridge] hosted post-call reconciliation completed: %s", call_id)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             self._write_hosted_call_registry(
                 call_id,
                 event_id=event_id,
                 state="failed",
                 payload=envelope,
                 outcome=outcome,
+                retryable=not isinstance(exc, _HostedToolSettlementError),
             )
             logger.exception("[bridge] hosted post-call reconciliation failed: %s", call_id)
 

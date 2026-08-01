@@ -4,6 +4,7 @@ import os
 import types
 
 from inkbox_codex.config import BridgeConfig
+from inkbox_codex.codex_client import CodexTurnResult, McpToolCallResult
 from inkbox_codex.gateway import InkboxGateway
 
 
@@ -16,11 +17,32 @@ class _Identity:
         ]
 
 
+def _sms_result(
+    *,
+    status="completed",
+    to="+15167251294",
+    sent=True,
+    error_kind="unknown",
+):
+    return CodexTurnResult(
+        text="This plaintext must not be delivered.",
+        mcp_tool_calls=(McpToolCallResult(
+            server="inkbox",
+            tool="inkbox_send_sms",
+            status=status,
+            arguments={"to": to, "text": "release update"},
+            sent=sent,
+            error_kind=error_kind,
+        ),),
+    )
+
+
 class _Session:
-    def __init__(self, gate=None, error=None):
+    def __init__(self, gate=None, error=None, results=None):
         self.prompts = []
         self.gate = gate
         self.error = error
+        self.results = list(results or [_sms_result()])
 
     async def run_consult(self, prompt):
         self.prompts.append(prompt)
@@ -29,6 +51,14 @@ class _Session:
         if self.error is not None:
             raise self.error
         return "This plaintext must not be delivered."
+
+    async def run_consult_detailed(self, prompt):
+        self.prompts.append(prompt)
+        if self.gate is not None:
+            await self.gate.wait()
+        if self.error is not None:
+            raise self.error
+        return self.results.pop(0)
 
 
 class _Sessions:
@@ -136,6 +166,149 @@ def test_hosted_completion_dedupes_same_process_inflight(tmp_path, monkeypatch):
         gate.set()
         await _drain(gateway)
         assert len(session.prompts) == 1
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_recoverable_failure_gets_one_correction(tmp_path, monkeypatch):
+    async def scenario():
+        session = _Session(results=[
+            _sms_result(status="failed", sent=False, error_kind="recoverable"),
+            _sms_result(),
+        ])
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(session.prompts) == 2
+        assert "only correction attempt" in session.prompts[1]
+        assert "+15167251294" in session.prompts[1]
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_failed_twice_stays_terminally_failed(tmp_path, monkeypatch):
+    async def scenario():
+        session = _Session(results=[
+            _sms_result(status="failed", sent=False, error_kind="recoverable"),
+            _sms_result(status="failed", sent=False, error_kind="recoverable"),
+        ])
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(session.prompts) == 2
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+        restarted = _gateway(tmp_path, monkeypatch, _Session())
+        await restarted._recover_hosted_call_completions()
+        assert restarted._hosted_call_jobs == {}
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_terminal_failure_is_not_retried(tmp_path, monkeypatch):
+    async def scenario():
+        session = _Session(results=[
+            _sms_result(status="failed", sent=False, error_kind="terminal"),
+        ])
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(session.prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_missing_tool_gets_only_one_correction(tmp_path, monkeypatch):
+    async def scenario():
+        empty = CodexTurnResult(text="", mcp_tool_calls=())
+        session = _Session(results=[empty, empty])
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(session.prompts) == 2
+        assert "tool was not called" in session.prompts[1]
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_requires_positive_sent_result(tmp_path, monkeypatch):
+    async def scenario():
+        session = _Session(results=[_sms_result(sent=False)])
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(session.prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_completed_to_wrong_target_is_not_retried(tmp_path, monkeypatch):
+    async def scenario():
+        session = _Session(results=[_sms_result(to="+19999999999")])
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(session.prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_duplicate_completed_side_effects_are_not_retried(tmp_path, monkeypatch):
+    async def scenario():
+        duplicate = CodexTurnResult(
+            text="",
+            mcp_tool_calls=_sms_result().mcp_tool_calls * 2,
+        )
+        session = _Session(results=[duplicate])
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(session.prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+    asyncio.run(scenario())
+
+
+def test_hosted_non_sms_action_does_not_require_sms_tool(tmp_path, monkeypatch):
+    async def scenario():
+        session = _Session()
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        payload = _payload()
+        payload["data"]["post_call_action_items"] = [{
+            "status": "open",
+            "action": "Update the release checklist",
+        }]
+        await gateway._on_hosted_call_ended(payload)
+        await _drain(gateway)
+
+        assert len(session.prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "completed"
 
     asyncio.run(scenario())
 

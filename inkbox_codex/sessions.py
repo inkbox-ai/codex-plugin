@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 try:
-    from .codex_client import CodexAppServerClient, CodexAppServerError
+    from .codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
     from .config import BridgeConfig, a2a_turn_context_path
     from .escalation import (
         PendingInteraction,
@@ -32,7 +32,7 @@ try:
     )
     from .prompts import build_channel_prompt, frame_inbound
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from codex_client import CodexAppServerClient, CodexAppServerError
+    from codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
     from config import BridgeConfig, a2a_turn_context_path
     from escalation import (
         PendingInteraction,
@@ -73,11 +73,12 @@ class _Turn:
     """
 
     text: str
-    future: Optional["asyncio.Future[str]"] = None
+    future: Optional["asyncio.Future[Any]"] = None
     # True for a one-shot turn spawned to recover from a rejected reply send.
     # A recovery turn that itself fails to send is not recovered again (no loop).
     recovery: bool = False
     a2a_context: Optional[Dict[str, Any]] = None
+    capture_tools: bool = False
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Codex as a turn.
@@ -648,9 +649,14 @@ class ContactSession:
             self._turn_active = True
             typing_task = asyncio.create_task(self._typing_loop())
             timeout = max(0.0, float(self.cfg.codex_turn_timeout_s or 0.0))
+            operation = (
+                client.run_detailed(turn.text)
+                if turn.capture_tools
+                else client.run(turn.text)
+            )
             if timeout:
                 try:
-                    reply_text = await asyncio.wait_for(client.run(turn.text), timeout=timeout)
+                    turn_result = await asyncio.wait_for(operation, timeout=timeout)
                 except asyncio.TimeoutError as exc:
                     logger.warning(
                         "[session %s] Codex turn exceeded %.0fs; restarting app-server",
@@ -663,7 +669,8 @@ class ContactSession:
                         "Send the request again or break it into a smaller step."
                     ) from exc
             else:
-                reply_text = await client.run(turn.text)
+                turn_result = await operation
+            reply_text = turn_result.text if turn.capture_tools else turn_result
             reply = reply_text.strip()
             if client.thread_id and self.on_session_id:
                 self.resume_session_id = client.thread_id
@@ -700,7 +707,12 @@ class ContactSession:
         # interrupted this one, in which case the partial answer is dropped.
         if turn.future is not None:
             if not turn.future.done():
-                turn.future.set_result(reply or "I finished that, but didn't have anything to say back.")
+                if turn.capture_tools:
+                    turn.future.set_result(turn_result)
+                else:
+                    turn.future.set_result(
+                        reply or "I finished that, but didn't have anything to say back."
+                    )
             return
         if self._interrupting:
             return
@@ -771,6 +783,17 @@ class ContactSession:
         future: asyncio.Future[str] = loop.create_future()
         await self._queue.put(
             _Turn(text=query, future=future, a2a_context=a2a_context)
+        )
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+        return await future
+
+    async def run_consult_detailed(self, query: str) -> CodexTurnResult:
+        """Run a capture turn and return sanitized MCP completion outcomes."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[CodexTurnResult] = loop.create_future()
+        await self._queue.put(
+            _Turn(text=query, future=future, capture_tools=True)
         )
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())
