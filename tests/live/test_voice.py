@@ -108,6 +108,38 @@ def _has_after_call_sms_intent(value: str | None) -> bool:
     return after_call and send and sms
 
 
+def _has_sms_action_intent(value: str | None) -> bool:
+    """Recognize a persisted send-SMS action without requiring prose wording."""
+    tokens = _spoken_tokens(value)
+    token_set = set(tokens)
+    joined = " ".join(tokens)
+    send = bool(token_set & {"send", "text"})
+    sms = bool(token_set & {"sms", "text", "message"}) or "s m s" in joined
+    return send and sms
+
+
+def _matching_post_call_action(call, marker):
+    """Return the open current-marker SMS action persisted for a hosted call."""
+    marker_key = _voice_marker_key(marker)
+    for item in getattr(call, "post_call_action_items", None) or []:
+        if isinstance(item, dict):
+            status = item.get("status", "")
+            action = item.get("action", "")
+            details = item.get("details", "")
+        else:
+            status = getattr(item, "status", "")
+            action = getattr(item, "action", "")
+            details = getattr(item, "details", "")
+        value = f"{action} {details}"
+        if (
+            str(status).casefold() == "open"
+            and marker_key in _voice_marker_key(value)
+            and _has_sms_action_intent(value)
+        ):
+            return item
+    return None
+
+
 def _client(key):
     from inkbox import Inkbox
 
@@ -176,9 +208,10 @@ def _call_state(remote, call_id) -> tuple[str, str]:
     return status, " ".join(fields)
 
 
-def _wait_for_two_way_call(remote, number_id, call_id):
+def _wait_for_two_way_call(remote, number_id, call_id, *, deadline=None):
     """Block until the call transcript shows BOTH the agent and the driver spoke."""
-    deadline = time.monotonic() + TIMEOUT_S
+    if deadline is None:
+        deadline = time.monotonic() + TIMEOUT_S
     last = ""
     ended_at = None
     while time.monotonic() < deadline:
@@ -209,28 +242,48 @@ def _wait_for_two_way_call(remote, number_id, call_id):
     pytest.fail(f"agent never held a two-way call within {TIMEOUT_S:.0f}s ({last})")
 
 
-def _wait_for_persisted_hosted_request(remote, number_id, call_id, marker):
-    """Wait for the current after-call SMS request in the caller transcript."""
+def _wait_for_persisted_hosted_request(
+    remote,
+    number_id,
+    call_id,
+    aut,
+    aut_call_id,
+    marker,
+    *,
+    deadline,
+):
+    """Wait for both caller intent and the AUT's durable open action item."""
     marker_key = _voice_marker_key(marker)
     assert marker_key
-    deadline = time.monotonic() + TIMEOUT_S
-    last = ""
+    transcript_ready = False
+    action_ready = False
+    last_transcript = ""
+    last_actions = ""
     while time.monotonic() < deadline:
         try:
             _all, _rem, loc = _segments(remote, number_id, call_id)
             text = " ".join(segment.text.strip() for segment in loc)
-            if (
+            transcript_ready = (
                 marker_key in _voice_marker_key(text)
                 and _has_after_call_sms_intent(text)
-            ):
-                return
-            last = f"local transcript so far: {text!r}"
+            )
+            last_transcript = repr(text)
         except Exception as exc:  # transcripts may 404 until the call is set up
-            last = f"transcripts not ready: {exc!r}"
+            last_transcript = f"not ready: {exc!r}"
+        try:
+            aut_call = aut.calls.get(aut_call_id)
+            action_ready = _matching_post_call_action(aut_call, marker) is not None
+            last_actions = repr(getattr(aut_call, "post_call_action_items", None))
+        except Exception as exc:
+            last_actions = f"not ready: {exc!r}"
+        if transcript_ready and action_ready:
+            return
         time.sleep(POLL_EVERY_S)
     pytest.fail(
-        "call ended before the current after-call SMS request was persisted "
-        f"({last})"
+        "hosted call did not persist both current caller intent and its open "
+        "post-call SMS action before the shared deadline "
+        f"(transcript_ready={transcript_ready}, action_ready={action_ready}, "
+        f"local_transcript={last_transcript}, action_items={last_actions})"
     )
 
 
@@ -408,13 +461,13 @@ def test_outbound_call_voice_ai_and_post_call_completion():
         if (created_at := _record_created_at(message)) is not None
     ]
     sms_watermark = max(baseline_times, default=datetime.min.replace(tzinfo=UTC))
+    hosted_deadline = time.monotonic() + TIMEOUT_S
     remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
 
     driver_call_id = None
     aut_call = None
     try:
-        deadline = time.monotonic() + TIMEOUT_S
-        while time.monotonic() < deadline:
+        while time.monotonic() < hosted_deadline:
             fresh_driver = [
                 call
                 for call in driver_calls()
@@ -453,15 +506,23 @@ def test_outbound_call_voice_ai_and_post_call_completion():
             f"driver_created_at={driver_created_at!r} "
             f"aut_created_at={aut_created_at!r}"
         )
-        _wait_for_two_way_call(remote, st["number_id"], driver_call_id)
-        # Greeting/filler turns do not prove the actual request reached the
-        # server. Require the current marker and after-call SMS intent in the
-        # caller's persisted transcript before ending the call.
+        _wait_for_two_way_call(
+            remote,
+            st["number_id"],
+            driver_call_id,
+            deadline=hosted_deadline,
+        )
+        # Greeting/filler turns do not prove that the request became durable.
+        # Require both the caller transcript and the AUT's matching open action
+        # item before ending the call, under the same placement deadline.
         _wait_for_persisted_hosted_request(
             remote,
             st["number_id"],
             driver_call_id,
+            aut,
+            aut_call.id,
             HOSTED_POST_CALL_MARKER,
+            deadline=hosted_deadline,
         )
     finally:
         _hangup_call(remote, driver_call_id)
@@ -503,8 +564,20 @@ def test_outbound_call_voice_ai_and_post_call_completion():
         and _voice_marker_key(HOSTED_POST_CALL_MARKER)
         in _voice_marker_key(getattr(message, "text", "") or "")
     ]
+    current_candidates = [
+        {
+            "id": getattr(message, "id", None),
+            "created_at": getattr(message, "created_at", None),
+            "targets": sorted(_sms_target_numbers(message)),
+            "text": getattr(message, "text", ""),
+        }
+        for message in aut_outbound_sms()
+        if message.id not in before_sms
+        and (created_at := _record_created_at(message)) is not None
+        and created_at >= sms_watermark
+    ]
     assert len(marker_sms) == 1, (
         "post-call processing did not produce exactly one current-marker SMS "
         "to the authoritative caller: "
-        f"{[getattr(message, 'text', '') for message in marker_sms]}"
+        f"candidates={current_candidates!r}"
     )
