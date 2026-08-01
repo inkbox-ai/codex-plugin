@@ -5,12 +5,16 @@ from pathlib import Path
 import pytest
 
 from inkbox_codex import sessions as sessions_mod
-from inkbox_codex.codex_client import CodexAppServerError
-from inkbox_codex.config import BridgeConfig, channel_hints_path
+from inkbox_codex.codex_client import CodexAppServerError, CodexTurnResult
+from inkbox_codex.config import (
+    BridgeConfig,
+    channel_hints_path,
+    hosted_sms_turn_context_path,
+)
 from inkbox_codex.sessions import (
     ContactSession,
-    _Turn,
     _parse_index,
+    _Turn,
     list_recent_sessions,
 )
 
@@ -55,6 +59,185 @@ def test_abort_settles_queued_capture_future():
         assert fut.done()
         assert fut.result() == ""
         assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_stop_command_aborts_queued_detailed_capture():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        parked_worker = asyncio.create_task(asyncio.sleep(30))
+        session._worker = parked_worker
+        consult = asyncio.create_task(session.run_consult_detailed("post-call"))
+        await asyncio.sleep(0)
+
+        await session.handle_inbound("/stop", "sms", {"to": "+15551112222"})
+
+        result = await asyncio.wait_for(consult, timeout=1)
+        assert result.aborted is True
+        assert result.mcp_tool_calls == ()
+        assert sent[-1][1] == "Stopped."
+        parked_worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_clear_command_aborts_queued_detailed_capture():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        parked_worker = asyncio.create_task(asyncio.sleep(30))
+        session._worker = parked_worker
+        consult = asyncio.create_task(session.run_consult_detailed("post-call"))
+        await asyncio.sleep(0)
+
+        await session.handle_inbound("/clear", "sms", {"to": "+15551112222"})
+
+        result = await asyncio.wait_for(consult, timeout=1)
+        assert result.aborted is True
+        assert result.mcp_tool_calls == ()
+        assert sent[-1][1].startswith("Started a fresh conversation")
+        parked_worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_stop_command_aborts_running_detailed_capture():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        started = asyncio.Event()
+        interrupted = asyncio.Event()
+
+        class FakeClient:
+            thread_id = "thread-1"
+
+            async def run_detailed(self, _text):
+                started.set()
+                await interrupted.wait()
+                raise CodexAppServerError("turn interrupted")
+
+            async def interrupt(self):
+                interrupted.set()
+
+        session._client = FakeClient()
+        consult = asyncio.create_task(session.run_consult_detailed("post-call"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        await session.handle_inbound("/stop", "sms", {"to": "+15551112222"})
+
+        result = await asyncio.wait_for(consult, timeout=1)
+        assert result.aborted is True
+        assert result.mcp_tool_calls == ()
+        assert sent[-1][1] == "Stopped."
+
+    asyncio.run(scenario())
+
+
+def test_detailed_capture_binds_private_hosted_sms_context():
+    async def scenario():
+        session = make_session([])
+        seen = {}
+
+        class FakeClient:
+            thread_id = "thread-1"
+
+            async def run_detailed(self, _text):
+                path = hosted_sms_turn_context_path("contact-1")
+                seen["context"] = json.loads(path.read_text())
+                seen["mode"] = path.stat().st_mode & 0o777
+                return CodexTurnResult(text="", mcp_tool_calls=())
+
+        session._client = FakeClient()
+        context = {
+            "call_id": "call-1",
+            "attempt": 1,
+            "remote_phone": "+15551112222",
+        }
+        await session.run_consult_detailed(
+            "post-call",
+            hosted_sms_context=context,
+        )
+
+        assert seen == {"context": context, "mode": 0o600}
+        assert not hosted_sms_turn_context_path("contact-1").exists()
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_context_write_failure_settles_capture_without_running_codex(
+    monkeypatch,
+):
+    async def scenario():
+        session = make_session([])
+        calls = []
+
+        class FakeClient:
+            thread_id = "thread-1"
+
+            async def run_detailed(self, _text):
+                calls.append("run")
+                return CodexTurnResult(text="", mcp_tool_calls=())
+
+        def fail_context_path(_chat_id):
+            raise OSError("state directory unavailable")
+
+        session._client = FakeClient()
+        monkeypatch.setattr(
+            sessions_mod,
+            "hosted_sms_turn_context_path",
+            fail_context_path,
+        )
+        with pytest.raises(OSError, match="state directory unavailable"):
+            await asyncio.wait_for(
+                session.run_consult_detailed(
+                    "post-call",
+                    hosted_sms_context={
+                        "call_id": "call-1",
+                        "attempt": 1,
+                        "remote_phone": "+15551112222",
+                    },
+                ),
+                timeout=1,
+            )
+
+        assert calls == []
+
+    asyncio.run(scenario())
+
+
+def test_clear_command_aborts_running_detailed_capture():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        started = asyncio.Event()
+        interrupted = asyncio.Event()
+
+        class FakeClient:
+            thread_id = "thread-1"
+
+            async def run_detailed(self, _text):
+                started.set()
+                await interrupted.wait()
+                raise CodexAppServerError("turn interrupted")
+
+            async def interrupt(self):
+                interrupted.set()
+
+            async def disconnect(self):
+                interrupted.set()
+
+        session._client = FakeClient()
+        consult = asyncio.create_task(session.run_consult_detailed("post-call"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        await session.handle_inbound("/clear", "sms", {"to": "+15551112222"})
+
+        result = await asyncio.wait_for(consult, timeout=1)
+        assert result.aborted is True
+        assert result.mcp_tool_calls == ()
+        assert sent[-1][1].startswith("Started a fresh conversation")
 
     asyncio.run(scenario())
 

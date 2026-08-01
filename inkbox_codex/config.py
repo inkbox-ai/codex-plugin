@@ -6,6 +6,7 @@ import importlib.metadata
 import hashlib
 import os
 from dataclasses import dataclass, field
+from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List
@@ -25,6 +26,14 @@ DISTRIBUTION_NAME = "codex-plugin"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8767
 DEFAULT_WEBHOOK_PATH = "/webhook"
+
+
+class VoiceStack(str, Enum):
+    """Supported phone-call voice stacks."""
+
+    INKBOX_VOICE_AI = "inkbox_voice_ai"
+    OPENAI_REALTIME = "openai_realtime"
+    INKBOX_TTS_STT = "inkbox_tts_stt"
 
 
 def call_contexts_dir() -> Path:
@@ -62,6 +71,16 @@ def a2a_turn_context_path(chat_id: str) -> Path:
     root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
     path = root / "a2a_turn_contexts"
     path.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(chat_id.encode()).hexdigest()
+    return path / f"{digest}.json"
+
+
+def hosted_sms_turn_context_path(chat_id: str) -> Path:
+    """Return the private cross-process context for one hosted SMS turn."""
+    root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
+    path = root / "hosted_sms_turn_contexts"
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o700)
     digest = hashlib.sha256(chat_id.encode()).hexdigest()
     return path / f"{digest}.json"
 
@@ -106,6 +125,10 @@ class BridgeConfig:
     permission_timeout_s: float = 600.0
     codex_turn_timeout_s: float = 1800.0
     codex_interrupt_timeout_s: float = 10.0
+    voice_stack: VoiceStack = VoiceStack.INKBOX_TTS_STT
+    voice_stack_invalid_value: str = ""
+    voice_ai_authority_mode: str = "contact_scoped"
+    voicemail_detection: str = "enabled"
     # OpenAI Realtime voice (off unless the wizard validated a key)
     realtime: RealtimeConfig = field(default_factory=RealtimeConfig)
 
@@ -133,12 +156,35 @@ def inkbox_client_kwargs(api_key: str, base_url: str | None = None) -> Dict[str,
     }
 
 
-def _read_realtime_config() -> RealtimeConfig:
+def resolve_voice_stack(
+    value: Any,
+    *,
+    realtime_enabled: Any = None,
+    realtime_api_key: str = "",
+) -> tuple[VoiceStack, str]:
+    """Resolve the canonical stack while preserving legacy Realtime behavior."""
+    normalized = str(value or "").strip().lower()
+    if normalized:
+        try:
+            return VoiceStack(normalized), ""
+        except ValueError:
+            return VoiceStack.INKBOX_TTS_STT, normalized
+
+    enabled = str(realtime_enabled or "").strip().lower() in {
+        "auto", "1", "true", "yes", "on",
+    }
+    if enabled and realtime_api_key:
+        return VoiceStack.OPENAI_REALTIME, ""
+    return VoiceStack.INKBOX_TTS_STT, ""
+
+
+def _read_realtime_config(voice_stack: VoiceStack) -> RealtimeConfig:
     """Build the Realtime voice config from the env.
 
     The API key falls back to OPENAI_API_KEY so an operator who already
-    exports one doesn't have to re-enter it. Realtime stays disabled unless
-    INKBOX_REALTIME_ENABLED is truthy.
+    exports one doesn't have to re-enter it. The resolved canonical voice
+    stack decides whether Realtime is enabled; legacy enablement is folded
+    into that resolution before this function runs.
 
     Returns:
         RealtimeConfig: Resolved settings; ``enabled`` False leaves calls on
@@ -146,7 +192,7 @@ def _read_realtime_config() -> RealtimeConfig:
     """
     api_key = str(os.getenv("INKBOX_REALTIME_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
     return RealtimeConfig(
-        enabled=env_flag("INKBOX_REALTIME_ENABLED", False) and bool(api_key),
+        enabled=voice_stack is VoiceStack.OPENAI_REALTIME and bool(api_key),
         api_key=api_key,
         model=str(os.getenv("INKBOX_REALTIME_MODEL") or REALTIME_DEFAULT_MODEL).strip(),
         voice=str(os.getenv("INKBOX_REALTIME_VOICE") or REALTIME_DEFAULT_VOICE).strip(),
@@ -156,6 +202,15 @@ def _read_realtime_config() -> RealtimeConfig:
 
 def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
     extra = extra or {}
+    realtime_api_key = str(
+        os.getenv("INKBOX_REALTIME_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+    ).strip()
+    realtime_enabled = os.getenv("INKBOX_REALTIME_ENABLED")
+    voice_stack, invalid_voice_stack = resolve_voice_stack(
+        extra.get("voice_stack") or os.getenv("INKBOX_VOICE_STACK"),
+        realtime_enabled=realtime_enabled,
+        realtime_api_key=realtime_api_key,
+    )
     return BridgeConfig(
         api_key=str(extra.get("api_key") or os.getenv("INKBOX_API_KEY") or "").strip(),
         identity=str(extra.get("identity") or os.getenv("INKBOX_IDENTITY") or "").strip(),
@@ -189,5 +244,17 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         permission_timeout_s=float(os.getenv("INKBOX_PERMISSION_TIMEOUT_S") or 600.0),
         codex_turn_timeout_s=float(os.getenv("CODEX_TURN_TIMEOUT_S") or 1800.0),
         codex_interrupt_timeout_s=float(os.getenv("CODEX_INTERRUPT_TIMEOUT_S") or 10.0),
-        realtime=_read_realtime_config(),
+        voice_stack=voice_stack,
+        voice_stack_invalid_value=invalid_voice_stack,
+        voice_ai_authority_mode=str(
+            extra.get("voice_ai_authority_mode")
+            or os.getenv("INKBOX_VOICE_AI_AUTHORITY_MODE")
+            or "contact_scoped"
+        ).strip().lower(),
+        voicemail_detection=str(
+            extra.get("voicemail_detection")
+            or os.getenv("INKBOX_VOICEMAIL_DETECTION")
+            or "enabled"
+        ).strip().lower(),
+        realtime=_read_realtime_config(voice_stack),
     )

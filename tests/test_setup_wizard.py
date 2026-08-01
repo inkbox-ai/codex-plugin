@@ -90,7 +90,7 @@ def test_install_command_prefers_uv_when_available(monkeypatch):
         "install",
         "--python",
         "/tmp/venv/bin/python",
-        "inkbox>=0.5.6,<1.0.0",
+        "inkbox>=0.5.9,<1.0.0",
         "aiohttp>=3.9",
     ]]
 
@@ -100,10 +100,10 @@ def test_install_command_falls_back_to_pip_and_ensurepip(monkeypatch):
     monkeypatch.setattr(setup_wizard.shutil, "which", lambda _name: None)
 
     assert setup_wizard._install_commands() == [
-        [["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.5.6,<1.0.0", "aiohttp>=3.9"]],
+        [["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.5.9,<1.0.0", "aiohttp>=3.9"]],
         [
             ["/tmp/venv/bin/python", "-m", "ensurepip", "--upgrade"],
-            ["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.5.6,<1.0.0", "aiohttp>=3.9"],
+            ["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.5.9,<1.0.0", "aiohttp>=3.9"],
         ],
     ]
 
@@ -122,7 +122,7 @@ def test_missing_sdk_guidance_prints_interpreter(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "/tmp/venv/bin/python" in out
     assert "uv pip install --python" in out
-    assert "inkbox>=0.5.6,<1.0.0" in out
+    assert "inkbox>=0.5.9,<1.0.0" in out
 
 
 # ----------------------------------------------------------------------
@@ -227,6 +227,7 @@ def test_admin_api_key_flow_selects_existing_identity_and_mints_agent_key(monkey
     assert identity.agent_handle == "selected-agent"
     assert agent_key == "ApiKey_agent_selected"
     assert did_provision_phone is False
+    assert setup_wizard._TRANSIENT_AUTHORITY_IDENTITY is identity
     assert FakeInkbox.instance.api_keys.created == [
         {
             "label": "Codex bridge - selected-agent",
@@ -294,6 +295,7 @@ def test_admin_api_key_flow_can_create_identity_and_mint_agent_key(monkeypatch):
     assert identity.agent_handle == "new-agent"
     assert agent_key == "ApiKey_agent_new"
     assert did_provision_phone is False
+    assert setup_wizard._TRANSIENT_AUTHORITY_IDENTITY is identity
     assert FakeInkbox.instance.created_identities == [
         ("new-agent", {"display_name": "New Agent", "phone_number": None})
     ]
@@ -603,54 +605,302 @@ def test_detect_realtime_key_none_when_unset(tmp_path, monkeypatch):
     assert setup_wizard._detect_openai_realtime_key() is None
 
 
-def test_configure_realtime_declined_writes_disabled(tmp_path, monkeypatch):
-    env_file = tmp_path / ".env"
-    monkeypatch.setenv("INKBOX_CODEX_ENV_FILE", str(env_file))
-    monkeypatch.delenv("INKBOX_REALTIME_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **k: False)
+class _FakeVoiceIdentity:
+    def __init__(self, authority_mode="contact_scoped"):
+        self.agent_handle = "voice-agent"
+        self.phone_number = types.SimpleNamespace(number="+15551234567")
+        self.hosted_config = types.SimpleNamespace(
+            voice="custom", model="custom", instructions="custom",
+            authority_mode=authority_mode,
+        )
+        self.incoming_config = types.SimpleNamespace(
+            incoming_call_action="auto_accept",
+            client_websocket_url="wss://old.example/ws",
+            incoming_call_webhook_url=None,
+        )
+        self.hosted_updates = []
+        self.incoming_updates = []
+        self.fail_hosted_once = False
 
-    identity = types.SimpleNamespace(phone_number=types.SimpleNamespace(number="+16614031457"))
-    setup_wizard._configure_realtime_calls(identity)
-    assert setup_wizard._env("INKBOX_REALTIME_ENABLED") == "false"
+    def get_hosted_agent_config(self):
+        return self.hosted_config
+
+    def set_hosted_agent_config(self, **kwargs):
+        self.hosted_updates.append(kwargs)
+
+    def get_incoming_call_action(self):
+        return self.incoming_config
+
+    def set_incoming_call_action(self, **kwargs):
+        self.incoming_updates.append(kwargs)
+        if self.fail_hosted_once and kwargs["incoming_call_action"] == "hosted_agent":
+            self.fail_hosted_once = False
+            raise RuntimeError("write failed")
 
 
-def test_configure_realtime_enables_on_valid_key(tmp_path, monkeypatch):
-    env_file = tmp_path / ".env"
-    monkeypatch.setenv("INKBOX_CODEX_ENV_FILE", str(env_file))
-    monkeypatch.setenv("INKBOX_REALTIME_API_KEY", "sk-rt")
-    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **k: True)
-    # Validation passes without hitting the network.
-    monkeypatch.setattr(setup_wizard, "_test_openai_realtime_api_key", lambda *a, **k: (True, "ok"))
+class _FakeAuthorityIdentity:
+    def __init__(self):
+        self.authority_updates = []
 
-    identity = types.SimpleNamespace(phone_number=types.SimpleNamespace(number="+16614031457"))
-    setup_wizard._configure_realtime_calls(identity)
-    assert setup_wizard._env("INKBOX_REALTIME_ENABLED") == "true"
-    assert setup_wizard._env("INKBOX_REALTIME_API_KEY") == "sk-rt"
+    def set_hosted_agent_authority_mode(self, mode):
+        self.authority_updates.append(mode)
 
 
-def test_configure_realtime_skips_without_phone(tmp_path, monkeypatch):
-    env_file = tmp_path / ".env"
-    monkeypatch.setenv("INKBOX_CODEX_ENV_FILE", str(env_file))
-    setup_wizard._configure_realtime_calls(types.SimpleNamespace(phone_number=None))
-    # No phone and no iMessage → returns before writing to this run's .env file.
-    assert not env_file.exists()
+def _voice_kwargs(**overrides):
+    values = {
+        "base_url": "",
+        "Inkbox": object,
+        "InkboxAPIError": Exception,
+        "WhoamiApiKeyResponse": None,
+        "ADMIN_SCOPED": "admin_scoped",
+    }
+    values.update(overrides)
+    return values
 
 
-def test_configure_realtime_offered_for_imessage_only_identity(tmp_path, monkeypatch):
-    # Calls can arrive over the shared iMessage line alone, so realtime is
-    # offered even without a dedicated number. The flag is threaded in
-    # explicitly because the local identity object may be stale.
-    env_file = tmp_path / ".env"
-    monkeypatch.setenv("INKBOX_CODEX_ENV_FILE", str(env_file))
-    monkeypatch.setenv("INKBOX_REALTIME_API_KEY", "sk-rt")
-    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **k: True)
-    monkeypatch.setattr(setup_wizard, "_test_openai_realtime_api_key", lambda *a, **k: (True, "ok"))
-
-    setup_wizard._configure_realtime_calls(
-        types.SimpleNamespace(phone_number=None), imessage_enabled=True
+def test_phone_voice_stack_offers_three_choices_and_configures_tts(monkeypatch):
+    identity = _FakeVoiceIdentity()
+    saved = []
+    presented = []
+    questions = []
+    monkeypatch.setattr(setup_wizard, "_detect_openai_realtime_key", lambda: None)
+    monkeypatch.setattr(setup_wizard, "_env", lambda _name: "")
+    monkeypatch.setattr(
+        setup_wizard,
+        "prompt",
+        lambda question, *a, **k: questions.append(question) or "",
     )
-    assert setup_wizard._env("INKBOX_REALTIME_ENABLED") == "true"
+    monkeypatch.setattr(
+        setup_wizard, "prompt_choice",
+        lambda question, choices, default=0, **_kwargs: presented.append((question, choices, default)) or 2,
+    )
+    monkeypatch.setattr(setup_wizard, "_save", lambda name, value: saved.append((name, value)))
+
+    setup_wizard._configure_phone_call_voice_stack(identity, **_voice_kwargs())
+
+    assert [choice.split(" —", 1)[0] for choice in presented[0][1]] == [
+        "Inkbox Voice AI", "OpenAI Realtime API", "Inkbox TTS/STT",
+    ]
+    assert questions == ["  Press Enter to continue and set up phone call handling"]
+    assert identity.incoming_updates == [{
+        "incoming_call_action": "auto_accept",
+        "client_websocket_url": "wss://voice-agent.inkboxwire.com/phone/media/ws",
+        "incoming_call_webhook_url": None,
+    }]
+    assert saved == [
+        ("INKBOX_REALTIME_ENABLED", "false"),
+        ("INKBOX_VOICE_STACK", "inkbox_tts_stt"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("saved_stack", "expected_index"),
+    [
+        ("inkbox_voice_ai", 0),
+        ("openai_realtime", 1),
+        ("inkbox_tts_stt", 2),
+    ],
+)
+def test_voice_stack_rerun_defaults_to_saved_selection(
+    saved_stack, expected_index, monkeypatch,
+):
+    monkeypatch.setattr(
+        setup_wizard,
+        "_env",
+        lambda name: saved_stack if name == "INKBOX_VOICE_STACK" else "",
+    )
+    assert setup_wizard._voice_stack_default_index("") == expected_index
+
+
+def test_prompt_choice_reprompts_invalid_input_and_honors_default(monkeypatch):
+    answers = iter(["not-a-number", "9", ""])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    assert setup_wizard.prompt_choice("choose", ["one", "two", "three"], 1) == 1
+
+
+def test_prompt_choice_cancellation_exits(monkeypatch):
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _prompt: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    with pytest.raises(SystemExit):
+        setup_wizard.prompt_choice("choose", ["one", "two"], 0)
+
+
+def test_phone_voice_stack_configures_valid_realtime(monkeypatch):
+    identity = _FakeVoiceIdentity()
+    saved = []
+    monkeypatch.setattr(
+        setup_wizard,
+        "_detect_openai_realtime_key",
+        lambda: ("INKBOX_REALTIME_API_KEY", "sk-valid"),
+    )
+    monkeypatch.setattr(setup_wizard, "_env", lambda _name: "")
+    monkeypatch.setattr(setup_wizard, "prompt", lambda *a, **k: "")
+    monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *a, **k: 1)
+    monkeypatch.setattr(
+        setup_wizard,
+        "_test_openai_realtime_api_key",
+        lambda *a, **k: (True, "ok"),
+    )
+    monkeypatch.setattr(
+        setup_wizard,
+        "_save",
+        lambda name, value: saved.append((name, value)),
+    )
+
+    setup_wizard._configure_phone_call_voice_stack(identity, **_voice_kwargs())
+
+    assert ("INKBOX_REALTIME_API_KEY", "sk-valid") in saved
+    assert ("INKBOX_REALTIME_ENABLED", "true") in saved
+    assert ("INKBOX_VOICE_STACK", "openai_realtime") in saved
+    assert identity.incoming_updates[-1]["incoming_call_action"] == "auto_accept"
+
+
+def test_realtime_failure_loops_back_without_partial_save(monkeypatch):
+    identity = _FakeVoiceIdentity()
+    saved = []
+    choices = iter([1, 2])
+    monkeypatch.setattr(
+        setup_wizard, "_detect_openai_realtime_key", lambda: ("OPENAI_API_KEY", "sk-bad")
+    )
+    monkeypatch.setattr(setup_wizard, "_env", lambda _name: "")
+    monkeypatch.setattr(setup_wizard, "prompt", lambda *a, **k: "")
+    monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *_args, **_kwargs: next(choices))
+    monkeypatch.setattr(setup_wizard, "_save", lambda name, value: saved.append((name, value)))
+    monkeypatch.setattr(
+        setup_wizard, "_test_openai_realtime_api_key", lambda *_args: (False, "invalid_api_key")
+    )
+
+    setup_wizard._configure_phone_call_voice_stack(identity, **_voice_kwargs())
+
+    assert saved == [
+        ("INKBOX_REALTIME_ENABLED", "false"),
+        ("INKBOX_VOICE_STACK", "inkbox_tts_stt"),
+    ]
+
+
+def test_voice_ai_contact_scope_does_not_prompt_for_admin(monkeypatch):
+    identity = _FakeVoiceIdentity()
+    saved = []
+    choices = iter([0, 0])
+    monkeypatch.setattr(setup_wizard, "_detect_openai_realtime_key", lambda: None)
+    monkeypatch.setattr(setup_wizard, "_env", lambda _name: "")
+    monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *_args, **_kwargs: next(choices))
+    monkeypatch.setattr(
+        setup_wizard, "prompt",
+        lambda question, *_args, **_kwargs: (
+            ""
+            if "Press Enter" in question
+            else (_ for _ in ()).throw(AssertionError("admin prompted"))
+        ),
+    )
+    monkeypatch.setattr(setup_wizard, "_save", lambda name, value: saved.append((name, value)))
+
+    setup_wizard._configure_phone_call_voice_stack(identity, **_voice_kwargs())
+
+    assert identity.hosted_updates == [{
+        "voice": "custom", "model": "custom", "instructions": "custom",
+    }]
+    assert identity.incoming_updates == [{
+        "incoming_call_action": "hosted_agent",
+        "client_websocket_url": None,
+        "incoming_call_webhook_url": None,
+    }]
+    assert ("INKBOX_VOICE_AI_AUTHORITY_MODE", "contact_scoped") in saved
+
+
+def test_voice_ai_reuses_transient_admin_identity_without_persisting_it(monkeypatch):
+    identity = _FakeVoiceIdentity()
+    authority = _FakeAuthorityIdentity()
+    saved = []
+    choices = iter([0, 1])
+    monkeypatch.setattr(setup_wizard, "_detect_openai_realtime_key", lambda: None)
+    monkeypatch.setattr(setup_wizard, "_env", lambda _name: "")
+    monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *_args, **_kwargs: next(choices))
+    monkeypatch.setattr(
+        setup_wizard, "prompt",
+        lambda question, *_args, **_kwargs: (
+            ""
+            if "Press Enter" in question
+            else (_ for _ in ()).throw(AssertionError("admin prompted"))
+        ),
+    )
+    monkeypatch.setattr(setup_wizard, "_save", lambda name, value: saved.append((name, value)))
+
+    setup_wizard._configure_phone_call_voice_stack(
+        identity, **_voice_kwargs(authority_identity=authority)
+    )
+
+    assert authority.authority_updates == ["yolo"]
+    assert all("ApiKey" not in value for _, value in saved)
+
+
+def test_voice_ai_rejects_non_admin_key_and_returns_to_stack_choices(
+    monkeypatch,
+    capsys,
+):
+    identity = _FakeVoiceIdentity()
+    saved = []
+    choices = iter([0, 1, 2])
+
+    class Whoami:
+        auth_subtype = "agent_scoped"
+
+    class FakeInkbox:
+        def __init__(self, **_kwargs):
+            pass
+
+        def whoami(self):
+            return Whoami()
+
+        def get_identity(self, _handle):
+            raise AssertionError("non-admin credential must not configure authority")
+
+    monkeypatch.setattr(setup_wizard, "_detect_openai_realtime_key", lambda: None)
+    monkeypatch.setattr(setup_wizard, "_env", lambda _name: "")
+    monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *a, **k: next(choices))
+    monkeypatch.setattr(
+        setup_wizard,
+        "prompt",
+        lambda question, *a, **k: (
+            "" if "Press Enter" in question else "ApiKey_not_admin"
+        ),
+    )
+    monkeypatch.setattr(setup_wizard, "_save", lambda name, value: saved.append((name, value)))
+
+    setup_wizard._configure_phone_call_voice_stack(
+        identity,
+        **_voice_kwargs(Inkbox=FakeInkbox, WhoamiApiKeyResponse=Whoami),
+    )
+
+    assert identity.hosted_updates == []
+    assert saved == [
+        ("INKBOX_REALTIME_ENABLED", "false"),
+        ("INKBOX_VOICE_STACK", "inkbox_tts_stt"),
+    ]
+    assert all(value != "ApiKey_not_admin" for _, value in saved)
+    assert "requires an admin-scoped API key" in capsys.readouterr().out
+
+
+def test_voice_ai_failure_rolls_back_before_returning_to_choices(monkeypatch):
+    identity = _FakeVoiceIdentity()
+    identity.fail_hosted_once = True
+    saved = []
+    choices = iter([0, 0, 2])
+    monkeypatch.setattr(setup_wizard, "_detect_openai_realtime_key", lambda: None)
+    monkeypatch.setattr(setup_wizard, "_env", lambda _name: "")
+    monkeypatch.setattr(setup_wizard, "prompt", lambda *a, **k: "")
+    monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *_args, **_kwargs: next(choices))
+    monkeypatch.setattr(setup_wizard, "_save", lambda name, value: saved.append((name, value)))
+
+    setup_wizard._configure_phone_call_voice_stack(identity, **_voice_kwargs())
+
+    assert identity.hosted_updates[-1] == {
+        "voice": "custom", "model": "custom", "instructions": "custom",
+    }
+    assert identity.incoming_updates[-1]["incoming_call_action"] == "auto_accept"
+    assert ("INKBOX_VOICE_STACK", "inkbox_voice_ai") not in saved
 
 
 # ----------------------------------------------------------------------
@@ -778,9 +1028,9 @@ def test_wizard_walks_imessage_before_dedicated_number(monkeypatch):
     )
     monkeypatch.setattr(
         setup_wizard,
-        "_configure_realtime_calls",
-        lambda _identity, *, imessage_enabled: calls.append(
-            ("realtime", imessage_enabled)
+        "_configure_phone_call_voice_stack",
+        lambda _identity, **kwargs: calls.append(
+            ("voice_stack", kwargs["imessage_enabled"])
         ),
     )
     monkeypatch.setattr(
@@ -804,7 +1054,7 @@ def test_wizard_walks_imessage_before_dedicated_number(monkeypatch):
         "imessage",
         "dedicated_number",
         "summary",
-        ("realtime", True),  # iMessage result threaded into the realtime gate
+        ("voice_stack", True),  # iMessage result threaded into the voice-stack gate
         "signing_key",
         "project_dir",
         "approvals",

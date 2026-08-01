@@ -5,7 +5,7 @@ number-scoped update only as a legacy-SDK fallback."""
 import types
 
 from inkbox_codex import gateway as gateway_mod
-from inkbox_codex.config import BridgeConfig
+from inkbox_codex.config import BridgeConfig, VoiceStack
 from inkbox_codex.gateway import InkboxGateway
 
 
@@ -19,6 +19,8 @@ class _FakeSubscriptions:
         return list(self.existing)
 
     def create(self, **kwargs):
+        families = {event.split(".", 1)[0] for event in kwargs["event_types"]}
+        assert len(families) == 1, f"mixed subscription families: {families}"
         self.created.append(kwargs)
         return None
 
@@ -86,8 +88,10 @@ def _legacy_identity(**kwargs):
     return legacy
 
 
-def _patched_gateway(identity, subscriptions=None):
-    gw = InkboxGateway(BridgeConfig(identity="codex-agent", allow_all_users=True))
+def _patched_gateway(identity, subscriptions=None, voice_stack=VoiceStack.INKBOX_TTS_STT):
+    gw = InkboxGateway(BridgeConfig(
+        identity="codex-agent", allow_all_users=True, voice_stack=voice_stack,
+    ))
     gw._inkbox = _FakeInkbox(identity, subscriptions)
     gw._public_url = "https://agent.inkboxwire.com"
     gw._public_host = "agent.inkboxwire.com"
@@ -102,10 +106,28 @@ def test_incoming_call_config_is_identity_scoped():
     assert identity.incoming_call_configs == [{
         "incoming_call_action": "auto_accept",
         "client_websocket_url": "wss://agent.inkboxwire.com/phone/media/ws",
-        "incoming_call_webhook_url": "https://agent.inkboxwire.com/webhook",
+        "incoming_call_webhook_url": None,
     }]
     # The number-scoped legacy write must not also fire.
     assert gw._inkbox.phone_numbers.updates == []
+
+
+def test_voice_ai_reconciles_hosted_incoming_action_and_completion_subscription():
+    identity = _Identity(phone=True, imessage=True)
+    subscriptions = _FakeSubscriptions()
+    _patched_gateway(
+        identity,
+        subscriptions=subscriptions,
+        voice_stack=VoiceStack.INKBOX_VOICE_AI,
+    )
+
+    assert identity.incoming_call_configs == [{
+        "incoming_call_action": "hosted_agent",
+        "client_websocket_url": None,
+        "incoming_call_webhook_url": None,
+    }]
+    assert subscriptions.created[-2]["event_types"] == gateway_mod.IMESSAGE_EVENTS
+    assert subscriptions.created[-1]["event_types"] == gateway_mod.CALL_EVENTS
 
 
 def test_incoming_call_config_registers_for_imessage_only_identity():
@@ -153,10 +175,11 @@ def test_a2a_subscription_falls_back_to_imessage_on_older_api():
         subscriptions=subscriptions,
     )
 
-    assert subscriptions.created[-1]["event_types"] == gateway_mod.IMESSAGE_EVENTS
+    assert subscriptions.created[-2]["event_types"] == gateway_mod.IMESSAGE_EVENTS
+    assert subscriptions.created[-1]["event_types"] == gateway_mod.CALL_EVENTS
 
 
-def test_a2a_and_imessage_use_channel_coherent_subscriptions():
+def test_a2a_imessage_and_call_use_channel_coherent_subscriptions():
     subscriptions = _FakeSubscriptions()
     _patched_gateway(
         _Identity(phone=False, imessage=True),
@@ -166,8 +189,10 @@ def test_a2a_and_imessage_use_channel_coherent_subscriptions():
     assert [created["event_types"] for created in subscriptions.created] == [
         gateway_mod.A2A_EVENTS,
         gateway_mod.IMESSAGE_EVENTS,
+        gateway_mod.CALL_EVENTS,
     ]
     assert [created["url"] for created in subscriptions.created] == [
+        "https://agent.inkboxwire.com/webhook",
         "https://agent.inkboxwire.com/webhook",
         "https://agent.inkboxwire.com/webhook",
     ]
@@ -186,11 +211,18 @@ def test_imessage_reconcile_preserves_existing_a2a_channel_subscription():
     )
 
     assert subscriptions.deleted == []
-    assert subscriptions.created == [{
-        "agent_identity_id": "identity-1",
-        "url": "https://agent.inkboxwire.com/webhook",
-        "event_types": gateway_mod.IMESSAGE_EVENTS,
-    }]
+    assert subscriptions.created == [
+        {
+            "agent_identity_id": "identity-1",
+            "url": "https://agent.inkboxwire.com/webhook",
+            "event_types": gateway_mod.IMESSAGE_EVENTS,
+        },
+        {
+            "agent_identity_id": "identity-1",
+            "url": "https://agent.inkboxwire.com/webhook",
+            "event_types": gateway_mod.CALL_EVENTS,
+        },
+    ]
 
 
 def test_a2a_only_subscription_is_skipped_on_older_api():

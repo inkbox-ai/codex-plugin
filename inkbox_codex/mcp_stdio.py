@@ -58,7 +58,7 @@ class InkboxMcpServer:
                     "capabilities": {"tools": {}},
                     "serverInfo": {
                         "name": "inkbox-codex",
-                        "version": "0.2.7",
+                        "version": "0.2.8",
                     },
                 },
             )

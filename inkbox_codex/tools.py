@@ -29,28 +29,44 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from media import file_to_email_attachment
 
 try:
-    from .config import (
-        INKBOX_WS_PATH,
-        a2a_turn_context_path,
-        call_contexts_dir,
-        channel_hints_path,
-    )
     from .a2a_delegations import (
         find_by_task,
         promote_after_send,
         record_before_send,
     )
-except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import (
+    from .config import (
         INKBOX_WS_PATH,
+        VoiceStack,
         a2a_turn_context_path,
         call_contexts_dir,
         channel_hints_path,
+        hosted_sms_turn_context_path,
+        read_config,
     )
+    from .delivery_policy import sms_tool_failure_kind
+    from .hosted_sms_guard import (
+        reserve_hosted_sms_attempt,
+        settle_hosted_sms_attempt,
+    )
+except ImportError:  # pragma: no cover - direct local import/test fallback
     from a2a_delegations import (
         find_by_task,
         promote_after_send,
         record_before_send,
+    )
+    from config import (
+        INKBOX_WS_PATH,
+        VoiceStack,
+        a2a_turn_context_path,
+        call_contexts_dir,
+        channel_hints_path,
+        hosted_sms_turn_context_path,
+        read_config,
+    )
+    from delivery_policy import sms_tool_failure_kind
+    from hosted_sms_guard import (
+        reserve_hosted_sms_attempt,
+        settle_hosted_sms_attempt,
     )
 
 
@@ -106,6 +122,22 @@ def _schema(properties: Dict[str, JsonSchema], required: List[str] | None = None
         "required": required or [],
         "additionalProperties": False,
     }
+
+
+def _schema_with_exactly_one_alias(
+    properties: Dict[str, JsonSchema],
+    *,
+    required: List[str],
+    left: str,
+    right: str,
+) -> JsonSchema:
+    """Require one spelling of an aliased field, never neither or both."""
+    schema = _schema(properties, required)
+    schema["oneOf"] = [
+        {"required": [left], "not": {"required": [right]}},
+        {"required": [right], "not": {"required": [left]}},
+    ]
+    return schema
 
 
 def _str(desc: str = "", *, max_length: int | None = None) -> JsonSchema:
@@ -210,11 +242,10 @@ TOOL_SPECS: List[ToolSpec] = [
         "dedicated phone number, or the shared Inkbox iMessage line you are already "
         "messaging the recipient on. Match the channel you're talking on — call "
         "SMS/phone contacts from your dedicated number, and call an iMessage contact "
-        "over the shared iMessage line (set `origination` accordingly). The call's "
-        "audio bridges to the running gateway. Always pass purpose so the live call "
-        "opens with context; optionally pass opening_message, context, and "
-        "voicemail_detection (enabled or disabled).",
-        _schema(
+        "over the shared iMessage line (set `origination` accordingly). The selected "
+        "phone voice stack handles the call. Always pass purpose so the call starts "
+        "with a concrete task; voicemail behavior comes from gateway configuration.",
+        _schema_with_exactly_one_alias(
             {
                 "to_number": _str("E.164 recipient number, e.g. +15551234567."),
                 "toNumber": _str("Alias for to_number."),
@@ -238,17 +269,10 @@ TOOL_SPECS: List[ToolSpec] = [
                 "context": _str("Optional extra background for the live call."),
                 "client_websocket_url": _str("Optional override for the call-media WebSocket URL."),
                 "clientWebsocketUrl": _str("Alias for client_websocket_url."),
-                "voicemail_detection": {
-                    "type": "string",
-                    "enum": ["enabled", "disabled"],
-                    "description": (
-                        "Whether the call should end when voicemail is detected. "
-                        "Omit to keep detection enabled."
-                    ),
-                },
-                "voicemailDetection": _str("Alias for voicemail_detection."),
             },
-            ["purpose"],
+            required=["purpose"],
+            left="to_number",
+            right="toNumber",
         ),
     ),
     ToolSpec(
@@ -498,12 +522,106 @@ def _tool_error(message: str, **fields: Any) -> Dict[str, Any]:
     }
 
 
+def _tool_exception_fields(exc: Exception) -> Dict[str, Any]:
+    """Project canonical SDK failure metadata without duplicating raw payloads."""
+    fields: Dict[str, Any] = {}
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        fields["status_code"] = status
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict):
+        code = detail.get("error") or detail.get("error_code") or detail.get("code")
+        rule = detail.get("rule")
+        if code:
+            fields["error_code"] = str(code)
+        if rule:
+            fields["rule"] = str(rule)
+    return fields
+
+
 def _message_too_long_reason(channel: str, content: str, max_chars: int) -> str:
     char_count = len(content or "")
     return (
         f"{channel} text is {char_count} characters; maximum is {max_chars}. "
         f"Shorten it or split it into smaller {channel} messages."
     )
+
+
+def _hosted_sms_context() -> Optional[Dict[str, Any]]:
+    """Load the gateway-bound hosted SMS context for this MCP subprocess."""
+    chat_id = (os.getenv("INKBOX_CODEX_CHAT_ID") or "").strip()
+    if not chat_id:
+        return None
+    path = hosted_sms_turn_context_path(chat_id)
+    try:
+        value = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(
+            "Hosted-call SMS safety state is unavailable; send blocked."
+        ) from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(
+            "Hosted-call SMS safety state is unavailable; send blocked."
+        )
+    return value
+
+
+def _settle_hosted_sms_context(context: Dict[str, Any], state: str) -> None:
+    settle_hosted_sms_attempt(
+        str(context.get("call_id") or ""),
+        int(context.get("attempt") or 1),
+        state,
+    )
+
+
+def _reserve_hosted_sms_target(
+    target: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Reserve one exact-target hosted SMS or return a fail-closed tool result."""
+    try:
+        context = _hosted_sms_context()
+    except RuntimeError as exc:
+        return None, _tool_error(
+            str(exc),
+            error_code="hosted_sms_send_blocked",
+        )
+    if context is None:
+        return None, None
+
+    expected = str(context.get("remote_phone") or "").strip()
+    if not expected or target != expected:
+        try:
+            _settle_hosted_sms_context(context, "terminal")
+        except Exception:
+            pass
+        return None, _tool_error(
+            "Hosted-call SMS target does not match the authoritative caller; "
+            "send blocked.",
+            error_code="hosted_sms_send_blocked",
+        )
+    try:
+        reserved = reserve_hosted_sms_attempt(
+            str(context.get("call_id") or ""),
+            int(context.get("attempt") or 1),
+            expected,
+        )
+    except Exception:
+        try:
+            _settle_hosted_sms_context(context, "terminal")
+        except Exception:
+            pass
+        return None, _tool_error(
+            "Hosted-call SMS safety state is unavailable; send blocked.",
+            error_code="hosted_sms_send_blocked",
+        )
+    if not reserved:
+        return None, _tool_error(
+            "This hosted-call SMS attempt was already used; duplicate send blocked.",
+            error_code="hosted_sms_duplicate_blocked",
+        )
+    return context, None
 
 
 def _upload_media_url(identity: Any, path: str) -> str:
@@ -624,14 +742,33 @@ def _write_call_context(
     return token
 
 
+def _hosted_call_reason(args: Dict[str, Any]) -> str:
+    """Build a bounded Voice AI task brief from the call request."""
+    parts = [str(args.get("purpose") or "").strip()]
+    opening = str(args.get("opening_message") or args.get("openingMessage") or "").strip()
+    context = str(args.get("context") or "").strip()
+    if opening:
+        parts.append(f"Opening guidance: {opening}")
+    if context:
+        parts.append(f"Context: {context}")
+    return "\n\n".join(part for part in parts if part)[:4000]
+
+
 async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Run one Inkbox MCP tool and return an MCP ``tools/call`` result."""
 
     args = dict(args or {})
+    hosted_sms_context: Optional[Dict[str, Any]] = None
 
     if name == "inkbox_send_sms":
         text = str(args.get("text") or "")
+        target = str(args.get("to") or "").strip()
+        hosted_sms_context, blocked = _reserve_hosted_sms_target(target)
+        if blocked is not None:
+            return blocked
         if len(text) > SMS_MAX_LENGTH:
+            if hosted_sms_context is not None:
+                _settle_hosted_sms_context(hosted_sms_context, "recoverable")
             return _tool_error(
                 _message_too_long_reason("SMS", text, SMS_MAX_LENGTH),
                 error_code="sms_too_long",
@@ -741,22 +878,27 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
             return {"sent": True, "id": str(getattr(msg, "id", ""))}
 
         if name == "inkbox_place_call":
-            to_number = str(args.get("to_number") or args.get("toNumber") or "").strip()
-            if not to_number:
-                raise ValueError("to_number is required (E.164, e.g. +15551234567)")
+            snake_to_number = str(args.get("to_number") or "").strip()
+            camel_to_number = str(args.get("toNumber") or "").strip()
+            if bool(snake_to_number) == bool(camel_to_number):
+                raise ValueError(
+                    "Specify exactly one of to_number or toNumber "
+                    "(E.164, e.g. +15551234567)"
+                )
+            to_number = snake_to_number or camel_to_number
             purpose = str(args.get("purpose") or "").strip()
             if not purpose:
                 raise ValueError(
                     "purpose is required so the live call opens with context"
                 )
-            voicemail_detection = str(
-                args.get("voicemail_detection")
-                or args.get("voicemailDetection")
-                or ""
-            ).strip().lower()
-            if voicemail_detection not in {"", "enabled", "disabled"}:
+            cfg = read_config()
+            if cfg.voice_stack_invalid_value:
                 raise ValueError(
-                    "voicemail_detection must be enabled or disabled"
+                    f"Invalid INKBOX_VOICE_STACK={cfg.voice_stack_invalid_value!r}; rerun setup"
+                )
+            if cfg.voicemail_detection not in {"enabled", "disabled"}:
+                raise ValueError(
+                    "INKBOX_VOICEMAIL_DETECTION must be enabled or disabled"
                 )
             identity = _identity()
             # Resolve the outbound line (dedicated number vs shared iMessage line).
@@ -769,6 +911,30 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                     "number and iMessage is not enabled. Provision a number or "
                     "enable iMessage first."
                 )
+            hosted = cfg.voice_stack is VoiceStack.INKBOX_VOICE_AI
+            if hosted:
+                call = identity.place_call(
+                    to_number=to_number,
+                    origination=origination,
+                    mode="hosted_agent",
+                    reason=_hosted_call_reason(args),
+                    voicemail_detection=cfg.voicemail_detection,
+                )
+                return {
+                    "placed": True,
+                    "id": str(getattr(call, "id", "")),
+                    "to": to_number,
+                    "origination": origination,
+                    "mode": _json_safe(getattr(call, "mode", None) or "hosted_agent"),
+                    "hosted_agent_authority_mode": _json_safe(
+                        getattr(call, "hosted_agent_authority_mode", None)
+                    ),
+                    "voicemail_detection": _json_safe(
+                        getattr(call, "voicemail_detection", None) or cfg.voicemail_detection
+                    ),
+                    "status": _json_safe(getattr(call, "status", None)),
+                }
+
             # An explicit override wins; otherwise resolve from the identity.
             ws_url = str(
                 args.get("client_websocket_url")
@@ -795,19 +961,14 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 "to_number": to_number,
                 "origination": origination,
                 "client_websocket_url": ws_url,
+                "mode": "client_websocket",
+                "voicemail_detection": cfg.voicemail_detection,
             }
-            if voicemail_detection:
-                call_kwargs["voicemail_detection"] = voicemail_detection
             try:
                 call = identity.place_call(**call_kwargs)
             except TypeError:
-                if voicemail_detection:
-                    raise RuntimeError(
-                        "voicemail_detection requires inkbox SDK 0.5.8 or newer"
-                    )
-                # Older SDK without ``origination`` support → dedicated only.
-                call = identity.place_call(
-                    to_number=to_number, client_websocket_url=ws_url
+                raise RuntimeError(
+                    "configured call options require inkbox SDK 0.5.9 or newer"
                 )
             except Exception as exc:
                 if "no_shared_connection" in str(exc):
@@ -825,6 +986,10 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 "id": str(getattr(call, "id", "")),
                 "to": to_number,
                 "origination": origination,
+                "mode": _json_safe(getattr(call, "mode", None) or "client_websocket"),
+                "voicemail_detection": _json_safe(
+                    getattr(call, "voicemail_detection", None) or cfg.voicemail_detection
+                ),
                 "context_token": token,
                 "status": _json_safe(getattr(call, "status", None)),
             }
@@ -1045,15 +1210,79 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
         raise ValueError(f"unknown Inkbox tool: {name}")
 
     try:
-        return _tool_result(await asyncio.to_thread(_run))
+        result = await asyncio.to_thread(_run)
+        if hosted_sms_context is not None:
+            _settle_hosted_sms_context(hosted_sms_context, "success")
+        return _tool_result(result)
     except Exception as exc:
-        return _tool_error(str(exc))
+        fields = _tool_exception_fields(exc)
+        if hosted_sms_context is not None:
+            _settle_hosted_sms_context(
+                hosted_sms_context,
+                sms_tool_failure_kind(message=str(exc), **fields),
+            )
+        return _tool_error(str(exc), **fields)
+
+
+def _place_call_tool_entry(voice_stack: VoiceStack) -> Dict[str, Any]:
+    hosted = voice_stack is VoiceStack.INKBOX_VOICE_AI
+    properties: Dict[str, Any] = {
+        "to_number": _str("E.164 recipient number, e.g. +15551234567."),
+        "toNumber": _str("Alias for to_number."),
+        "purpose": _str(
+            "Why Codex is placing this call; becomes Inkbox Voice AI's task brief."
+            if hosted else
+            "Why Codex is placing this call; loaded before the live greeting."
+        ),
+        "origination": {
+            "type": "string",
+            "enum": ["dedicated_number", "shared_imessage_number"],
+            "description": (
+                "Which line to call from. Use dedicated_number for the agent's own "
+                "phone line or shared_imessage_number for an existing iMessage contact."
+            ),
+        },
+        "opening_message": _str(
+            "Optional opening guidance included in the Voice AI task brief."
+            if hosted else "Optional exact first line to say on pickup."
+        ),
+        "openingMessage": _str("Alias for opening_message."),
+        "context": _str(
+            "Optional concise background included in the Voice AI task brief."
+            if hosted else "Optional extra background for the local voice agent."
+        ),
+    }
+    if not hosted:
+        properties.update({
+            "client_websocket_url": _str("Optional override for the call-media WebSocket URL."),
+            "clientWebsocketUrl": _str("Alias for client_websocket_url."),
+        })
+    return {
+        "name": "inkbox_place_call",
+        "description": (
+            "Ask Inkbox Voice AI to place an outbound call and complete the stated "
+            "task over either of the identity's two lines. Codex is notified "
+            "after the call ends."
+            if hosted else
+            "Place an outbound voice call over either of the identity's two lines, "
+            "handled by this Codex agent through the configured local voice stack."
+        ),
+        "inputSchema": _schema_with_exactly_one_alias(
+            properties,
+            required=["purpose"],
+            left="to_number",
+            right="toNumber",
+        ),
+    }
 
 
 def mcp_tool_list() -> List[Dict[str, Any]]:
     """Return MCP ``tools/list`` entries for every Inkbox tool."""
+    cfg = read_config()
     return [
-        {
+        _place_call_tool_entry(cfg.voice_stack)
+        if spec.name == "inkbox_place_call"
+        else {
             "name": spec.name,
             "description": spec.description,
             "inputSchema": spec.input_schema,
@@ -1068,6 +1297,9 @@ def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]
         "INKBOX_API_KEY": cfg.api_key,
         "INKBOX_IDENTITY": cfg.identity,
         "INKBOX_BASE_URL": cfg.base_url,
+        "INKBOX_VOICE_STACK": cfg.voice_stack.value,
+        "INKBOX_VOICE_AI_AUTHORITY_MODE": cfg.voice_ai_authority_mode,
+        "INKBOX_VOICEMAIL_DETECTION": cfg.voicemail_detection,
     }
     # Keep the tool process on the same state dir (call contexts, channel
     # hints) when the operator moved it.

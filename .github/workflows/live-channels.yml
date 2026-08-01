@@ -71,7 +71,7 @@ jobs:
       - name: Install bridge + test deps
         run: |
           pip install \
-            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@a4dd76b534e33c0a8352148d8f0e9ab25199f05b#subdirectory=sdk/python" \
+            "inkbox==0.5.9" \
             -e . pytest
 
       # @alpha is the prerelease channel cut from codex main near-daily — the
@@ -98,6 +98,8 @@ jobs:
             echo "INKBOX_IDENTITY=$HANDLE"
             echo "INKBOX_ALLOW_ALL_USERS=true"
             echo "INKBOX_REALTIME_ENABLED=false"
+            echo "INKBOX_VOICE_STACK=inkbox_tts_stt"
+            echo "INKBOX_VOICEMAIL_DETECTION=disabled"
             # Unattended runner: nobody is on the other end to answer an approval
             # text, so never escalate — and keep the sandbox read-only so a stray
             # command the model dreams up stays harmless.
@@ -134,7 +136,7 @@ jobs:
           nohup python3 "$GITHUB_WORKSPACE/tests/live/mock_openai.py" 8088 > "$RUNNER_TEMP/mock.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/mock.pid"
           for i in $(seq 1 10); do
-            curl -sf http://127.0.0.1:8088/v1/models >/dev/null && { echo "mock model ready"; exit 0; }
+            curl -sf --connect-timeout 1 --max-time 3 http://127.0.0.1:8088/v1/models >/dev/null && { echo "mock model ready"; exit 0; }
             sleep 1
           done
           echo "::error::mock model did not start"; cat "$RUNNER_TEMP/mock.log"; exit 1
@@ -177,7 +179,7 @@ jobs:
       # Failure-only: these logs carry live phone/email/message content and this repo
       # (and its Action logs/artifacts) is public.
       - name: Dump logs (on failure only)
-        if: failure()
+        if: failure() || cancelled()
         run: |
           echo "=== gateway.log ==="; cat "$GATEWAY_LOG" || true
           echo "=== mock model log ==="; cat "$RUNNER_TEMP/mock.log" 2>/dev/null || true
@@ -189,7 +191,7 @@ jobs:
           kill "$(cat "$RUNNER_TEMP/mock.pid" 2>/dev/null)" 2>/dev/null || true
 
       - name: Upload artifacts (on failure only)
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
           name: live-logs-${{ matrix.mode }}

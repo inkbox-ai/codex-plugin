@@ -1,10 +1,11 @@
-name: Live — voice calls (Inkbox TTS/STT + realtime)
+name: Live — voice calls (Voice AI + Realtime + Inkbox TTS/STT)
 
 # Boots the agent-under-test (AUT) gateway plus a driver process that bridges the
-# other side of a real phone call over its own Inkbox tunnel. Two matrix legs:
+# other side of a real phone call over its own Inkbox tunnel. Three matrix legs:
 #   inbound_inkbox    — driver calls the agent; agent answers with Inkbox STT/TTS.
 #   outbound_realtime — driver texts "call me"; the agent calls back powered by the
 #                       OpenAI Realtime API.
+#   outbound_hosted   — Voice AI calls back; Codex executes one commitment after hangup.
 # Each leg verifies the stored call transcript shows the agent spoke to the caller.
 # Real model + real calls, so this runs only on ready (non-draft) PRs + dispatch, and
 # shares the AUT tunnel lock with the other live suites.
@@ -53,7 +54,7 @@ jobs:
       fail-fast: false
       max-parallel: 1          # legs share the AUT identity → one at a time
       matrix:
-        scenario: ${{ fromJSON(inputs.include_inbound && '["inbound_inkbox","outbound_realtime"]' || '["outbound_realtime"]') }}
+        scenario: ${{ fromJSON(inputs.include_inbound && '["inbound_inkbox","outbound_realtime","outbound_hosted"]' || '["outbound_realtime","outbound_hosted"]') }}
 
     steps:
       - uses: actions/checkout@v7
@@ -80,7 +81,7 @@ jobs:
       - name: Install bridge + test deps
         run: |
           pip install \
-            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@a4dd76b534e33c0a8352148d8f0e9ab25199f05b#subdirectory=sdk/python" \
+            "inkbox==0.5.9" \
             -e . pytest fastapi 'uvicorn[standard]'
 
       # @alpha is the prerelease channel cut from codex main near-daily — the
@@ -117,12 +118,18 @@ jobs:
             # MCP tool confirmations are opt-in here: without this flag the
             # gateway escalates each Inkbox tool prompt as a poll nobody answers.
             echo "INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS=true"
+            echo "INKBOX_VOICEMAIL_DETECTION=disabled"
           } >> "$GITHUB_ENV"
           if [ "${{ matrix.scenario }}" = "outbound_realtime" ]; then
             # Realtime key falls back to OPENAI_API_KEY in the gateway env.
             echo "INKBOX_REALTIME_ENABLED=true" >> "$GITHUB_ENV"
+            echo "INKBOX_VOICE_STACK=openai_realtime" >> "$GITHUB_ENV"
+          elif [ "${{ matrix.scenario }}" = "outbound_hosted" ]; then
+            echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
+            echo "INKBOX_VOICE_STACK=inkbox_voice_ai" >> "$GITHUB_ENV"
           else
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
+            echo "INKBOX_VOICE_STACK=inkbox_tts_stt" >> "$GITHUB_ENV"
           fi
 
       - name: Start gateway and wait for readiness
@@ -146,6 +153,28 @@ jobs:
         env:
           REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
         run: |
+          if [ "${{ matrix.scenario }}" = "outbound_hosted" ]; then
+            # Long digit strings do not survive TTS/PSTN/STT reliably. Derive
+            # a current-run marker from radio-alphabet words so the persisted
+            # transcript and resulting SMS remain comparable after speech.
+            RADIO_WORDS=(
+              alpha bravo charlie delta echo foxtrot golf hotel india juliet
+              kilo lima mike november oscar papa quebec romeo sierra tango
+              uniform victor whiskey xray yankee zulu
+            )
+            marker_value=$((GITHUB_RUN_ID * 10 + GITHUB_RUN_ATTEMPT))
+            HOSTED_MARKER=""
+            for _ in 1 2 3 4 5; do
+              marker_index=$((marker_value % ${#RADIO_WORDS[@]}))
+              HOSTED_MARKER="${HOSTED_MARKER:+$HOSTED_MARKER }${RADIO_WORDS[$marker_index]}"
+              marker_value=$((marker_value / ${#RADIO_WORDS[@]}))
+            done
+            echo "HOSTED_POST_CALL_MARKER=$HOSTED_MARKER" >> "$GITHUB_ENV"
+            export VOICE_DRIVER_LINE="After we hang up, send me one SMS. Create the post-call action now with this exact SMS body: $HOSTED_MARKER. Read those five words back to me after the action is saved. Do not send it during the call."
+            # The test owns hangup after both transcript and durable action-item
+            # evidence exist; keep the media peer alive until then.
+            export VOICE_DRIVER_LISTEN=180
+          fi
           VOICE_DRIVER_STATE="$DRIVER_STATE" VOICE_DRIVER_PORT=8090 \
             python3 "$GITHUB_WORKSPACE/tests/live/voice_driver.py" > "$DRIVER_LOG" 2>&1 &
           echo $! > "$RUNNER_TEMP/driver.pid"
@@ -167,7 +196,7 @@ jobs:
 
       # Failure-only: these logs carry live call content and this repo is public.
       - name: Dump logs (on failure only)
-        if: failure()
+        if: failure() || cancelled()
         run: |
           echo "=== gateway.log ==="; cat "$GATEWAY_LOG" || true
           echo "=== driver.log ==="; cat "$DRIVER_LOG" || true

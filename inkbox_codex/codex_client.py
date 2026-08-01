@@ -11,8 +11,10 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 try:
     from .config import BridgeConfig
+    from .delivery_policy import sms_tool_failure_kind
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import BridgeConfig
+    from delivery_policy import sms_tool_failure_kind
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +30,35 @@ class CodexAppServerError(RuntimeError):
 class _TurnCapture:
     thread_id: str
     turn_id: str
-    future: "asyncio.Future[str]"
+    future: "asyncio.Future[CodexTurnResult]"
     messages: list[Dict[str, Any]] = field(default_factory=list)
     deltas: list[str] = field(default_factory=list)
+    mcp_tool_calls: list["McpToolCallResult"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class McpToolCallResult:
+    """Sanitized final state for one MCP tool item.
+
+    Tool result bodies and raw errors can contain message content or provider
+    payloads. Keep only the fields needed to settle a required side effect.
+    """
+
+    server: str
+    tool: str
+    status: str
+    arguments: Dict[str, Any]
+    sent: bool
+    error_kind: str
+
+
+@dataclass(frozen=True)
+class CodexTurnResult:
+    """Final reply plus sanitized MCP outcomes for one app-server turn."""
+
+    text: str
+    mcp_tool_calls: tuple[McpToolCallResult, ...]
+    aborted: bool = False
 
 
 class CodexAppServerClient:
@@ -80,6 +108,10 @@ class CodexAppServerClient:
 
     async def run(self, text: str) -> str:
         """Run one turn in the current thread and return the final reply text."""
+        return (await self.run_detailed(text)).text
+
+    async def run_detailed(self, text: str) -> CodexTurnResult:
+        """Run one turn and return its final reply and sanitized MCP outcomes."""
         if not self.thread_id:
             await self.connect()
         assert self.thread_id is not None
@@ -184,7 +216,7 @@ class CodexAppServerClient:
                 "clientInfo": {
                     "name": "inkbox_codex",
                     "title": "Inkbox Codex Bridge",
-                    "version": "0.2.7",
+                    "version": "0.2.8",
                 },
                 "capabilities": {"experimentalApi": True},
             },
@@ -285,6 +317,8 @@ class CodexAppServerClient:
             item = params.get("item") or {}
             if capture is not None and item.get("type") == "agentMessage":
                 capture.messages.append(item)
+            if capture is not None and item.get("type") == "mcpToolCall":
+                capture.mcp_tool_calls.append(_mcp_tool_call_result(item))
             return
 
         if method == "turn/completed":
@@ -297,7 +331,10 @@ class CodexAppServerClient:
                 error = turn.get("error") or turn.get("codexErrorInfo") or "turn failed"
                 capture.future.set_exception(CodexAppServerError(str(error)))
                 return
-            capture.future.set_result(_final_message(capture))
+            capture.future.set_result(CodexTurnResult(
+                text=_final_message(capture),
+                mcp_tool_calls=tuple(capture.mcp_tool_calls),
+            ))
 
     def _fail_all(self, exc: Exception) -> None:
         for future in list(self._pending.values()):
@@ -319,3 +356,74 @@ def _final_message(capture: _TurnCapture) -> str:
     if text:
         return text
     return "".join(capture.deltas).strip()
+
+
+def _mcp_tool_call_result(item: Dict[str, Any]) -> McpToolCallResult:
+    """Reduce a final MCP item without retaining result or error payloads."""
+    arguments = item.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    result = item.get("result")
+    sent = False
+    error_fragments: list[str] = []
+    error_code: Any = None
+    error_rule: Any = None
+    status_code: Any = None
+
+    def capture_error_metadata(payload: Dict[str, Any]) -> None:
+        nonlocal error_code, error_rule, status_code
+        error_code = payload.get("error_code") or payload.get("code") or error_code
+        error_rule = payload.get("rule") or error_rule
+        status_code = payload.get("status_code") or status_code
+        if payload.get("error"):
+            error_fragments.append(str(payload["error"]))
+
+    if isinstance(result, dict):
+        structured = result.get("structuredContent") or result.get("structured_content")
+        if isinstance(structured, dict):
+            sent = structured.get("sent") is True
+            capture_error_metadata(structured)
+        content = result.get("content")
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            text = str(block.get("text") or "")
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                sent = sent or payload.get("sent") is True
+                capture_error_metadata(payload)
+
+    error = item.get("error")
+    if isinstance(error, dict) and error.get("message"):
+        error_fragments.append(str(error["message"]))
+    elif error:
+        error_fragments.append(str(error))
+
+    safe_arguments = {
+        key: value
+        for key in ("to", "to_number", "toNumber", "conversation_id")
+        if (value := arguments.get(key)) is not None
+        and isinstance(value, (str, int, float, bool))
+    }
+    return McpToolCallResult(
+        server=str(item.get("server") or ""),
+        tool=str(item.get("tool") or ""),
+        status=str(item.get("status") or ""),
+        arguments=safe_arguments,
+        sent=sent,
+        error_kind=sms_tool_failure_kind(
+            error_code=error_code,
+            rule=error_rule,
+            status_code=status_code,
+            message=" ".join(error_fragments),
+        ),
+    )

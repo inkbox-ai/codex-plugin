@@ -21,8 +21,12 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 try:
-    from .codex_client import CodexAppServerClient, CodexAppServerError
-    from .config import BridgeConfig, a2a_turn_context_path
+    from .codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
+    from .config import (
+        BridgeConfig,
+        a2a_turn_context_path,
+        hosted_sms_turn_context_path,
+    )
     from .escalation import (
         PendingInteraction,
         format_codex_approval_request,
@@ -32,8 +36,8 @@ try:
     )
     from .prompts import build_channel_prompt, frame_inbound
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from codex_client import CodexAppServerClient, CodexAppServerError
-    from config import BridgeConfig, a2a_turn_context_path
+    from codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
+    from config import BridgeConfig, a2a_turn_context_path, hosted_sms_turn_context_path
     from escalation import (
         PendingInteraction,
         format_codex_approval_request,
@@ -73,11 +77,13 @@ class _Turn:
     """
 
     text: str
-    future: Optional["asyncio.Future[str]"] = None
+    future: Optional["asyncio.Future[Any]"] = None
     # True for a one-shot turn spawned to recover from a rejected reply send.
     # A recovery turn that itself fails to send is not recovered again (no loop).
     recovery: bool = False
     a2a_context: Optional[Dict[str, Any]] = None
+    capture_tools: bool = False
+    hosted_sms_context: Optional[Dict[str, Any]] = None
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Codex as a turn.
@@ -149,9 +155,12 @@ def _send_error_reason(exc: Exception) -> str:
     """
     detail = getattr(exc, "detail", None)
     if isinstance(detail, dict):
-        message = detail.get("message") or detail.get("error")
-        if message:
-            return str(message)
+        code = str(detail.get("error") or "").strip()
+        message = str(detail.get("message") or "").strip()
+        if code and message and code != message:
+            return f"[{code}] {message}"
+        if message or code:
+            return message or code
     return str(exc)
 
 
@@ -534,7 +543,14 @@ class ContactSession:
             except asyncio.QueueEmpty:
                 break
             if turn.future is not None and not turn.future.done():
-                turn.future.set_result("")
+                if turn.capture_tools:
+                    turn.future.set_result(CodexTurnResult(
+                        text="",
+                        mcp_tool_calls=(),
+                        aborted=True,
+                    ))
+                else:
+                    turn.future.set_result("")
 
     async def _begin_resume(self) -> None:
         """List recent sessions and let the human pick one to reopen.
@@ -631,6 +647,7 @@ class ContactSession:
         self._current_turn = turn
         typing_task: Optional[asyncio.Task] = None
         a2a_context_path: Optional[Path] = None
+        hosted_sms_context_path: Optional[Path] = None
         if turn.a2a_context is not None:
             a2a_context_path = a2a_turn_context_path(self.chat_id)
             tmp = a2a_context_path.with_suffix(".tmp")
@@ -639,15 +656,33 @@ class ContactSession:
             os.replace(tmp, a2a_context_path)
             a2a_context_path.chmod(0o600)
         try:
+            if turn.hosted_sms_context is not None:
+                hosted_sms_context_path = hosted_sms_turn_context_path(self.chat_id)
+                tmp = hosted_sms_context_path.with_suffix(".tmp")
+                try:
+                    tmp.write_text(
+                        json.dumps(turn.hosted_sms_context, sort_keys=True) + "\n"
+                    )
+                    tmp.chmod(0o600)
+                    os.replace(tmp, hosted_sms_context_path)
+                    hosted_sms_context_path.chmod(0o600)
+                except Exception:
+                    tmp.unlink(missing_ok=True)
+                    raise
             client = await self._ensure_client()
             # Keep a typing indicator alive on the human's channel for the whole
             # turn, then always tear it down — even if the turn raises.
             self._turn_active = True
             typing_task = asyncio.create_task(self._typing_loop())
             timeout = max(0.0, float(self.cfg.codex_turn_timeout_s or 0.0))
+            operation = (
+                client.run_detailed(turn.text)
+                if turn.capture_tools
+                else client.run(turn.text)
+            )
             if timeout:
                 try:
-                    reply_text = await asyncio.wait_for(client.run(turn.text), timeout=timeout)
+                    turn_result = await asyncio.wait_for(operation, timeout=timeout)
                 except asyncio.TimeoutError as exc:
                     logger.warning(
                         "[session %s] Codex turn exceeded %.0fs; restarting app-server",
@@ -660,7 +695,8 @@ class ContactSession:
                         "Send the request again or break it into a smaller step."
                     ) from exc
             else:
-                reply_text = await client.run(turn.text)
+                turn_result = await operation
+            reply_text = turn_result.text if turn.capture_tools else turn_result
             reply = reply_text.strip()
             if client.thread_id and self.on_session_id:
                 self.resume_session_id = client.thread_id
@@ -669,7 +705,14 @@ class ContactSession:
             # A capture turn must always settle its waiter — surface the error
             # there. A normal turn re-raises so _drain shows the human a notice.
             if turn.future is not None and not turn.future.done():
-                turn.future.set_exception(exc)
+                if turn.capture_tools and self._interrupting:
+                    turn.future.set_result(CodexTurnResult(
+                        text="",
+                        mcp_tool_calls=(),
+                        aborted=True,
+                    ))
+                else:
+                    turn.future.set_exception(exc)
                 return
             raise
         finally:
@@ -682,6 +725,8 @@ class ContactSession:
                 except (FileNotFoundError, json.JSONDecodeError):
                     pass
                 a2a_context_path.unlink(missing_ok=True)
+            if hosted_sms_context_path is not None:
+                hosted_sms_context_path.unlink(missing_ok=True)
             self._turn_active = False
             self._current_turn = None
             if typing_task is not None:
@@ -697,7 +742,16 @@ class ContactSession:
         # interrupted this one, in which case the partial answer is dropped.
         if turn.future is not None:
             if not turn.future.done():
-                turn.future.set_result(reply or "I finished that, but didn't have anything to say back.")
+                if turn.capture_tools:
+                    turn.future.set_result(CodexTurnResult(
+                        text=turn_result.text,
+                        mcp_tool_calls=turn_result.mcp_tool_calls,
+                        aborted=self._interrupting or turn_result.aborted,
+                    ))
+                else:
+                    turn.future.set_result(
+                        reply or "I finished that, but didn't have anything to say back."
+                    )
             return
         if self._interrupting:
             return
@@ -710,14 +764,11 @@ class ContactSession:
         A synchronous send rejection (carrier spam filter, opt-out, invalid
         recipient) comes back as an API error, not a webhook. Rather than
         surfacing a generic failure, hand the reason back to Codex once so it
-        can rephrase or switch channels. A recovery turn that itself fails is
-        re-raised (the worker logs it) — never retried, so it can't loop.
-
-        When wired with ``on_send_failure`` the rejection is recorded against
-        the gateway's shared per-conversation retry budget (the same one the
-        async delivery-failure webhooks use), and the recovery turn is skipped
-        once that budget is exhausted so the thread goes quiet instead of
-        looping.
+        can rephrase or switch channels. When wired with ``on_send_failure``,
+        every rejected send is recorded against the gateway's shared
+        per-conversation retry budget (the same one the async delivery-failure
+        webhooks use). A failed first recovery can therefore receive the
+        attempt-2 stop-or-retry instruction; the hard cap prevents a loop.
 
         Args:
             turn (_Turn): The turn whose reply is being sent.
@@ -731,8 +782,6 @@ class ContactSession:
         except Exception as exc:
             reason = _send_error_reason(exc)
             logger.warning("[session %s] reply send rejected: %s", self.chat_id, reason)
-            if turn.recovery:
-                raise  # already a recovery attempt — don't spawn another
             if self.on_send_failure is not None:
                 prompt = self.on_send_failure(
                     self.chat_id, self.mode, self.reply_meta, reply, reason
@@ -740,6 +789,8 @@ class ContactSession:
                 if prompt:
                     await self._queue.put(_Turn(text=prompt, recovery=True))
                 return
+            if turn.recovery:
+                raise  # no shared budget is available to cap another attempt
             await self._queue.put(
                 _Turn(text=_send_rejected_prompt(reply, reason), recovery=True)
             )
@@ -771,6 +822,27 @@ class ContactSession:
         future: asyncio.Future[str] = loop.create_future()
         await self._queue.put(
             _Turn(text=query, future=future, a2a_context=a2a_context)
+        )
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+        return await future
+
+    async def run_consult_detailed(
+        self,
+        query: str,
+        *,
+        hosted_sms_context: Optional[Dict[str, Any]] = None,
+    ) -> CodexTurnResult:
+        """Run a capture turn and return sanitized MCP completion outcomes."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[CodexTurnResult] = loop.create_future()
+        await self._queue.put(
+            _Turn(
+                text=query,
+                future=future,
+                capture_tools=True,
+                hosted_sms_context=hosted_sms_context,
+            )
         )
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())

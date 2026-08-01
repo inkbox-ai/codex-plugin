@@ -8,6 +8,8 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from inkbox_codex import tools as tools_mod
+from inkbox_codex.config import hosted_sms_turn_context_path
+from inkbox_codex.hosted_sms_guard import hosted_sms_attempt_state
 
 
 @pytest.fixture(autouse=True)
@@ -430,6 +432,7 @@ def test_place_call_requires_purpose():
 
 def test_place_call_forwards_disabled_voicemail_detection(tmp_path, monkeypatch):
     monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    monkeypatch.setenv("INKBOX_VOICEMAIL_DETECTION", "disabled")
     client = _FakeClient()
 
     data = _call(
@@ -438,7 +441,6 @@ def test_place_call_forwards_disabled_voicemail_detection(tmp_path, monkeypatch)
         {
             "to_number": "+15551112222",
             "purpose": "run the CI voice check",
-            "voicemail_detection": "disabled",
         },
     )
 
@@ -487,6 +489,85 @@ def test_send_sms_rejects_text_over_limit():
     assert data["error_code"] == "sms_too_long"
     assert data["char_count"] == tools_mod.SMS_MAX_LENGTH + 1
     assert client.identity.sent_texts == []
+
+
+def test_hosted_sms_is_exact_target_durable_and_single_use(monkeypatch):
+    monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact-1")
+    context_path = hosted_sms_turn_context_path("contact-1")
+    context_path.write_text(json.dumps({
+        "call_id": "call-hosted-1",
+        "attempt": 1,
+        "remote_phone": "+15551112222",
+    }) + "\n")
+    context_path.chmod(0o600)
+    client = _FakeClient()
+
+    first = _call(
+        client,
+        "inkbox_send_sms",
+        {"to": "+15551112222", "text": "release update"},
+    )
+    duplicate = _call(
+        client,
+        "inkbox_send_sms",
+        {"to": "+15551112222", "text": "release update"},
+    )
+
+    assert first["sent"] is True
+    assert duplicate["error_code"] == "hosted_sms_duplicate_blocked"
+    assert len(client.identity.sent_texts) == 1
+    assert hosted_sms_attempt_state("call-hosted-1", 1) == "success"
+
+
+def test_hosted_sms_wrong_target_is_terminal_before_provider_io(monkeypatch):
+    monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact-1")
+    context_path = hosted_sms_turn_context_path("contact-1")
+    context_path.write_text(json.dumps({
+        "call_id": "call-hosted-2",
+        "attempt": 1,
+        "remote_phone": "+15551112222",
+    }) + "\n")
+    context_path.chmod(0o600)
+    client = _FakeClient()
+
+    result = _call(
+        client,
+        "inkbox_send_sms",
+        {"to": "+15559990000", "text": "release update"},
+    )
+
+    assert result["error_code"] == "hosted_sms_send_blocked"
+    assert client.identity.sent_texts == []
+    assert hosted_sms_attempt_state("call-hosted-2", 1) == "terminal"
+
+
+def test_send_sms_projects_structured_sdk_failure_metadata():
+    client = _FakeClient()
+
+    class Rejected(Exception):
+        def __init__(self):
+            super().__init__("private provider response")
+            self.status_code = 422
+            self.detail = {
+                "error": "message_blocked_spam_filter",
+                "rule": "emoji_overload",
+                "provider_id": "private-provider-id",
+            }
+
+    def reject(**_kwargs):
+        raise Rejected()
+
+    client.identity.send_text = reject
+    data = _call(
+        client,
+        "inkbox_send_sms",
+        {"to": "+15551112222", "text": "release update"},
+    )
+
+    assert data["error_code"] == "message_blocked_spam_filter"
+    assert data["rule"] == "emoji_overload"
+    assert data["status_code"] == 422
+    assert "provider_id" not in data
 
 
 def test_send_imessage_rejects_text_over_limit():
