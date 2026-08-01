@@ -836,6 +836,53 @@ def test_voice_ai_reuses_transient_admin_identity_without_persisting_it(monkeypa
     assert all("ApiKey" not in value for _, value in saved)
 
 
+def test_voice_ai_rejects_non_admin_key_and_returns_to_stack_choices(
+    monkeypatch,
+    capsys,
+):
+    identity = _FakeVoiceIdentity()
+    saved = []
+    choices = iter([0, 1, 2])
+
+    class Whoami:
+        auth_subtype = "agent_scoped"
+
+    class FakeInkbox:
+        def __init__(self, **_kwargs):
+            pass
+
+        def whoami(self):
+            return Whoami()
+
+        def get_identity(self, _handle):
+            raise AssertionError("non-admin credential must not configure authority")
+
+    monkeypatch.setattr(setup_wizard, "_detect_openai_realtime_key", lambda: None)
+    monkeypatch.setattr(setup_wizard, "_env", lambda _name: "")
+    monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *a, **k: next(choices))
+    monkeypatch.setattr(
+        setup_wizard,
+        "prompt",
+        lambda question, *a, **k: (
+            "" if "Press Enter" in question else "ApiKey_not_admin"
+        ),
+    )
+    monkeypatch.setattr(setup_wizard, "_save", lambda name, value: saved.append((name, value)))
+
+    setup_wizard._configure_phone_call_voice_stack(
+        identity,
+        **_voice_kwargs(Inkbox=FakeInkbox, WhoamiApiKeyResponse=Whoami),
+    )
+
+    assert identity.hosted_updates == []
+    assert saved == [
+        ("INKBOX_REALTIME_ENABLED", "false"),
+        ("INKBOX_VOICE_STACK", "inkbox_tts_stt"),
+    ]
+    assert all(value != "ApiKey_not_admin" for _, value in saved)
+    assert "requires an admin-scoped API key" in capsys.readouterr().out
+
+
 def test_voice_ai_failure_rolls_back_before_returning_to_choices(monkeypatch):
     identity = _FakeVoiceIdentity()
     identity.fail_hosted_once = True
