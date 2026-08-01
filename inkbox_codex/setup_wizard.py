@@ -1073,7 +1073,6 @@ def _save_voice_stack(
         _save("INKBOX_REALTIME_MODEL", REALTIME_MODEL)
         _save("INKBOX_REALTIME_ENABLED", "true")
     else:
-        _save("INKBOX_REALTIME_API_KEY", "")
         _save("INKBOX_REALTIME_ENABLED", "false")
         if authority_mode:
             _save("INKBOX_VOICE_AI_AUTHORITY_MODE", authority_mode)

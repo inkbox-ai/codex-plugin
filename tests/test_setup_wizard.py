@@ -688,7 +688,6 @@ def test_phone_voice_stack_offers_three_choices_and_configures_tts(monkeypatch):
         "incoming_call_webhook_url": None,
     }]
     assert saved == [
-        ("INKBOX_REALTIME_API_KEY", ""),
         ("INKBOX_REALTIME_ENABLED", "false"),
         ("INKBOX_VOICE_STACK", "inkbox_tts_stt"),
     ]
@@ -776,7 +775,6 @@ def test_realtime_failure_loops_back_without_partial_save(monkeypatch):
     setup_wizard._configure_phone_call_voice_stack(identity, **_voice_kwargs())
 
     assert saved == [
-        ("INKBOX_REALTIME_API_KEY", ""),
         ("INKBOX_REALTIME_ENABLED", "false"),
         ("INKBOX_VOICE_STACK", "inkbox_tts_stt"),
     ]
