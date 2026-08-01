@@ -311,7 +311,7 @@ _TRANSCRIPT_POST_CALL_TIMING = (
     r"(?:this|the)\s+call\s+(?:ends?|is\s+over))"
 )
 _TRANSCRIPT_TEXT_VERB = (
-    r"text\s+(?!conversation\b|messages?\b|history\b|thread\b|"
+    r"text\s+(?!conversation\b|exchange\b|messages?\b|history\b|thread\b|"
     r"yesterday\b|earlier\b|from\b)[\w@][\w@.'’+-]*\b"
 )
 _TRANSCRIPT_TEXT_CLAUSE_PREFIX = (
@@ -343,6 +343,10 @@ _TRANSCRIPT_SMS_COMMITMENT_PATTERNS = (
         rf"\b{_TRANSCRIPT_SEND_SMS}.{{0,160}}\b{_TRANSCRIPT_POST_CALL_TIMING}\b",
         re.IGNORECASE,
     ),
+)
+_OPEN_ACTION_SMS_COMMITMENT_PATTERNS = (
+    re.compile(rf"\b{_TRANSCRIPT_TEXT_VERB}", re.IGNORECASE),
+    re.compile(rf"\b{_TRANSCRIPT_SEND_SMS}", re.IGNORECASE),
 )
 
 
@@ -380,8 +384,8 @@ def _hosted_requires_sms(
         if str(action.get("status") or "open").strip().lower() == "open"
     )
     action_requires_sms = any(
-        re.search(r"\b(?:sms|text|texted|texting)\b", text, re.IGNORECASE)
-        and not _TRANSCRIPT_NEGATED_SMS_ACTION.search(text)
+        not _TRANSCRIPT_NEGATED_SMS_ACTION.search(text)
+        and any(pattern.search(text) for pattern in _OPEN_ACTION_SMS_COMMITMENT_PATTERNS)
         for text in open_action_texts
     )
     return action_requires_sms or _transcript_requires_sms_commitment(transcript)

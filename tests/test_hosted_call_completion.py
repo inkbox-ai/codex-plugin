@@ -533,11 +533,24 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
     assert not gateway_module._hosted_requires_sms(
         [{"status": "open", "action": "Do not send me an SMS."}], []
     )
+    assert not gateway_module._hosted_requires_sms(
+        [
+            {"status": "open", "action": "Review the text exchange."},
+            {"status": "open", "action": "Search SMS history for the release."},
+            {"status": "open", "action": "Summarize the text conversation."},
+            {"status": "open", "action": "Read the SMS thread."},
+        ],
+        [],
+    )
     assert gateway_module._hosted_requires_sms(
         [
             {"status": "open", "action": "Do not send me an SMS."},
             {"status": "open", "action": "Text the operator by SMS."},
         ],
+        [],
+    )
+    assert gateway_module._hosted_requires_sms(
+        [{"status": "open", "action": "Send Alex a text message with the result."}],
         [],
     )
 
