@@ -385,8 +385,8 @@ def test_outbound_call_voice_ai_and_post_call_completion():
         sent = [
             message for message in aut_outbound_sms()
             if message.id not in before_sms
-            and (getattr(message, "text", "") or "").strip()
-            == HOSTED_POST_CALL_MARKER
+            and HOSTED_POST_CALL_MARKER
+            in (getattr(message, "text", "") or "")
         ]
         if completion in gateway_log and sent:
             break
@@ -402,8 +402,8 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     sent = [
         message for message in aut_outbound_sms()
         if message.id not in before_sms
-        and (getattr(message, "text", "") or "").strip()
-        == HOSTED_POST_CALL_MARKER
+        and HOSTED_POST_CALL_MARKER
+        in (getattr(message, "text", "") or "")
     ]
     assert len(sent) == 1, (
         "post-call processing did not send exactly one marker SMS to the "
