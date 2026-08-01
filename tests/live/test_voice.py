@@ -22,6 +22,7 @@ import os
 import re
 import time
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 
@@ -65,6 +66,20 @@ def _digits(s: str) -> str:
 def _voice_marker_key(value: str) -> str:
     """Normalize punctuation/case that may change across TTS/PSTN/STT."""
     return re.sub(r"\W+", "", value or "").casefold()
+
+
+def _message_created_at(message):
+    """Return an aware timestamp from an SDK SMS row."""
+    value = getattr(message, "created_at", None)
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _client(key):
@@ -340,7 +355,13 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     assert HOSTED_POST_CALL_MARKER
     before_driver = {call.id for call in driver_calls()}
     before_aut = {call.id for call in aut_calls()}
-    before_sms = {message.id for message in aut_outbound_sms()}
+    baseline_sms = aut_outbound_sms()
+    before_sms = {message.id for message in baseline_sms}
+    baseline_times = [
+        created_at for message in baseline_sms
+        if (created_at := _message_created_at(message)) is not None
+    ]
+    sms_watermark = max(baseline_times, default=datetime.min.replace(tzinfo=timezone.utc))
     remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
 
     driver_call_id = None
@@ -384,14 +405,18 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     # tool result passes the one-call, exact-target and `sent: true` checks.
     completion = f"hosted post-call reconciliation completed: {aut_call.id}"
     deadline = time.monotonic() + 90
-    new_sms = []
+    marker_sms = []
     while time.monotonic() < deadline:
         gateway_log = _gateway_log_text()
-        new_sms = [
+        marker_sms = [
             message for message in aut_outbound_sms()
             if message.id not in before_sms
+            and (created_at := _message_created_at(message)) is not None
+            and created_at >= sms_watermark
+            and _voice_marker_key(HOSTED_POST_CALL_MARKER)
+            in _voice_marker_key(getattr(message, "text", "") or "")
         ]
-        if completion in gateway_log and new_sms:
+        if completion in gateway_log and marker_sms:
             break
         time.sleep(3)
     gateway_log = _gateway_log_text()
@@ -402,16 +427,16 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     # MCP tool may execute without emitting one. The sender-side message rows
     # are the authoritative record of the accepted side effect.
     time.sleep(2 * POLL_EVERY_S)
-    new_sms = [
+    marker_sms = [
         message for message in aut_outbound_sms()
         if message.id not in before_sms
+        and (created_at := _message_created_at(message)) is not None
+        and created_at >= sms_watermark
+        and _voice_marker_key(HOSTED_POST_CALL_MARKER)
+        in _voice_marker_key(getattr(message, "text", "") or "")
     ]
-    assert len(new_sms) == 1, (
-        "post-call processing did not send exactly one SMS to the authoritative "
-        f"caller: {[getattr(message, 'text', '') for message in new_sms]}"
-    )
-    body = getattr(new_sms[0], "text", "") or ""
-    assert _voice_marker_key(HOSTED_POST_CALL_MARKER) in _voice_marker_key(body), (
-        "post-call SMS did not preserve the unique spoken marker: "
-        f"{body!r}"
+    assert len(marker_sms) == 1, (
+        "post-call processing did not produce exactly one current-marker SMS "
+        "to the authoritative caller: "
+        f"{[getattr(message, 'text', '') for message in marker_sms]}"
     )

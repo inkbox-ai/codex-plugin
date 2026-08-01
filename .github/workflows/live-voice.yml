@@ -154,7 +154,21 @@ jobs:
           REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
         run: |
           if [ "${{ matrix.scenario }}" = "outbound_hosted" ]; then
-            HOSTED_MARKER="hosted-post-call-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            # Long digit strings do not survive TTS/PSTN/STT reliably. Derive
+            # a current-run marker from radio-alphabet words so the persisted
+            # transcript and resulting SMS remain comparable after speech.
+            RADIO_WORDS=(
+              alpha bravo charlie delta echo foxtrot golf hotel india juliet
+              kilo lima mike november oscar papa quebec romeo sierra tango
+              uniform victor whiskey xray yankee zulu
+            )
+            marker_value=$((GITHUB_RUN_ID * 10 + GITHUB_RUN_ATTEMPT))
+            HOSTED_MARKER="codex"
+            for _ in 1 2 3 4 5; do
+              marker_index=$((marker_value % ${#RADIO_WORDS[@]}))
+              HOSTED_MARKER="$HOSTED_MARKER ${RADIO_WORDS[$marker_index]}"
+              marker_value=$((marker_value / ${#RADIO_WORDS[@]}))
+            done
             echo "HOSTED_POST_CALL_MARKER=$HOSTED_MARKER" >> "$GITHUB_ENV"
             export VOICE_DRIVER_LINE="After we hang up, send me one SMS containing exactly: $HOSTED_MARKER. Do not send it during the call."
             export VOICE_DRIVER_LISTEN=45
