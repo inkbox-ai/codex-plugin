@@ -13,8 +13,11 @@ class _Identity:
     def list_transcripts(self, call_id):
         assert call_id == "call-1"
         return [
-            types.SimpleNamespace(party="remote", text="Please text me the result."),
-            types.SimpleNamespace(party="local", text="I will do that after we hang up."),
+            types.SimpleNamespace(
+                party="remote",
+                text="After we hang up, send me one SMS with the result.",
+            ),
+            types.SimpleNamespace(party="local", text="I will do that."),
         ]
 
 
@@ -144,7 +147,7 @@ def test_hosted_completion_fetches_transcript_and_suppresses_plaintext(tmp_path,
         assert "Mark it complete only after the required tool reports success" in prompt
         assert "After a terminal error or a failed second attempt" in prompt
         assert "stop without claiming success or duplicating the send" in prompt
-        assert "Please text me the result." in prompt
+        assert "After we hang up, send me one SMS with the result." in prompt
         assert "Send the requested release update" in prompt
         assert "Prefers concise release updates." in prompt
         assert prompt.count("Prefers concise release updates.") == 1
@@ -431,13 +434,13 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
         [], [("remote", "After we hang up, text Alex with the release status.")]
     )
     assert gateway_module._hosted_requires_sms(
-        [], [("remote", "Could you text her the confirmation?")]
+        [], [("remote", "When this call ends, could you text her the confirmation?")]
     )
     assert gateway_module._hosted_requires_sms(
-        [], [("remote", "Please text Alex the confirmation.")]
+        [], [("remote", "Please text Alex the confirmation once the call is over.")]
     )
     assert gateway_module._hosted_requires_sms(
-        [], [("local", "I'll text you the final result.")]
+        [], [("local", "I'll send you a text message after we hang up.")]
     )
     assert not gateway_module._hosted_requires_sms(
         [],
@@ -447,6 +450,8 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
             ("local", "We discussed texting during the call."),
             ("local", "I will send her the confirmation."),
             ("remote", "After we hang up, send me the summary."),
+            ("remote", "Please text me the status."),
+            ("local", "I'll text you the final result."),
         ],
     )
 
