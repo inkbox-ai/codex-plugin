@@ -642,6 +642,28 @@ def test_hosted_non_sms_action_does_not_require_sms_tool(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_hosted_callback_prompt_anchors_authoritative_caller_over_contact_memory(
+    tmp_path, monkeypatch,
+):
+    async def scenario():
+        session = _Session()
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        payload = _payload()
+        payload["data"]["post_call_action_items"] = [{
+            "status": "open",
+            "action": "Call the current caller back after this call",
+        }]
+
+        await gateway._on_hosted_call_ended(payload)
+        await _drain(gateway)
+
+        prompt = session.prompts[0]
+        assert "+15167251294" in prompt
+        assert "+19999999999" not in prompt
+
+    asyncio.run(scenario())
+
+
 def test_hosted_completion_recovers_after_restart_without_redelivery(tmp_path, monkeypatch):
     async def scenario():
         original = _gateway(

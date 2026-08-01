@@ -48,6 +48,11 @@ def _digits(s: str) -> str:
     return re.sub(r"\D", "", s or "")
 
 
+def _voicemail_detection_value(call) -> str:
+    value = getattr(call, "voicemail_detection", "")
+    return str(getattr(value, "value", value))
+
+
 def _client(key):
     from inkbox import Inkbox
 
@@ -174,7 +179,7 @@ def _wait_for_new_call(remote, remote_pid: str, aut_phone: str, before: set):
     while time.monotonic() < deadline:
         for c in _inbound_calls_from_aut(remote, remote_pid, aut_phone):
             if c.id not in before:
-                return  # a fresh call from the AUT landed on the driver's number
+                return c  # a fresh call from the AUT landed on the driver's number
         time.sleep(POLL_EVERY_S)
     pytest.fail(f"agent did not place a call to the driver within {TIMEOUT_S:.0f}s")
 
@@ -192,7 +197,8 @@ def test_email_request_gets_call(xc):
             "you late, still place the call."
         ),
     )
-    _wait_for_new_call(remote, remote_pid, aut_phone, before)
+    call = _wait_for_new_call(remote, remote_pid, aut_phone, before)
+    assert _voicemail_detection_value(call) == "disabled"
 
 
 def test_sms_request_gets_call(xc):
@@ -210,4 +216,5 @@ def test_sms_request_gets_call(xc):
             f"now. Even if you get this late, still call. (ref {_token()})"
         ),
     )
-    _wait_for_new_call(remote, remote_pid, aut_phone, before)
+    call = _wait_for_new_call(remote, remote_pid, aut_phone, before)
+    assert _voicemail_detection_value(call) == "disabled"

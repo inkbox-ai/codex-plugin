@@ -52,6 +52,14 @@ GATEWAY_LOG = os.environ.get("GATEWAY_LOG", "/tmp/gateway.log")
 HOSTED_POST_CALL_MARKER = os.environ.get("HOSTED_POST_CALL_MARKER", "")
 TIMEOUT_S = float(os.environ.get("LIVE_VOICE_TIMEOUT", "220"))
 POLL_EVERY_S = 6.0
+HOSTED_POST_CALL_SETTLEMENT_S = 90.0
+HOSTED_DUPLICATE_GRACE_S = 2 * POLL_EVERY_S
+HOSTED_SCENARIO_TIMEOUT_S = (
+    TIMEOUT_S
+    + HOSTED_POST_CALL_SETTLEMENT_S
+    + HOSTED_DUPLICATE_GRACE_S
+    + POLL_EVERY_S
+)
 
 pytestmark = pytest.mark.skipif(
     not (REMOTE_KEY and AUT_KEY and REAL),
@@ -61,6 +69,14 @@ pytestmark = pytest.mark.skipif(
 
 def _digits(s: str) -> str:
     return re.sub(r"\D", "", s or "")
+
+
+def _enum_value(value) -> str:
+    return str(getattr(value, "value", value))
+
+
+def _voicemail_detection_value(call) -> str:
+    return _enum_value(getattr(call, "voicemail_detection", ""))
 
 
 def _spoken_tokens(value: str | None) -> list[str]:
@@ -354,6 +370,8 @@ def test_inbound_call_inkbox_tts_stt():
     try:
         agent_said = _wait_for_two_way_call(remote, st["number_id"], call.id)
         assert agent_said, "agent produced no speech on the inbound call"
+        persisted = remote.calls.get(call.id)
+        assert _voicemail_detection_value(persisted) == "disabled"
 
         tts, stt = _aut_speech_mode(aut, "inbound", st["number"])
         assert tts and stt, f"inbound call should run Inkbox STT/TTS, got tts={tts} stt={stt}"
@@ -388,6 +406,8 @@ def test_outbound_call_realtime():
                 break
             time.sleep(POLL_EVERY_S)
         assert call_id, f"agent never placed a call back within {TIMEOUT_S:.0f}s"
+        persisted = remote.calls.get(call_id)
+        assert _voicemail_detection_value(persisted) == "disabled"
 
         agent_said = _wait_for_two_way_call(remote, st["number_id"], call_id)
         assert agent_said, "agent produced no speech on the outbound call"
@@ -461,13 +481,24 @@ def test_outbound_call_voice_ai_and_post_call_completion():
         if (created_at := _record_created_at(message)) is not None
     ]
     sms_watermark = max(baseline_times, default=datetime.min.replace(tzinfo=UTC))
-    hosted_deadline = time.monotonic() + TIMEOUT_S
+    identity_handle = aut.mailboxes.list()[0].email_address.split("@", 1)[0]
+    hosted_config = aut.get_identity(identity_handle).get_hosted_agent_config()
+    expected_authority = _enum_value(
+        getattr(hosted_config, "authority_mode", "contact_scoped")
+    ) or "contact_scoped"
+    scenario_deadline = time.monotonic() + HOSTED_SCENARIO_TIMEOUT_S
+    pre_hangup_deadline = (
+        scenario_deadline
+        - HOSTED_POST_CALL_SETTLEMENT_S
+        - HOSTED_DUPLICATE_GRACE_S
+        - POLL_EVERY_S
+    )
     remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
 
     driver_call_id = None
     aut_call = None
     try:
-        while time.monotonic() < hosted_deadline:
+        while time.monotonic() < pre_hangup_deadline:
             fresh_driver = [
                 call
                 for call in driver_calls()
@@ -494,9 +525,11 @@ def test_outbound_call_voice_ai_and_post_call_completion():
             time.sleep(POLL_EVERY_S)
         assert driver_call_id and aut_call is not None
         assert str(getattr(getattr(aut_call, "mode", ""), "value", getattr(aut_call, "mode", ""))) == "hosted_agent"
-        assert str(getattr(getattr(aut_call, "voicemail_detection", ""), "value", getattr(aut_call, "voicemail_detection", ""))) == "disabled"
+        assert _voicemail_detection_value(aut_call) == "disabled"
         assert getattr(aut_call, "reason", None)
-        assert getattr(aut_call, "hosted_agent_authority_mode", None) is not None
+        assert _enum_value(
+            getattr(aut_call, "hosted_agent_authority_mode", "")
+        ) == expected_authority
         driver_call = remote.calls.get(driver_call_id)
         driver_created_at = _record_created_at(driver_call)
         aut_created_at = _record_created_at(aut_call)
@@ -510,7 +543,7 @@ def test_outbound_call_voice_ai_and_post_call_completion():
             remote,
             st["number_id"],
             driver_call_id,
-            deadline=hosted_deadline,
+            deadline=pre_hangup_deadline,
         )
         # Greeting/filler turns do not prove that the request became durable.
         # Require both the caller transcript and the AUT's matching open action
@@ -522,7 +555,7 @@ def test_outbound_call_voice_ai_and_post_call_completion():
             aut,
             aut_call.id,
             HOSTED_POST_CALL_MARKER,
-            deadline=hosted_deadline,
+            deadline=pre_hangup_deadline,
         )
     finally:
         _hangup_call(remote, driver_call_id)
@@ -533,9 +566,11 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     # inbox rows. The reconciliation log is emitted only after the captured
     # tool result passes the one-call, exact-target and `sent: true` checks.
     completion = f"hosted post-call reconciliation completed: {aut_call.id}"
-    deadline = time.monotonic() + 90
+    settlement_deadline = (
+        scenario_deadline - HOSTED_DUPLICATE_GRACE_S - POLL_EVERY_S
+    )
     marker_sms = []
-    while time.monotonic() < deadline:
+    while time.monotonic() < settlement_deadline:
         gateway_log = _gateway_log_text()
         marker_sms = [
             message for message in aut_outbound_sms()
@@ -555,7 +590,10 @@ def test_outbound_call_voice_ai_and_post_call_completion():
     # Approval-elicitation logs are an implementation detail: a pre-approved
     # MCP tool may execute without emitting one. The sender-side message rows
     # are the authoritative record of the accepted side effect.
-    time.sleep(2 * POLL_EVERY_S)
+    assert time.monotonic() + HOSTED_DUPLICATE_GRACE_S <= scenario_deadline, (
+        "hosted settlement left no room for the duplicate-detection grace window"
+    )
+    time.sleep(HOSTED_DUPLICATE_GRACE_S)
     marker_sms = [
         message for message in aut_outbound_sms()
         if message.id not in before_sms

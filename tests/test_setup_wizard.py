@@ -662,8 +662,14 @@ def test_phone_voice_stack_offers_three_choices_and_configures_tts(monkeypatch):
     identity = _FakeVoiceIdentity()
     saved = []
     presented = []
+    questions = []
     monkeypatch.setattr(setup_wizard, "_detect_openai_realtime_key", lambda: None)
     monkeypatch.setattr(setup_wizard, "_env", lambda _name: "")
+    monkeypatch.setattr(
+        setup_wizard,
+        "prompt",
+        lambda question, *a, **k: questions.append(question) or "",
+    )
     monkeypatch.setattr(
         setup_wizard, "prompt_choice",
         lambda question, choices, default=0, **_kwargs: presented.append((question, choices, default)) or 2,
@@ -675,6 +681,7 @@ def test_phone_voice_stack_offers_three_choices_and_configures_tts(monkeypatch):
     assert [choice.split(" —", 1)[0] for choice in presented[0][1]] == [
         "Inkbox Voice AI", "OpenAI Realtime API", "Inkbox TTS/STT",
     ]
+    assert questions == ["  Press Enter to continue and set up phone call handling"]
     assert identity.incoming_updates == [{
         "incoming_call_action": "auto_accept",
         "client_websocket_url": "wss://voice-agent.inkboxwire.com/phone/media/ws",
@@ -687,6 +694,70 @@ def test_phone_voice_stack_offers_three_choices_and_configures_tts(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize(
+    ("saved_stack", "expected_index"),
+    [
+        ("inkbox_voice_ai", 0),
+        ("openai_realtime", 1),
+        ("inkbox_tts_stt", 2),
+    ],
+)
+def test_voice_stack_rerun_defaults_to_saved_selection(
+    saved_stack, expected_index, monkeypatch,
+):
+    monkeypatch.setattr(
+        setup_wizard,
+        "_env",
+        lambda name: saved_stack if name == "INKBOX_VOICE_STACK" else "",
+    )
+    assert setup_wizard._voice_stack_default_index("") == expected_index
+
+
+def test_prompt_choice_reprompts_invalid_input_and_honors_default(monkeypatch):
+    answers = iter(["not-a-number", "9", ""])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    assert setup_wizard.prompt_choice("choose", ["one", "two", "three"], 1) == 1
+
+
+def test_prompt_choice_cancellation_exits(monkeypatch):
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _prompt: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    with pytest.raises(SystemExit):
+        setup_wizard.prompt_choice("choose", ["one", "two"], 0)
+
+
+def test_phone_voice_stack_configures_valid_realtime(monkeypatch):
+    identity = _FakeVoiceIdentity()
+    saved = []
+    monkeypatch.setattr(
+        setup_wizard,
+        "_detect_openai_realtime_key",
+        lambda: ("INKBOX_REALTIME_API_KEY", "sk-valid"),
+    )
+    monkeypatch.setattr(setup_wizard, "_env", lambda _name: "")
+    monkeypatch.setattr(setup_wizard, "prompt", lambda *a, **k: "")
+    monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *a, **k: 1)
+    monkeypatch.setattr(
+        setup_wizard,
+        "_test_openai_realtime_api_key",
+        lambda *a, **k: (True, "ok"),
+    )
+    monkeypatch.setattr(
+        setup_wizard,
+        "_save",
+        lambda name, value: saved.append((name, value)),
+    )
+
+    setup_wizard._configure_phone_call_voice_stack(identity, **_voice_kwargs())
+
+    assert ("INKBOX_REALTIME_API_KEY", "sk-valid") in saved
+    assert ("INKBOX_REALTIME_ENABLED", "true") in saved
+    assert ("INKBOX_VOICE_STACK", "openai_realtime") in saved
+    assert identity.incoming_updates[-1]["incoming_call_action"] == "auto_accept"
+
+
 def test_realtime_failure_loops_back_without_partial_save(monkeypatch):
     identity = _FakeVoiceIdentity()
     saved = []
@@ -695,6 +766,7 @@ def test_realtime_failure_loops_back_without_partial_save(monkeypatch):
         setup_wizard, "_detect_openai_realtime_key", lambda: ("OPENAI_API_KEY", "sk-bad")
     )
     monkeypatch.setattr(setup_wizard, "_env", lambda _name: "")
+    monkeypatch.setattr(setup_wizard, "prompt", lambda *a, **k: "")
     monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *_args, **_kwargs: next(choices))
     monkeypatch.setattr(setup_wizard, "_save", lambda name, value: saved.append((name, value)))
     monkeypatch.setattr(
@@ -719,7 +791,11 @@ def test_voice_ai_contact_scope_does_not_prompt_for_admin(monkeypatch):
     monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *_args, **_kwargs: next(choices))
     monkeypatch.setattr(
         setup_wizard, "prompt",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("admin prompted")),
+        lambda question, *_args, **_kwargs: (
+            ""
+            if "Press Enter" in question
+            else (_ for _ in ()).throw(AssertionError("admin prompted"))
+        ),
     )
     monkeypatch.setattr(setup_wizard, "_save", lambda name, value: saved.append((name, value)))
 
@@ -746,7 +822,11 @@ def test_voice_ai_reuses_transient_admin_identity_without_persisting_it(monkeypa
     monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *_args, **_kwargs: next(choices))
     monkeypatch.setattr(
         setup_wizard, "prompt",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("admin prompted")),
+        lambda question, *_args, **_kwargs: (
+            ""
+            if "Press Enter" in question
+            else (_ for _ in ()).throw(AssertionError("admin prompted"))
+        ),
     )
     monkeypatch.setattr(setup_wizard, "_save", lambda name, value: saved.append((name, value)))
 
@@ -765,6 +845,7 @@ def test_voice_ai_failure_rolls_back_before_returning_to_choices(monkeypatch):
     choices = iter([0, 0, 2])
     monkeypatch.setattr(setup_wizard, "_detect_openai_realtime_key", lambda: None)
     monkeypatch.setattr(setup_wizard, "_env", lambda _name: "")
+    monkeypatch.setattr(setup_wizard, "prompt", lambda *a, **k: "")
     monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *_args, **_kwargs: next(choices))
     monkeypatch.setattr(setup_wizard, "_save", lambda name, value: saved.append((name, value)))
 

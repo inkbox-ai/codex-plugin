@@ -1094,6 +1094,7 @@ def _configure_phone_call_voice_stack(
     if getattr(identity, "phone_number", None) is None and not imessage_enabled:
         return
     print()
+    prompt("  Press Enter to continue and set up phone call handling")
     print(color("  --- Phone call voice stack ---", Colors.CYAN))
     detected = _detect_openai_realtime_key()
     detected_key = detected[1] if detected is not None else ""
