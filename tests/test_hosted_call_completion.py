@@ -7,6 +7,7 @@ from inkbox_codex import gateway as gateway_module
 from inkbox_codex.codex_client import CodexTurnResult, McpToolCallResult
 from inkbox_codex.config import BridgeConfig
 from inkbox_codex.gateway import InkboxGateway
+from inkbox_codex.hosted_sms_guard import reserve_hosted_sms_attempt
 
 
 class _Identity:
@@ -58,6 +59,7 @@ class _Session:
         self.gate = gate
         self.error = error
         self.results = list(results or [_sms_result()])
+        self.hosted_contexts = []
 
     async def run_consult(self, prompt):
         self.prompts.append(prompt)
@@ -67,8 +69,9 @@ class _Session:
             raise self.error
         return "This plaintext must not be delivered."
 
-    async def run_consult_detailed(self, prompt):
+    async def run_consult_detailed(self, prompt, **kwargs):
         self.prompts.append(prompt)
+        self.hosted_contexts.append(kwargs.get("hosted_sms_context"))
         if self.gate is not None:
             await self.gate.wait()
         if self.error is not None:
@@ -206,9 +209,22 @@ def test_hosted_sms_recoverable_failure_gets_one_correction(tmp_path, monkeypatc
 
         assert len(session.prompts) == 2
         assert "only correction attempt" in session.prompts[1]
+        assert "Do not return [SILENT], skip, or defer" in session.prompts[1]
         assert "+15167251294" in session.prompts[1]
         entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
         assert entry["state"] == "completed"
+        assert session.hosted_contexts == [
+            {
+                "call_id": "call-1",
+                "attempt": 1,
+                "remote_phone": "+15167251294",
+            },
+            {
+                "call_id": "call-1",
+                "attempt": 2,
+                "remote_phone": "+15167251294",
+            },
+        ]
 
     asyncio.run(scenario())
 
@@ -368,6 +384,27 @@ def test_hosted_sms_duplicate_completed_side_effects_are_not_retried(tmp_path, m
     asyncio.run(scenario())
 
 
+def test_hosted_sms_blocked_duplicate_preserves_single_success():
+    result = CodexTurnResult(
+        text="",
+        mcp_tool_calls=(
+            _sms_result().mcp_tool_calls[0],
+            McpToolCallResult(
+                server="inkbox",
+                tool="inkbox_send_sms",
+                status="failed",
+                arguments={"to": "+15167251294"},
+                sent=False,
+                error_kind="duplicate_blocked",
+            ),
+        ),
+    )
+
+    assert gateway_module._hosted_sms_settlement(
+        result, "+15167251294"
+    ) == "success"
+
+
 def test_hosted_sms_failure_then_success_in_one_turn_is_terminal(tmp_path, monkeypatch):
     async def scenario():
         mixed = CodexTurnResult(
@@ -513,6 +550,10 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
     assert gateway_module._hosted_requires_sms(
         [], [("local", "After I hang up, text the release status to Dima.")]
     )
+    assert gateway_module._hosted_requires_sms(
+        [],
+        [("remote", "Don't text me now; after this call ends, text me the code.")],
+    )
     assert not gateway_module._hosted_requires_sms(
         [],
         [
@@ -551,6 +592,13 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
     )
     assert gateway_module._hosted_requires_sms(
         [{"status": "open", "action": "Send Alex a text message with the result."}],
+        [],
+    )
+    assert gateway_module._hosted_requires_sms(
+        [{
+            "status": "open",
+            "action": "Do not text now; text the operator after the call.",
+        }],
         [],
     )
 
@@ -608,6 +656,37 @@ def test_hosted_completion_recovers_after_restart_without_redelivery(tmp_path, m
         assert len(restarted_session.prompts) == 1
         registry = json.loads(restarted._hosted_call_registry_path.read_text())
         assert registry["call-1"]["state"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_hosted_reserved_sms_attempt_is_not_replayed_after_restart(
+    tmp_path, monkeypatch,
+):
+    async def scenario():
+        gateway = _gateway(tmp_path, monkeypatch, _Session())
+        gateway._write_hosted_call_registry(
+            "call-1",
+            event_id="event-1",
+            state="running",
+            payload=_payload(),
+            outcome="completed",
+        )
+        assert reserve_hosted_sms_attempt(
+            "call-1", 1, "+15167251294"
+        ) is True
+
+        restarted_session = _Session()
+        restarted = _gateway(tmp_path, monkeypatch, restarted_session)
+        await restarted._recover_hosted_call_completions()
+
+        assert restarted._hosted_call_jobs == {}
+        assert restarted_session.prompts == []
+        entry = json.loads(
+            restarted._hosted_call_registry_path.read_text()
+        )["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
 
     asyncio.run(scenario())
 

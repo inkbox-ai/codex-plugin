@@ -73,6 +73,7 @@ try:
     from .codex_client import CodexTurnResult
     from .a2a_delegations import find_by_task as find_a2a_delegation
     from .media import download_media, inbound_media_note
+    from .hosted_sms_guard import hosted_sms_attempt_state
     from .prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
     from .realtime import (
         RealtimeBridgeConnectError,
@@ -87,6 +88,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from codex_client import CodexTurnResult
     from a2a_delegations import find_by_task as find_a2a_delegation
     from media import download_media, inbound_media_note
+    from hosted_sms_guard import hosted_sms_attempt_state
     from prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
     from realtime import (
         RealtimeBridgeConnectError,
@@ -348,6 +350,20 @@ _OPEN_ACTION_SMS_COMMITMENT_PATTERNS = (
     re.compile(rf"\b{_TRANSCRIPT_TEXT_VERB}", re.IGNORECASE),
     re.compile(rf"\b{_TRANSCRIPT_SEND_SMS}", re.IGNORECASE),
 )
+_SMS_CLAUSE_SPLIT = re.compile(
+    r"(?:[.!?;]+|\s+—\s+|\b(?:but|however)\b)",
+    re.IGNORECASE,
+)
+
+
+def _clause_requires_sms(text: str, patterns: Any) -> bool:
+    """Match one positive SMS clause without letting another clause negate it."""
+    clauses = [part.strip() for part in _SMS_CLAUSE_SPLIT.split(text) if part.strip()]
+    return any(
+        not _TRANSCRIPT_NEGATED_SMS_ACTION.search(clause)
+        and any(pattern.search(clause) for pattern in patterns)
+        for clause in clauses
+    )
 
 
 def _transcript_requires_sms_commitment(transcript: Any) -> bool:
@@ -364,10 +380,8 @@ def _transcript_requires_sms_commitment(transcript: Any) -> bool:
         if text:
             turns.append(text)
     return any(
-        not _TRANSCRIPT_NEGATED_SMS_ACTION.search(turn)
-        and pattern.search(turn)
+        _clause_requires_sms(turn, _TRANSCRIPT_SMS_COMMITMENT_PATTERNS)
         for turn in turns
-        for pattern in _TRANSCRIPT_SMS_COMMITMENT_PATTERNS
     )
 
 
@@ -384,8 +398,7 @@ def _hosted_requires_sms(
         if str(action.get("status") or "open").strip().lower() == "open"
     )
     action_requires_sms = any(
-        not _TRANSCRIPT_NEGATED_SMS_ACTION.search(text)
-        and any(pattern.search(text) for pattern in _OPEN_ACTION_SMS_COMMITMENT_PATTERNS)
+        _clause_requires_sms(text, _OPEN_ACTION_SMS_COMMITMENT_PATTERNS)
         for text in open_action_texts
     )
     return action_requires_sms or _transcript_requires_sms_commitment(transcript)
@@ -404,9 +417,12 @@ def _hosted_sms_settlement(
     ]
     if not calls:
         return "missing"
-    if len(calls) != 1:
+    effective_calls = [
+        call for call in calls if call.error_kind != "duplicate_blocked"
+    ]
+    if len(effective_calls) != 1:
         return "terminal"
-    call = calls[0]
+    call = effective_calls[0]
     if call.status == "completed":
         target = str(call.arguments.get("to") or "").strip()
         if target != remote_phone or not call.sent:
@@ -432,7 +448,8 @@ def _hosted_sms_correction_prompt(remote_phone: str, *, missing: bool) -> str:
         f"authoritative remote number {remote_phone} and `text` set to the "
         "still-needed message from the prior hosted-call reconciliation.",
         "Do not use another recipient, do not repeat any completed action, and "
-        "do not answer with prose. Stop after the tool result.",
+        "do not answer with prose. Do not return [SILENT], skip, or defer. "
+        "Stop after the tool result.",
     ])
 
 
@@ -1323,6 +1340,24 @@ class InkboxGateway:
                 continue
             if entry.get("state") == "failed" and entry.get("retryable") is False:
                 continue
+            if any(
+                hosted_sms_attempt_state(str(call_id), attempt) is not None
+                for attempt in (1, 2)
+            ):
+                self._write_hosted_call_registry(
+                    str(call_id),
+                    event_id=str(entry.get("event_id") or ""),
+                    state="failed",
+                    payload=entry.get("payload"),
+                    outcome=str(entry.get("outcome") or ""),
+                    retryable=False,
+                )
+                logger.warning(
+                    "[bridge] hosted SMS attempt was commit-ambiguous after restart; "
+                    "replay blocked call_id=%s",
+                    call_id,
+                )
+                continue
             payload = entry.get("payload")
             if not isinstance(payload, dict) or call_id in self._hosted_call_jobs:
                 continue
@@ -1677,14 +1712,28 @@ class InkboxGateway:
                 # commit-ambiguous: the app server may have completed a tool
                 # call before the failed turn returned its detailed result.
                 required_sms_turn_started = True
-                result = await session.run_consult_detailed(prompt)
+                result = await session.run_consult_detailed(
+                    prompt,
+                    hosted_sms_context={
+                        "call_id": call_id,
+                        "attempt": 1,
+                        "remote_phone": remote_phone,
+                    },
+                )
                 settlement = _hosted_sms_settlement(result, remote_phone)
                 if settlement in {"missing", "recoverable"}:
                     correction = _hosted_sms_correction_prompt(
                         remote_phone,
                         missing=settlement == "missing",
                     )
-                    corrected = await session.run_consult_detailed(correction)
+                    corrected = await session.run_consult_detailed(
+                        correction,
+                        hosted_sms_context={
+                            "call_id": call_id,
+                            "attempt": 2,
+                            "remote_phone": remote_phone,
+                        },
+                    )
                     settlement = _hosted_sms_settlement(corrected, remote_phone)
                 if settlement != "success":
                     raise _HostedToolSettlementError(

@@ -22,7 +22,11 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 try:
     from .codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
-    from .config import BridgeConfig, a2a_turn_context_path
+    from .config import (
+        BridgeConfig,
+        a2a_turn_context_path,
+        hosted_sms_turn_context_path,
+    )
     from .escalation import (
         PendingInteraction,
         format_codex_approval_request,
@@ -33,7 +37,7 @@ try:
     from .prompts import build_channel_prompt, frame_inbound
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
-    from config import BridgeConfig, a2a_turn_context_path
+    from config import BridgeConfig, a2a_turn_context_path, hosted_sms_turn_context_path
     from escalation import (
         PendingInteraction,
         format_codex_approval_request,
@@ -79,6 +83,7 @@ class _Turn:
     recovery: bool = False
     a2a_context: Optional[Dict[str, Any]] = None
     capture_tools: bool = False
+    hosted_sms_context: Optional[Dict[str, Any]] = None
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Codex as a turn.
@@ -642,6 +647,7 @@ class ContactSession:
         self._current_turn = turn
         typing_task: Optional[asyncio.Task] = None
         a2a_context_path: Optional[Path] = None
+        hosted_sms_context_path: Optional[Path] = None
         if turn.a2a_context is not None:
             a2a_context_path = a2a_turn_context_path(self.chat_id)
             tmp = a2a_context_path.with_suffix(".tmp")
@@ -649,6 +655,13 @@ class ContactSession:
             tmp.chmod(0o600)
             os.replace(tmp, a2a_context_path)
             a2a_context_path.chmod(0o600)
+        if turn.hosted_sms_context is not None:
+            hosted_sms_context_path = hosted_sms_turn_context_path(self.chat_id)
+            tmp = hosted_sms_context_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(turn.hosted_sms_context, sort_keys=True) + "\n")
+            tmp.chmod(0o600)
+            os.replace(tmp, hosted_sms_context_path)
+            hosted_sms_context_path.chmod(0o600)
         try:
             client = await self._ensure_client()
             # Keep a typing indicator alive on the human's channel for the whole
@@ -706,6 +719,8 @@ class ContactSession:
                 except (FileNotFoundError, json.JSONDecodeError):
                     pass
                 a2a_context_path.unlink(missing_ok=True)
+            if hosted_sms_context_path is not None:
+                hosted_sms_context_path.unlink(missing_ok=True)
             self._turn_active = False
             self._current_turn = None
             if typing_task is not None:
@@ -806,12 +821,22 @@ class ContactSession:
             self._worker = asyncio.create_task(self._drain())
         return await future
 
-    async def run_consult_detailed(self, query: str) -> CodexTurnResult:
+    async def run_consult_detailed(
+        self,
+        query: str,
+        *,
+        hosted_sms_context: Optional[Dict[str, Any]] = None,
+    ) -> CodexTurnResult:
         """Run a capture turn and return sanitized MCP completion outcomes."""
         loop = asyncio.get_running_loop()
         future: asyncio.Future[CodexTurnResult] = loop.create_future()
         await self._queue.put(
-            _Turn(text=query, future=future, capture_tools=True)
+            _Turn(
+                text=query,
+                future=future,
+                capture_tools=True,
+                hosted_sms_context=hosted_sms_context,
+            )
         )
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())

@@ -40,7 +40,13 @@ try:
         a2a_turn_context_path,
         call_contexts_dir,
         channel_hints_path,
+        hosted_sms_turn_context_path,
         read_config,
+    )
+    from .delivery_policy import sms_tool_failure_kind
+    from .hosted_sms_guard import (
+        reserve_hosted_sms_attempt,
+        settle_hosted_sms_attempt,
     )
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from a2a_delegations import (
@@ -54,7 +60,13 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
         a2a_turn_context_path,
         call_contexts_dir,
         channel_hints_path,
+        hosted_sms_turn_context_path,
         read_config,
+    )
+    from delivery_policy import sms_tool_failure_kind
+    from hosted_sms_guard import (
+        reserve_hosted_sms_attempt,
+        settle_hosted_sms_attempt,
     )
 
 
@@ -535,6 +547,83 @@ def _message_too_long_reason(channel: str, content: str, max_chars: int) -> str:
     )
 
 
+def _hosted_sms_context() -> Optional[Dict[str, Any]]:
+    """Load the gateway-bound hosted SMS context for this MCP subprocess."""
+    chat_id = (os.getenv("INKBOX_CODEX_CHAT_ID") or "").strip()
+    if not chat_id:
+        return None
+    path = hosted_sms_turn_context_path(chat_id)
+    try:
+        value = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(
+            "Hosted-call SMS safety state is unavailable; send blocked."
+        ) from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(
+            "Hosted-call SMS safety state is unavailable; send blocked."
+        )
+    return value
+
+
+def _settle_hosted_sms_context(context: Dict[str, Any], state: str) -> None:
+    settle_hosted_sms_attempt(
+        str(context.get("call_id") or ""),
+        int(context.get("attempt") or 1),
+        state,
+    )
+
+
+def _reserve_hosted_sms_target(
+    target: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Reserve one exact-target hosted SMS or return a fail-closed tool result."""
+    try:
+        context = _hosted_sms_context()
+    except RuntimeError as exc:
+        return None, _tool_error(
+            str(exc),
+            error_code="hosted_sms_send_blocked",
+        )
+    if context is None:
+        return None, None
+
+    expected = str(context.get("remote_phone") or "").strip()
+    if not expected or target != expected:
+        try:
+            _settle_hosted_sms_context(context, "terminal")
+        except Exception:
+            pass
+        return None, _tool_error(
+            "Hosted-call SMS target does not match the authoritative caller; "
+            "send blocked.",
+            error_code="hosted_sms_send_blocked",
+        )
+    try:
+        reserved = reserve_hosted_sms_attempt(
+            str(context.get("call_id") or ""),
+            int(context.get("attempt") or 1),
+            expected,
+        )
+    except Exception:
+        try:
+            _settle_hosted_sms_context(context, "terminal")
+        except Exception:
+            pass
+        return None, _tool_error(
+            "Hosted-call SMS safety state is unavailable; send blocked.",
+            error_code="hosted_sms_send_blocked",
+        )
+    if not reserved:
+        return None, _tool_error(
+            "This hosted-call SMS attempt was already used; duplicate send blocked.",
+            error_code="hosted_sms_duplicate_blocked",
+        )
+    return context, None
+
+
 def _upload_media_url(identity: Any, path: str) -> str:
     resolved = Path(path).expanduser()
     upload = identity.upload_imessage_media(
@@ -669,10 +758,17 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
     """Run one Inkbox MCP tool and return an MCP ``tools/call`` result."""
 
     args = dict(args or {})
+    hosted_sms_context: Optional[Dict[str, Any]] = None
 
     if name == "inkbox_send_sms":
         text = str(args.get("text") or "")
+        target = str(args.get("to") or "").strip()
+        hosted_sms_context, blocked = _reserve_hosted_sms_target(target)
+        if blocked is not None:
+            return blocked
         if len(text) > SMS_MAX_LENGTH:
+            if hosted_sms_context is not None:
+                _settle_hosted_sms_context(hosted_sms_context, "recoverable")
             return _tool_error(
                 _message_too_long_reason("SMS", text, SMS_MAX_LENGTH),
                 error_code="sms_too_long",
@@ -1114,9 +1210,18 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
         raise ValueError(f"unknown Inkbox tool: {name}")
 
     try:
-        return _tool_result(await asyncio.to_thread(_run))
+        result = await asyncio.to_thread(_run)
+        if hosted_sms_context is not None:
+            _settle_hosted_sms_context(hosted_sms_context, "success")
+        return _tool_result(result)
     except Exception as exc:
-        return _tool_error(str(exc), **_tool_exception_fields(exc))
+        fields = _tool_exception_fields(exc)
+        if hosted_sms_context is not None:
+            _settle_hosted_sms_context(
+                hosted_sms_context,
+                sms_tool_failure_kind(message=str(exc), **fields),
+            )
+        return _tool_error(str(exc), **fields)
 
 
 def _place_call_tool_entry(voice_stack: VoiceStack) -> Dict[str, Any]:

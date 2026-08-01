@@ -33,6 +33,7 @@ _RECOVERABLE_CODES = frozenset({
     "content_rejected_by_carrier",
     "content_blocked_by_policy",
 })
+_DUPLICATE_BLOCKED_CODES = frozenset({"hosted_sms_duplicate_blocked"})
 _COMMIT_AMBIGUOUS_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _TERMINAL_MARKERS = (
     "opted out",
@@ -86,7 +87,7 @@ def sms_tool_failure_kind(
     status_code: Any = None,
     message: Any = None,
 ) -> str:
-    """Return recoverable, terminal, or unknown without retaining raw detail."""
+    """Return a sanitized hosted-SMS failure kind without raw detail."""
     code = str(error_code or "").strip().lower()
     detail = " ".join(
         str(value or "").strip().lower()
@@ -98,6 +99,8 @@ def sms_tool_failure_kind(
     except (TypeError, ValueError):
         status = None
 
+    if code in _DUPLICATE_BLOCKED_CODES:
+        return "duplicate_blocked"
     if (
         code in _TERMINAL_CODES
         or status in _COMMIT_AMBIGUOUS_STATUSES

@@ -75,6 +75,16 @@ def a2a_turn_context_path(chat_id: str) -> Path:
     return path / f"{digest}.json"
 
 
+def hosted_sms_turn_context_path(chat_id: str) -> Path:
+    """Return the private cross-process context for one hosted SMS turn."""
+    root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
+    path = root / "hosted_sms_turn_contexts"
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o700)
+    digest = hashlib.sha256(chat_id.encode()).hexdigest()
+    return path / f"{digest}.json"
+
+
 def env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:

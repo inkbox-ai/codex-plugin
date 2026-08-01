@@ -5,8 +5,12 @@ from pathlib import Path
 import pytest
 
 from inkbox_codex import sessions as sessions_mod
-from inkbox_codex.codex_client import CodexAppServerError
-from inkbox_codex.config import BridgeConfig, channel_hints_path
+from inkbox_codex.codex_client import CodexAppServerError, CodexTurnResult
+from inkbox_codex.config import (
+    BridgeConfig,
+    channel_hints_path,
+    hosted_sms_turn_context_path,
+)
 from inkbox_codex.sessions import (
     ContactSession,
     _parse_index,
@@ -127,6 +131,37 @@ def test_stop_command_aborts_running_detailed_capture():
         assert result.aborted is True
         assert result.mcp_tool_calls == ()
         assert sent[-1][1] == "Stopped."
+
+    asyncio.run(scenario())
+
+
+def test_detailed_capture_binds_private_hosted_sms_context():
+    async def scenario():
+        session = make_session([])
+        seen = {}
+
+        class FakeClient:
+            thread_id = "thread-1"
+
+            async def run_detailed(self, _text):
+                path = hosted_sms_turn_context_path("contact-1")
+                seen["context"] = json.loads(path.read_text())
+                seen["mode"] = path.stat().st_mode & 0o777
+                return CodexTurnResult(text="", mcp_tool_calls=())
+
+        session._client = FakeClient()
+        context = {
+            "call_id": "call-1",
+            "attempt": 1,
+            "remote_phone": "+15551112222",
+        }
+        await session.run_consult_detailed(
+            "post-call",
+            hosted_sms_context=context,
+        )
+
+        assert seen == {"context": context, "mode": 0o600}
+        assert not hosted_sms_turn_context_path("contact-1").exists()
 
     asyncio.run(scenario())
 

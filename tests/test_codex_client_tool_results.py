@@ -112,6 +112,7 @@ def test_mcp_failed_item_reduces_raw_error_to_recoverable_kind():
         ("upstream_failure", "", 503, "terminal"),
         ("recipient_opted_out", "", 403, "terminal"),
         ("invalid_phone_number", "", 422, "terminal"),
+        ("hosted_sms_duplicate_blocked", "", 409, "duplicate_blocked"),
     ],
 )
 def test_mcp_failed_item_uses_structured_sms_error_metadata(
