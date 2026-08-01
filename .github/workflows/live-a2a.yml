@@ -85,6 +85,7 @@ jobs:
           {
             echo "INKBOX_IDENTITY=$HANDLE"
             echo "INKBOX_ALLOW_ALL_USERS=true"
+            echo "INKBOX_VOICEMAIL_DETECTION=disabled"
             echo "CODEX_SANDBOX=read-only"
             echo "CODEX_APPROVAL_POLICY=never"
             echo "INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS=true"
