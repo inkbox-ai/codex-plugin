@@ -1,4 +1,8 @@
-from inkbox_codex.config import VoiceStack, read_config
+from inkbox_codex.config import (
+    DEFAULT_CODEX_APP_SERVER_STREAM_LIMIT_BYTES,
+    VoiceStack,
+    read_config,
+)
 
 
 def test_read_config_defaults(monkeypatch):
@@ -7,6 +11,7 @@ def test_read_config_defaults(monkeypatch):
         "INKBOX_ALLOWED_USERS", "CODEX_BIN", "CODEX_SANDBOX",
         "CODEX_APPROVAL_POLICY", "INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS",
         "INKBOX_BASE_URL", "CODEX_TURN_TIMEOUT_S", "CODEX_INTERRUPT_TIMEOUT_S",
+        "CODEX_APP_SERVER_STREAM_LIMIT_BYTES",
         "INKBOX_CONTACT_MEMORIES_ENABLED",
     ):
         monkeypatch.delenv(var, raising=False)
@@ -19,6 +24,10 @@ def test_read_config_defaults(monkeypatch):
     assert cfg.auto_approve_inkbox_tools is False
     assert cfg.codex_turn_timeout_s == 1800.0
     assert cfg.codex_interrupt_timeout_s == 10.0
+    assert (
+        cfg.codex_app_server_stream_limit_bytes
+        == DEFAULT_CODEX_APP_SERVER_STREAM_LIMIT_BYTES
+    )
     assert cfg.contact_memories_enabled is True
 
 
@@ -33,6 +42,7 @@ def test_read_config_env(monkeypatch):
     monkeypatch.setenv("INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS", "true")
     monkeypatch.setenv("CODEX_TURN_TIMEOUT_S", "42")
     monkeypatch.setenv("CODEX_INTERRUPT_TIMEOUT_S", "3")
+    monkeypatch.setenv("CODEX_APP_SERVER_STREAM_LIMIT_BYTES", "8388608")
     cfg = read_config()
     assert cfg.api_key == "ApiKey_test"
     assert cfg.base_url == "https://proxy.example"
@@ -43,6 +53,7 @@ def test_read_config_env(monkeypatch):
     assert cfg.auto_approve_inkbox_tools is True
     assert cfg.codex_turn_timeout_s == 42.0
     assert cfg.codex_interrupt_timeout_s == 3.0
+    assert cfg.codex_app_server_stream_limit_bytes == 8388608
 
 
 def test_contact_memories_can_be_disabled(monkeypatch):

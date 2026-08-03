@@ -272,6 +272,7 @@ curl --fail-with-body --request POST 'https://your-agent-host.example/webhook' \
 | `CODEX_BIN` | no | `codex` | Codex CLI executable to run. |
 | `CODEX_SANDBOX` | no | `workspace-write` | App-server thread sandbox (`read-only`, `workspace-write`, `danger-full-access`). |
 | `CODEX_APPROVAL_POLICY` | no | `on-request` | Codex approval policy for bridged turns. |
+| `CODEX_APP_SERVER_STREAM_LIMIT_BYTES` | no | `16777216` | Maximum size of one newline-delimited app-server message. |
 | `INKBOX_REALTIME_ENABLED` | no | `false` | Use OpenAI Realtime for calls. Needs a key; off → Inkbox STT/TTS. |
 | `INKBOX_REALTIME_API_KEY` | realtime | `OPENAI_API_KEY` | OpenAI key with `/v1/realtime` access. |
 | `INKBOX_REALTIME_MODEL` | no | `gpt-realtime-2` | Realtime model id. |
