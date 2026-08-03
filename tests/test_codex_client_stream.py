@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,8 +15,11 @@ import json
 import sys
 
 
-def send(message):
-    sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
+def send(message, require_oversized=False):
+    encoded = json.dumps(message, separators=(",", ":")) + "\n"
+    if require_oversized:
+        assert len(encoded.encode()) > 65536
+    sys.stdout.write(encoded)
     sys.stdout.flush()
 
 
@@ -37,7 +41,7 @@ for raw in sys.stdin:
                 "turnId": "turn-1",
                 "item": {"type": "agentMessage", "text": reply},
             },
-        })
+        }, require_oversized=True)
         send({
             "method": "turn/completed",
             "params": {
@@ -48,7 +52,12 @@ for raw in sys.stdin:
                     "items": [{"type": "commandExecution", "output": "y" * 70000}],
                 },
             },
-        })
+        }, require_oversized=True)
+    elif method == "probe/fail":
+        send({
+            "method": "probe/oversized",
+            "params": {"padding": "z" * 70000},
+        }, require_oversized=True)
 '''
 
 
@@ -84,7 +93,7 @@ def test_large_item_and_turn_notifications_complete(tmp_path):
     asyncio.run(scenario())
 
 
-def test_reader_limit_failure_fails_turn_and_marks_client_unhealthy(tmp_path):
+def test_reader_limit_failure_fails_turn_and_terminates_child(tmp_path):
     async def scenario():
         client = _client(_mock_app_server(tmp_path), stream_limit=1024)
         try:
@@ -92,6 +101,39 @@ def test_reader_limit_failure_fails_turn_and_marks_client_unhealthy(tmp_path):
             with pytest.raises(CodexAppServerError, match="reader"):
                 await asyncio.wait_for(client.run_detailed("test"), timeout=2)
             assert client.is_healthy is False
+            assert client._proc is not None
+            await asyncio.wait_for(client._proc.wait(), timeout=1)
+            assert client._proc.returncode is not None
+        finally:
+            await client.disconnect()
+
+    asyncio.run(scenario())
+
+
+def test_reader_failure_logs_and_fails_all_pending_requests(tmp_path, caplog):
+    async def scenario():
+        client = _client(_mock_app_server(tmp_path), stream_limit=1024)
+        caplog.set_level(logging.ERROR, logger="inkbox_codex.codex_client")
+        try:
+            await client.connect()
+            first = asyncio.create_task(client._request("probe/wait", {}))
+            second = asyncio.create_task(client._request("probe/wait", {}))
+            await asyncio.sleep(0)
+            assert len(client._pending) == 2
+            trigger = asyncio.create_task(client._request("probe/fail", {}))
+
+            results = await asyncio.wait_for(
+                asyncio.gather(first, second, trigger, return_exceptions=True),
+                timeout=2,
+            )
+
+            assert all(isinstance(result, CodexAppServerError) for result in results)
+            assert all("reader" in str(result) for result in results)
+            assert client._pending == {}
+            assert client.is_healthy is False
+            assert "Codex app-server reader stopped unexpectedly" in caplog.text
+            assert client._proc is not None
+            await asyncio.wait_for(client._proc.wait(), timeout=1)
         finally:
             await client.disconnect()
 
