@@ -179,60 +179,55 @@ def _has_sms_action_intent(value: str | None) -> bool:
     return send and sms
 
 
-def _matching_post_call_action(call, marker):
-    """Return the open current-marker SMS action persisted for a hosted call."""
-    marker_key = _voice_marker_key(marker)
+def _open_post_call_sms_action(call):
+    """Return the open SMS action persisted for this hosted call."""
     for item in getattr(call, "post_call_action_items", None) or []:
         if isinstance(item, dict):
             status = item.get("status", "")
             action = item.get("action", "")
+            description = item.get("description", "")
             details = item.get("details", "")
         else:
             status = getattr(item, "status", "")
             action = getattr(item, "action", "")
+            description = getattr(item, "description", "")
             details = getattr(item, "details", "")
-        value = f"{action} {details}"
+        value = f"{action} {description} {details}"
         if (
             str(status).casefold() == "open"
-            and marker_key in _voice_marker_key(value)
             and _has_sms_action_intent(value)
         ):
             return item
     return None
 
 
-def _post_call_action_diagnostic(call, marker) -> dict[str, int | bool]:
+def _post_call_action_diagnostic(call) -> dict[str, int | bool]:
     """Bounded, content-redacted predicates for the hosted action gate."""
     items = getattr(call, "post_call_action_items", None) or []
     open_count = 0
-    marker_count = 0
     sms_count = 0
     matching_action = False
-    marker_key = _voice_marker_key(marker)
     for item in items[:10]:
         if isinstance(item, dict):
             status = item.get("status", "")
             action = item.get("action", "")
+            description = item.get("description", "")
             details = item.get("details", "")
         else:
             status = getattr(item, "status", "")
             action = getattr(item, "action", "")
+            description = getattr(item, "description", "")
             details = getattr(item, "details", "")
-        value = f"{action} {details}"
+        value = f"{action} {description} {details}"
         is_open = str(status).casefold() == "open"
-        has_marker = bool(marker_key) and marker_key in _voice_marker_key(value)
         has_sms_intent = _has_sms_action_intent(value)
         open_count += int(is_open)
-        marker_count += int(has_marker)
         sms_count += int(has_sms_intent)
-        matching_action = matching_action or (
-            is_open and has_marker and has_sms_intent
-        )
+        matching_action = matching_action or (is_open and has_sms_intent)
     return {
         "item_count": len(items),
         "inspected_count": min(len(items), 10),
         "open_count": open_count,
-        "marker_count": marker_count,
         "sms_count": sms_count,
         "matching_action": matching_action,
     }
@@ -374,8 +369,8 @@ def _wait_for_persisted_hosted_request(
             transcript_diagnostic = {"error_type": type(exc).__name__}
         try:
             aut_call = aut.calls.get(aut_call_id)
-            action_ready = _matching_post_call_action(aut_call, marker) is not None
-            action_diagnostic = _post_call_action_diagnostic(aut_call, marker)
+            action_ready = _open_post_call_sms_action(aut_call) is not None
+            action_diagnostic = _post_call_action_diagnostic(aut_call)
         except Exception as exc:
             action_diagnostic = {"error_type": type(exc).__name__}
         if transcript_ready and action_ready:
