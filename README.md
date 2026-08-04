@@ -38,6 +38,20 @@ The one thing to have ready: be **logged into Codex** — a ChatGPT/Codex login 
 
 Flags: `--start` (launch the background gateway when done), `--no-setup` (install only). From a local checkout, run `./install.sh`. Re-running is safe.
 
+### Bootstrap an existing identity without prompts
+
+For unattended agent setup, install without opening the wizard and pass the API key through the environment (or standard input), never a command-line argument:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/inkbox-ai/codex-plugin/main/install.sh | bash -s -- --no-setup
+export INKBOX_API_KEY="ApiKey_..."
+inkbox-codex bootstrap --identity my-agent --project-dir "$PWD" \
+  --voice-ai --rotate-signing-key --start-gateway
+unset INKBOX_API_KEY
+```
+
+`bootstrap` validates that the key can access exactly the requested identity, scopes down an admin key before saving it, preserves existing Voice AI settings, enables native Inkbox tool approvals, and starts or restarts the detached gateway. Signing-key replacement is opt-in because it transfers verified webhook delivery away from any gateway using the previous key. The command prints a secret-redacted JSON result and is safe to resume.
+
 Check it any time:
 
 ```bash
