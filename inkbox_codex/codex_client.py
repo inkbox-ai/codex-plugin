@@ -85,7 +85,19 @@ class CodexAppServerClient:
         self._pending: Dict[int, "asyncio.Future[Any]"] = {}
         self._turns: Dict[str, _TurnCapture] = {}
         self._current_turn_id: Optional[str] = None
+        self._turn_start_pending = False
+        self._early_turn_notifications: Dict[str, list[Dict[str, Any]]] = {}
         self._initialized = False
+
+    @property
+    def is_healthy(self) -> bool:
+        """Return whether the subprocess and its stdout reader are usable."""
+        return (
+            self._proc is not None
+            and self._proc.returncode is None
+            and self._reader_task is not None
+            and not self._reader_task.done()
+        )
 
     async def connect(self, resume_thread_id: Optional[str] = None) -> str:
         """Start app-server and create or resume a Codex thread."""
@@ -114,21 +126,36 @@ class CodexAppServerClient:
         """Run one turn and return its final reply and sanitized MCP outcomes."""
         if not self.thread_id:
             await self.connect()
+        elif not self.is_healthy:
+            raise CodexAppServerError("Codex app-server reader is not running")
         assert self.thread_id is not None
 
-        result = await self._request(
-            "turn/start",
-            {
-                "threadId": self.thread_id,
-                "input": [{"type": "text", "text": text}],
-                "cwd": self.cfg.project_dir or None,
-                "model": self.cfg.codex_model or None,
-                "approvalPolicy": self.cfg.codex_approval_policy or "on-request",
-            },
-        )
+        self._turn_start_pending = True
+        self._early_turn_notifications.clear()
+        try:
+            result = await self._request(
+                "turn/start",
+                {
+                    "threadId": self.thread_id,
+                    "input": [{"type": "text", "text": text}],
+                    "cwd": self.cfg.project_dir or None,
+                    "model": self.cfg.codex_model or None,
+                    "approvalPolicy": self.cfg.codex_approval_policy or "on-request",
+                },
+            )
+        except BaseException:
+            self._turn_start_pending = False
+            self._early_turn_notifications.clear()
+            raise
+        if not self.is_healthy:
+            self._turn_start_pending = False
+            self._early_turn_notifications.clear()
+            raise CodexAppServerError("Codex app-server reader is not running")
         turn = result.get("turn") or {}
         turn_id = str(turn.get("id") or "")
         if not turn_id:
+            self._turn_start_pending = False
+            self._early_turn_notifications.clear()
             raise CodexAppServerError(f"app-server did not return a turn id: {result!r}")
 
         loop = asyncio.get_running_loop()
@@ -139,6 +166,11 @@ class CodexAppServerClient:
         )
         self._turns[turn_id] = capture
         self._current_turn_id = turn_id
+        early_notifications = self._early_turn_notifications.pop(turn_id, [])
+        self._turn_start_pending = False
+        self._early_turn_notifications.clear()
+        for notification in early_notifications:
+            self._handle_notification(notification)
         try:
             return await capture.future
         finally:
@@ -166,18 +198,43 @@ class CodexAppServerClient:
                 capture.future.set_exception(CodexAppServerError("Codex app-server disconnected"))
         self._turns.clear()
 
-        if self._proc is not None and self._proc.returncode is None:
-            self._proc.terminate()
+        proc = self._proc
+        if proc is not None and proc.stdin is not None:
+            proc.stdin.close()
             try:
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
+                await asyncio.wait_for(proc.stdin.wait_closed(), timeout=1)
+            except (asyncio.TimeoutError, BrokenPipeError, ConnectionResetError):
+                pass
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+        if proc is not None:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
             except asyncio.TimeoutError:
-                self._proc.kill()
-                await self._proc.wait()
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-        if self._stderr_task is not None:
-            self._stderr_task.cancel()
+                proc.kill()
+                await proc.wait()
+        background_tasks = [
+            task
+            for task in (self._reader_task, self._stderr_task)
+            if task is not None
+        ]
+        for task in background_tasks:
+            if not task.done():
+                task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+        await asyncio.sleep(0)
         self._proc = None
+        self._reader_task = None
+        self._stderr_task = None
+        self.thread_id = None
+        self._current_turn_id = None
+        self._turn_start_pending = False
+        self._early_turn_notifications.clear()
+        self._initialized = False
 
     def _thread_params(self) -> Dict[str, Any]:
         config: Dict[str, Any] = {}
@@ -195,8 +252,10 @@ class CodexAppServerClient:
         }
 
     async def _ensure_process(self) -> None:
-        if self._proc is not None and self._proc.returncode is None:
+        if self.is_healthy:
             return
+        if self._proc is not None:
+            await self.disconnect()
         env = os.environ.copy()
         self._proc = await asyncio.create_subprocess_exec(
             self.cfg.codex_bin or "codex",
@@ -205,6 +264,7 @@ class CodexAppServerClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            limit=max(1, int(self.cfg.codex_app_server_stream_limit_bytes)),
         )
         self._reader_task = asyncio.create_task(self._reader_loop())
         self._stderr_task = asyncio.create_task(self._stderr_loop())
@@ -216,7 +276,7 @@ class CodexAppServerClient:
                 "clientInfo": {
                     "name": "inkbox_codex",
                     "title": "Inkbox Codex Bridge",
-                    "version": "0.2.8",
+                    "version": "0.2.9",
                 },
                 "capabilities": {"experimentalApi": True},
             },
@@ -225,7 +285,7 @@ class CodexAppServerClient:
         self._initialized = True
 
     async def _request(self, method: str, params: Dict[str, Any]) -> Any:
-        if self._proc is None or self._proc.stdin is None:
+        if not self.is_healthy or self._proc is None or self._proc.stdin is None:
             raise CodexAppServerError("Codex app-server is not running")
         message_id = self._next_id
         self._next_id += 1
@@ -245,25 +305,42 @@ class CodexAppServerClient:
 
     async def _reader_loop(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
-        while True:
-            line = await self._proc.stdout.readline()
-            if not line:
-                self._fail_all(CodexAppServerError("Codex app-server exited"))
-                return
-            try:
-                message = json.loads(line.decode())
-            except json.JSONDecodeError:
-                logger.warning("invalid app-server JSON: %r", line[:500])
-                continue
+        try:
+            while True:
+                line = await self._proc.stdout.readline()
+                if not line:
+                    raise CodexAppServerError("Codex app-server stdout closed")
+                try:
+                    message = json.loads(line.decode())
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    logger.warning("invalid app-server JSON: %r", line[:500])
+                    continue
 
-            if "id" in message and ("result" in message or "error" in message) and "method" not in message:
-                self._handle_response(message)
-                continue
-            if "id" in message and "method" in message:
-                asyncio.create_task(self._handle_server_request(message))
-                continue
-            if "method" in message:
-                self._handle_notification(message)
+                if "id" in message and ("result" in message or "error" in message) and "method" not in message:
+                    self._handle_response(message)
+                    continue
+                if "id" in message and "method" in message:
+                    asyncio.create_task(self._handle_server_request(message))
+                    continue
+                if "method" in message:
+                    self._handle_notification(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Codex app-server reader stopped unexpectedly")
+            self._fail_all(
+                CodexAppServerError(f"Codex app-server reader failed: {exc}")
+            )
+            if self._proc is not None and self._proc.returncode is None:
+                # A line-limit failure pauses the pipe; close it so the child
+                # cannot keep teardown blocked while its stdout is unreadable.
+                stdout_transport = getattr(self._proc.stdout, "_transport", None)
+                if stdout_transport is not None:
+                    stdout_transport.close()
+                try:
+                    self._proc.terminate()
+                except ProcessLookupError:
+                    pass
 
     async def _stderr_loop(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
@@ -305,6 +382,19 @@ class CodexAppServerClient:
         method = message.get("method")
         params = message.get("params") or {}
         turn_id = str(params.get("turnId") or (params.get("turn") or {}).get("id") or "")
+
+        if (
+            turn_id
+            and turn_id not in self._turns
+            and self._turn_start_pending
+            and method in {
+                "item/agentMessage/delta",
+                "item/completed",
+                "turn/completed",
+            }
+        ):
+            self._early_turn_notifications.setdefault(turn_id, []).append(message)
+            return
 
         if method == "item/agentMessage/delta":
             capture = self._turns.get(turn_id)

@@ -26,6 +26,7 @@ DISTRIBUTION_NAME = "codex-plugin"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8767
 DEFAULT_WEBHOOK_PATH = "/webhook"
+DEFAULT_CODEX_APP_SERVER_STREAM_LIMIT_BYTES = 16 * 1024 * 1024
 
 
 class VoiceStack(str, Enum):
@@ -125,6 +126,9 @@ class BridgeConfig:
     permission_timeout_s: float = 600.0
     codex_turn_timeout_s: float = 1800.0
     codex_interrupt_timeout_s: float = 10.0
+    codex_app_server_stream_limit_bytes: int = (
+        DEFAULT_CODEX_APP_SERVER_STREAM_LIMIT_BYTES
+    )
     voice_stack: VoiceStack = VoiceStack.INKBOX_TTS_STT
     voice_stack_invalid_value: str = ""
     voice_ai_authority_mode: str = "contact_scoped"
@@ -244,6 +248,11 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         permission_timeout_s=float(os.getenv("INKBOX_PERMISSION_TIMEOUT_S") or 600.0),
         codex_turn_timeout_s=float(os.getenv("CODEX_TURN_TIMEOUT_S") or 1800.0),
         codex_interrupt_timeout_s=float(os.getenv("CODEX_INTERRUPT_TIMEOUT_S") or 10.0),
+        codex_app_server_stream_limit_bytes=int(
+            extra.get("codex_app_server_stream_limit_bytes")
+            or os.getenv("CODEX_APP_SERVER_STREAM_LIMIT_BYTES")
+            or DEFAULT_CODEX_APP_SERVER_STREAM_LIMIT_BYTES
+        ),
         voice_stack=voice_stack,
         voice_stack_invalid_value=invalid_voice_stack,
         voice_ai_authority_mode=str(

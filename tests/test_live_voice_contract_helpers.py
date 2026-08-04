@@ -114,24 +114,21 @@ def test_call_pair_duplicate_diagnostic_names_owner_and_ids():
         )
 
 
-def test_matching_post_call_action_requires_open_current_marker_sms():
-    marker = "victor echo juliet"
+def test_hosted_action_gate_requires_open_sms_action():
     matching = {
         "status": "open",
-        "action": "send_sms",
-        "details": "After the call, send Victor-Echo, Juliet to the caller.",
+        "description": "Send the requested SMS to the caller after the call.",
     }
-    assert voice._matching_post_call_action(
-        SimpleNamespace(post_call_action_items=[matching]), marker
+    assert voice._open_post_call_sms_action(
+        SimpleNamespace(post_call_action_items=[matching])
     ) is matching
 
     for item in (
         {**matching, "status": "canceled"},
-        {**matching, "details": "Send a different marker."},
-        {**matching, "action": "create_note", "details": marker},
+        {**matching, "description": "Record the request in a note."},
     ):
-        assert voice._matching_post_call_action(
-            SimpleNamespace(post_call_action_items=[item]), marker
+        assert voice._open_post_call_sms_action(
+            SimpleNamespace(post_call_action_items=[item])
         ) is None
 
 
@@ -151,16 +148,12 @@ def test_action_gate_diagnostic_is_bounded_and_content_redacted():
         ]
     )
 
-    diagnostic = voice._post_call_action_diagnostic(
-        call,
-        "Victor Echo Juliet",
-    )
+    diagnostic = voice._post_call_action_diagnostic(call)
 
     assert diagnostic == {
         "item_count": 16,
         "inspected_count": 10,
         "open_count": 1,
-        "marker_count": 1,
         "sms_count": 1,
         "matching_action": True,
     }

@@ -33,7 +33,7 @@ def _request_account_usage(codex_bin: str = "codex", timeout: float = 10.0) -> d
                     "clientInfo": {
                         "name": "inkbox_codex_usage",
                         "title": "Inkbox Codex Usage",
-                        "version": "0.2.8",
+                        "version": "0.2.9",
                     },
                     "capabilities": {"experimentalApi": True},
                 },

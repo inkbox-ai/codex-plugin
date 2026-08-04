@@ -874,8 +874,11 @@ class ContactSession:
             return
 
     async def _ensure_client(self) -> CodexAppServerClient:
-        if self._client is not None:
+        if self._client is not None and getattr(self._client, "is_healthy", True):
             return self._client
+        if self._client is not None:
+            await self._client.disconnect()
+            self._client = None
         developer_instructions = build_channel_prompt(
             project_dir=self.cfg.project_dir,
             identity_handle=self.identity_info.get("handle", ""),

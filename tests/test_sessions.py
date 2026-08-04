@@ -500,6 +500,47 @@ def test_clear_command_starts_fresh_session():
     asyncio.run(scenario())
 
 
+def test_ensure_client_restarts_unhealthy_app_server(monkeypatch):
+    async def scenario():
+        session = make_session([])
+        session.resume_session_id = "saved-thread"
+        session.on_session_id = lambda _chat_id, _thread_id: None
+
+        class UnhealthyClient:
+            is_healthy = False
+
+            def __init__(self):
+                self.disconnects = 0
+
+            async def disconnect(self):
+                self.disconnects += 1
+
+        class ReplacementClient:
+            is_healthy = True
+
+            def __init__(self, *_args, **_kwargs):
+                self.thread_id = None
+                self.resumed_from = None
+
+            async def connect(self, resume_thread_id=None):
+                self.resumed_from = resume_thread_id
+                self.thread_id = "resumed-thread"
+                return self.thread_id
+
+        old_client = UnhealthyClient()
+        session._client = old_client
+        monkeypatch.setattr(sessions_mod, "CodexAppServerClient", ReplacementClient)
+
+        replacement = await session._ensure_client()
+
+        assert old_client.disconnects == 1
+        assert isinstance(replacement, ReplacementClient)
+        assert replacement.resumed_from == "saved-thread"
+        assert session.resume_session_id == "resumed-thread"
+
+    asyncio.run(scenario())
+
+
 def test_stop_command_interrupts_turn_without_clearing():
     async def scenario():
         sent = []
