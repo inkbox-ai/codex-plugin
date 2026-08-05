@@ -155,22 +155,22 @@ jobs:
         run: |
           if [ "${{ matrix.scenario }}" = "outbound_hosted" ]; then
             # Long digit strings do not survive TTS/PSTN/STT reliably. Derive
-            # a current-run marker from radio-alphabet words so the persisted
+            # a current-run marker from longer everyday words so the persisted
             # transcript and resulting SMS remain comparable after speech.
-            RADIO_WORDS=(
-              alpha bravo charlie delta echo foxtrot golf hotel india juliet
-              kilo lima mike november oscar papa quebec romeo sierra tango
-              uniform victor whiskey xray yankee zulu
+            SPEECH_WORDS=(
+              banana elephant pineapple alligator motorcycle umbrella dinosaur
+              potato computer volcano airplane butterfly kangaroo octopus
+              calendar chocolate hospital library sandwich telescope
             )
             marker_value=$((GITHUB_RUN_ID * 10 + GITHUB_RUN_ATTEMPT))
             HOSTED_MARKER=""
             for _ in 1 2 3 4 5; do
-              marker_index=$((marker_value % ${#RADIO_WORDS[@]}))
-              HOSTED_MARKER="${HOSTED_MARKER:+$HOSTED_MARKER }${RADIO_WORDS[$marker_index]}"
-              marker_value=$((marker_value / ${#RADIO_WORDS[@]}))
+              marker_index=$((marker_value % ${#SPEECH_WORDS[@]}))
+              HOSTED_MARKER="${HOSTED_MARKER:+$HOSTED_MARKER }${SPEECH_WORDS[$marker_index]}"
+              marker_value=$((marker_value / ${#SPEECH_WORDS[@]}))
             done
             echo "HOSTED_POST_CALL_MARKER=$HOSTED_MARKER" >> "$GITHUB_ENV"
-            export VOICE_DRIVER_LINE="Create one post-call action now with both its title and details exactly: Send SMS $HOSTED_MARKER. Then list the actions. If either field lacks that exact phrase, edit that same action until both match. Only then read the five-word body back. After we hang up, send me one SMS containing exactly $HOSTED_MARKER. Do not send it during the call."
+            export VOICE_DRIVER_LINE="After we hang up, send me one SMS containing exactly $HOSTED_MARKER. First create one post-call action with both its title and details exactly: Send SMS $HOSTED_MARKER. Then list the actions and edit that same action until both fields match. Only then read the five-word body back. Do not send it during the call."
             # The test owns hangup after both transcript and durable action-item
             # evidence exist; keep the media peer alive until then.
             export VOICE_DRIVER_LISTEN=180
