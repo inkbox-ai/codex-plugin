@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import importlib.util
 from datetime import UTC, datetime
 from pathlib import Path
@@ -165,3 +167,63 @@ def test_action_gate_diagnostic_is_bounded_and_content_redacted():
         "matching_action": True,
     }
     assert "customer-secret" not in repr(diagnostic)
+
+
+def test_paired_agent_leg_is_queried_through_aut_identity():
+    stamp = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+    pair_id = "33333333-3333-3333-3333-333333333333"
+    driver_call = SimpleNamespace(
+        id="driver", paired_call_id=pair_id, created_at=stamp,
+    )
+    aut_call = SimpleNamespace(
+        id="aut", paired_call_id=pair_id, direction="outbound", created_at=stamp,
+    )
+    driver = SimpleNamespace(calls=SimpleNamespace(get=lambda _call_id: driver_call))
+
+    class Calls:
+        kwargs = None
+
+        def list(self, **kwargs):
+            self.kwargs = kwargs
+            return [aut_call]
+
+    calls = Calls()
+    result = voice._wait_for_agent_leg(
+        driver,
+        SimpleNamespace(calls=calls),
+        "driver",
+        lambda: [],
+        direction="outbound",
+        deadline=time.monotonic() + 1,
+    )
+
+    assert result is aut_call
+    assert calls.kwargs == {"limit": 2, "paired_call_id": pair_id}
+
+
+def test_owned_leg_transcript_proof_uses_local_speech_correctly():
+    class Calls:
+        def __init__(self, segments):
+            self.segments = segments
+
+        def transcripts(self, _call_id):
+            return self.segments
+
+        def get(self, _call_id):
+            return SimpleNamespace(status="answered")
+
+    driver = SimpleNamespace(calls=Calls([
+        SimpleNamespace(party="local", text="scripted driver line"),
+    ]))
+    aut = SimpleNamespace(calls=Calls([
+        SimpleNamespace(party="remote", text="caller line"),
+        SimpleNamespace(party="local", text="agent reply"),
+    ]))
+    deadline = time.monotonic() + 1
+
+    assert voice._wait_for_driver_local_speech(
+        driver, "unused", "driver", deadline=deadline
+    ) == "scripted driver line"
+    assert voice._wait_for_two_way_call(
+        aut, "unused", "aut", deadline=deadline
+    ) == "agent reply"

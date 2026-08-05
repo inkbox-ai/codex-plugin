@@ -6,7 +6,7 @@ name: Live — voice calls (Voice AI + Realtime + Inkbox TTS/STT)
 #   outbound_realtime — driver texts "call me"; the agent calls back powered by the
 #                       OpenAI Realtime API.
 #   outbound_hosted   — Voice AI calls back; Codex executes one commitment after hangup.
-# Each leg verifies the stored call transcript shows the agent spoke to the caller.
+# Each leg verifies driver-local speech and a two-way paired agent transcript.
 # Real model + real calls, so this runs only on ready (non-draft) PRs + dispatch, and
 # shares the AUT tunnel lock with the other live suites.
 on:
