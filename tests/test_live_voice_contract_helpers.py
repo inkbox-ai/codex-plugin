@@ -33,7 +33,7 @@ def test_workflow_requires_exact_action_body_and_corrective_readback():
     workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
 
     assert (
-        "After we hang up, send me exactly one SMS containing exactly $HOSTED_MARKER. Before "
+        "After we hang up, send me one SMS containing exactly $HOSTED_MARKER. Before "
         "we hang up, record one post-call action whose action title and details are both "
         "exactly Send SMS $HOSTED_MARKER. Read the five-word SMS body back after recording "
         "it. Do not send the SMS during the call."
