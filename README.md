@@ -38,19 +38,50 @@ The one thing to have ready: be **logged into Codex** — a ChatGPT/Codex login 
 
 Flags: `--start` (launch the background gateway when done), `--no-setup` (install only). From a local checkout, run `./install.sh`. Re-running is safe.
 
-### Bootstrap an existing identity without prompts
+### Bootstrap an assigned identity without prompts
 
-For unattended agent setup, install without opening the wizard and pass the API key through the environment (or standard input), never a command-line argument:
+Use this path when a human has already assigned the agent an identity handle,
+API base URL, and credential. Inspect the official repository's `install.sh`
+before executing it, then install without opening the interactive setup wizard:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/inkbox-ai/codex-plugin/main/install.sh | bash -s -- --no-setup
-export INKBOX_API_KEY="ApiKey_..."
-inkbox-codex bootstrap --identity my-agent --project-dir "$PWD" \
+installer="$(mktemp)"
+trap 'rm -f "$installer"' EXIT
+curl -fsSL https://raw.githubusercontent.com/inkbox-ai/codex-plugin/main/install.sh -o "$installer"
+cat "$installer"
+bash "$installer" --no-setup
+rm -f "$installer"
+trap - EXIT
+```
+
+Have the human supply the assigned credential privately as `INKBOX_API_KEY` in
+the bootstrap process environment. Do not put it in a command-line argument,
+source control, a project `.env`, or agent/project instructions. Keep the saved
+configuration in the plugin's local state directory, then run the complete
+bootstrap command with the assigned values substituted:
+
+```bash
+export INKBOX_CODEX_ENV_FILE="${INKBOX_CODEX_HOME:-$HOME/.inkbox-codex}/.env"
+inkbox-codex bootstrap --identity '<handle>' --base-url '<url>' --project-dir "$PWD" \
   --voice-ai --rotate-signing-key --start-gateway
 unset INKBOX_API_KEY
 ```
 
-`bootstrap` validates that the key can access exactly the requested identity, scopes down an admin key before saving it, preserves existing Voice AI settings, enables native Inkbox tool approvals, and starts or restarts the detached gateway. Signing-key replacement is opt-in because it transfers verified webhook delivery away from any gateway using the previous key. The command prints a secret-redacted JSON result and is safe to resume.
+`bootstrap` is non-interactive and resumable. It validates that the credential
+can access exactly the requested identity, scopes down an admin credential before
+saving it, preserves existing Voice AI settings, enables native Inkbox tool
+approvals, and starts or restarts the detached gateway. Reuse the assigned handle;
+do not run `setup` or create a replacement identity. Signing-key replacement
+transfers verified webhook delivery away from any gateway using the previous key,
+so that gateway must be set up again before it can receive events.
+
+The command prints a secret-redacted JSON result. A `configured` status means
+bootstrap completed. If the status is `requires_human`, show every entry in
+`human_actions` to the human and wait for that work to finish, then resume by
+running the same complete bootstrap command with the same identity. If the status
+is `error`, diagnose the reported `error` (and use `inkbox-codex doctor` or the
+gateway log when relevant), correct the cause, and retry that same command instead
+of starting a different setup flow.
 
 Check it any time:
 
