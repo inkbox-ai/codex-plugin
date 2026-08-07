@@ -87,9 +87,7 @@ jobs:
       # @alpha is the prerelease channel cut from codex main near-daily — the
       # freshest main build available without compiling the host from source.
       - name: Install Codex (freshest main prerelease)
-        run: |
-          npm install -g @openai/codex@alpha
-          codex --version
+        run: bash "$GITHUB_WORKSPACE/tests/ci/install_codex.sh"
 
       - name: Configure AUT identity + model + speech path (${{ matrix.scenario }})
         env:
@@ -103,7 +101,6 @@ jobs:
           print(c.mailboxes.list()[0].email_address.split("@", 1)[0])
           PYEOF
           )"
-          echo "AUT handle: $HANDLE"
           # The agent's reasoning (deciding to place a call, composing replies)
           # uses the chat model; authenticate the codex CLI with the API key.
           printenv OPENAI_API_KEY | codex login --with-api-key
@@ -147,30 +144,18 @@ jobs:
             fi
             sleep 5
           done
-          echo "::error::gateway did not become ready"; cat "$GATEWAY_LOG"; exit 1
+          echo "::error::gateway did not become ready"
+          python3 "$GITHUB_WORKSPACE/tests/ci/summarize_live_failure.py" gateway "$GATEWAY_LOG"
+          exit 1
 
       - name: Start voice driver and wait for its tunnel
         env:
           REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
         run: |
           if [ "${{ matrix.scenario }}" = "outbound_hosted" ]; then
-            # Long digit strings do not survive TTS/PSTN/STT reliably. Derive
-            # a current-run marker from radio-alphabet words so the persisted
-            # transcript and resulting SMS remain comparable after speech.
-            RADIO_WORDS=(
-              alpha bravo charlie delta echo foxtrot golf hotel india juliet
-              kilo lima mike november oscar papa quebec romeo sierra tango
-              uniform victor whiskey xray yankee zulu
-            )
-            marker_value=$((GITHUB_RUN_ID * 10 + GITHUB_RUN_ATTEMPT))
-            HOSTED_MARKER=""
-            for _ in 1 2 3 4 5; do
-              marker_index=$((marker_value % ${#RADIO_WORDS[@]}))
-              HOSTED_MARKER="${HOSTED_MARKER:+$HOSTED_MARKER }${RADIO_WORDS[$marker_index]}"
-              marker_value=$((marker_value / ${#RADIO_WORDS[@]}))
-            done
+            HOSTED_MARKER="$(python3 "$GITHUB_WORKSPACE/tests/ci/hosted_marker.py" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT")"
             echo "HOSTED_POST_CALL_MARKER=$HOSTED_MARKER" >> "$GITHUB_ENV"
-            export VOICE_DRIVER_LINE="After we hang up, send me one SMS. Create one post-call action now with the title Send SMS and put this exact five-word SMS body in the action details: $HOSTED_MARKER. Wait for the action tool to succeed, then read all five words back to me. Do not paraphrase, omit a word, or send the SMS during the call."
+            export VOICE_DRIVER_LINE="After we hang up, send me one SMS with this exact three-word body: $HOSTED_MARKER. Record that post-call SMS action now. Once the action tool succeeds, read the exact three words back to me. Do not send the SMS during the call."
             # The test owns hangup after both transcript and durable action-item
             # evidence exist; keep the media peer alive until then.
             export VOICE_DRIVER_LISTEN=180
@@ -179,10 +164,12 @@ jobs:
             python3 "$GITHUB_WORKSPACE/tests/live/voice_driver.py" > "$DRIVER_LOG" 2>&1 &
           echo $! > "$RUNNER_TEMP/driver.pid"
           for i in $(seq 1 30); do      # up to ~90s
-            if [ -s "$DRIVER_STATE" ]; then echo "driver ready:"; cat "$DRIVER_STATE"; exit 0; fi
+            if [ -s "$DRIVER_STATE" ]; then echo "driver ready"; exit 0; fi
             sleep 3
           done
-          echo "::error::driver did not become ready"; cat "$DRIVER_LOG"; exit 1
+          echo "::error::driver did not become ready"
+          python3 "$GITHUB_WORKSPACE/tests/ci/summarize_live_failure.py" driver "$DRIVER_LOG"
+          exit 1
 
       - name: Run voice test (${{ matrix.scenario }})
         env:
@@ -194,12 +181,11 @@ jobs:
           LIVE_REAL_MODEL=1 VOICE_DRIVER_STATE="$DRIVER_STATE" \
             python3 -m pytest tests/live/test_voice.py -v
 
-      # Failure-only: these logs carry live call content and this repo is public.
-      - name: Dump logs (on failure only)
+      - name: Summarize runtime state on failure
         if: failure() || cancelled()
         run: |
-          echo "=== gateway.log ==="; cat "$GATEWAY_LOG" || true
-          echo "=== driver.log ==="; cat "$DRIVER_LOG" || true
+          python3 "$GITHUB_WORKSPACE/tests/ci/summarize_live_failure.py" gateway "$GATEWAY_LOG"
+          python3 "$GITHUB_WORKSPACE/tests/ci/summarize_live_failure.py" driver "$DRIVER_LOG"
 
       - name: Tear down (always)
         if: always()

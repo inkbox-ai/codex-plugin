@@ -40,9 +40,7 @@ jobs:
       # @alpha is the prerelease channel cut from codex main near-daily — the
       # freshest main build available without compiling the host from source.
       - name: Install Codex (freshest main prerelease)
-        run: |
-          npm install -g @openai/codex@alpha
-          codex --version
+        run: bash "$GITHUB_WORKSPACE/tests/ci/install_codex.sh"
 
       # Live tests self-skip without credentials; the complete live stack runs
       # only after this latest-host canary succeeds.
