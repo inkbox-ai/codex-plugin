@@ -66,9 +66,7 @@ jobs:
         run: pip install -e .
 
       - name: Install Codex
-        run: |
-          npm install -g @openai/codex@alpha
-          codex --version
+        run: bash "$GITHUB_WORKSPACE/tests/ci/install_codex.sh"
 
       - name: Configure the real model and AUT identity
         env:
@@ -122,9 +120,11 @@ jobs:
           REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
         run: python3 tests/live/a2a_driver.py
 
-      - name: Dump gateway log on failure
+      - name: Summarize gateway state on failure
         if: failure()
-        run: tail -n 300 "$RUNNER_TEMP/gateway.log" 2>/dev/null || true
+        run: >-
+          python3 "$GITHUB_WORKSPACE/tests/ci/summarize_live_failure.py"
+          gateway "$RUNNER_TEMP/gateway.log"
 
       - name: Stop gateway
         if: always()
