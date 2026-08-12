@@ -9,6 +9,7 @@ from inkbox_codex.realtime import (
     EDIT_POST_CALL_ACTION_TOOL_NAME,
     HANG_UP_CALL_TOOL_NAME,
     POST_CALL_ACTION_TOOL_NAME,
+    OpenedRealtimeBridge,
     RealtimeCallMeta,
     RealtimeConfig,
     _BridgeState,
@@ -364,11 +365,213 @@ def test_hangup_is_two_step(monkeypatch):
     assert state.hangup_armed_at is not None
     assert not any(f.get("event") == "stop" for f in ink.sent)
 
-    # Second call: real stop frame to Inkbox + sockets closed.
+    # Second call: real stop frame; the bridge lifecycle owns socket closure.
     _dispatch(ws, HANG_UP_CALL_TOOL_NAME, {"reason": "done"}, state, inkbox_ws=ink)
     stop = next(f for f in ink.sent if f.get("event") == "stop")
     assert stop["reason"] == "done" and stop["stream_id"] == "s1"
-    assert ink.closed is True and state.closed is True
+    assert ink.closed is False and state.closed is True
+    assert state.shutdown_event.is_set()
+
+
+def test_delayed_consult_defers_hangup_until_result_audio_done_and_closes_once(monkeypatch):
+    monkeypatch.setattr(realtime, "HANGUP_CLOSE_DELAY_S", 0.0)
+    monkeypatch.setattr(
+        realtime,
+        "aiohttp",
+        types.SimpleNamespace(
+            WSMsgType=types.SimpleNamespace(
+                TEXT="TEXT",
+                CLOSE="CLOSE",
+                CLOSED="CLOSED",
+                ERROR="ERROR",
+            )
+        ),
+    )
+
+    class QueueWS:
+        def __init__(self):
+            self.incoming = asyncio.Queue()
+            self.sent = []
+            self.close_count = 0
+
+        async def send_str(self, data):
+            self.sent.append(json.loads(data))
+
+        async def close(self):
+            self.close_count += 1
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return await self.incoming.get()
+
+        async def feed(self, frame):
+            await self.incoming.put(
+                type("Msg", (), {"type": "TEXT", "data": json.dumps(frame)})()
+            )
+
+    class Session:
+        def __init__(self):
+            self.close_count = 0
+
+        async def close(self):
+            self.close_count += 1
+
+    async def scenario():
+        openai, inkbox, session = QueueWS(), QueueWS(), Session()
+        state = _BridgeState(stream_id="stream-1")
+        bridge = OpenedRealtimeBridge(
+            session=session,
+            openai_ws=openai,
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            meta=_meta(),
+        )
+        consult_started = asyncio.Event()
+        release_consult = asyncio.Event()
+
+        async def delayed_consult(*_args):
+            consult_started.set()
+            await release_consult.wait()
+            return "The requested result is ready."
+
+        async def no_actions(*_args):
+            return None
+
+        bridge_task = asyncio.create_task(
+            bridge.run(
+                inkbox_ws=inkbox,
+                on_agent_consult=delayed_consult,
+                on_post_call_actions=no_actions,
+                on_call_ended=no_actions,
+            )
+        )
+        consult_task = asyncio.create_task(_dispatch_tool_call(
+            openai_ws=openai,
+            inkbox_ws=inkbox,
+            call_id="consult-1",
+            name=CONSULT_TOOL_NAME,
+            arguments_json=json.dumps({"query": "look this up"}),
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            meta=_meta(),
+            on_agent_consult=delayed_consult,
+        ))
+        await consult_started.wait()
+
+        await _dispatch_tool_call(
+            openai_ws=openai,
+            inkbox_ws=inkbox,
+            call_id="hangup-arm",
+            name=HANG_UP_CALL_TOOL_NAME,
+            arguments_json="{}",
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            meta=_meta(),
+            on_agent_consult=delayed_consult,
+        )
+        await _dispatch_tool_call(
+            openai_ws=openai,
+            inkbox_ws=inkbox,
+            call_id="hangup-confirm",
+            name=HANG_UP_CALL_TOOL_NAME,
+            arguments_json=json.dumps({"reason": "done"}),
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            meta=_meta(),
+            on_agent_consult=delayed_consult,
+        )
+        assert not any(frame.get("event") == "stop" for frame in inkbox.sent)
+        assert openai.close_count == inkbox.close_count == 0
+
+        release_consult.set()
+        await consult_task
+        assert not any(frame.get("event") == "stop" for frame in inkbox.sent)
+
+        await openai.feed({"type": "response.created", "response": {"id": "result-1"}})
+        await openai.feed({
+            "type": "response.done",
+            "response": {"id": "result-1", "status": "completed"},
+        })
+        await asyncio.sleep(0)
+        assert not any(frame.get("event") == "stop" for frame in inkbox.sent)
+
+        await openai.feed({
+            "type": "response.output_audio.done",
+            "response_id": "result-1",
+        })
+        await asyncio.sleep(0)
+        assert not any(frame.get("event") == "stop" for frame in inkbox.sent)
+
+        await openai.feed({
+            "type": "response.output_audio_transcript.done",
+            "response_id": "result-1",
+            "transcript": "The requested result is ready.",
+        })
+        await asyncio.wait_for(bridge_task, timeout=1)
+
+        stops = [frame for frame in inkbox.sent if frame.get("event") == "stop"]
+        assert stops == [{"event": "stop", "reason": "done", "stream_id": "stream-1"}]
+        assert openai.close_count == 1
+        assert inkbox.close_count == 1
+        assert session.close_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_consult_response_timeout_releases_deferred_hangup(monkeypatch):
+    monkeypatch.setattr(realtime, "CONSULT_RESPONSE_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(realtime, "HANGUP_CLOSE_DELAY_S", 0.0)
+
+    async def scenario():
+        openai, inkbox, state = _FakeWS(), _FakeInkboxWS(), _BridgeState()
+
+        async def consult(*_args):
+            return "done"
+
+        await _dispatch_tool_call(
+            openai_ws=openai,
+            inkbox_ws=inkbox,
+            call_id="consult-timeout",
+            name=CONSULT_TOOL_NAME,
+            arguments_json=json.dumps({"query": "look this up"}),
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            meta=_meta(),
+            on_agent_consult=consult,
+        )
+        await _dispatch_tool_call(
+            openai_ws=openai,
+            inkbox_ws=inkbox,
+            call_id="hangup-arm",
+            name=HANG_UP_CALL_TOOL_NAME,
+            arguments_json="{}",
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            meta=_meta(),
+            on_agent_consult=consult,
+        )
+        await _dispatch_tool_call(
+            openai_ws=openai,
+            inkbox_ws=inkbox,
+            call_id="hangup-confirm",
+            name=HANG_UP_CALL_TOOL_NAME,
+            arguments_json="{}",
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            meta=_meta(),
+            on_agent_consult=consult,
+        )
+
+        assert not any(frame.get("event") == "stop" for frame in inkbox.sent)
+        await asyncio.sleep(0.02)
+        assert [frame for frame in inkbox.sent if frame.get("event") == "stop"] == [
+            {"event": "stop"}
+        ]
+        assert state.pending_consults == {}
+
+    asyncio.run(scenario())
 
 
 def test_post_call_dispatch_runs_actions_when_queued():
