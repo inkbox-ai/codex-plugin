@@ -107,7 +107,7 @@ jobs:
           {
             echo "INKBOX_IDENTITY=$HANDLE"
             echo "INKBOX_ALLOW_ALL_USERS=true"
-            echo "CODEX_MODEL=gpt-5.6-terra"
+            echo "CODEX_MODEL=gpt-5.6-sol"
             # Unattended runner: nobody answers approval texts → never escalate,
             # and keep the sandbox read-only so stray commands stay harmless.
             echo "CODEX_SANDBOX=read-only"
@@ -120,6 +120,7 @@ jobs:
           if [ "${{ matrix.scenario }}" = "outbound_realtime" ]; then
             # Realtime key falls back to OPENAI_API_KEY in the gateway env.
             echo "INKBOX_REALTIME_ENABLED=true" >> "$GITHUB_ENV"
+            echo "INKBOX_REALTIME_MODEL=gpt-realtime-2" >> "$GITHUB_ENV"
             echo "INKBOX_VOICE_STACK=openai_realtime" >> "$GITHUB_ENV"
           elif [ "${{ matrix.scenario }}" = "outbound_hosted" ]; then
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
