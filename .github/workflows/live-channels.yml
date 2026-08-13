@@ -110,7 +110,7 @@ jobs:
             # Real OpenAI via the default provider — authenticate the codex CLI
             # with the API key (writes auth.json under CODEX_HOME).
             printenv OPENAI_API_KEY | codex login --with-api-key
-            echo "CODEX_MODEL=gpt-5.6-terra" >> "$GITHUB_ENV"
+            echo "CODEX_MODEL=gpt-5.6-sol" >> "$GITHUB_ENV"
           else
             # Custom provider pointed at the local mock. Codex speaks the
             # Responses API (wire_api "chat" is gone from the host), and a custom
