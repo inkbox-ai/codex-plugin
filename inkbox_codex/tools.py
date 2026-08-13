@@ -1315,5 +1315,7 @@ def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]
         "startup_timeout_sec": 10.0,
         "tool_timeout_sec": 60.0,
     }
+    if cfg.auto_approve_inkbox_tools:
+        server["default_tools_approval_mode"] = "approve"
     tool_names = [f"mcp__inkbox__{spec.name}" for spec in TOOL_SPECS]
     return server, tool_names
