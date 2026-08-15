@@ -73,11 +73,13 @@ class CodexAppServerClient:
         developer_instructions: str,
         mcp_server_config: Optional[Dict[str, Any]] = None,
         approval_handler: Optional[ApprovalHandler] = None,
+        tools_enabled: bool = True,
     ) -> None:
         self.cfg = cfg
         self.developer_instructions = developer_instructions
         self.mcp_server_config = dict(mcp_server_config or {})
         self.approval_handler = approval_handler
+        self.tools_enabled = tools_enabled
 
         self.thread_id: Optional[str] = None
         self._proc: Optional[asyncio.subprocess.Process] = None
@@ -128,16 +130,18 @@ class CodexAppServerClient:
             await self.connect()
         assert self.thread_id is not None
 
-        result = await self._request(
-            "turn/start",
-            {
-                "threadId": self.thread_id,
-                "input": [{"type": "text", "text": text}],
-                "cwd": self.cfg.project_dir or None,
-                "model": self.cfg.codex_model or None,
-                "approvalPolicy": self.cfg.codex_approval_policy or "on-request",
-            },
-        )
+        params = {
+            "threadId": self.thread_id,
+            "input": [{"type": "text", "text": text}],
+            "cwd": self.cfg.project_dir or None,
+            "model": self.cfg.codex_model or None,
+            "approvalPolicy": self.cfg.codex_approval_policy or "on-request",
+        }
+        if not self.tools_enabled:
+            # A turn-level cwd override otherwise restores the default local
+            # environment after thread/start disabled it.
+            params["environments"] = []
+        result = await self._request("turn/start", params)
         turn = result.get("turn") or {}
         turn_id = str(turn.get("id") or "")
         if not turn_id:
@@ -194,9 +198,9 @@ class CodexAppServerClient:
 
     def _thread_params(self) -> Dict[str, Any]:
         config: Dict[str, Any] = {}
-        if self.mcp_server_config:
+        if self.tools_enabled and self.mcp_server_config:
             config["mcp_servers"] = {"inkbox": self.mcp_server_config}
-        return {
+        params = {
             "cwd": self.cfg.project_dir or None,
             "model": self.cfg.codex_model or None,
             "approvalPolicy": self.cfg.codex_approval_policy or "on-request",
@@ -206,6 +210,41 @@ class CodexAppServerClient:
             "config": config or None,
             "serviceName": "inkbox-codex",
         }
+        if not self.tools_enabled:
+            # app-server has no single `tools: []` thread option. These are
+            # its host-native gates for every built-in/external tool source.
+            params.update(
+                {
+                    "environments": [],
+                    "dynamicTools": [],
+                    "selectedCapabilityRoots": [],
+                    "config": {
+                        "web_search": "disabled",
+                        "apps": {"_default": {"enabled": False}},
+                        "orchestrator": {
+                            "skills": {"enabled": False},
+                            "mcp": {"enabled": False},
+                        },
+                        "tools": {
+                            "update_plan": {"enabled": False},
+                            "experimental_request_user_input": {"enabled": False},
+                        },
+                        "features": {
+                            "apps": False,
+                            "goals": False,
+                            "image_generation": False,
+                            "multi_agent": False,
+                            "multi_agent_v2": False,
+                            "plugins": False,
+                            "shell_tool": False,
+                            "tool_suggest": False,
+                            "unified_exec": False,
+                            "view_image": False,
+                        },
+                    },
+                }
+            )
+        return params
 
     async def _ensure_process(self) -> None:
         if self._proc is not None and self._proc.returncode is None:

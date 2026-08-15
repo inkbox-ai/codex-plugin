@@ -14,6 +14,51 @@ def _client():
     )
 
 
+def test_tool_disabled_client_uses_host_native_empty_tool_sources():
+    disabled = CodexAppServerClient(
+        BridgeConfig(project_dir="/workspace"),
+        developer_instructions="test",
+        mcp_server_config={"command": "must-not-be-exposed"},
+        tools_enabled=False,
+    )
+    params = disabled._thread_params()
+
+    assert params["environments"] == []
+    assert params["dynamicTools"] == []
+    assert params["selectedCapabilityRoots"] == []
+    assert "mcp_servers" not in params["config"]
+    assert params["config"]["web_search"] == "disabled"
+    assert params["config"]["apps"] == {"_default": {"enabled": False}}
+    assert params["config"]["orchestrator"] == {
+        "skills": {"enabled": False},
+        "mcp": {"enabled": False},
+    }
+    assert params["config"]["tools"] == {
+        "update_plan": {"enabled": False},
+        "experimental_request_user_input": {"enabled": False},
+    }
+    assert not any(params["config"]["features"].values())
+
+
+def test_normal_client_keeps_main_turn_tool_configuration():
+    enabled = CodexAppServerClient(
+        BridgeConfig(project_dir="/workspace"),
+        developer_instructions="test",
+        mcp_server_config={"command": "inkbox-mcp"},
+    )
+
+    assert enabled._thread_params() == {
+        "cwd": "/workspace",
+        "model": None,
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "developerInstructions": "test",
+        "sandbox": "workspace-write",
+        "config": {"mcp_servers": {"inkbox": {"command": "inkbox-mcp"}}},
+        "serviceName": "inkbox-codex",
+    }
+
+
 def test_mcp_completed_item_captures_only_settlement_fields():
     async def scenario():
         client = _client()

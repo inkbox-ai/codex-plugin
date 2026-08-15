@@ -48,8 +48,10 @@ def test_progress_summary_is_isolated_short_and_nonterminal(monkeypatch):
     )
 
     auxiliary_cfg = calls[0][0]
+    client_kwargs = calls[0][1]
     assert auxiliary_cfg.codex_sandbox == "read-only"
     assert auxiliary_cfg.codex_approval_policy == "never"
+    assert client_kwargs["tools_enabled"] is False
     assert update == "I'm reviewing the requested records."
     assert "list_directory_users" in calls[1]
     assert "I'm checking the request." in calls[1]
