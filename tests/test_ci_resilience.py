@@ -39,6 +39,7 @@ def test_every_host_workflow_uses_bounded_codex_installer():
     installer = ROOT.joinpath("tests", "ci", "install_codex.sh").read_text()
     assert "CODEX_INSTALL_ATTEMPTS:-4" in installer
     assert "attempt * 15" in installer
+    assert "npm install -g @openai/codex@alpha && codex --version" in installer
 
 
 def test_live_runs_never_cancel_an_existing_shared_cycle():
