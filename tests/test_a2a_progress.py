@@ -1,23 +1,24 @@
 import asyncio
 import types
 
+import pytest
+
 from inkbox_codex import a2a_progress as progress
 from inkbox_codex.config import BridgeConfig
 
 
-def test_activity_mapping_and_fallback_are_sanitized():
-    activities = [
-        progress.activity_for_item("mcpToolCall", "list_directory_users"),
-        progress.activity_for_item("mcpToolCall", "run_sql_query"),
-    ]
-
-    assert activities == [
-        "reviewing the requested records",
-        "checking the requested data",
-    ]
-    assert progress.fallback_update(activities) == (
-        "I'm reviewing the requested records and checking the requested data."
+def test_item_identifiers_are_normalized_without_classification():
+    assert (
+        progress.safe_item_identifier("mcpToolCall", " List Directory Users ")
+        == "list_directory_users"
     )
+    assert progress.safe_item_identifier("commandExecution") == "command_execution"
+    assert (
+        progress.safe_item_identifier("mcpToolCall", "run/sql query\n")
+        == "run_sql_query"
+    )
+    assert len(progress.safe_item_identifier("mcpToolCall", "x" * 100)) == 80
+    assert progress.fallback_update() == "I'm continuing the requested work."
 
 
 def test_progress_summary_is_isolated_short_and_nonterminal(monkeypatch):
@@ -29,7 +30,7 @@ def test_progress_summary_is_isolated_short_and_nonterminal(monkeypatch):
 
         async def run(self, prompt):
             calls.append(prompt)
-            return "Completed the task and found everything."
+            return "I'm reviewing the requested records."
 
         async def disconnect(self):
             calls.append("disconnected")
@@ -37,9 +38,12 @@ def test_progress_summary_is_isolated_short_and_nonterminal(monkeypatch):
     monkeypatch.setattr(progress, "CodexAppServerClient", Client)
     update = asyncio.run(
         progress.build_progress_update(
-            BridgeConfig(codex_sandbox="workspace-write", codex_approval_policy="on-request"),
+            BridgeConfig(
+                codex_sandbox="workspace-write", codex_approval_policy="on-request"
+            ),
             task_text="Inspect the requested records.",
-            activities=["reviewing the requested records"],
+            identifiers=["list_directory_users"],
+            previous_update="I'm checking the request.",
         )
     )
 
@@ -47,7 +51,46 @@ def test_progress_summary_is_isolated_short_and_nonterminal(monkeypatch):
     assert auxiliary_cfg.codex_sandbox == "read-only"
     assert auxiliary_cfg.codex_approval_policy == "never"
     assert update == "I'm reviewing the requested records."
+    assert "list_directory_users" in calls[1]
+    assert "I'm checking the request." in calls[1]
     assert calls[-1] == "disconnected"
+
+
+def test_progress_summary_rejects_terminal_claim():
+    assert (
+        progress.clean_update("Done — the task is complete.", ["run_tests"])
+        == "I'm continuing the requested work."
+    )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        "I'm using browser_search to investigate.",
+        "I'm using browser search to investigate.",
+    ],
+)
+def test_progress_summary_rejects_echoed_item_identifier(monkeypatch, result):
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def run(self, _prompt):
+            return result
+
+        async def disconnect(self):
+            pass
+
+    monkeypatch.setattr(progress, "CodexAppServerClient", Client)
+    update = asyncio.run(
+        progress.build_progress_update(
+            BridgeConfig(),
+            task_text="Research the requested topic.",
+            identifiers=["browser_search"],
+        )
+    )
+
+    assert update == "I'm continuing the requested work."
 
 
 def test_progress_summary_enforces_word_limit(monkeypatch):
@@ -66,7 +109,7 @@ def test_progress_summary_enforces_word_limit(monkeypatch):
         progress.build_progress_update(
             BridgeConfig(),
             task_text="Work.",
-            activities=[],
+            identifiers=[],
         )
     )
 
@@ -98,6 +141,19 @@ def test_activity_observer_receives_no_tool_arguments_or_results():
                     "type": "mcpToolCall",
                     "tool": "run_sql_query",
                     "arguments": {"secret": "must-not-be-retained"},
+                    "result": {"private": "must-not-be-retained"},
+                },
+            },
+        }
+    )
+    client._handle_notification(
+        {
+            "method": "item/completed",
+            "params": {
+                "turnId": "turn-1",
+                "item": {
+                    "type": "mcpToolCall",
+                    "tool": "run_sql_query",
                     "result": {"private": "must-not-be-retained"},
                 },
             },

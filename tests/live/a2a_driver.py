@@ -20,7 +20,8 @@ STOPPED_WIRE_STATES = {
     "TASK_STATE_AUTH_REQUIRED",
 }
 PROGRESS_RECEIPT_SUFFIX = "Expect progress updates about every 1 minute."
-PROGRESS_UPDATE_RE = re.compile(r"^.+ \((\d+)s elapsed\)$")
+PROGRESS_FALLBACK = "I'm continuing the requested work."
+PROGRESS_UPDATE_RE = re.compile(r"^(.+) \((\d+)s elapsed\)$")
 TERMINAL_PROGRESS_RE = re.compile(
     r"\b(?:done|complete|completed|finished|failed|blocked)\b",
     re.IGNORECASE,
@@ -271,7 +272,7 @@ def _inbound_progress(a2a: Any, target: Any, timeout: float, run: str) -> None:
         "Add 2 + 2. Wait for one minute. Then add 3 + 3. Wait for another "
         "minute. Finally add the two results together and return the final "
         f"total. Do not finish before both waits elapse. Include `{completion}` "
-        "and the exact calculation `4 + 6 = 10` in the final answer.",
+        "and the exact expression `4 + 6 = 10` in the final answer.",
     )
     try:
         _, receipt = _wait_for_history_message(
@@ -305,9 +306,12 @@ def _inbound_progress(a2a: Any, target: Any, timeout: float, run: str) -> None:
             raise AssertionError(
                 f"Expected at least two periodic progress updates, got {len(progress)}"
             )
-        if any(TERMINAL_PROGRESS_RE.search(text) for _, text, _ in progress):
+        summaries = [match.group(1) for _, _, match in progress]
+        if any(TERMINAL_PROGRESS_RE.search(summary) for summary in summaries):
             raise AssertionError("A periodic progress message claimed terminal state")
-        elapsed = [int(match.group(1)) for _, _, match in progress]
+        if any(summary == PROGRESS_FALLBACK for summary in summaries):
+            raise AssertionError("A periodic progress message used the generic fallback")
+        elapsed = [int(match.group(2)) for _, _, match in progress]
         first_interval = elapsed[0]
         second_interval = elapsed[1] - elapsed[0]
         if not (50 <= first_interval <= 90 and 50 <= second_interval <= 90):

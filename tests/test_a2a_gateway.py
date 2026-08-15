@@ -57,7 +57,7 @@ def _gateway(tmp_path):
     gateway._a2a_registry_path = tmp_path / "a2a.json"
     gateway._a2a_jobs = {}
     gateway._a2a_progress_jobs = {}
-    gateway._a2a_activities = {}
+    gateway._a2a_identifiers = {}
     gateway.cfg = BridgeConfig(a2a_progress_interval_seconds=0)
     gateway._identity = types.SimpleNamespace(
         id="identity-1",
@@ -203,7 +203,7 @@ def test_a2a_progress_is_durable_nonterminal_and_not_duplicated(
     monkeypatch.setattr(gateway_mod, "build_progress_update", summary)
     gateway = _gateway(tmp_path)
     gateway.cfg.a2a_progress_interval_seconds = 60
-    gateway._a2a_activities["task-1"] = ["checking the requested data"]
+    gateway._a2a_identifiers["task-1"] = ["run_sql_query"]
     gateway._write_a2a_registry(
         "task-1:message-1",
         _event()["data"],
@@ -247,6 +247,19 @@ def test_a2a_progress_is_durable_nonterminal_and_not_duplicated(
         )
     )
     assert len(gateway.replies) == before
+
+
+def test_a2a_identifier_buffer_is_normalized_bounded_and_deduplicated(tmp_path):
+    gateway = _gateway(tmp_path)
+
+    gateway._observe_a2a_identifier("task-1", "commandExecution", "")
+    gateway._observe_a2a_identifier("task-1", "commandExecution", "")
+    for index in range(9):
+        gateway._observe_a2a_identifier("task-1", "mcpToolCall", f"Tool {index}")
+
+    assert gateway._a2a_identifiers["task-1"] == [
+        f"tool_{index}" for index in range(1, 9)
+    ]
 
 
 def test_a2a_progress_elapsed_time_continues_across_caller_follow_up(tmp_path):
@@ -323,7 +336,7 @@ def test_a2a_cancel_stops_progress_child(tmp_path):
             "task-1:message-1",
             child,
         )
-        gateway._a2a_activities["task-1"] = ["working through the task"]
+        gateway._a2a_identifiers["task-1"] = ["command_execution"]
         await gateway._on_a2a_event(event)
         return child
 
@@ -331,7 +344,7 @@ def test_a2a_cancel_stops_progress_child(tmp_path):
 
     assert child.cancelled()
     assert gateway._a2a_progress_jobs == {}
-    assert gateway._a2a_activities == {}
+    assert gateway._a2a_identifiers == {}
 
 
 def test_a2a_gateway_resumes_nonfinal_registry_entries(tmp_path, monkeypatch):

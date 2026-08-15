@@ -319,7 +319,7 @@ class CodexAppServerClient:
         params = message.get("params") or {}
         turn_id = str(params.get("turnId") or (params.get("turn") or {}).get("id") or "")
 
-        if method in {"item/started", "item/completed"}:
+        if method == "item/started":
             capture = self._turns.get(turn_id)
             item = params.get("item") or {}
             if capture is not None and capture.activity_handler is not None:

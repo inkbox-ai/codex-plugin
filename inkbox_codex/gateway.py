@@ -62,7 +62,11 @@ except ImportError:  # pragma: no cover
     INKBOX_TUNNEL_AVAILABLE = False
 
 try:
-    from .a2a_progress import activity_for_item, build_progress_update
+    from .a2a_progress import (
+        A2A_PROGRESS_MAX_IDENTIFIERS,
+        build_progress_update,
+        safe_item_identifier,
+    )
     from .config import (
         DEFAULT_WEBHOOK_PATH,
         INKBOX_WS_PATH,
@@ -85,7 +89,11 @@ try:
     from .tools import build_inkbox_mcp_server_config
     from .webhook_providers import match_provider
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from a2a_progress import activity_for_item, build_progress_update
+    from a2a_progress import (
+        A2A_PROGRESS_MAX_IDENTIFIERS,
+        build_progress_update,
+        safe_item_identifier,
+    )
     from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, VoiceStack, call_contexts_dir, inkbox_client_kwargs
     from codex_client import CodexTurnResult
     from a2a_delegations import find_by_task as find_a2a_delegation
@@ -918,7 +926,7 @@ class InkboxGateway:
         )
         self._a2a_jobs: Dict[str, set[asyncio.Task[Any]]] = {}
         self._a2a_progress_jobs: Dict[str, Tuple[str, asyncio.Task[Any]]] = {}
-        self._a2a_activities: Dict[str, List[str]] = {}
+        self._a2a_identifiers: Dict[str, List[str]] = {}
         state_root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
         self._hosted_call_registry_path = state_root / "hosted_call_completions.json"
         self._hosted_call_registry_owner = uuid.uuid4().hex
@@ -2239,17 +2247,19 @@ class InkboxGateway:
             receipt_delivered=True,
         )
 
-    def _observe_a2a_activity(
+    def _observe_a2a_identifier(
         self,
         task_id: str,
         item_type: str,
         tool_name: str,
     ) -> None:
-        activity = activity_for_item(item_type, tool_name)
-        items = self._a2a_activities.setdefault(task_id, [])
-        if not items or items[-1] != activity:
-            items.append(activity)
-            del items[:-8]
+        identifier = safe_item_identifier(item_type, tool_name)
+        if not identifier:
+            return
+        items = self._a2a_identifiers.setdefault(task_id, [])
+        if not items or items[-1] != identifier:
+            items.append(identifier)
+            del items[:-A2A_PROGRESS_MAX_IDENTIFIERS]
 
     async def _stop_a2a_progress(
         self,
@@ -2264,7 +2274,7 @@ class InkboxGateway:
         if task is not asyncio.current_task() and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        self._a2a_activities.pop(task_id, None)
+        self._a2a_identifiers.pop(task_id, None)
 
     async def _start_a2a_progress(
         self,
@@ -2280,7 +2290,7 @@ class InkboxGateway:
         interval = float(getattr(self.cfg, "a2a_progress_interval_seconds", 180.0))
         if interval <= 0:
             return
-        self._a2a_activities[task_id] = []
+        self._a2a_identifiers[task_id] = []
         self._write_a2a_registry(
             registry_key,
             data,
@@ -2341,7 +2351,7 @@ class InkboxGateway:
             summary = await build_progress_update(
                 self.cfg,
                 task_text=task_text,
-                activities=list(self._a2a_activities.get(task_id, ())),
+                identifiers=list(self._a2a_identifiers.get(task_id, ())),
                 previous_update=str(progress.get("last_delivered_text") or ""),
             )
             started_at = float(progress.get("started_at") or time.time())
@@ -2501,7 +2511,7 @@ class InkboxGateway:
             ).run_consult(
                 f"{marker}\n{text}".rstrip(),
                 a2a_context=context,
-                activity_handler=lambda item_type, tool_name: self._observe_a2a_activity(
+                activity_handler=lambda item_type, tool_name: self._observe_a2a_identifier(
                     task_id,
                     item_type,
                     tool_name,
