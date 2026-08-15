@@ -56,9 +56,19 @@ def test_progress_summary_is_isolated_short_and_nonterminal(monkeypatch):
     assert calls[-1] == "disconnected"
 
 
-def test_progress_summary_rejects_terminal_claim():
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "Done — the task is complete.",
+        "The final answer is ready.",
+        "I successfully resolved the request.",
+        "I cannot continue.",
+        "I'm waiting for your input.",
+    ],
+)
+def test_progress_summary_rejects_terminal_claim(claim):
     assert (
-        progress.clean_update("Done — the task is complete.", ["run_tests"])
+        progress.clean_update(claim, ["run_tests"])
         == "I'm continuing the requested work."
     )
 
