@@ -20,8 +20,8 @@ STOPPED_WIRE_STATES = {
     "TASK_STATE_AUTH_REQUIRED",
 }
 PROGRESS_RECEIPT_SUFFIX = "Expect progress updates about every 1 minute."
-GENERIC_PROGRESS_FALLBACK = "I'm continuing the requested work."
 PROGRESS_UPDATE_RE = re.compile(r"^(.+) \((\d+)s elapsed\)$")
+GENERIC_PROGRESS_FALLBACK = "I'm continuing the requested work."
 TERMINAL_PROGRESS_RE = re.compile(
     r"\b(?:done|complete|completed|finished|failed|failure|blocked|solved|"
     r"finalized|ready|succeed(?:ed|s|ing)?|successful(?:ly)?|resolved|"
