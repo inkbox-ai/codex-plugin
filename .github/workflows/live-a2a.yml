@@ -1,8 +1,7 @@
 name: Live — Agent2Agent
 
-# Four real protocol legs cover both roles and conversation lengths:
-# inbound/outbound × single-turn/multi-turn. The plugin and remote identities
-# are preconfigured to allow one another in both directions.
+# Real protocol legs cover both roles, conversation lengths, and periodic
+# progress for a long-running inbound worker task.
 on:
   workflow_call:
     inputs:
@@ -42,6 +41,7 @@ jobs:
         scenario:
           - inbound-single
           - inbound-multi
+          - inbound-progress
           - outbound-single
           - outbound-multi
 
@@ -87,6 +87,7 @@ jobs:
             echo "CODEX_SANDBOX=read-only"
             echo "CODEX_APPROVAL_POLICY=never"
             echo "INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS=true"
+            echo "INKBOX_A2A_PROGRESS_INTERVAL_SECONDS=60"
             echo "CODEX_MODEL=gpt-5.6-sol"
           } >> "$GITHUB_ENV"
           printenv OPENAI_API_KEY | codex login --with-api-key
