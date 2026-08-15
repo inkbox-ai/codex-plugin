@@ -24,8 +24,7 @@ A2A_PROGRESS_MAX_IDENTIFIERS = 8
 _MAX_IDENTIFIER_CHARS = 80
 
 _TERMINAL_CLAIM_RE = re.compile(
-    r"\b(?:done|complete|completed|finished|failed|failure|blocked|solved|"
-    r"finalized|ready|succeed(?:ed|s|ing)?|successful(?:ly)?|resolved|"
+    r"\b(?:done|complete|completed|finished|failed|failure|blocked|"
     r"final\s+(?:answer|result)|cannot\s+(?:complete|continue)|"
     r"need(?:ed|s)?\s+(?:your\s+)?input|"
     r"waiting\s+(?:for\s+)?(?:your\s+)?input|waiting\s+for\s+you)\b",

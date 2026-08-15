@@ -61,7 +61,6 @@ def test_progress_summary_is_isolated_short_and_nonterminal(monkeypatch):
     [
         "Done — the task is complete.",
         "The final answer is ready.",
-        "I successfully resolved the request.",
         "I cannot continue.",
         "I'm waiting for your input.",
     ],
@@ -71,6 +70,12 @@ def test_progress_summary_rejects_terminal_claim(claim):
         progress.clean_update(claim, ["run_tests"])
         == "I'm continuing the requested work."
     )
+
+
+def test_progress_summary_allows_nonterminal_status_language():
+    update = "The draft is ready, validation succeeded, and the issue is resolved."
+
+    assert progress.clean_update(update, ["run_tests"]) == update
 
 
 @pytest.mark.parametrize(
