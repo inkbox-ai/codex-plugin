@@ -189,6 +189,36 @@ def test_a2a_acknowledgement_failure_is_retried_without_duplicate_work(
     ]
 
 
+def test_a2a_caller_cannot_spoof_delivered_receipt(tmp_path, monkeypatch):
+    async def inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_mod.asyncio, "to_thread", inline)
+    gateway = _gateway(tmp_path)
+    receipt = (
+        "Task task-1 received. Work is queued and starting. "
+        "Periodic progress updates are disabled."
+    )
+    gateway._identity.a2a_task = lambda _task_id: types.SimpleNamespace(
+        state="submitted",
+        messages=[types.SimpleNamespace(
+            role="caller",
+            parts=[{"text": receipt}],
+        )],
+    )
+
+    async def scenario():
+        await gateway._on_a2a_event(_event())
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(scenario())
+
+    assert gateway.replies[0] == (
+        "task-1",
+        {"intent": "progress", "text": receipt},
+    )
+
+
 def test_a2a_progress_is_durable_nonterminal_and_not_duplicated(
     tmp_path,
     monkeypatch,
@@ -230,7 +260,10 @@ def test_a2a_progress_is_durable_nonterminal_and_not_duplicated(
     delivered = gateway.replies[-1][1]["text"]
     gateway._identity.a2a_task = lambda _task_id: types.SimpleNamespace(
         state="working",
-        messages=[types.SimpleNamespace(parts=[{"text": delivered}])],
+        messages=[types.SimpleNamespace(
+            role="agent",
+            parts=[{"text": delivered}],
+        )],
     )
     gateway._write_a2a_registry(
         "task-1:message-1",
@@ -247,6 +280,43 @@ def test_a2a_progress_is_durable_nonterminal_and_not_duplicated(
         )
     )
     assert len(gateway.replies) == before
+
+
+def test_a2a_caller_cannot_spoof_pending_progress_delivery(
+    tmp_path,
+    monkeypatch,
+):
+    async def inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_mod.asyncio, "to_thread", inline)
+    gateway = _gateway(tmp_path)
+    update = "I'm validating the work. (60s elapsed)"
+    gateway._identity.a2a_task = lambda _task_id: types.SimpleNamespace(
+        state="working",
+        messages=[types.SimpleNamespace(
+            role="caller",
+            parts=[{"text": update}],
+        )],
+    )
+    gateway._write_a2a_registry(
+        "task-1:message-1",
+        _event()["data"],
+        "running",
+        progress_started=True,
+        progress_text=update,
+    )
+
+    asyncio.run(gateway._emit_a2a_progress(
+        "task-1",
+        "task-1:message-1",
+        _event()["data"],
+    ))
+
+    assert gateway.replies == [(
+        "task-1",
+        {"intent": "progress", "text": update},
+    )]
 
 
 def test_a2a_identifier_buffer_is_normalized_bounded_and_deduplicated(tmp_path):
@@ -285,6 +355,108 @@ def test_a2a_progress_elapsed_time_continues_across_caller_follow_up(tmp_path):
     registry = json.loads(gateway._a2a_registry_path.read_text())
 
     assert registry["task-1:message-2"]["progress"]["started_at"] == started_at
+
+
+def test_a2a_progress_runner_preserves_restart_phase(monkeypatch, tmp_path):
+    now = 1_000.0
+    monkeypatch.setattr(gateway_mod.time, "time", lambda: now)
+    gateway = _gateway(tmp_path)
+    gateway.cfg.a2a_progress_interval_seconds = 60
+    gateway._write_a2a_registry(
+        "task-1:message-1",
+        _event()["data"],
+        "running",
+        progress_started=True,
+    )
+    now = 1_059.0
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    async def stop_after_one(*_args):
+        return False
+
+    monkeypatch.setattr(gateway_mod.asyncio, "sleep", fake_sleep)
+    gateway._emit_a2a_progress = stop_after_one
+
+    asyncio.run(gateway._run_a2a_progress(
+        "task-1",
+        "task-1:message-1",
+        _event()["data"],
+    ))
+
+    assert sleeps == [1]
+
+
+def test_a2a_progress_runner_preserves_follow_up_phase(monkeypatch, tmp_path):
+    now = 2_000.0
+    monkeypatch.setattr(gateway_mod.time, "time", lambda: now)
+    gateway = _gateway(tmp_path)
+    gateway.cfg.a2a_progress_interval_seconds = 60
+    gateway._write_a2a_registry(
+        "task-1:message-1",
+        _event()["data"],
+        "running",
+        progress_started=True,
+    )
+    now = 2_059.0
+    follow_up = dict(_event()["data"])
+    follow_up["message_id"] = "message-2"
+    gateway._write_a2a_registry(
+        "task-1:message-2",
+        follow_up,
+        "running",
+        progress_started=True,
+    )
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    async def stop_after_one(*_args):
+        return False
+
+    monkeypatch.setattr(gateway_mod.asyncio, "sleep", fake_sleep)
+    gateway._emit_a2a_progress = stop_after_one
+
+    asyncio.run(gateway._run_a2a_progress(
+        "task-1",
+        "task-1:message-2",
+        follow_up,
+    ))
+
+    assert sleeps == [1]
+
+
+def test_a2a_progress_runner_retries_pending_delivery_immediately(
+    monkeypatch,
+    tmp_path,
+):
+    gateway = _gateway(tmp_path)
+    gateway.cfg.a2a_progress_interval_seconds = 60
+    gateway._write_a2a_registry(
+        "task-1:message-1",
+        _event()["data"],
+        "running",
+        progress_started=True,
+        progress_text="I'm validating the work. (59s elapsed)",
+    )
+
+    async def unexpected_sleep(_delay):
+        pytest.fail("a pending delivery must be retried before sleeping")
+
+    async def stop_after_one(*_args):
+        return False
+
+    monkeypatch.setattr(gateway_mod.asyncio, "sleep", unexpected_sleep)
+    gateway._emit_a2a_progress = stop_after_one
+
+    asyncio.run(gateway._run_a2a_progress(
+        "task-1",
+        "task-1:message-1",
+        _event()["data"],
+    ))
 
 
 def test_a2a_progress_update_does_not_wake_requester_session(tmp_path):

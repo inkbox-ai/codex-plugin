@@ -2212,12 +2212,45 @@ class InkboxGateway:
     @staticmethod
     def _a2a_task_has_text(task: Any, expected: str) -> bool:
         for message in getattr(task, "messages", ()) or ():
+            role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+            role = getattr(role, "value", role)
+            if str(role or "").strip().lower() != "agent":
+                continue
             parts = message.get("parts", ()) if isinstance(message, dict) else getattr(message, "parts", ())
             for part in parts or ():
                 text = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
                 if str(text or "") == expected:
                     return True
         return False
+
+    def _a2a_progress_delay(
+        self,
+        registry_key: str,
+        interval: float,
+        *,
+        retry_pending: bool,
+    ) -> float:
+        entry = self._read_a2a_registry().get(registry_key)
+        progress = entry.get("progress") if isinstance(entry, dict) else None
+        progress = progress if isinstance(progress, dict) else {}
+        pending = progress.get("pending")
+        if (
+            retry_pending
+            and isinstance(pending, dict)
+            and str(pending.get("text") or "").strip()
+        ):
+            return 0.0
+        try:
+            started_at = float(progress.get("started_at"))
+        except (TypeError, ValueError):
+            return interval
+        elapsed = max(0.0, time.time() - started_at)
+        if elapsed < interval:
+            return interval - elapsed
+        remainder = elapsed % interval
+        if remainder <= 1e-9 or interval - remainder <= 1e-9:
+            return 0.0
+        return interval - remainder
 
     async def _acknowledge_a2a_task(
         self,
@@ -2310,9 +2343,17 @@ class InkboxGateway:
         data: Dict[str, Any],
     ) -> None:
         interval = float(getattr(self.cfg, "a2a_progress_interval_seconds", 180.0))
+        retry_pending = True
         try:
             while True:
-                await asyncio.sleep(interval)
+                delay = self._a2a_progress_delay(
+                    registry_key,
+                    interval,
+                    retry_pending=retry_pending,
+                )
+                retry_pending = False
+                if delay > 0:
+                    await asyncio.sleep(delay)
                 try:
                     if not await self._emit_a2a_progress(task_id, registry_key, data):
                         return
