@@ -1206,7 +1206,10 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
             task_id = str(context["task_id"])
             gate = acquire_a2a_progress_gate(task_id)
             try:
-                fence_a2a_progress(task_id)
+                fence_a2a_progress(
+                    task_id,
+                    str(context.get("message_id") or ""),
+                )
                 result = _identity().a2a_reply(
                     task_id,
                     intent=intent,

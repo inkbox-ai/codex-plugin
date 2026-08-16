@@ -54,10 +54,22 @@ def a2a_progress_is_fenced(task_id: str) -> bool:
     return fence_path.exists()
 
 
-def fence_a2a_progress(task_id: str) -> None:
+def a2a_progress_fence_owner(task_id: str) -> str:
+    """Return the message key that owns the durable fence, when available."""
+    _, fence_path = _gate_paths(task_id)
+    try:
+        return fence_path.read_text().strip()
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def fence_a2a_progress(task_id: str, message_id: str) -> None:
     """Persist a fence while the caller holds the task gate."""
     _, fence_path = _gate_paths(task_id)
-    fence_path.touch(mode=0o600, exist_ok=True)
+    tmp = fence_path.with_suffix(".tmp")
+    tmp.write_text(str(message_id or "") + "\n")
+    tmp.chmod(0o600)
+    os.replace(tmp, fence_path)
     fence_path.chmod(0o600)
 
 
