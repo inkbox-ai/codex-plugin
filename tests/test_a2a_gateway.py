@@ -66,6 +66,7 @@ def _gateway(tmp_path):
     gateway._a2a_jobs = {}
     gateway._a2a_progress_jobs = {}
     gateway._a2a_progress_stop_events = {}
+    gateway._a2a_closing = False
     gateway._a2a_identifiers = {}
     gateway.cfg = BridgeConfig(a2a_progress_interval_seconds=0)
     gateway._identity = types.SimpleNamespace(
@@ -1058,6 +1059,43 @@ def test_a2a_cleanup_waits_for_inflight_reply_thread(tmp_path):
 
     assert len(replies) == 1
     assert gateway._a2a_progress_jobs == {}
+
+
+def test_a2a_cleanup_closes_admission_before_drain(tmp_path):
+    gateway = _gateway(tmp_path)
+    gateway._hosted_call_jobs = {}
+    gateway._runner = None
+    gateway._tunnel = None
+    gateway.sessions = None
+    entered = threading.Event()
+    release = threading.Event()
+    tracked = []
+
+    def task(_task_id):
+        entered.set()
+        release.wait(timeout=5)
+        return types.SimpleNamespace(state="working", messages=[])
+
+    gateway._identity.a2a_task = task
+    gateway._track_a2a_job = lambda *args: tracked.append(args)
+
+    async def scenario():
+        webhook = asyncio.create_task(gateway._on_a2a_event(_event()))
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        await gateway._cleanup()
+        assert not webhook.done()
+        release.set()
+        response = await webhook
+        await asyncio.sleep(0.05)
+        return response
+
+    response = asyncio.run(scenario())
+
+    assert response.status == 503
+    assert tracked == []
+    assert gateway.replies == []
+    assert gateway._a2a_jobs == {}
 
 
 def test_a2a_default_completion_drains_and_fences_progress(tmp_path):

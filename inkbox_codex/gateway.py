@@ -745,6 +745,7 @@ A2A_EVENTS = [
 ]
 A2A_TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 A2A_SETTLED_STATES = A2A_TERMINAL_STATES | {"input_required", "auth_required"}
+A2A_ADMISSION_CLOSING = "__closing__"
 A2A_RECEIPT_TEMPLATE = "Task {task_id} received. Work is queued and starting."
 # Mail: inbound plus the two delivery-failure transitions that feed the loop
 # (_on_mail_delivery_failed). The success transitions stay unsubscribed — they
@@ -953,6 +954,7 @@ class InkboxGateway:
         self._a2a_jobs: Dict[str, set[asyncio.Task[Any]]] = {}
         self._a2a_progress_jobs: Dict[str, Tuple[str, asyncio.Task[Any]]] = {}
         self._a2a_progress_stop_events: Dict[str, asyncio.Event] = {}
+        self._a2a_closing = False
         self._a2a_identifiers: Dict[str, List[str]] = {}
         state_root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
         self._hosted_call_registry_path = state_root / "hosted_call_completions.json"
@@ -969,6 +971,7 @@ class InkboxGateway:
         Returns:
             None
         """
+        self._a2a_closing = False
         if not AIOHTTP_AVAILABLE:
             raise RuntimeError("aiohttp is not installed; run: pip install aiohttp")
         if not INKBOX_AVAILABLE:
@@ -1206,6 +1209,7 @@ class InkboxGateway:
         logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
     async def _cleanup(self) -> None:
+        self._a2a_closing = True
         progress_jobs = [
             task for _key, task in self._a2a_progress_jobs.values()
         ]
@@ -2338,6 +2342,8 @@ class InkboxGateway:
         if isinstance(entry, dict) and entry.get("receipt_delivered") is True:
             return
         authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
+        if self._a2a_closing:
+            return A2A_ADMISSION_CLOSING
         state = _a2a_state(authoritative.state)
         if state in A2A_SETTLED_STATES:
             return state
@@ -2644,6 +2650,12 @@ class InkboxGateway:
                 )
             return web.json_response({"ok": True})
 
+        if self._a2a_closing:
+            return web.json_response(
+                {"ok": False, "retry": "gateway-stopping"},
+                status=503,
+            )
+
         if a2a_progress_fence_owner(task_id) == message_id:
             logger.info(
                 "[bridge] Ignored replay of outcome-fenced A2A message %s",
@@ -2667,6 +2679,11 @@ class InkboxGateway:
                         status=503,
                     )
                 if settled_state:
+                    if settled_state == A2A_ADMISSION_CLOSING:
+                        return web.json_response(
+                            {"ok": False, "retry": "gateway-stopping"},
+                            status=503,
+                        )
                     self._write_a2a_registry(key, data, "finalized")
                     return web.json_response({"ok": True, "stopped": settled_state})
             return web.json_response({"ok": True, "deduped": True})
@@ -2682,6 +2699,11 @@ class InkboxGateway:
                 task_id,
             )
         if settled_state:
+            if settled_state == A2A_ADMISSION_CLOSING:
+                return web.json_response(
+                    {"ok": False, "retry": "gateway-stopping"},
+                    status=503,
+                )
             self._write_a2a_registry(key, data, "finalized")
             return web.json_response({"ok": True, "stopped": settled_state})
         self._track_a2a_job(task_id, key, data)
@@ -2731,6 +2753,8 @@ class InkboxGateway:
                 )
             else:
                 if settled_state:
+                    if settled_state == A2A_ADMISSION_CLOSING:
+                        return
                     self._write_a2a_registry(registry_key, data, "finalized")
                     return
             reply = await self.sessions.get(
