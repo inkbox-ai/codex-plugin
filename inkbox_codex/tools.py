@@ -34,6 +34,11 @@ try:
         promote_after_send,
         record_before_send,
     )
+    from .a2a_progress_gate import (
+        acquire_a2a_progress_gate,
+        fence_a2a_progress,
+        release_a2a_progress_gate,
+    )
     from .config import (
         INKBOX_WS_PATH,
         VoiceStack,
@@ -53,6 +58,11 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
         find_by_task,
         promote_after_send,
         record_before_send,
+    )
+    from a2a_progress_gate import (
+        acquire_a2a_progress_gate,
+        fence_a2a_progress,
+        release_a2a_progress_gate,
     )
     from config import (
         INKBOX_WS_PATH,
@@ -1193,12 +1203,19 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 "inkbox_a2a_fail": "fail",
             }[name]
             text = str(args["reason"] if name == "inkbox_a2a_fail" else args["text"])
-            result = _identity().a2a_reply(
-                context["task_id"],
-                intent=intent,
-                text=text,
-            )
+            task_id = str(context["task_id"])
+            gate = acquire_a2a_progress_gate(task_id)
+            try:
+                fence_a2a_progress(task_id)
+                result = _identity().a2a_reply(
+                    task_id,
+                    intent=intent,
+                    text=text,
+                )
+            finally:
+                release_a2a_progress_gate(gate)
             context["reply_intent_committed"] = True
+            context["reply_intent"] = intent
             if context_path is not None:
                 tmp = context_path.with_suffix(".tmp")
                 tmp.write_text(json.dumps(context, sort_keys=True) + "\n")

@@ -736,6 +736,9 @@ class ContactSession:
                     turn.a2a_context["reply_intent_committed"] = bool(
                         persisted.get("reply_intent_committed")
                     )
+                    turn.a2a_context["reply_intent"] = str(
+                        persisted.get("reply_intent") or ""
+                    )
                 except (FileNotFoundError, json.JSONDecodeError):
                     pass
                 a2a_context_path.unlink(missing_ok=True)

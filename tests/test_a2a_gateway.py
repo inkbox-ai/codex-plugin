@@ -5,6 +5,12 @@ import types
 import pytest
 
 from inkbox_codex import gateway as gateway_mod
+from inkbox_codex import tools as tools_mod
+from inkbox_codex.a2a_progress_gate import (
+    acquire_a2a_progress_gate,
+    fence_a2a_progress,
+    release_a2a_progress_gate,
+)
 from inkbox_codex.config import BridgeConfig
 from inkbox_codex.gateway import InkboxGateway
 
@@ -219,6 +225,34 @@ def test_a2a_caller_cannot_spoof_delivered_receipt(tmp_path, monkeypatch):
     )
 
 
+def test_a2a_acknowledgement_accepts_raw_agent_role(tmp_path, monkeypatch):
+    async def inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_mod.asyncio, "to_thread", inline)
+    gateway = _gateway(tmp_path)
+    data = _event()["data"]
+    receipt = (
+        "Task task-1 received. Work is queued and starting. "
+        "Periodic progress updates are disabled."
+    )
+    gateway._identity.a2a_task = lambda _task_id: types.SimpleNamespace(
+        state="submitted",
+        messages=[types.SimpleNamespace(
+            role="ROLE_AGENT",
+            parts=[{"text": receipt}],
+        )],
+    )
+    gateway._write_a2a_registry("task-1:message-1", data, "queued")
+
+    asyncio.run(gateway._acknowledge_a2a_task(
+        "task-1:message-1",
+        data,
+    ))
+
+    assert gateway.replies == []
+
+
 def test_a2a_progress_is_durable_nonterminal_and_not_duplicated(
     tmp_path,
     monkeypatch,
@@ -261,7 +295,7 @@ def test_a2a_progress_is_durable_nonterminal_and_not_duplicated(
     gateway._identity.a2a_task = lambda _task_id: types.SimpleNamespace(
         state="working",
         messages=[types.SimpleNamespace(
-            role="agent",
+            role="ROLE_AGENT",
             parts=[{"text": delivered}],
         )],
     )
@@ -355,6 +389,69 @@ def test_a2a_progress_elapsed_time_continues_across_caller_follow_up(tmp_path):
     registry = json.loads(gateway._a2a_registry_path.read_text())
 
     assert registry["task-1:message-2"]["progress"]["started_at"] == started_at
+
+
+def test_a2a_progress_pending_moves_to_follow_up_without_duplication(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    gateway = _gateway(tmp_path)
+    first = _event()["data"]
+    update = "I'm validating the work. (59s elapsed)"
+    gateway._write_a2a_registry(
+        "task-1:message-1",
+        first,
+        "running",
+        progress_started=True,
+        progress_text=update,
+    )
+    follow_up = dict(first)
+    follow_up["message_id"] = "message-2"
+    gateway._write_a2a_registry(
+        "task-1:message-2",
+        follow_up,
+        "running",
+        progress_started=True,
+    )
+    gateway._identity.a2a_task = lambda _task_id: types.SimpleNamespace(
+        state="working",
+        messages=[types.SimpleNamespace(
+            role="ROLE_AGENT",
+            parts=[{"text": update}],
+        )],
+    )
+    original_emit = gateway._emit_a2a_progress
+
+    async def no_sleep(_delay):
+        pytest.fail("inherited pending progress must reconcile before sleeping")
+
+    async def reconcile_once(*args):
+        result = await original_emit(*args)
+        assert result is True
+        return False
+
+    gateway._emit_a2a_progress = reconcile_once
+    monkeypatch.setattr(gateway_mod.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(
+        gateway_mod,
+        "build_progress_update",
+        lambda *_args, **_kwargs: pytest.fail(
+            "inherited pending text must not be regenerated"
+        ),
+    )
+
+    asyncio.run(gateway._run_a2a_progress(
+        "task-1",
+        "task-1:message-2",
+        follow_up,
+    ))
+
+    registry = json.loads(gateway._a2a_registry_path.read_text())
+    progress = registry["task-1:message-2"]["progress"]
+    assert progress["delivered_count"] == 1
+    assert progress["last_delivered_text"] == update
+    assert "pending" not in progress
 
 
 def test_a2a_progress_runner_preserves_restart_phase(monkeypatch, tmp_path):
@@ -459,6 +556,236 @@ def test_a2a_progress_runner_retries_pending_delivery_immediately(
     ))
 
 
+def test_a2a_progress_runner_retries_active_delivery_after_five_seconds(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    gateway = _gateway(tmp_path)
+    gateway.cfg.a2a_progress_interval_seconds = 60
+    gateway._write_a2a_registry(
+        "task-1:message-1",
+        _event()["data"],
+        "running",
+        progress_started=True,
+    )
+    reply_attempts = 0
+
+    def reply(task_id, **kwargs):
+        nonlocal reply_attempts
+        reply_attempts += 1
+        if reply_attempts == 1:
+            raise OSError("delivery unavailable")
+        gateway.replies.append((task_id, kwargs))
+
+    gateway._identity.a2a_reply = reply
+    summary_calls = 0
+
+    async def summary(*_args, **_kwargs):
+        nonlocal summary_calls
+        summary_calls += 1
+        return "I'm validating the work."
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(gateway_mod, "build_progress_update", summary)
+    monkeypatch.setattr(gateway_mod.asyncio, "sleep", fake_sleep)
+    original_emit = gateway._emit_a2a_progress
+
+    async def stop_after_retry(*args):
+        result = await original_emit(*args)
+        return False if reply_attempts == 2 else result
+
+    gateway._emit_a2a_progress = stop_after_retry
+
+    asyncio.run(gateway._run_a2a_progress(
+        "task-1",
+        "task-1:message-1",
+        _event()["data"],
+    ))
+
+    assert sleeps[0] == pytest.approx(60, abs=0.1)
+    assert sleeps[1:] == [5]
+    assert summary_calls == 1
+    assert reply_attempts == 2
+
+
+def test_a2a_terminal_tool_waits_for_inflight_progress(monkeypatch, tmp_path):
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    gateway = _gateway(tmp_path)
+    gateway._write_a2a_registry(
+        "task-1:message-1",
+        _event()["data"],
+        "running",
+        progress_started=True,
+    )
+    progress_entered = asyncio.Event()
+    release_progress = asyncio.Event()
+    terminal_replies = []
+
+    async def paused_summary(*_args, **_kwargs):
+        progress_entered.set()
+        await release_progress.wait()
+        return "I'm validating the work."
+
+    class Identity:
+        def a2a_reply(self, task_id, **kwargs):
+            terminal_replies.append((task_id, kwargs))
+            return {"id": task_id, "state": kwargs["intent"]}
+
+    client = types.SimpleNamespace(
+        get_identity=lambda _handle: Identity(),
+    )
+    monkeypatch.setattr(gateway_mod, "build_progress_update", paused_summary)
+
+    async def scenario():
+        token = tools_mod.A2A_TURN_CONTEXT.set({
+            "task_id": "task-1",
+            "message_id": "message-1",
+            "context_id": "context-1",
+            "reply_intent_committed": False,
+        })
+        try:
+            progress_task = asyncio.create_task(gateway._emit_a2a_progress(
+                "task-1",
+                "task-1:message-1",
+                _event()["data"],
+            ))
+            await progress_entered.wait()
+            terminal_task = asyncio.create_task(tools_mod.call_inkbox_tool(
+                client,
+                "agent",
+                "inkbox_a2a_complete",
+                {"text": "Done."},
+            ))
+            await asyncio.sleep(0.05)
+            assert terminal_replies == []
+            release_progress.set()
+            await progress_task
+            await terminal_task
+        finally:
+            tools_mod.A2A_TURN_CONTEXT.reset(token)
+
+    asyncio.run(scenario())
+
+    assert gateway.replies[-1][1]["intent"] == "progress"
+    assert terminal_replies == [(
+        "task-1",
+        {"intent": "complete", "text": "Done."},
+    )]
+
+
+def test_a2a_progress_gate_wait_is_cancellation_safe(monkeypatch, tmp_path):
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    gateway = _gateway(tmp_path)
+    held = acquire_a2a_progress_gate("task-1")
+
+    async def scenario():
+        blocked = asyncio.create_task(gateway._emit_a2a_progress(
+            "task-1",
+            "task-1:message-1",
+            _event()["data"],
+        ))
+        await asyncio.sleep(0.01)
+        blocked.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await blocked
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_a2a_progress_gate(held)
+
+    available = acquire_a2a_progress_gate("task-1")
+    release_a2a_progress_gate(available)
+
+
+def test_a2a_terminal_failure_keeps_progress_fenced(monkeypatch, tmp_path):
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    gateway = _gateway(tmp_path)
+    gateway._write_a2a_registry(
+        "task-1:message-1",
+        _event()["data"],
+        "running",
+        progress_started=True,
+    )
+
+    class Identity:
+        def a2a_reply(self, *_args, **_kwargs):
+            raise OSError("ambiguous delivery")
+
+    client = types.SimpleNamespace(get_identity=lambda _handle: Identity())
+
+    async def scenario():
+        token = tools_mod.A2A_TURN_CONTEXT.set({
+            "task_id": "task-1",
+            "message_id": "message-1",
+            "context_id": "context-1",
+            "reply_intent_committed": False,
+        })
+        try:
+            result = await tools_mod.call_inkbox_tool(
+                client,
+                "agent",
+                "inkbox_a2a_fail",
+                {"reason": "Cannot continue."},
+            )
+        finally:
+            tools_mod.A2A_TURN_CONTEXT.reset(token)
+        keep_running = await gateway._emit_a2a_progress(
+            "task-1",
+            "task-1:message-1",
+            _event()["data"],
+        )
+        return result, keep_running
+
+    result, keep_running = asyncio.run(scenario())
+
+    assert "ambiguous delivery" in result["content"][0]["text"]
+    assert keep_running is False
+    assert gateway.replies == []
+
+
+def test_a2a_ask_caller_follow_up_reacquires_progress(monkeypatch, tmp_path):
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    gateway = _gateway(tmp_path)
+    gateway.cfg.a2a_progress_interval_seconds = 60
+    first = _event()["data"]
+    gateway._write_a2a_registry(
+        "task-1:message-1",
+        first,
+        "finalized",
+        progress_started=True,
+        preserve_progress_pending=True,
+    )
+    gate = acquire_a2a_progress_gate("task-1")
+    try:
+        fence_a2a_progress("task-1")
+    finally:
+        release_a2a_progress_gate(gate)
+    follow_up = dict(first)
+    follow_up["message_id"] = "message-2"
+
+    async def scenario():
+        await gateway._start_a2a_progress(
+            "task-1",
+            "task-1:message-2",
+            follow_up,
+        )
+        await gateway._stop_a2a_progress("task-1", "task-1:message-2")
+        return await gateway._emit_a2a_progress(
+            "task-1",
+            "task-1:message-2",
+            follow_up,
+        )
+
+    assert asyncio.run(scenario()) is True
+    assert gateway.replies[-1][1]["intent"] == "progress"
+
+
 def test_a2a_progress_update_does_not_wake_requester_session(tmp_path):
     gateway = _gateway(tmp_path)
     event = _event()
@@ -537,12 +864,26 @@ def test_a2a_gateway_resumes_nonfinal_registry_entries(tmp_path, monkeypatch):
         messages=[
             types.SimpleNamespace(
                 message_id="message-1",
-                parts=[{"text": "Resume this."}],
-            )
+                role="ROLE_CALLER",
+                parts=[{"text": "SDK copy must not replace persisted input."}],
+            ),
+            types.SimpleNamespace(
+                message_id="receipt-1",
+                role="ROLE_AGENT",
+                parts=[{"text": (
+                    "Task task-1 received. Work is queued and starting. "
+                    "Periodic progress updates are disabled."
+                )}],
+            ),
+            types.SimpleNamespace(
+                message_id="progress-1",
+                role="agent",
+                parts=[{"text": "I'm continuing the requested work. (60s elapsed)"}],
+            ),
         ],
     )
     gateway._identity.a2a_task = lambda _task_id: task
-    gateway._identity.iter_a2a_tasks = lambda **_kwargs: iter(())
+    gateway._identity.iter_a2a_tasks = lambda **_kwargs: iter((task,))
     gateway._write_a2a_registry(
         "task-1:message-1",
         _event()["data"],
@@ -557,7 +898,56 @@ def test_a2a_gateway_resumes_nonfinal_registry_entries(tmp_path, monkeypatch):
     registry = json.loads(gateway._a2a_registry_path.read_text())
 
     assert registry["task-1:message-1"]["state"] == "finalized"
-    assert gateway.sessions.session.calls[0][0].endswith("Resume this.")
+    assert list(registry) == ["task-1:message-1"]
+    assert gateway.sessions.session.calls[0][0].endswith("Investigate.")
+
+
+def test_a2a_catch_up_new_task_selects_latest_caller_message(
+    tmp_path,
+    monkeypatch,
+):
+    async def inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_mod.asyncio, "to_thread", inline)
+    gateway = _gateway(tmp_path)
+    task = types.SimpleNamespace(
+        id="task-1",
+        context_id="context-1",
+        state="submitted",
+        caller=types.SimpleNamespace(
+            identity_id="caller-1",
+            organization_id="org-1",
+            handle="caller",
+        ),
+        messages=[
+            types.SimpleNamespace(
+                message_id="message-1",
+                role="ROLE_CALLER",
+                parts=[{"text": "Use this caller request."}],
+            ),
+            types.SimpleNamespace(
+                message_id="progress-1",
+                role="ROLE_AGENT",
+                parts=[{"text": "Ignore this worker progress."}],
+            ),
+        ],
+    )
+    gateway._identity.a2a_task = lambda _task_id: task
+    gateway._identity.iter_a2a_tasks = lambda **_kwargs: iter((task,))
+
+    async def scenario():
+        await gateway._catch_up_a2a_tasks()
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(scenario())
+
+    assert len(gateway.sessions.session.calls) == 1
+    assert gateway.sessions.session.calls[0][0].endswith(
+        "Use this caller request."
+    )
+    registry = json.loads(gateway._a2a_registry_path.read_text())
+    assert list(registry) == ["task-1:message-1"]
 
 
 def test_a2a_sent_update_returns_to_the_delegating_session(
