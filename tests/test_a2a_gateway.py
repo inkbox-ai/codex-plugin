@@ -834,6 +834,47 @@ def test_a2a_same_key_restart_with_older_sibling_keeps_fence(
     assert gateway.replies == []
 
 
+def test_a2a_restart_does_not_track_outcome_fenced_message(
+    monkeypatch,
+    tmp_path,
+):
+    gateway = _gateway(tmp_path)
+    data = _event()["data"]
+    gateway._write_a2a_registry(
+        "task-1:message-1",
+        data,
+        "running",
+    )
+    gate = acquire_a2a_progress_gate("task-1")
+    try:
+        fence_a2a_progress("task-1", "message-1")
+    finally:
+        release_a2a_progress_gate(gate)
+    authoritative = types.SimpleNamespace(state="working")
+    gateway._identity.a2a_task = lambda _task_id: authoritative
+    gateway._identity.iter_a2a_tasks = lambda **_kwargs: iter(())
+    tracked = []
+    gateway._track_a2a_job = lambda *args: tracked.append(args)
+
+    async def inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_mod.asyncio, "to_thread", inline)
+
+    async def scenario():
+        await gateway._catch_up_a2a_tasks()
+        await gateway._on_a2a_event(_event())
+        follow_up = _event()
+        follow_up["data"] = dict(follow_up["data"])
+        follow_up["data"]["message_id"] = "message-2"
+        await gateway._on_a2a_event(follow_up)
+
+    asyncio.run(scenario())
+
+    assert len(tracked) == 1
+    assert tracked[0][1] == "task-1:message-2"
+
+
 def test_a2a_progress_update_does_not_wake_requester_session(tmp_path):
     gateway = _gateway(tmp_path)
     event = _event()

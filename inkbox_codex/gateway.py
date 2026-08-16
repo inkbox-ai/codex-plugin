@@ -2635,6 +2635,13 @@ class InkboxGateway:
                 )
             return web.json_response({"ok": True})
 
+        if a2a_progress_fence_owner(task_id) == message_id:
+            logger.info(
+                "[bridge] Ignored replay of outcome-fenced A2A message %s",
+                message_id,
+            )
+            return web.json_response({"ok": True, "deduped": True})
+
         key = f"{task_id}:{message_id}"
         existing = self._read_a2a_registry().get(key)
         if isinstance(existing, dict):
@@ -2777,6 +2784,11 @@ class InkboxGateway:
                     if isinstance(saved_data, dict)
                     else self._a2a_event_data(full)
                 )
+                if (
+                    a2a_progress_fence_owner(task_id)
+                    == str(data.get("message_id") or "")
+                ):
+                    continue
                 if state in A2A_SETTLED_STATES:
                     self._write_a2a_registry(key, data, "finalized")
                 else:
