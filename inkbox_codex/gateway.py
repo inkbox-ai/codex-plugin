@@ -2330,7 +2330,7 @@ class InkboxGateway:
         self,
         registry_key: str,
         data: Dict[str, Any],
-    ) -> None:
+    ) -> str:
         task_id = str(data.get("task_id") or "")
         interval = float(getattr(self.cfg, "a2a_progress_interval_seconds", 180.0))
         receipt = _a2a_receipt_text(task_id, interval)
@@ -2338,8 +2338,9 @@ class InkboxGateway:
         if isinstance(entry, dict) and entry.get("receipt_delivered") is True:
             return
         authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
-        if _a2a_state(authoritative.state) in A2A_SETTLED_STATES:
-            return
+        state = _a2a_state(authoritative.state)
+        if state in A2A_SETTLED_STATES:
+            return state
         if not self._a2a_task_has_text(authoritative, receipt):
             await _to_thread_to_completion(
                 self._identity.a2a_reply,
@@ -2353,6 +2354,7 @@ class InkboxGateway:
             str((self._read_a2a_registry().get(registry_key) or {}).get("state") or "queued"),
             receipt_delivered=True,
         )
+        return ""
 
     def _observe_a2a_identifier(
         self,
@@ -2654,7 +2656,7 @@ class InkboxGateway:
         if isinstance(existing, dict):
             if existing.get("receipt_delivered") is not True:
                 try:
-                    await self._acknowledge_a2a_task(key, data)
+                    settled_state = await self._acknowledge_a2a_task(key, data)
                 except Exception:
                     logger.warning(
                         "[bridge] Could not retry A2A acknowledgement for task %s",
@@ -2664,17 +2666,24 @@ class InkboxGateway:
                         {"ok": False, "retry": "acknowledgement"},
                         status=503,
                     )
+                if settled_state:
+                    self._write_a2a_registry(key, data, "finalized")
+                    return web.json_response({"ok": True, "stopped": settled_state})
             return web.json_response({"ok": True, "deduped": True})
         self._write_a2a_registry(key, data, "queued")
         acknowledged = True
+        settled_state = ""
         try:
-            await self._acknowledge_a2a_task(key, data)
+            settled_state = await self._acknowledge_a2a_task(key, data)
         except Exception:
             acknowledged = False
             logger.warning(
                 "[bridge] Could not acknowledge A2A task %s; worker will retry",
                 task_id,
             )
+        if settled_state:
+            self._write_a2a_registry(key, data, "finalized")
+            return web.json_response({"ok": True, "stopped": settled_state})
         self._track_a2a_job(task_id, key, data)
         return web.json_response(
             {"ok": acknowledged},
@@ -2711,12 +2720,19 @@ class InkboxGateway:
             if self.sessions is None:
                 return
             try:
-                await self._acknowledge_a2a_task(registry_key, data)
+                settled_state = await self._acknowledge_a2a_task(
+                    registry_key,
+                    data,
+                )
             except Exception:
                 logger.warning(
                     "[bridge] Could not retry A2A acknowledgement for task %s",
                     task_id,
                 )
+            else:
+                if settled_state:
+                    self._write_a2a_registry(registry_key, data, "finalized")
+                    return
             reply = await self.sessions.get(
                 f"a2a:{self._identity.id}:{context_id}"
             ).run_consult(

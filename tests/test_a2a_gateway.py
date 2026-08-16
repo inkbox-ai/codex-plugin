@@ -198,6 +198,39 @@ def test_a2a_acknowledgement_failure_is_retried_without_duplicate_work(
     ]
 
 
+@pytest.mark.parametrize(
+    "stopped_state",
+    [
+        "completed",
+        "failed",
+        "canceled",
+        "rejected",
+        "input_required",
+        "auth_required",
+    ],
+)
+def test_stale_stopped_a2a_webhook_never_tracks_model(
+    tmp_path,
+    stopped_state,
+):
+    gateway = _gateway(tmp_path)
+    gateway._identity.a2a_task = lambda _task_id: types.SimpleNamespace(
+        state=stopped_state,
+        messages=[],
+    )
+    tracked = []
+    gateway._track_a2a_job = lambda *args: tracked.append(args)
+
+    response = asyncio.run(gateway._on_a2a_event(_event()))
+
+    assert response.status == 200
+    assert json.loads(response.text)["stopped"] == stopped_state
+    assert tracked == []
+    assert gateway.sessions.session.calls == []
+    registry = json.loads(gateway._a2a_registry_path.read_text())
+    assert registry["task-1:message-1"]["state"] == "finalized"
+
+
 def test_a2a_caller_cannot_spoof_delivered_receipt(tmp_path, monkeypatch):
     async def inline(function, *args, **kwargs):
         return function(*args, **kwargs)
