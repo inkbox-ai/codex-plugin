@@ -2621,6 +2621,11 @@ class InkboxGateway:
     ) -> "web.Response":
         event_type = str(envelope.get("event_type") or "")
         data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
+        if self._a2a_closing:
+            return web.json_response(
+                {"ok": False, "retry": "gateway-stopping"},
+                status=503,
+            )
         task_id = str(data.get("task_id") or "")
         context_id = str(data.get("context_id") or "")
         message_id = str(data.get("message_id") or envelope.get("id") or "")
@@ -2714,11 +2719,6 @@ class InkboxGateway:
                 )
             return web.json_response({"ok": True})
 
-        if self._a2a_closing:
-            return web.json_response(
-                {"ok": False, "retry": "gateway-stopping"},
-                status=503,
-            )
         if event_type not in {"a2a.task.created", "a2a.task.message"}:
             return web.json_response({"ok": True, "ignored": "unsupported-a2a-event"})
 
@@ -2973,9 +2973,20 @@ class InkboxGateway:
                 )
                 self._track_a2a_job(task_id, key, data)
 
-            tasks = await asyncio.to_thread(
-                lambda: list(self._identity.iter_a2a_tasks(state="submitted"))
-            )
+            tasks = []
+            discovered_task_ids = set()
+            for task_state in ("submitted", "working"):
+                discovered = await asyncio.to_thread(
+                    lambda state=task_state: list(
+                        self._identity.iter_a2a_tasks(state=state)
+                    )
+                )
+                for task in discovered:
+                    task_id = str(getattr(task, "id", "") or "")
+                    if not task_id or task_id in discovered_task_ids:
+                        continue
+                    discovered_task_ids.add(task_id)
+                    tasks.append(task)
             for task in tasks:
                 full = await asyncio.to_thread(self._identity.a2a_task, task.id)
                 message = self._latest_a2a_caller_message(full)

@@ -1291,6 +1291,44 @@ def test_a2a_restart_rejects_delayed_canceled_message_and_uses_authoritative_par
     }
 
 
+def test_a2a_closing_rejects_cancellation_and_sent_update(tmp_path, monkeypatch):
+    gateway = _gateway(tmp_path)
+    gateway._a2a_closing = True
+    monkeypatch.setattr(
+        gateway_mod,
+        "find_a2a_delegation",
+        lambda _task_id: {
+            "session_key": "requester-session",
+            "card_url": "https://target.example/card",
+        },
+    )
+    canceled = _event()
+    canceled["event_type"] = "a2a.task.canceled"
+    sent_update = _event()
+    sent_update["event_type"] = "a2a.sent_task.updated"
+    sent_update["data"]["state"] = "completed"
+
+    async def scenario():
+        return (
+            await gateway._on_a2a_event(canceled),
+            await gateway._on_a2a_event(sent_update),
+        )
+
+    responses = asyncio.run(scenario())
+
+    assert [response.status for response in responses] == [503, 503]
+    assert all(
+        json.loads(response.text) == {
+            "ok": False,
+            "retry": "gateway-stopping",
+        }
+        for response in responses
+    )
+    assert gateway._a2a_canceled_messages == {}
+    assert gateway.sessions.session.inbound == []
+    assert gateway.replies == []
+
+
 def test_a2a_cleanup_waits_for_inflight_reply_thread(tmp_path):
     gateway = _gateway(tmp_path)
     gateway.cfg.a2a_progress_interval_seconds = 60
@@ -1487,7 +1525,9 @@ def test_a2a_gateway_resumes_nonfinal_registry_entries(tmp_path, monkeypatch):
         ],
     )
     gateway._identity.a2a_task = lambda _task_id: task
-    gateway._identity.iter_a2a_tasks = lambda **_kwargs: iter((task,))
+    gateway._identity.iter_a2a_tasks = lambda *, state: (
+        iter((task,)) if state == "working" else iter(())
+    )
     gateway._write_a2a_registry(
         "task-1:message-1",
         _event()["data"],
@@ -1538,7 +1578,13 @@ def test_a2a_catch_up_rejects_stale_persisted_message_and_admits_current_once(
         )],
     )
     gateway._identity.a2a_task = lambda _task_id: task
-    gateway._identity.iter_a2a_tasks = lambda **_kwargs: iter((task,))
+    queried_states = []
+
+    def iter_tasks(*, state):
+        queried_states.append(state)
+        return iter((task,)) if state == "working" else iter(())
+
+    gateway._identity.iter_a2a_tasks = iter_tasks
 
     async def scenario():
         await gateway._catch_up_a2a_tasks()
@@ -1562,6 +1608,7 @@ def test_a2a_catch_up_rejects_stale_persisted_message_and_admits_current_once(
     assert gateway.sessions.session.calls[0][0].endswith(
         "Current authoritative request."
     )
+    assert queried_states == ["submitted", "working", "submitted", "working"]
 
 
 @pytest.mark.parametrize("settled_state", ["input_required", "auth_required"])
@@ -1673,7 +1720,9 @@ def test_a2a_catch_up_new_task_selects_latest_caller_message(
         ],
     )
     gateway._identity.a2a_task = lambda _task_id: task
-    gateway._identity.iter_a2a_tasks = lambda **_kwargs: iter((task,))
+    gateway._identity.iter_a2a_tasks = lambda *, state: (
+        iter((task,)) if state == "submitted" else iter(())
+    )
 
     async def scenario():
         await gateway._catch_up_a2a_tasks()
