@@ -1077,15 +1077,23 @@ def test_a2a_cancel_serializes_blocked_admission_and_worker_drain(tmp_path):
 
 def test_a2a_cancel_tombstone_allows_only_genuine_later_caller_message(tmp_path):
     gateway = _gateway(tmp_path)
-    current = {"state": "canceled", "message_id": "message-1"}
+    current = {
+        "state": "canceled",
+        "task_id": "task-1",
+        "context_id": "context-1",
+        "role": "ROLE_CALLER",
+        "message_id": "message-1",
+    }
     tracked = []
 
     def task(_task_id):
         return types.SimpleNamespace(
             state=current["state"],
+            id=current["task_id"],
+            context_id=current["context_id"],
             messages=[
                 types.SimpleNamespace(
-                    role="ROLE_CALLER",
+                    role=current["role"],
                     message_id=current["message_id"],
                     parts=[{"text": "Continue."}],
                 )
@@ -1096,6 +1104,7 @@ def test_a2a_cancel_tombstone_allows_only_genuine_later_caller_message(tmp_path)
     gateway._track_a2a_job = lambda *args: tracked.append(args)
     canceled_event = _event()
     canceled_event["event_type"] = "a2a.task.canceled"
+    canceled_event["data"].pop("message_id")
     follow_up = _event()
     follow_up["event_type"] = "a2a.task.message"
     follow_up["data"]["message_id"] = "message-2"
@@ -1107,19 +1116,71 @@ def test_a2a_cancel_tombstone_allows_only_genuine_later_caller_message(tmp_path)
         await gateway._on_a2a_event(canceled_event)
         canceled_replay = await gateway._on_a2a_event(_event())
         current.update(state="working", message_id="message-2")
+        created = dict(follow_up)
+        created["event_type"] = "a2a.task.created"
+        created_response = await gateway._on_a2a_event(created)
+        current["context_id"] = "context-other"
+        wrong_context = await gateway._on_a2a_event(follow_up)
+        current["context_id"] = "context-1"
+        current["task_id"] = "task-other"
+        wrong_task = await gateway._on_a2a_event(follow_up)
+        current["task_id"] = "task-1"
+        current["state"] = "completed"
+        stopped = await gateway._on_a2a_event(follow_up)
+        current["state"] = "working"
+        current["role"] = "ROLE_AGENT"
+        noncaller = await gateway._on_a2a_event(follow_up)
+        current["role"] = "ROLE_CALLER"
         spoofed_response = await gateway._on_a2a_event(spoofed)
         resumed = await gateway._on_a2a_event(follow_up)
         duplicate = await gateway._on_a2a_event(follow_up)
-        return canceled_replay, spoofed_response, resumed, duplicate
+        return (
+            canceled_replay,
+            created_response,
+            wrong_context,
+            wrong_task,
+            stopped,
+            noncaller,
+            spoofed_response,
+            resumed,
+            duplicate,
+        )
 
-    canceled_replay, spoofed_response, resumed, duplicate = asyncio.run(scenario())
+    responses = asyncio.run(scenario())
 
-    assert json.loads(canceled_replay.text)["deduped"] is True
-    assert json.loads(spoofed_response.text)["deduped"] is True
-    assert resumed.status == 200
-    assert json.loads(duplicate.text)["deduped"] is True
+    assert all(json.loads(response.text)["deduped"] is True for response in responses[:7])
+    assert responses[7].status == 200
+    assert json.loads(responses[8].text)["deduped"] is True
     assert [call[1] for call in tracked] == ["task-1:message-2"]
     assert gateway._a2a_canceled_messages == {}
+
+
+def test_a2a_cancel_without_message_id_tombstones_known_registry_keys(tmp_path):
+    gateway = _gateway(tmp_path)
+    gateway._write_a2a_registry(
+        "task-1:message-0",
+        _event()["data"] | {"message_id": "message-0"},
+        "running",
+    )
+    gateway._identity.a2a_task = lambda _task_id: types.SimpleNamespace(
+        id="task-1",
+        context_id="context-1",
+        state="canceled",
+        messages=[types.SimpleNamespace(
+            role="ROLE_CALLER",
+            message_id="message-1",
+            parts=[],
+        )],
+    )
+    canceled = _event()
+    canceled["event_type"] = "a2a.task.canceled"
+    canceled["data"].pop("message_id")
+
+    asyncio.run(gateway._on_a2a_event(canceled))
+
+    assert gateway._a2a_canceled_messages == {
+        "task-1": ("context-1", {"message-0", "message-1"})
+    }
 
 
 def test_a2a_cleanup_waits_for_inflight_reply_thread(tmp_path):

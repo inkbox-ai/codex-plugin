@@ -955,7 +955,7 @@ class InkboxGateway:
         self._a2a_progress_jobs: Dict[str, Tuple[str, asyncio.Task[Any]]] = {}
         self._a2a_progress_stop_events: Dict[str, asyncio.Event] = {}
         self._a2a_admission_tasks: set[asyncio.Task[Any]] = set()
-        self._a2a_canceled_messages: Dict[str, str] = {}
+        self._a2a_canceled_messages: Dict[str, Tuple[str, set[str]]] = {}
         self._a2a_ingest_lock = asyncio.Lock()
         self._a2a_closing = False
         self._a2a_identifiers: Dict[str, List[str]] = {}
@@ -2627,8 +2627,38 @@ class InkboxGateway:
         if not task_id or not context_id:
             return web.json_response({"ok": True, "ignored": "invalid-a2a-event"})
         if event_type == "a2a.task.canceled":
-            self._a2a_canceled_messages[task_id] = str(
-                data.get("message_id") or ""
+            canceled_message_ids = {
+                str(data.get("message_id") or "")
+            } - {""}
+            if not canceled_message_ids:
+                for entry in self._read_a2a_registry().values():
+                    if not isinstance(entry, dict):
+                        continue
+                    if str(entry.get("task_id") or "") != task_id:
+                        continue
+                    if str(entry.get("context_id") or "") != context_id:
+                        continue
+                    known_message_id = str(entry.get("message_id") or "")
+                    if known_message_id:
+                        canceled_message_ids.add(known_message_id)
+                try:
+                    authoritative = await asyncio.to_thread(
+                        self._identity.a2a_task,
+                        task_id,
+                    )
+                    caller_message_id = self._a2a_message_id(
+                        self._latest_a2a_caller_message(authoritative)
+                    )
+                    if caller_message_id:
+                        canceled_message_ids.add(caller_message_id)
+                except Exception:
+                    logger.warning(
+                        "[bridge] Could not resolve the canceled A2A message for task %s",
+                        task_id,
+                    )
+            self._a2a_canceled_messages[task_id] = (
+                context_id,
+                canceled_message_ids,
             )
             progress = self._a2a_progress_jobs.get(task_id)
             while True:
@@ -2684,14 +2714,19 @@ class InkboxGateway:
                 )
             return web.json_response({"ok": True})
 
-        canceled_message_id = self._a2a_canceled_messages.get(task_id)
-        if canceled_message_id is not None:
-            if message_id == canceled_message_id:
+        canceled_generation = self._a2a_canceled_messages.get(task_id)
+        if canceled_generation is not None:
+            canceled_context_id, canceled_message_ids = canceled_generation
+            if message_id in canceled_message_ids:
                 return web.json_response({"ok": True, "deduped": True})
             authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
             latest_caller = self._latest_a2a_caller_message(authoritative)
             if (
                 event_type != "a2a.task.message"
+                or context_id != canceled_context_id
+                or str(getattr(authoritative, "id", "") or "") != task_id
+                or str(getattr(authoritative, "context_id", "") or "")
+                != context_id
                 or _a2a_state(authoritative.state) not in {"submitted", "working"}
                 or self._a2a_message_id(latest_caller) != message_id
             ):
