@@ -66,6 +66,9 @@ def _gateway(tmp_path):
     gateway._a2a_jobs = {}
     gateway._a2a_progress_jobs = {}
     gateway._a2a_progress_stop_events = {}
+    gateway._a2a_admission_tasks = set()
+    gateway._a2a_canceled_tasks = set()
+    gateway._a2a_ingest_lock = asyncio.Lock()
     gateway._a2a_closing = False
     gateway._a2a_identifiers = {}
     gateway.cfg = BridgeConfig(a2a_progress_interval_seconds=0)
@@ -971,7 +974,7 @@ def test_a2a_cancel_stops_progress_child(tmp_path):
     assert gateway._a2a_identifiers == {}
 
 
-def test_a2a_cancel_drains_worker_without_erasing_new_job(tmp_path):
+def test_a2a_cancel_drains_all_same_task_jobs_before_return(tmp_path):
     gateway = _gateway(tmp_path)
     event = _event()
     event["event_type"] = "a2a.task.canceled"
@@ -999,15 +1002,77 @@ def test_a2a_cancel_drains_worker_without_erasing_new_job(tmp_path):
         await cancellation
         effects_at_return = list(effects)
         await asyncio.sleep(0.05)
-        assert gateway._a2a_jobs["task-1"] == {new_job}
-        new_job.cancel()
-        await asyncio.gather(new_job, return_exceptions=True)
-        return effects_at_return
+        return effects_at_return, new_job
 
-    effects_at_return = asyncio.run(scenario())
+    effects_at_return, new_job = asyncio.run(scenario())
 
     assert effects_at_return == ["old-worker-finished"]
     assert effects == effects_at_return
+    assert new_job.cancelled()
+    assert gateway._a2a_jobs == {}
+
+
+def test_a2a_cancel_serializes_blocked_admission_and_worker_drain(tmp_path):
+    gateway = _gateway(tmp_path)
+    lookup_entered = threading.Event()
+    lookup_release = threading.Event()
+    worker_started = asyncio.Event()
+    worker_canceled = asyncio.Event()
+    worker_release = asyncio.Event()
+    effects = []
+    tracked = []
+
+    def task(_task_id):
+        lookup_entered.set()
+        lookup_release.wait(timeout=5)
+        return types.SimpleNamespace(state="working", messages=[])
+
+    gateway._identity.a2a_task = task
+
+    async def worker():
+        worker_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            worker_canceled.set()
+            await worker_release.wait()
+        effects.append("worker-finished")
+
+    async def scenario():
+        worker_job = asyncio.create_task(worker())
+        await worker_started.wait()
+
+        def track(task_id, _registry_key, _data):
+            tracked.append(task_id)
+            gateway._a2a_jobs.setdefault(task_id, set()).add(worker_job)
+
+        gateway._track_a2a_job = track
+        webhook = asyncio.create_task(gateway._on_a2a_event(_event()))
+        while not lookup_entered.is_set():
+            await asyncio.sleep(0.01)
+        canceled_event = _event()
+        canceled_event["event_type"] = "a2a.task.canceled"
+        cancellation = asyncio.create_task(gateway._on_a2a_event(canceled_event))
+        await asyncio.sleep(0.05)
+        assert not cancellation.done()
+        lookup_release.set()
+        await webhook
+        await worker_canceled.wait()
+        assert not cancellation.done()
+        worker_release.set()
+        await cancellation
+        effects_at_return = list(effects)
+        replay = await gateway._on_a2a_event(_event())
+        await asyncio.sleep(0.05)
+        return effects_at_return, replay
+
+    effects_at_return, replay = asyncio.run(scenario())
+
+    assert effects_at_return == ["worker-finished"]
+    assert effects == effects_at_return
+    assert tracked == ["task-1"]
+    assert json.loads(replay.text)["deduped"] is True
+    assert gateway._a2a_jobs == {}
 
 
 def test_a2a_cleanup_waits_for_inflight_reply_thread(tmp_path):
@@ -1083,10 +1148,12 @@ def test_a2a_cleanup_closes_admission_before_drain(tmp_path):
         webhook = asyncio.create_task(gateway._on_a2a_event(_event()))
         while not entered.is_set():
             await asyncio.sleep(0.01)
-        await gateway._cleanup()
-        assert not webhook.done()
+        cleanup = asyncio.create_task(gateway._cleanup())
+        await asyncio.sleep(0.05)
+        assert not cleanup.done()
         release.set()
         response = await webhook
+        await cleanup
         await asyncio.sleep(0.05)
         return response
 

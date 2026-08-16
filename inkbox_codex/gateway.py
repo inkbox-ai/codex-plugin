@@ -954,6 +954,9 @@ class InkboxGateway:
         self._a2a_jobs: Dict[str, set[asyncio.Task[Any]]] = {}
         self._a2a_progress_jobs: Dict[str, Tuple[str, asyncio.Task[Any]]] = {}
         self._a2a_progress_stop_events: Dict[str, asyncio.Event] = {}
+        self._a2a_admission_tasks: set[asyncio.Task[Any]] = set()
+        self._a2a_canceled_tasks: set[str] = set()
+        self._a2a_ingest_lock = asyncio.Lock()
         self._a2a_closing = False
         self._a2a_identifiers: Dict[str, List[str]] = {}
         state_root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
@@ -1210,6 +1213,14 @@ class InkboxGateway:
 
     async def _cleanup(self) -> None:
         self._a2a_closing = True
+        current = asyncio.current_task()
+        admission_tasks = [
+            task
+            for task in self._a2a_admission_tasks
+            if task is not current
+        ]
+        if admission_tasks:
+            await asyncio.gather(*admission_tasks, return_exceptions=True)
         progress_jobs = [
             task for _key, task in self._a2a_progress_jobs.values()
         ]
@@ -2589,6 +2600,20 @@ class InkboxGateway:
         self,
         envelope: Dict[str, Any],
     ) -> "web.Response":
+        current = asyncio.current_task()
+        if current is not None:
+            self._a2a_admission_tasks.add(current)
+        try:
+            async with self._a2a_ingest_lock:
+                return await self._on_a2a_event_tracked(envelope)
+        finally:
+            if current is not None:
+                self._a2a_admission_tasks.discard(current)
+
+    async def _on_a2a_event_tracked(
+        self,
+        envelope: Dict[str, Any],
+    ) -> "web.Response":
         event_type = str(envelope.get("event_type") or "")
         data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
         task_id = str(data.get("task_id") or "")
@@ -2597,17 +2622,19 @@ class InkboxGateway:
         if not task_id or not context_id:
             return web.json_response({"ok": True, "ignored": "invalid-a2a-event"})
         if event_type == "a2a.task.canceled":
-            worker_jobs = set(self._a2a_jobs.get(task_id, set()))
+            self._a2a_canceled_tasks.add(task_id)
             progress = self._a2a_progress_jobs.get(task_id)
-            for job in worker_jobs:
-                job.cancel()
-            if worker_jobs:
-                await asyncio.gather(*worker_jobs, return_exceptions=True)
-            current_jobs = self._a2a_jobs.get(task_id)
-            if current_jobs is not None:
-                current_jobs.difference_update(worker_jobs)
-                if not current_jobs and self._a2a_jobs.get(task_id) is current_jobs:
+            while True:
+                worker_jobs = set(self._a2a_jobs.get(task_id, set()))
+                if not worker_jobs:
                     self._a2a_jobs.pop(task_id, None)
+                    break
+                for job in worker_jobs:
+                    job.cancel()
+                await asyncio.gather(*worker_jobs, return_exceptions=True)
+                current_jobs = self._a2a_jobs.get(task_id)
+                if current_jobs is not None:
+                    current_jobs.difference_update(worker_jobs)
             if progress is not None:
                 await self._stop_a2a_progress(task_id, progress[0])
             return web.json_response({"ok": True})
@@ -2650,6 +2677,8 @@ class InkboxGateway:
                 )
             return web.json_response({"ok": True})
 
+        if task_id in self._a2a_canceled_tasks:
+            return web.json_response({"ok": True, "deduped": True})
         if self._a2a_closing:
             return web.json_response(
                 {"ok": False, "retry": "gateway-stopping"},
