@@ -72,12 +72,19 @@ def _gateway(tmp_path):
     gateway._a2a_closing = False
     gateway._a2a_identifiers = {}
     gateway.cfg = BridgeConfig(a2a_progress_interval_seconds=0)
+    task = types.SimpleNamespace(
+        id="task-1",
+        context_id="context-1",
+        state="submitted",
+        messages=[types.SimpleNamespace(
+            role="ROLE_CALLER",
+            message_id="message-1",
+            parts=[{"text": "Investigate."}],
+        )],
+    )
     gateway._identity = types.SimpleNamespace(
         id="identity-1",
-        a2a_task=lambda _task_id: types.SimpleNamespace(
-            state="submitted",
-            messages=[],
-        ),
+        a2a_task=lambda _task_id: task,
         a2a_reply=lambda task_id, **kwargs: gateway.replies.append(
             (task_id, kwargs)
         ),
@@ -219,8 +226,14 @@ def test_stale_stopped_a2a_webhook_never_tracks_model(
 ):
     gateway = _gateway(tmp_path)
     gateway._identity.a2a_task = lambda _task_id: types.SimpleNamespace(
+        id="task-1",
+        context_id="context-1",
         state=stopped_state,
-        messages=[],
+        messages=[types.SimpleNamespace(
+            role="ROLE_CALLER",
+            message_id="message-1",
+            parts=[{"text": "Investigate."}],
+        )],
     )
     tracked = []
     gateway._track_a2a_job = lambda *args: tracked.append(args)
@@ -231,8 +244,7 @@ def test_stale_stopped_a2a_webhook_never_tracks_model(
     assert json.loads(response.text)["stopped"] == stopped_state
     assert tracked == []
     assert gateway.sessions.session.calls == []
-    registry = json.loads(gateway._a2a_registry_path.read_text())
-    assert registry["task-1:message-1"]["state"] == "finalized"
+    assert not gateway._a2a_registry_path.exists()
 
 
 def test_a2a_caller_cannot_spoof_delivered_receipt(tmp_path, monkeypatch):
@@ -246,9 +258,12 @@ def test_a2a_caller_cannot_spoof_delivered_receipt(tmp_path, monkeypatch):
         "Periodic progress updates are disabled."
     )
     gateway._identity.a2a_task = lambda _task_id: types.SimpleNamespace(
+        id="task-1",
+        context_id="context-1",
         state="submitted",
         messages=[types.SimpleNamespace(
             role="caller",
+            message_id="message-1",
             parts=[{"text": receipt}],
         )],
     )
@@ -887,7 +902,16 @@ def test_a2a_restart_does_not_track_outcome_fenced_message(
         fence_a2a_progress("task-1", "message-1")
     finally:
         release_a2a_progress_gate(gate)
-    authoritative = types.SimpleNamespace(state="working")
+    authoritative = types.SimpleNamespace(
+        id="task-1",
+        context_id="context-1",
+        state="working",
+        messages=[types.SimpleNamespace(
+            role="ROLE_CALLER",
+            message_id="message-1",
+            parts=[{"text": "Investigate."}],
+        )],
+    )
     gateway._identity.a2a_task = lambda _task_id: authoritative
     gateway._identity.iter_a2a_tasks = lambda **_kwargs: iter(())
     tracked = []
@@ -902,8 +926,14 @@ def test_a2a_restart_does_not_track_outcome_fenced_message(
         await gateway._catch_up_a2a_tasks()
         await gateway._on_a2a_event(_event())
         follow_up = _event()
+        follow_up["event_type"] = "a2a.task.message"
         follow_up["data"] = dict(follow_up["data"])
         follow_up["data"]["message_id"] = "message-2"
+        authoritative.messages = [types.SimpleNamespace(
+            role="ROLE_CALLER",
+            message_id="message-2",
+            parts=[{"text": "Continue."}],
+        )]
         await gateway._on_a2a_event(follow_up)
 
     asyncio.run(scenario())
@@ -1025,7 +1055,16 @@ def test_a2a_cancel_serializes_blocked_admission_and_worker_drain(tmp_path):
     def task(_task_id):
         lookup_entered.set()
         lookup_release.wait(timeout=5)
-        return types.SimpleNamespace(state="working", messages=[])
+        return types.SimpleNamespace(
+            id="task-1",
+            context_id="context-1",
+            state="working",
+            messages=[types.SimpleNamespace(
+                role="ROLE_CALLER",
+                message_id="message-1",
+                parts=[{"text": "Investigate."}],
+            )],
+        )
 
     gateway._identity.a2a_task = task
 
@@ -1148,7 +1187,10 @@ def test_a2a_cancel_tombstone_allows_only_genuine_later_caller_message(tmp_path)
 
     responses = asyncio.run(scenario())
 
-    assert all(json.loads(response.text)["deduped"] is True for response in responses[:7])
+    assert json.loads(responses[0].text)["stopped"] == "canceled"
+    assert all(json.loads(response.text)["deduped"] is True for response in responses[1:4])
+    assert json.loads(responses[4].text)["stopped"] == "completed"
+    assert all(json.loads(response.text)["deduped"] is True for response in responses[5:7])
     assert responses[7].status == 200
     assert json.loads(responses[8].text)["deduped"] is True
     assert [call[1] for call in tracked] == ["task-1:message-2"]
@@ -1181,6 +1223,52 @@ def test_a2a_cancel_without_message_id_tombstones_known_registry_keys(tmp_path):
     assert gateway._a2a_canceled_messages == {
         "task-1": ("context-1", {"message-0", "message-1"})
     }
+
+
+def test_a2a_restart_rejects_delayed_canceled_message_and_uses_authoritative_parts(
+    tmp_path,
+):
+    before_restart = _gateway(tmp_path)
+    canceled_task = before_restart._identity.a2a_task("task-1")
+    canceled_task.state = "canceled"
+    canceled = _event()
+    canceled["event_type"] = "a2a.task.canceled"
+    canceled["data"].pop("message_id")
+    asyncio.run(before_restart._on_a2a_event(canceled))
+
+    gateway = _gateway(tmp_path)
+    authoritative = gateway._identity.a2a_task("task-1")
+    authoritative.state = "working"
+    authoritative.messages = [types.SimpleNamespace(
+        role="ROLE_CALLER",
+        message_id="message-2",
+        parts=[{"text": "Trusted follow-up."}],
+    )]
+    gateway._track_a2a_job = lambda *args: gateway.tracked.append(args)
+    gateway.tracked = []
+    delayed = _event()
+    delayed["event_type"] = "a2a.task.message"
+    follow_up = _event()
+    follow_up["event_type"] = "a2a.task.message"
+    follow_up["data"]["message_id"] = "message-2"
+    follow_up["data"]["parts"] = [{"text": "Spoofed webhook text."}]
+
+    async def scenario():
+        delayed_response = await gateway._on_a2a_event(delayed)
+        admitted = await gateway._on_a2a_event(follow_up)
+        duplicate = await gateway._on_a2a_event(follow_up)
+        return delayed_response, admitted, duplicate
+
+    delayed_response, admitted, duplicate = asyncio.run(scenario())
+
+    assert json.loads(delayed_response.text)["deduped"] is True
+    assert admitted.status == 200
+    assert json.loads(duplicate.text)["deduped"] is True
+    assert [call[1] for call in gateway.tracked] == ["task-1:message-2"]
+    registry = json.loads(gateway._a2a_registry_path.read_text())
+    assert registry["task-1:message-2"]["data"]["parts"] == [
+        {"text": "Trusted follow-up."}
+    ]
 
 
 def test_a2a_cleanup_waits_for_inflight_reply_thread(tmp_path):
@@ -1247,7 +1335,16 @@ def test_a2a_cleanup_closes_admission_before_drain(tmp_path):
     def task(_task_id):
         entered.set()
         release.wait(timeout=5)
-        return types.SimpleNamespace(state="working", messages=[])
+        return types.SimpleNamespace(
+            id="task-1",
+            context_id="context-1",
+            state="working",
+            messages=[types.SimpleNamespace(
+                role="ROLE_CALLER",
+                message_id="message-1",
+                parts=[{"text": "Investigate."}],
+            )],
+        )
 
     gateway._identity.a2a_task = task
     gateway._track_a2a_job = lambda *args: tracked.append(args)
@@ -1426,7 +1523,16 @@ def test_a2a_new_caller_follow_up_runs_after_settled_recovery(
 
     monkeypatch.setattr(gateway_mod.asyncio, "to_thread", inline)
     gateway = _gateway(tmp_path)
-    authoritative = types.SimpleNamespace(state="input_required")
+    authoritative = types.SimpleNamespace(
+        id="task-1",
+        context_id="context-1",
+        state="input_required",
+        messages=[types.SimpleNamespace(
+            role="ROLE_CALLER",
+            message_id="message-1",
+            parts=[{"text": "Investigate."}],
+        )],
+    )
     gateway._identity.a2a_task = lambda _task_id: authoritative
     gateway._identity.iter_a2a_tasks = lambda **_kwargs: iter(())
     gateway._write_a2a_registry(
@@ -1438,7 +1544,13 @@ def test_a2a_new_caller_follow_up_runs_after_settled_recovery(
     async def scenario():
         await gateway._catch_up_a2a_tasks()
         authoritative.state = "working"
+        authoritative.messages = [types.SimpleNamespace(
+            role="ROLE_CALLER",
+            message_id="message-2",
+            parts=[{"text": "Continue."}],
+        )]
         follow_up = _event()
+        follow_up["event_type"] = "a2a.task.message"
         follow_up["data"] = dict(follow_up["data"])
         follow_up["data"]["message_id"] = "message-2"
         await gateway._on_a2a_event(follow_up)

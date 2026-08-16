@@ -2714,29 +2714,47 @@ class InkboxGateway:
                 )
             return web.json_response({"ok": True})
 
-        canceled_generation = self._a2a_canceled_messages.get(task_id)
-        if canceled_generation is not None:
-            canceled_context_id, canceled_message_ids = canceled_generation
-            if message_id in canceled_message_ids:
-                return web.json_response({"ok": True, "deduped": True})
-            authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
-            latest_caller = self._latest_a2a_caller_message(authoritative)
-            if (
-                event_type != "a2a.task.message"
-                or context_id != canceled_context_id
-                or str(getattr(authoritative, "id", "") or "") != task_id
-                or str(getattr(authoritative, "context_id", "") or "")
-                != context_id
-                or _a2a_state(authoritative.state) not in {"submitted", "working"}
-                or self._a2a_message_id(latest_caller) != message_id
-            ):
-                return web.json_response({"ok": True, "deduped": True})
-            self._a2a_canceled_messages.pop(task_id, None)
         if self._a2a_closing:
             return web.json_response(
                 {"ok": False, "retry": "gateway-stopping"},
                 status=503,
             )
+        if event_type not in {"a2a.task.created", "a2a.task.message"}:
+            return web.json_response({"ok": True, "ignored": "unsupported-a2a-event"})
+
+        authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
+        latest_caller = self._latest_a2a_caller_message(authoritative)
+        authoritative_message_id = self._a2a_message_id(latest_caller)
+        if (
+            str(getattr(authoritative, "id", "") or "") != task_id
+            or str(getattr(authoritative, "context_id", "") or "") != context_id
+            or authoritative_message_id != message_id
+        ):
+            return web.json_response({"ok": True, "deduped": True})
+        authoritative_state = _a2a_state(authoritative.state)
+        if authoritative_state in A2A_SETTLED_STATES:
+            return web.json_response({"ok": True, "stopped": authoritative_state})
+        if authoritative_state not in {"submitted", "working"}:
+            return web.json_response({"ok": True, "deduped": True})
+        authoritative_parts = (
+            latest_caller.get("parts", ())
+            if isinstance(latest_caller, dict)
+            else getattr(latest_caller, "parts", ())
+        )
+        data = dict(data)
+        data["message_id"] = authoritative_message_id
+        data["parts"] = list(authoritative_parts or ())
+
+        canceled_generation = self._a2a_canceled_messages.get(task_id)
+        if canceled_generation is not None:
+            canceled_context_id, canceled_message_ids = canceled_generation
+            if (
+                event_type != "a2a.task.message"
+                or context_id != canceled_context_id
+                or message_id in canceled_message_ids
+            ):
+                return web.json_response({"ok": True, "deduped": True})
+            self._a2a_canceled_messages.pop(task_id, None)
 
         if a2a_progress_fence_owner(task_id) == message_id:
             logger.info(
