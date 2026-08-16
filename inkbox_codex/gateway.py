@@ -2744,6 +2744,21 @@ class InkboxGateway:
         data = dict(data)
         data["message_id"] = authoritative_message_id
         data["parts"] = list(authoritative_parts or ())
+        authoritative_caller = self._field(authoritative, "caller")
+        data["caller"] = {
+            "identity_id": str(
+                self._field(authoritative_caller, "identity_id", "identityId") or ""
+            ),
+            "organization_id": str(
+                self._field(
+                    authoritative_caller,
+                    "organization_id",
+                    "organizationId",
+                )
+                or ""
+            ),
+            "handle": str(self._field(authoritative_caller, "handle") or ""),
+        }
 
         canceled_generation = self._a2a_canceled_messages.get(task_id)
         if canceled_generation is not None:
@@ -2924,22 +2939,39 @@ class InkboxGateway:
                 if not task_id or self._a2a_jobs.get(task_id):
                     continue
                 full = await asyncio.to_thread(self._identity.a2a_task, task_id)
-                state = str(getattr(full.state, "value", full.state))
+                state = _a2a_state(full.state)
                 saved_data = entry.get("data")
-                data = (
+                saved_data = (
                     dict(saved_data)
                     if isinstance(saved_data, dict)
-                    else self._a2a_event_data(full)
+                    else {}
                 )
+                if state in A2A_SETTLED_STATES:
+                    self._write_a2a_registry(key, saved_data, "finalized")
+                    continue
+                caller_message = self._latest_a2a_caller_message(full)
+                caller_message_id = self._a2a_message_id(caller_message)
+                if (
+                    state not in {"submitted", "working"}
+                    or str(getattr(full, "id", "") or "") != task_id
+                    or str(getattr(full, "context_id", "") or "")
+                    != str(entry.get("context_id") or "")
+                    or f"{task_id}:{caller_message_id}" != key
+                ):
+                    self._write_a2a_registry(key, saved_data, "finalized")
+                    continue
+                data = self._a2a_event_data(full)
                 if (
                     a2a_progress_fence_owner(task_id)
                     == str(data.get("message_id") or "")
                 ):
                     continue
-                if state in A2A_SETTLED_STATES:
-                    self._write_a2a_registry(key, data, "finalized")
-                else:
-                    self._track_a2a_job(task_id, key, data)
+                self._write_a2a_registry(
+                    key,
+                    data,
+                    str(entry.get("state") or "queued"),
+                )
+                self._track_a2a_job(task_id, key, data)
 
             tasks = await asyncio.to_thread(
                 lambda: list(self._identity.iter_a2a_tasks(state="submitted"))

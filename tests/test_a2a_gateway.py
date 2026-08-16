@@ -76,6 +76,11 @@ def _gateway(tmp_path):
         id="task-1",
         context_id="context-1",
         state="submitted",
+        caller=types.SimpleNamespace(
+            identity_id="caller-1",
+            organization_id="org-1",
+            handle="caller",
+        ),
         messages=[types.SimpleNamespace(
             role="ROLE_CALLER",
             message_id="message-1",
@@ -1239,6 +1244,11 @@ def test_a2a_restart_rejects_delayed_canceled_message_and_uses_authoritative_par
     gateway = _gateway(tmp_path)
     authoritative = gateway._identity.a2a_task("task-1")
     authoritative.state = "working"
+    authoritative.caller = types.SimpleNamespace(
+        identity_id="trusted-caller",
+        organization_id="trusted-org",
+        handle="trusted-handle",
+    )
     authoritative.messages = [types.SimpleNamespace(
         role="ROLE_CALLER",
         message_id="message-2",
@@ -1251,6 +1261,11 @@ def test_a2a_restart_rejects_delayed_canceled_message_and_uses_authoritative_par
     follow_up = _event()
     follow_up["event_type"] = "a2a.task.message"
     follow_up["data"]["message_id"] = "message-2"
+    follow_up["data"]["caller"] = {
+        "identity_id": "spoofed-caller",
+        "organization_id": "spoofed-org",
+        "handle": "spoofed-handle",
+    }
     follow_up["data"]["parts"] = [{"text": "Spoofed webhook text."}]
 
     async def scenario():
@@ -1269,6 +1284,11 @@ def test_a2a_restart_rejects_delayed_canceled_message_and_uses_authoritative_par
     assert registry["task-1:message-2"]["data"]["parts"] == [
         {"text": "Trusted follow-up."}
     ]
+    assert registry["task-1:message-2"]["data"]["caller"] == {
+        "identity_id": "trusted-caller",
+        "organization_id": "trusted-org",
+        "handle": "trusted-handle",
+    }
 
 
 def test_a2a_cleanup_waits_for_inflight_reply_thread(tmp_path):
@@ -1483,7 +1503,65 @@ def test_a2a_gateway_resumes_nonfinal_registry_entries(tmp_path, monkeypatch):
 
     assert registry["task-1:message-1"]["state"] == "finalized"
     assert list(registry) == ["task-1:message-1"]
-    assert gateway.sessions.session.calls[0][0].endswith("Investigate.")
+    assert gateway.sessions.session.calls[0][0].endswith(
+        "SDK copy must not replace persisted input."
+    )
+
+
+def test_a2a_catch_up_rejects_stale_persisted_message_and_admits_current_once(
+    tmp_path,
+    monkeypatch,
+):
+    async def inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_mod.asyncio, "to_thread", inline)
+    gateway = _gateway(tmp_path)
+    gateway._write_a2a_registry(
+        "task-1:message-1",
+        _event()["data"],
+        "running",
+    )
+    task = types.SimpleNamespace(
+        id="task-1",
+        context_id="context-1",
+        state="working",
+        caller=types.SimpleNamespace(
+            identity_id="current-caller",
+            organization_id="current-org",
+            handle="current-handle",
+        ),
+        messages=[types.SimpleNamespace(
+            message_id="message-2",
+            role="ROLE_CALLER",
+            parts=[{"text": "Current authoritative request."}],
+        )],
+    )
+    gateway._identity.a2a_task = lambda _task_id: task
+    gateway._identity.iter_a2a_tasks = lambda **_kwargs: iter((task,))
+
+    async def scenario():
+        await gateway._catch_up_a2a_tasks()
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+        await gateway._catch_up_a2a_tasks()
+
+    asyncio.run(scenario())
+
+    registry = json.loads(gateway._a2a_registry_path.read_text())
+    assert registry["task-1:message-1"]["state"] == "finalized"
+    assert registry["task-1:message-2"]["state"] == "finalized"
+    assert registry["task-1:message-2"]["data"]["parts"] == [
+        {"text": "Current authoritative request."}
+    ]
+    assert registry["task-1:message-2"]["data"]["caller"] == {
+        "identity_id": "current-caller",
+        "organization_id": "current-org",
+        "handle": "current-handle",
+    }
+    assert len(gateway.sessions.session.calls) == 1
+    assert gateway.sessions.session.calls[0][0].endswith(
+        "Current authoritative request."
+    )
 
 
 @pytest.mark.parametrize("settled_state", ["input_required", "auth_required"])
