@@ -955,7 +955,7 @@ class InkboxGateway:
         self._a2a_progress_jobs: Dict[str, Tuple[str, asyncio.Task[Any]]] = {}
         self._a2a_progress_stop_events: Dict[str, asyncio.Event] = {}
         self._a2a_admission_tasks: set[asyncio.Task[Any]] = set()
-        self._a2a_canceled_tasks: set[str] = set()
+        self._a2a_canceled_messages: Dict[str, str] = {}
         self._a2a_ingest_lock = asyncio.Lock()
         self._a2a_closing = False
         self._a2a_identifiers: Dict[str, List[str]] = {}
@@ -2259,14 +2259,19 @@ class InkboxGateway:
                 return message
         return None
 
-    @classmethod
-    def _a2a_event_data(cls, task: Any) -> Dict[str, Any]:
-        message = cls._latest_a2a_caller_message(task)
-        message_id = (
+    @staticmethod
+    def _a2a_message_id(message: Any) -> str:
+        value = (
             message.get("message_id") or message.get("messageId")
             if isinstance(message, dict)
             else getattr(message, "message_id", None)
         )
+        return str(value or "")
+
+    @classmethod
+    def _a2a_event_data(cls, task: Any) -> Dict[str, Any]:
+        message = cls._latest_a2a_caller_message(task)
+        message_id = cls._a2a_message_id(message)
         parts = (
             message.get("parts", ())
             if isinstance(message, dict)
@@ -2622,7 +2627,9 @@ class InkboxGateway:
         if not task_id or not context_id:
             return web.json_response({"ok": True, "ignored": "invalid-a2a-event"})
         if event_type == "a2a.task.canceled":
-            self._a2a_canceled_tasks.add(task_id)
+            self._a2a_canceled_messages[task_id] = str(
+                data.get("message_id") or ""
+            )
             progress = self._a2a_progress_jobs.get(task_id)
             while True:
                 worker_jobs = set(self._a2a_jobs.get(task_id, set()))
@@ -2677,8 +2684,19 @@ class InkboxGateway:
                 )
             return web.json_response({"ok": True})
 
-        if task_id in self._a2a_canceled_tasks:
-            return web.json_response({"ok": True, "deduped": True})
+        canceled_message_id = self._a2a_canceled_messages.get(task_id)
+        if canceled_message_id is not None:
+            if message_id == canceled_message_id:
+                return web.json_response({"ok": True, "deduped": True})
+            authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
+            latest_caller = self._latest_a2a_caller_message(authoritative)
+            if (
+                event_type != "a2a.task.message"
+                or _a2a_state(authoritative.state) not in {"submitted", "working"}
+                or self._a2a_message_id(latest_caller) != message_id
+            ):
+                return web.json_response({"ok": True, "deduped": True})
+            self._a2a_canceled_messages.pop(task_id, None)
         if self._a2a_closing:
             return web.json_response(
                 {"ok": False, "retry": "gateway-stopping"},

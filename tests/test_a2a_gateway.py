@@ -67,7 +67,7 @@ def _gateway(tmp_path):
     gateway._a2a_progress_jobs = {}
     gateway._a2a_progress_stop_events = {}
     gateway._a2a_admission_tasks = set()
-    gateway._a2a_canceled_tasks = set()
+    gateway._a2a_canceled_messages = {}
     gateway._a2a_ingest_lock = asyncio.Lock()
     gateway._a2a_closing = False
     gateway._a2a_identifiers = {}
@@ -1073,6 +1073,53 @@ def test_a2a_cancel_serializes_blocked_admission_and_worker_drain(tmp_path):
     assert tracked == ["task-1"]
     assert json.loads(replay.text)["deduped"] is True
     assert gateway._a2a_jobs == {}
+
+
+def test_a2a_cancel_tombstone_allows_only_genuine_later_caller_message(tmp_path):
+    gateway = _gateway(tmp_path)
+    current = {"state": "canceled", "message_id": "message-1"}
+    tracked = []
+
+    def task(_task_id):
+        return types.SimpleNamespace(
+            state=current["state"],
+            messages=[
+                types.SimpleNamespace(
+                    role="ROLE_CALLER",
+                    message_id=current["message_id"],
+                    parts=[{"text": "Continue."}],
+                )
+            ],
+        )
+
+    gateway._identity.a2a_task = task
+    gateway._track_a2a_job = lambda *args: tracked.append(args)
+    canceled_event = _event()
+    canceled_event["event_type"] = "a2a.task.canceled"
+    follow_up = _event()
+    follow_up["event_type"] = "a2a.task.message"
+    follow_up["data"]["message_id"] = "message-2"
+    spoofed = _event()
+    spoofed["event_type"] = "a2a.task.message"
+    spoofed["data"]["message_id"] = "message-3"
+
+    async def scenario():
+        await gateway._on_a2a_event(canceled_event)
+        canceled_replay = await gateway._on_a2a_event(_event())
+        current.update(state="working", message_id="message-2")
+        spoofed_response = await gateway._on_a2a_event(spoofed)
+        resumed = await gateway._on_a2a_event(follow_up)
+        duplicate = await gateway._on_a2a_event(follow_up)
+        return canceled_replay, spoofed_response, resumed, duplicate
+
+    canceled_replay, spoofed_response, resumed, duplicate = asyncio.run(scenario())
+
+    assert json.loads(canceled_replay.text)["deduped"] is True
+    assert json.loads(spoofed_response.text)["deduped"] is True
+    assert resumed.status == 200
+    assert json.loads(duplicate.text)["deduped"] is True
+    assert [call[1] for call in tracked] == ["task-1:message-2"]
+    assert gateway._a2a_canceled_messages == {}
 
 
 def test_a2a_cleanup_waits_for_inflight_reply_thread(tmp_path):
