@@ -62,6 +62,19 @@ except ImportError:  # pragma: no cover
     INKBOX_TUNNEL_AVAILABLE = False
 
 try:
+    from .a2a_progress import (
+        A2A_PROGRESS_MAX_IDENTIFIERS,
+        build_progress_update,
+        safe_item_identifier,
+    )
+    from .a2a_progress_gate import (
+        a2a_progress_fence_owner,
+        a2a_progress_is_fenced,
+        clear_a2a_progress_fence,
+        fence_a2a_progress,
+        release_a2a_progress_gate,
+        try_acquire_a2a_progress_gate,
+    )
     from .config import (
         DEFAULT_WEBHOOK_PATH,
         INKBOX_WS_PATH,
@@ -84,6 +97,19 @@ try:
     from .tools import build_inkbox_mcp_server_config
     from .webhook_providers import match_provider
 except ImportError:  # pragma: no cover - direct local import/test fallback
+    from a2a_progress import (
+        A2A_PROGRESS_MAX_IDENTIFIERS,
+        build_progress_update,
+        safe_item_identifier,
+    )
+    from a2a_progress_gate import (
+        a2a_progress_fence_owner,
+        a2a_progress_is_fenced,
+        clear_a2a_progress_fence,
+        fence_a2a_progress,
+        release_a2a_progress_gate,
+        try_acquire_a2a_progress_gate,
+    )
     from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, VoiceStack, call_contexts_dir, inkbox_client_kwargs
     from codex_client import CodexTurnResult
     from a2a_delegations import find_by_task as find_a2a_delegation
@@ -718,10 +744,23 @@ A2A_EVENTS = [
     "a2a.sent_task.updated",
 ]
 A2A_TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
+A2A_SETTLED_STATES = A2A_TERMINAL_STATES | {"input_required", "auth_required"}
+A2A_ADMISSION_CLOSING = "__closing__"
+A2A_RECEIPT_TEMPLATE = "Task {task_id} received. Work is queued and starting."
 # Mail: inbound plus the two delivery-failure transitions that feed the loop
 # (_on_mail_delivery_failed). The success transitions stay unsubscribed — they
 # would pay signature cost on every outbound email for no behaviour.
 MAIL_EVENTS = ["message.received", "message.bounced", "message.failed"]
+
+
+async def _to_thread_to_completion(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Do not let coroutine cancellation abandon an active thread side effect."""
+    job = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(job)
+    except asyncio.CancelledError:
+        await job
+        raise
 
 
 def _is_unsupported_a2a_event_types(exc: Exception) -> bool:
@@ -733,6 +772,24 @@ def _is_unsupported_a2a_event_types(exc: Exception) -> bool:
             or "does not belong to any known channel" in detail
         )
     )
+
+
+def _a2a_state(value: Any) -> str:
+    state = str(getattr(value, "value", value) or "").strip().lower()
+    return state.removeprefix("task_state_")
+
+
+def _a2a_receipt_text(task_id: str, interval_seconds: float) -> str:
+    receipt = A2A_RECEIPT_TEMPLATE.format(task_id=task_id)
+    if interval_seconds <= 0:
+        return f"{receipt} Periodic progress updates are disabled."
+    if float(interval_seconds).is_integer() and int(interval_seconds) % 60 == 0:
+        count = int(interval_seconds) // 60
+        unit = "minute" if count == 1 else "minutes"
+        return f"{receipt} Expect progress updates about every {count} {unit}."
+    interval = f"{interval_seconds:g}"
+    unit = "second" if interval_seconds == 1 else "seconds"
+    return f"{receipt} Expect progress updates about every {interval} {unit}."
 
 
 def _outbound_failure_keys(
@@ -895,6 +952,13 @@ class InkboxGateway:
             Path.home() / ".inkbox-codex" / "a2a_tasks.json"
         )
         self._a2a_jobs: Dict[str, set[asyncio.Task[Any]]] = {}
+        self._a2a_progress_jobs: Dict[str, Tuple[str, asyncio.Task[Any]]] = {}
+        self._a2a_progress_stop_events: Dict[str, asyncio.Event] = {}
+        self._a2a_admission_tasks: set[asyncio.Task[Any]] = set()
+        self._a2a_canceled_messages: Dict[str, Tuple[str, set[str]]] = {}
+        self._a2a_ingest_lock = asyncio.Lock()
+        self._a2a_closing = False
+        self._a2a_identifiers: Dict[str, List[str]] = {}
         state_root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
         self._hosted_call_registry_path = state_root / "hosted_call_completions.json"
         self._hosted_call_registry_owner = uuid.uuid4().hex
@@ -910,6 +974,7 @@ class InkboxGateway:
         Returns:
             None
         """
+        self._a2a_closing = False
         if not AIOHTTP_AVAILABLE:
             raise RuntimeError("aiohttp is not installed; run: pip install aiohttp")
         if not INKBOX_AVAILABLE:
@@ -1147,7 +1212,29 @@ class InkboxGateway:
         logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
     async def _cleanup(self) -> None:
-        jobs = list(self._hosted_call_jobs.values())
+        self._a2a_closing = True
+        current = asyncio.current_task()
+        admission_tasks = [
+            task
+            for task in self._a2a_admission_tasks
+            if task is not current
+        ]
+        if admission_tasks:
+            await asyncio.gather(*admission_tasks, return_exceptions=True)
+        progress_jobs = [
+            task for _key, task in self._a2a_progress_jobs.values()
+        ]
+        for stop_event in self._a2a_progress_stop_events.values():
+            stop_event.set()
+        if progress_jobs:
+            await asyncio.gather(*progress_jobs, return_exceptions=True)
+        self._a2a_progress_jobs.clear()
+        self._a2a_progress_stop_events.clear()
+
+        jobs = [
+            *self._hosted_call_jobs.values(),
+            *(task for tasks in self._a2a_jobs.values() for task in tasks),
+        ]
         for task in jobs:
             task.cancel()
         if jobs:
@@ -2084,15 +2171,65 @@ class InkboxGateway:
         key: str,
         data: Dict[str, Any],
         state: str,
+        *,
+        receipt_delivered: bool = False,
+        progress_started: bool = False,
+        progress_text: Optional[str] = None,
+        progress_delivered: bool = False,
+        preserve_progress_pending: bool = False,
     ) -> None:
         current = self._read_a2a_registry()
-        current[key] = {
+        previous = current.get(key)
+        entry = dict(previous) if isinstance(previous, dict) else {}
+        entry.update({
             "task_id": str(data.get("task_id") or ""),
             "message_id": str(data.get("message_id") or ""),
             "context_id": str(data.get("context_id") or ""),
             "state": state,
+            "data": data,
             "updated_at": time.time(),
-        }
+        })
+        if receipt_delivered:
+            entry["receipt_delivered"] = True
+        progress = entry.get("progress")
+        progress = dict(progress) if isinstance(progress, dict) else {}
+        if progress_started and not progress:
+            prior_progress = []
+            task_id = str(data.get("task_id") or "")
+            for candidate_key, candidate in current.items():
+                if candidate_key == key:
+                    continue
+                if not isinstance(candidate, dict):
+                    continue
+                if str(candidate.get("task_id") or "") != task_id:
+                    continue
+                candidate_progress = candidate.get("progress")
+                if isinstance(candidate_progress, dict):
+                    prior_progress.append((
+                        float(candidate.get("updated_at") or 0),
+                        candidate_progress,
+                    ))
+            if prior_progress:
+                progress = dict(max(prior_progress, key=lambda item: item[0])[1])
+            else:
+                progress["started_at"] = time.time()
+        if progress_text is not None:
+            progress["pending"] = {
+                "text": str(progress_text),
+                "created_at": time.time(),
+            }
+        if progress_delivered:
+            pending = progress.get("pending")
+            if isinstance(pending, dict):
+                progress["last_delivered_text"] = str(pending.get("text") or "")
+            progress["last_delivered_at"] = time.time()
+            progress["delivered_count"] = int(progress.get("delivered_count") or 0) + 1
+            progress.pop("pending", None)
+        if state == "finalized" and not preserve_progress_pending:
+            progress.pop("pending", None)
+        if progress:
+            entry["progress"] = progress
+        current[key] = entry
         self._a2a_registry_path.parent.mkdir(parents=True, exist_ok=True)
         self._write_private_json(self._a2a_registry_path, current)
 
@@ -2109,8 +2246,37 @@ class InkboxGateway:
         )
 
     @staticmethod
-    def _a2a_event_data(task: Any) -> Dict[str, Any]:
-        message = task.messages[-1] if task.messages else None
+    def _latest_a2a_caller_message(task: Any) -> Any:
+        messages = getattr(task, "messages", ()) or ()
+        for message in reversed(messages):
+            role = (
+                message.get("role")
+                if isinstance(message, dict)
+                else getattr(message, "role", None)
+            )
+            role = str(getattr(role, "value", role) or "").strip().lower()
+            if role in {"caller", "role_caller"}:
+                return message
+        return None
+
+    @staticmethod
+    def _a2a_message_id(message: Any) -> str:
+        value = (
+            message.get("message_id") or message.get("messageId")
+            if isinstance(message, dict)
+            else getattr(message, "message_id", None)
+        )
+        return str(value or "")
+
+    @classmethod
+    def _a2a_event_data(cls, task: Any) -> Dict[str, Any]:
+        message = cls._latest_a2a_caller_message(task)
+        message_id = cls._a2a_message_id(message)
+        parts = (
+            message.get("parts", ())
+            if isinstance(message, dict)
+            else getattr(message, "parts", ())
+        )
         return {
             "task_id": str(task.id),
             "context_id": str(task.context_id),
@@ -2121,30 +2287,404 @@ class InkboxGateway:
                 "handle": task.caller.handle,
             },
             "message_id": (
-                str(message.message_id)
-                if message is not None
+                str(message_id)
+                if message_id
                 else f"task:{task.id}"
             ),
-            "parts": message.parts if message is not None else [],
+            "parts": list(parts or ()),
         }
+
+    @staticmethod
+    def _a2a_task_has_text(task: Any, expected: str) -> bool:
+        for message in getattr(task, "messages", ()) or ():
+            role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+            role = getattr(role, "value", role)
+            if str(role or "").strip().lower() not in {"agent", "role_agent"}:
+                continue
+            parts = message.get("parts", ()) if isinstance(message, dict) else getattr(message, "parts", ())
+            for part in parts or ():
+                text = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+                if str(text or "") == expected:
+                    return True
+        return False
+
+    def _a2a_progress_delay(
+        self,
+        registry_key: str,
+        interval: float,
+        *,
+        pending_delay: Optional[float],
+    ) -> float:
+        entry = self._read_a2a_registry().get(registry_key)
+        progress = entry.get("progress") if isinstance(entry, dict) else None
+        progress = progress if isinstance(progress, dict) else {}
+        pending = progress.get("pending")
+        if (
+            pending_delay is not None
+            and isinstance(pending, dict)
+            and str(pending.get("text") or "").strip()
+        ):
+            return pending_delay
+        try:
+            started_at = float(progress.get("started_at"))
+        except (TypeError, ValueError):
+            return interval
+        elapsed = max(0.0, time.time() - started_at)
+        if elapsed < interval:
+            return interval - elapsed
+        remainder = elapsed % interval
+        if remainder <= 1e-9 or interval - remainder <= 1e-9:
+            return 0.0
+        return interval - remainder
+
+    def _a2a_progress_has_pending(self, registry_key: str) -> bool:
+        entry = self._read_a2a_registry().get(registry_key)
+        progress = entry.get("progress") if isinstance(entry, dict) else None
+        pending = progress.get("pending") if isinstance(progress, dict) else None
+        return (
+            isinstance(pending, dict)
+            and bool(str(pending.get("text") or "").strip())
+        )
+
+    async def _acknowledge_a2a_task(
+        self,
+        registry_key: str,
+        data: Dict[str, Any],
+    ) -> str:
+        task_id = str(data.get("task_id") or "")
+        interval = float(getattr(self.cfg, "a2a_progress_interval_seconds", 180.0))
+        receipt = _a2a_receipt_text(task_id, interval)
+        entry = self._read_a2a_registry().get(registry_key)
+        if isinstance(entry, dict) and entry.get("receipt_delivered") is True:
+            return
+        authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
+        if self._a2a_closing:
+            return A2A_ADMISSION_CLOSING
+        state = _a2a_state(authoritative.state)
+        if state in A2A_SETTLED_STATES:
+            return state
+        if not self._a2a_task_has_text(authoritative, receipt):
+            await _to_thread_to_completion(
+                self._identity.a2a_reply,
+                task_id,
+                intent="progress",
+                text=receipt,
+            )
+        self._write_a2a_registry(
+            registry_key,
+            data,
+            str((self._read_a2a_registry().get(registry_key) or {}).get("state") or "queued"),
+            receipt_delivered=True,
+        )
+        return ""
+
+    def _observe_a2a_identifier(
+        self,
+        task_id: str,
+        item_type: str,
+        tool_name: str,
+    ) -> None:
+        identifier = safe_item_identifier(item_type, tool_name)
+        if not identifier:
+            return
+        items = self._a2a_identifiers.setdefault(task_id, [])
+        if not items or items[-1] != identifier:
+            items.append(identifier)
+            del items[:-A2A_PROGRESS_MAX_IDENTIFIERS]
+
+    async def _stop_a2a_progress(
+        self,
+        task_id: str,
+        registry_key: str,
+    ) -> None:
+        owned = self._a2a_progress_jobs.get(task_id)
+        if owned is None or owned[0] != registry_key:
+            return
+        task = owned[1]
+        stop_event = self._a2a_progress_stop_events.get(task_id)
+        if stop_event is not None:
+            stop_event.set()
+        if task is not asyncio.current_task():
+            await asyncio.gather(task, return_exceptions=True)
+        if self._a2a_progress_jobs.get(task_id) == owned:
+            self._a2a_progress_jobs.pop(task_id, None)
+        if self._a2a_progress_stop_events.get(task_id) is stop_event:
+            self._a2a_progress_stop_events.pop(task_id, None)
+        self._a2a_identifiers.pop(task_id, None)
+
+    async def _acquire_a2a_progress_gate(self, task_id: str) -> Any:
+        while True:
+            gate = try_acquire_a2a_progress_gate(task_id)
+            if gate is not None:
+                return gate
+            await asyncio.sleep(0.05)
+
+    async def _start_a2a_progress(
+        self,
+        task_id: str,
+        registry_key: str,
+        data: Dict[str, Any],
+    ) -> None:
+        previous = self._a2a_progress_jobs.get(task_id)
+        if previous is not None:
+            await self._stop_a2a_progress(task_id, previous[0])
+        interval = float(getattr(self.cfg, "a2a_progress_interval_seconds", 180.0))
+        if interval <= 0:
+            return
+        self._a2a_identifiers[task_id] = []
+        self._write_a2a_registry(
+            registry_key,
+            data,
+            "running",
+            progress_started=True,
+        )
+        fence_owner = a2a_progress_fence_owner(task_id)
+        message_id = str(data.get("message_id") or "")
+        if fence_owner and message_id and fence_owner != message_id:
+            gate = await self._acquire_a2a_progress_gate(task_id)
+            try:
+                if a2a_progress_fence_owner(task_id) == fence_owner:
+                    clear_a2a_progress_fence(task_id)
+            finally:
+                release_a2a_progress_gate(gate)
+        stop_event = asyncio.Event()
+        self._a2a_progress_stop_events[task_id] = stop_event
+        job = asyncio.create_task(
+            self._run_a2a_progress(
+                task_id,
+                registry_key,
+                data,
+                stop_event=stop_event,
+            ),
+            name=f"inkbox-a2a-progress-{task_id}",
+        )
+        self._a2a_progress_jobs[task_id] = (registry_key, job)
+
+    async def _run_a2a_progress(
+        self,
+        task_id: str,
+        registry_key: str,
+        data: Dict[str, Any],
+        *,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> None:
+        interval = float(getattr(self.cfg, "a2a_progress_interval_seconds", 180.0))
+        stop_event = stop_event or asyncio.Event()
+        pending_delay: Optional[float] = 0.0
+        try:
+            while not stop_event.is_set():
+                delay = self._a2a_progress_delay(
+                    registry_key,
+                    interval,
+                    pending_delay=pending_delay,
+                )
+                if delay > 0:
+                    sleeper = asyncio.create_task(asyncio.sleep(delay))
+                    stopper = asyncio.create_task(stop_event.wait())
+                    try:
+                        done, _pending = await asyncio.wait(
+                            {sleeper, stopper},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if stopper in done:
+                            return
+                    finally:
+                        for waiter in (sleeper, stopper):
+                            if not waiter.done():
+                                waiter.cancel()
+                        await asyncio.gather(
+                            sleeper,
+                            stopper,
+                            return_exceptions=True,
+                        )
+                if stop_event.is_set():
+                    return
+                try:
+                    if not await self._emit_a2a_progress(task_id, registry_key, data):
+                        return
+                except Exception:
+                    logger.warning(
+                        "[bridge] Could not prepare A2A progress for task %s; continuing",
+                        task_id,
+                    )
+                    pending_delay = (
+                        min(5.0, interval)
+                        if self._a2a_progress_has_pending(registry_key)
+                        else None
+                    )
+                    continue
+                pending_delay = (
+                    min(5.0, interval)
+                    if self._a2a_progress_has_pending(registry_key)
+                    else None
+                )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            owned = self._a2a_progress_jobs.get(task_id)
+            if owned is not None and owned[1] is asyncio.current_task():
+                self._a2a_progress_jobs.pop(task_id, None)
+            if self._a2a_progress_stop_events.get(task_id) is stop_event:
+                self._a2a_progress_stop_events.pop(task_id, None)
+
+    async def _emit_a2a_progress(
+        self,
+        task_id: str,
+        registry_key: str,
+        data: Dict[str, Any],
+    ) -> bool:
+        gate = await self._acquire_a2a_progress_gate(task_id)
+        try:
+            if a2a_progress_is_fenced(task_id):
+                return False
+            return await self._emit_a2a_progress_unfenced(
+                task_id,
+                registry_key,
+                data,
+            )
+        finally:
+            release_a2a_progress_gate(gate)
+
+    async def _emit_a2a_progress_unfenced(
+        self,
+        task_id: str,
+        registry_key: str,
+        data: Dict[str, Any],
+    ) -> bool:
+        entry = self._read_a2a_registry().get(registry_key)
+        if not isinstance(entry, dict) or entry.get("state") == "finalized":
+            return False
+        authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
+        if _a2a_state(authoritative.state) in A2A_SETTLED_STATES:
+            return False
+        progress = entry.get("progress")
+        progress = progress if isinstance(progress, dict) else {}
+        pending = progress.get("pending")
+        pending = pending if isinstance(pending, dict) else {}
+        text = str(pending.get("text") or "").strip()
+        if not text:
+            parts = data.get("parts") if isinstance(data.get("parts"), list) else []
+            task_text = "\n".join(
+                str(part.get("text"))
+                for part in parts
+                if isinstance(part, dict) and part.get("text")
+            )
+            summary = await build_progress_update(
+                self.cfg,
+                task_text=task_text,
+                identifiers=list(self._a2a_identifiers.get(task_id, ())),
+                previous_update=str(progress.get("last_delivered_text") or ""),
+            )
+            started_at = float(progress.get("started_at") or time.time())
+            text = f"{summary} ({max(1, int(time.time() - started_at))}s elapsed)"
+            self._write_a2a_registry(
+                registry_key,
+                data,
+                "running",
+                progress_text=text,
+            )
+        authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
+        if _a2a_state(authoritative.state) in A2A_SETTLED_STATES:
+            return False
+        if not self._a2a_task_has_text(authoritative, text):
+            await _to_thread_to_completion(
+                self._identity.a2a_reply,
+                task_id,
+                intent="progress",
+                text=text,
+            )
+        self._write_a2a_registry(
+            registry_key,
+            data,
+            "running",
+            progress_delivered=True,
+        )
+        return True
 
     async def _on_a2a_event(
         self,
         envelope: Dict[str, Any],
     ) -> "web.Response":
+        current = asyncio.current_task()
+        if current is not None:
+            self._a2a_admission_tasks.add(current)
+        try:
+            async with self._a2a_ingest_lock:
+                return await self._on_a2a_event_tracked(envelope)
+        finally:
+            if current is not None:
+                self._a2a_admission_tasks.discard(current)
+
+    async def _on_a2a_event_tracked(
+        self,
+        envelope: Dict[str, Any],
+    ) -> "web.Response":
         event_type = str(envelope.get("event_type") or "")
         data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
+        if self._a2a_closing:
+            return web.json_response(
+                {"ok": False, "retry": "gateway-stopping"},
+                status=503,
+            )
         task_id = str(data.get("task_id") or "")
         context_id = str(data.get("context_id") or "")
         message_id = str(data.get("message_id") or envelope.get("id") or "")
         if not task_id or not context_id:
             return web.json_response({"ok": True, "ignored": "invalid-a2a-event"})
         if event_type == "a2a.task.canceled":
-            for job in list(self._a2a_jobs.get(task_id, set())):
-                job.cancel()
-            self._a2a_jobs.pop(task_id, None)
+            canceled_message_ids = {
+                str(data.get("message_id") or "")
+            } - {""}
+            if not canceled_message_ids:
+                for entry in self._read_a2a_registry().values():
+                    if not isinstance(entry, dict):
+                        continue
+                    if str(entry.get("task_id") or "") != task_id:
+                        continue
+                    if str(entry.get("context_id") or "") != context_id:
+                        continue
+                    known_message_id = str(entry.get("message_id") or "")
+                    if known_message_id:
+                        canceled_message_ids.add(known_message_id)
+                try:
+                    authoritative = await asyncio.to_thread(
+                        self._identity.a2a_task,
+                        task_id,
+                    )
+                    caller_message_id = self._a2a_message_id(
+                        self._latest_a2a_caller_message(authoritative)
+                    )
+                    if caller_message_id:
+                        canceled_message_ids.add(caller_message_id)
+                except Exception:
+                    logger.warning(
+                        "[bridge] Could not resolve the canceled A2A message for task %s",
+                        task_id,
+                    )
+            self._a2a_canceled_messages[task_id] = (
+                context_id,
+                canceled_message_ids,
+            )
+            progress = self._a2a_progress_jobs.get(task_id)
+            while True:
+                worker_jobs = set(self._a2a_jobs.get(task_id, set()))
+                if not worker_jobs:
+                    self._a2a_jobs.pop(task_id, None)
+                    break
+                for job in worker_jobs:
+                    job.cancel()
+                await asyncio.gather(*worker_jobs, return_exceptions=True)
+                current_jobs = self._a2a_jobs.get(task_id)
+                if current_jobs is not None:
+                    current_jobs.difference_update(worker_jobs)
+            if progress is not None:
+                await self._stop_a2a_progress(task_id, progress[0])
             return web.json_response({"ok": True})
         if event_type == "a2a.sent_task.updated":
+            state = _a2a_state(data.get("state"))
+            if state in {"submitted", "working"}:
+                logger.info("[bridge] outbound A2A task updated: %s", task_id)
+                return web.json_response({"ok": True})
             delegation = find_a2a_delegation(task_id)
             session_key = str((delegation or {}).get("session_key") or "")
             if self.sessions is not None and session_key:
@@ -2179,12 +2719,113 @@ class InkboxGateway:
                 )
             return web.json_response({"ok": True})
 
+        if event_type not in {"a2a.task.created", "a2a.task.message"}:
+            return web.json_response({"ok": True, "ignored": "unsupported-a2a-event"})
+
+        authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
+        latest_caller = self._latest_a2a_caller_message(authoritative)
+        authoritative_message_id = self._a2a_message_id(latest_caller)
+        if (
+            str(getattr(authoritative, "id", "") or "") != task_id
+            or str(getattr(authoritative, "context_id", "") or "") != context_id
+            or authoritative_message_id != message_id
+        ):
+            return web.json_response({"ok": True, "deduped": True})
+        authoritative_state = _a2a_state(authoritative.state)
+        if authoritative_state in A2A_SETTLED_STATES:
+            return web.json_response({"ok": True, "stopped": authoritative_state})
+        if authoritative_state not in {"submitted", "working"}:
+            return web.json_response({"ok": True, "deduped": True})
+        authoritative_parts = (
+            latest_caller.get("parts", ())
+            if isinstance(latest_caller, dict)
+            else getattr(latest_caller, "parts", ())
+        )
+        data = dict(data)
+        data["message_id"] = authoritative_message_id
+        data["parts"] = list(authoritative_parts or ())
+        authoritative_caller = self._field(authoritative, "caller")
+        data["caller"] = {
+            "identity_id": str(
+                self._field(authoritative_caller, "identity_id", "identityId") or ""
+            ),
+            "organization_id": str(
+                self._field(
+                    authoritative_caller,
+                    "organization_id",
+                    "organizationId",
+                )
+                or ""
+            ),
+            "handle": str(self._field(authoritative_caller, "handle") or ""),
+        }
+
+        canceled_generation = self._a2a_canceled_messages.get(task_id)
+        if canceled_generation is not None:
+            canceled_context_id, canceled_message_ids = canceled_generation
+            if (
+                event_type != "a2a.task.message"
+                or context_id != canceled_context_id
+                or message_id in canceled_message_ids
+            ):
+                return web.json_response({"ok": True, "deduped": True})
+            self._a2a_canceled_messages.pop(task_id, None)
+
+        if a2a_progress_fence_owner(task_id) == message_id:
+            logger.info(
+                "[bridge] Ignored replay of outcome-fenced A2A message %s",
+                message_id,
+            )
+            return web.json_response({"ok": True, "deduped": True})
+
         key = f"{task_id}:{message_id}"
-        if key in self._read_a2a_registry():
+        existing = self._read_a2a_registry().get(key)
+        if isinstance(existing, dict):
+            if existing.get("receipt_delivered") is not True:
+                try:
+                    settled_state = await self._acknowledge_a2a_task(key, data)
+                except Exception:
+                    logger.warning(
+                        "[bridge] Could not retry A2A acknowledgement for task %s",
+                        task_id,
+                    )
+                    return web.json_response(
+                        {"ok": False, "retry": "acknowledgement"},
+                        status=503,
+                    )
+                if settled_state:
+                    if settled_state == A2A_ADMISSION_CLOSING:
+                        return web.json_response(
+                            {"ok": False, "retry": "gateway-stopping"},
+                            status=503,
+                        )
+                    self._write_a2a_registry(key, data, "finalized")
+                    return web.json_response({"ok": True, "stopped": settled_state})
             return web.json_response({"ok": True, "deduped": True})
         self._write_a2a_registry(key, data, "queued")
+        acknowledged = True
+        settled_state = ""
+        try:
+            settled_state = await self._acknowledge_a2a_task(key, data)
+        except Exception:
+            acknowledged = False
+            logger.warning(
+                "[bridge] Could not acknowledge A2A task %s; worker will retry",
+                task_id,
+            )
+        if settled_state:
+            if settled_state == A2A_ADMISSION_CLOSING:
+                return web.json_response(
+                    {"ok": False, "retry": "gateway-stopping"},
+                    status=503,
+                )
+            self._write_a2a_registry(key, data, "finalized")
+            return web.json_response({"ok": True, "stopped": settled_state})
         self._track_a2a_job(task_id, key, data)
-        return web.json_response({"ok": True})
+        return web.json_response(
+            {"ok": acknowledged},
+            status=200 if acknowledged else 503,
+        )
 
     async def _run_a2a_turn(
         self,
@@ -2211,44 +2852,83 @@ class InkboxGateway:
             "reply_intent_committed": False,
         }
         self._write_a2a_registry(registry_key, data, "running")
+        await self._start_a2a_progress(task_id, registry_key, data)
         try:
             if self.sessions is None:
                 return
+            try:
+                settled_state = await self._acknowledge_a2a_task(
+                    registry_key,
+                    data,
+                )
+            except Exception:
+                logger.warning(
+                    "[bridge] Could not retry A2A acknowledgement for task %s",
+                    task_id,
+                )
+            else:
+                if settled_state:
+                    if settled_state == A2A_ADMISSION_CLOSING:
+                        return
+                    self._write_a2a_registry(registry_key, data, "finalized")
+                    return
             reply = await self.sessions.get(
                 f"a2a:{self._identity.id}:{context_id}"
             ).run_consult(
                 f"{marker}\n{text}".rstrip(),
                 a2a_context=context,
+                activity_handler=lambda item_type, tool_name: self._observe_a2a_identifier(
+                    task_id,
+                    item_type,
+                    tool_name,
+                ),
             )
             if (
                 not context["reply_intent_committed"]
                 and reply.strip()
                 and reply.strip().upper() != "[SILENT]"
             ):
-                authoritative = await asyncio.to_thread(
-                    self._identity.a2a_task, task_id
-                )
-                state = str(
-                    getattr(authoritative.state, "value", authoritative.state)
-                )
-                if state not in A2A_TERMINAL_STATES:
-                    await asyncio.to_thread(
-                        self._identity.a2a_reply,
+                gate = await self._acquire_a2a_progress_gate(task_id)
+                try:
+                    fence_a2a_progress(
                         task_id,
-                        intent="complete",
-                        text=reply,
+                        str(data.get("message_id") or ""),
                     )
-            self._write_a2a_registry(registry_key, data, "finalized")
+                    authoritative = await asyncio.to_thread(
+                        self._identity.a2a_task, task_id
+                    )
+                    state = _a2a_state(authoritative.state)
+                    if state not in A2A_SETTLED_STATES:
+                        await _to_thread_to_completion(
+                            self._identity.a2a_reply,
+                            task_id,
+                            intent="complete",
+                            text=reply,
+                        )
+                        context["reply_intent_committed"] = True
+                        context["reply_intent"] = "complete"
+                finally:
+                    release_a2a_progress_gate(gate)
+            self._write_a2a_registry(
+                registry_key,
+                data,
+                "finalized",
+                preserve_progress_pending=(
+                    context.get("reply_intent") == "ask_caller"
+                ),
+            )
         except asyncio.CancelledError:
             authoritative = await asyncio.to_thread(
                 self._identity.a2a_task, task_id
             )
             state = str(getattr(authoritative.state, "value", authoritative.state))
-            if state in A2A_TERMINAL_STATES:
+            if state in A2A_SETTLED_STATES:
                 self._write_a2a_registry(registry_key, data, "finalized")
             raise
         except Exception:
             logger.exception("[bridge] A2A turn failed: %s", task_id)
+        finally:
+            await self._stop_a2a_progress(task_id, registry_key)
 
     async def _catch_up_a2a_tasks(self) -> None:
         try:
@@ -2259,19 +2939,66 @@ class InkboxGateway:
                 if not task_id or self._a2a_jobs.get(task_id):
                     continue
                 full = await asyncio.to_thread(self._identity.a2a_task, task_id)
-                state = str(getattr(full.state, "value", full.state))
+                state = _a2a_state(full.state)
+                saved_data = entry.get("data")
+                saved_data = (
+                    dict(saved_data)
+                    if isinstance(saved_data, dict)
+                    else {}
+                )
+                if state in A2A_SETTLED_STATES:
+                    self._write_a2a_registry(key, saved_data, "finalized")
+                    continue
+                caller_message = self._latest_a2a_caller_message(full)
+                caller_message_id = self._a2a_message_id(caller_message)
+                if (
+                    state not in {"submitted", "working"}
+                    or str(getattr(full, "id", "") or "") != task_id
+                    or str(getattr(full, "context_id", "") or "")
+                    != str(entry.get("context_id") or "")
+                    or f"{task_id}:{caller_message_id}" != key
+                ):
+                    self._write_a2a_registry(key, saved_data, "finalized")
+                    continue
                 data = self._a2a_event_data(full)
-                if state in A2A_TERMINAL_STATES:
-                    self._write_a2a_registry(key, data, "finalized")
-                else:
-                    self._track_a2a_job(task_id, key, data)
+                if (
+                    a2a_progress_fence_owner(task_id)
+                    == str(data.get("message_id") or "")
+                ):
+                    continue
+                self._write_a2a_registry(
+                    key,
+                    data,
+                    str(entry.get("state") or "queued"),
+                )
+                self._track_a2a_job(task_id, key, data)
 
-            tasks = await asyncio.to_thread(
-                lambda: list(self._identity.iter_a2a_tasks(state="submitted"))
-            )
+            tasks = []
+            discovered_task_ids = set()
+            for task_state in ("submitted", "working"):
+                discovered = await asyncio.to_thread(
+                    lambda state=task_state: list(
+                        self._identity.iter_a2a_tasks(state=state)
+                    )
+                )
+                for task in discovered:
+                    task_id = str(getattr(task, "id", "") or "")
+                    if not task_id or task_id in discovered_task_ids:
+                        continue
+                    discovered_task_ids.add(task_id)
+                    tasks.append(task)
             for task in tasks:
                 full = await asyncio.to_thread(self._identity.a2a_task, task.id)
+                message = self._latest_a2a_caller_message(full)
+                if message is None:
+                    logger.warning(
+                        "[bridge] Cannot catch up A2A task %s without caller input",
+                        task.id,
+                    )
+                    continue
                 data = self._a2a_event_data(full)
+                if f"{task.id}:{data['message_id']}" in self._read_a2a_registry():
+                    continue
                 await self._on_a2a_event(
                     {
                         "id": f"catchup:{task.id}:{data['message_id']}",

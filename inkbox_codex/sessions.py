@@ -84,6 +84,7 @@ class _Turn:
     a2a_context: Optional[Dict[str, Any]] = None
     capture_tools: bool = False
     hosted_sms_context: Optional[Dict[str, Any]] = None
+    activity_handler: Optional[Callable[[str, str], None]] = None
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Codex as a turn.
@@ -675,11 +676,24 @@ class ContactSession:
             self._turn_active = True
             typing_task = asyncio.create_task(self._typing_loop())
             timeout = max(0.0, float(self.cfg.codex_turn_timeout_s or 0.0))
-            operation = (
-                client.run_detailed(turn.text)
-                if turn.capture_tools
-                else client.run(turn.text)
-            )
+            if turn.capture_tools:
+                operation = (
+                    client.run_detailed(
+                        turn.text,
+                        activity_handler=turn.activity_handler,
+                    )
+                    if turn.activity_handler is not None
+                    else client.run_detailed(turn.text)
+                )
+            else:
+                operation = (
+                    client.run(
+                        turn.text,
+                        activity_handler=turn.activity_handler,
+                    )
+                    if turn.activity_handler is not None
+                    else client.run(turn.text)
+                )
             if timeout:
                 try:
                     turn_result = await asyncio.wait_for(operation, timeout=timeout)
@@ -721,6 +735,9 @@ class ContactSession:
                     persisted = json.loads(a2a_context_path.read_text())
                     turn.a2a_context["reply_intent_committed"] = bool(
                         persisted.get("reply_intent_committed")
+                    )
+                    turn.a2a_context["reply_intent"] = str(
+                        persisted.get("reply_intent") or ""
                     )
                 except (FileNotFoundError, json.JSONDecodeError):
                     pass
@@ -800,6 +817,7 @@ class ContactSession:
         query: str,
         *,
         a2a_context: Optional[Dict[str, Any]] = None,
+        activity_handler: Optional[Callable[[str, str], None]] = None,
     ) -> str:
         """Run one Codex turn and RETURN its text (don't send it).
 
@@ -821,7 +839,12 @@ class ContactSession:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str] = loop.create_future()
         await self._queue.put(
-            _Turn(text=query, future=future, a2a_context=a2a_context)
+            _Turn(
+                text=query,
+                future=future,
+                a2a_context=a2a_context,
+                activity_handler=activity_handler,
+            )
         )
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())

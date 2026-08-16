@@ -191,7 +191,14 @@ def test_bridge_client_full_mock_turn(tmp_path, monkeypatch):
     import mock_openai  # noqa: E402
 
     port = _free_port()
-    server = ThreadingHTTPServer(("127.0.0.1", port), mock_openai.Handler)
+    model_requests = []
+
+    class RecordingHandler(mock_openai.Handler):
+        def _respond_responses(self, request):
+            model_requests.append(request)
+            super()._respond_responses(request)
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), RecordingHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
     home = tmp_path / "codex-home"
@@ -218,7 +225,7 @@ def test_bridge_client_full_mock_turn(tmp_path, monkeypatch):
     )
     client = CodexAppServerClient(cfg, developer_instructions="contract-test")
 
-    async def _run() -> tuple[str, str, str]:
+    async def _run() -> tuple[str, str, str, str]:
         try:
             thread_id = await client.connect()
             assert thread_id
@@ -232,12 +239,31 @@ def test_bridge_client_full_mock_turn(tmp_path, monkeypatch):
             resumed_id = await client2.connect(resume_thread_id=thread_id)
         finally:
             await client2.disconnect()
-        return reply, thread_id, resumed_id
+        tool_free = CodexAppServerClient(
+            cfg,
+            developer_instructions="contract-test",
+            tools_enabled=False,
+        )
+        try:
+            tool_free_reply = await asyncio.wait_for(
+                tool_free.run("tool-free smoke"),
+                timeout=60,
+            )
+        finally:
+            await tool_free.disconnect()
+        return reply, thread_id, resumed_id, tool_free_reply
 
     try:
-        reply, thread_id, resumed_id = asyncio.run(_run())
+        reply, thread_id, resumed_id, tool_free_reply = asyncio.run(_run())
     finally:
         server.shutdown()
     assert "REPLY_OK" in reply, f"mock reply did not round-trip: {reply!r}"
     assert "smoke-c0ffee42" in reply, f"nonce lost in the turn pipeline: {reply!r}"
     assert resumed_id == thread_id, f"thread/resume reopened {resumed_id!r}, wanted {thread_id!r}"
+    assert "REPLY_OK" in tool_free_reply
+    assert len(model_requests) == 2
+    assert model_requests[0]["tools"], "normal main turn unexpectedly lost its tools"
+    assert model_requests[1]["tools"] == [], (
+        "tool-disabled auxiliary turn exposed model tools: "
+        f"{model_requests[1]['tools']!r}"
+    )

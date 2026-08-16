@@ -281,6 +281,7 @@ curl --fail-with-body --request POST 'https://your-agent-host.example/webhook' \
 | `INKBOX_BRIDGE_PORT` | no | `8767` | Local webhook server port. |
 | `INKBOX_PERMISSION_TIMEOUT_S` | no | `600` | Seconds to wait for a permission/poll reply. |
 | `INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS` | no | `false` | Auto-accept Codex MCP prompts for Inkbox tools only. The setup wizard writes `true` when you trust the agent to send through Inkbox without per-call approval. |
+| `INKBOX_A2A_PROGRESS_INTERVAL_SECONDS` | no | `180` | Seconds between progress updates for active inbound A2A tasks. Set to `0` to disable periodic updates. |
 | `INKBOX_VOICE_STACK` | no | `inkbox_tts_stt` | `inkbox_voice_ai`, `openai_realtime`, or `inkbox_tts_stt`. When absent, legacy Realtime settings remain compatible. |
 | `INKBOX_VOICE_AI_AUTHORITY_MODE` | Voice AI | `contact_scoped` | Saved Voice AI authority selected during setup: `contact_scoped` or `yolo`. |
 | `INKBOX_VOICEMAIL_DETECTION` | no | `enabled` | Outbound-call voicemail policy: `enabled` or `disabled`. Live CI uses `disabled`. |
@@ -313,6 +314,10 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_a2a_call` · `inkbox_a2a_check` · `inkbox_a2a_reply` — delegate work to another agent and follow its task.
 - `inkbox_list_a2a_tasks` · `inkbox_list_a2a_messages` — page and search this identity's inbound and outbound A2A history, with participant, task, context, role, state, and timestamp filters.
 - `inkbox_a2a_complete` · `inkbox_a2a_ask_caller` · `inkbox_a2a_fail` — commit the outcome of a verified inbound A2A task. These tools are rejected outside that task's isolated session.
+
+Inbound A2A tasks acknowledge pickup immediately. While a task remains active,
+the worker sends a short progress update about every three minutes by default;
+these updates are visible in task history without starting a requester turn.
 
 The bridge requires Inkbox SDK 0.5.9 or newer.
 

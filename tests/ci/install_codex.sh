@@ -4,8 +4,7 @@ set -euo pipefail
 attempts="${CODEX_INSTALL_ATTEMPTS:-4}"
 
 for attempt in $(seq 1 "$attempts"); do
-  if npm install -g @openai/codex@alpha; then
-    codex --version
+  if npm install -g @openai/codex@alpha && codex --version; then
     exit 0
   fi
   if [ "$attempt" -eq "$attempts" ]; then
