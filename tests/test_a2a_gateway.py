@@ -937,6 +937,45 @@ def test_a2a_cancel_stops_progress_child(tmp_path):
     assert gateway._a2a_identifiers == {}
 
 
+def test_a2a_cancel_drains_worker_without_erasing_new_job(tmp_path):
+    gateway = _gateway(tmp_path)
+    event = _event()
+    event["event_type"] = "a2a.task.canceled"
+    canceled = asyncio.Event()
+    release = asyncio.Event()
+    effects = []
+
+    async def cancellation_insensitive_worker():
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            canceled.set()
+            await release.wait()
+        effects.append("old-worker-finished")
+
+    async def scenario():
+        old_job = asyncio.create_task(cancellation_insensitive_worker())
+        gateway._a2a_jobs["task-1"] = {old_job}
+        cancellation = asyncio.create_task(gateway._on_a2a_event(event))
+        await canceled.wait()
+        assert not cancellation.done()
+        new_job = asyncio.create_task(asyncio.sleep(60))
+        gateway._a2a_jobs["task-1"].add(new_job)
+        release.set()
+        await cancellation
+        effects_at_return = list(effects)
+        await asyncio.sleep(0.05)
+        assert gateway._a2a_jobs["task-1"] == {new_job}
+        new_job.cancel()
+        await asyncio.gather(new_job, return_exceptions=True)
+        return effects_at_return
+
+    effects_at_return = asyncio.run(scenario())
+
+    assert effects_at_return == ["old-worker-finished"]
+    assert effects == effects_at_return
+
+
 def test_a2a_cleanup_waits_for_inflight_reply_thread(tmp_path):
     gateway = _gateway(tmp_path)
     gateway.cfg.a2a_progress_interval_seconds = 60

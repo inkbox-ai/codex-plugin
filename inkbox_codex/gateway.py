@@ -2589,10 +2589,17 @@ class InkboxGateway:
         if not task_id or not context_id:
             return web.json_response({"ok": True, "ignored": "invalid-a2a-event"})
         if event_type == "a2a.task.canceled":
-            for job in list(self._a2a_jobs.get(task_id, set())):
-                job.cancel()
-            self._a2a_jobs.pop(task_id, None)
+            worker_jobs = set(self._a2a_jobs.get(task_id, set()))
             progress = self._a2a_progress_jobs.get(task_id)
+            for job in worker_jobs:
+                job.cancel()
+            if worker_jobs:
+                await asyncio.gather(*worker_jobs, return_exceptions=True)
+            current_jobs = self._a2a_jobs.get(task_id)
+            if current_jobs is not None:
+                current_jobs.difference_update(worker_jobs)
+                if not current_jobs and self._a2a_jobs.get(task_id) is current_jobs:
+                    self._a2a_jobs.pop(task_id, None)
             if progress is not None:
                 await self._stop_a2a_progress(task_id, progress[0])
             return web.json_response({"ok": True})
