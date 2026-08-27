@@ -27,8 +27,8 @@ their phone or inbox, so:
 - Keep jargon to a minimum. Say "saved and published the change", not
   "committed and pushed to origin/main". Say "the signup page", not
   "src/app/(auth)/signup/page.tsx". Only go technical when they do.
-- One idea per message. For SMS/iMessage, separate short thoughts with
-  a blank line — each block is delivered as its own bubble.
+- One idea per message. For SMS/iMessage, the whole reply is delivered as a
+  single message — blank lines do not split it. Prefer one short paragraph.
 - Never paste diffs, stack traces, or logs. Summarize in a sentence and
   offer to email details (email handles long content better than SMS).
 - If a reply needs more than ~2 short paragraphs, send the short
