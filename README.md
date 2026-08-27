@@ -40,24 +40,61 @@ Flags: `--start` (launch the background gateway when done), `--no-setup` (instal
 
 ### Bootstrap an existing identity without prompts
 
-For unattended agent setup, install without opening the wizard and pass the API key through the environment (or standard input), never a command-line argument:
+An agent can finish setup non-interactively after a human assigns it an existing
+identity, API key, and server URL. First, download the official installer once,
+inspect the exact file that will run, and execute that same file with the setup
+wizard disabled:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/inkbox-ai/codex-plugin/main/install.sh | bash -s -- --no-setup
-export INKBOX_API_KEY="ApiKey_..."
-inkbox-codex bootstrap --identity my-agent --project-dir "$PWD" \
-  --voice-ai --rotate-signing-key --start-gateway
-unset INKBOX_API_KEY
+(
+  set -eu
+  installer_path="$(mktemp)"
+  trap 'rm -f "$installer_path"' EXIT
+  curl -fsSL https://raw.githubusercontent.com/inkbox-ai/codex-plugin/main/install.sh \
+    -o "$installer_path"
+  cat "$installer_path"
+  bash "$installer_path" --no-setup
+)
 ```
 
-`bootstrap` validates that the key can access exactly the requested identity, scopes down an admin key before saving it, preserves existing Voice AI settings, enables native Inkbox tool approvals, and starts or restarts the detached gateway. Signing-key replacement is opt-in because it transfers verified webhook delivery away from any gateway using the previous key. The command prints a secret-redacted JSON result and is safe to resume.
+Stop if the downloaded script contains anything unexpected. The subshell removes
+the temporary installer whether downloading or installation succeeds or fails.
 
-Check it any time:
+Keep the assigned API key in a private local environment variable. Never put it
+in source control, a project instruction file, a command-line argument, or setup
+notes. Then run the complete bootstrap command from the project Codex should use:
 
 ```bash
-inkbox-codex doctor    # config, codex CLI/auth, identity reachability
-inkbox-codex status    # is the background gateway up? where are the logs?
+inkbox-codex bootstrap --identity '<handle>' --base-url '<url>' \
+  --project-dir "$PWD" --voice-ai --rotate-signing-key --start-gateway
 ```
+
+`INKBOX_API_KEY` must be present in the command environment; unset any transient
+copy after each attempt. `bootstrap` validates that the credential can access
+exactly `'<handle>'`, scopes down an admin key before saving it, and configures
+that assigned identity rather than creating another one. The saved scoped key is
+kept in the plugin's user-only configuration file. Bootstrap preserves existing
+Voice AI settings, enables native Inkbox tool approvals, and starts or restarts
+the detached gateway. Signing-key replacement is explicit because it transfers
+verified webhook delivery away from any gateway using the previous key.
+
+The command does not prompt and prints a secret-redacted JSON result, so it is
+safe to resume. On `"status": "requires_human"`, show the human every entry in
+`"human_actions"`, wait for them to complete the requested action, and rerun the
+same command with the same assigned handle. On `"status": "error"`, inspect the
+reported error and `~/.inkbox-codex/gateway.log` when directed, correct the cause,
+and retry that same command. Do not switch identities or run the interactive
+wizard while resuming.
+
+After the JSON reports `"status": "configured"`, verify the complete setup:
+
+```bash
+inkbox-codex doctor
+```
+
+Resolve every failed check and rerun `inkbox-codex doctor` until it exits
+successfully. `inkbox-codex status` can additionally report whether the
+background gateway is running and where its logs are stored.
 
 ## What it does
 
