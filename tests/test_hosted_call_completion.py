@@ -873,3 +873,31 @@ def test_local_call_completion_is_ignored(tmp_path, monkeypatch):
         assert session.prompts == []
 
     asyncio.run(scenario())
+
+
+def test_exact_sms_body_survives_post_call_prompt_without_accepted_send_replay(tmp_path, monkeypatch):
+    async def scenario():
+        session = _Session()
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        body = "Blue  lantern, meadow!"
+        gateway._inkbox = types.SimpleNamespace(get_identity=lambda _handle: types.SimpleNamespace(
+            list_transcripts=lambda _call_id: [types.SimpleNamespace(
+                party="remote", text=f'After we hang up, send one SMS with this exact body: "{body}".',
+            )],
+        ))
+        payload = _payload()
+        payload["data"]["post_call_action_items"][0]["details"] = f'Exact SMS body: "{body}"'
+        await gateway._on_hosted_call_ended(payload)
+        await _drain(gateway)
+        assert len(session.prompts) == 1
+        prompt = session.prompts[0]
+        assert f'Exact SMS body: "{body}"' in prompt
+        assert "copy it verbatim" in prompt
+        assert "Do not replace it with a summary or an acknowledgment" in prompt
+        assert "After a send is accepted, do not send another message" in prompt
+        # A confirmed send is never replayed to repair model wording.
+        await gateway._on_hosted_call_ended(payload)
+        await _drain(gateway)
+        assert len(session.prompts) == 1
+
+    asyncio.run(scenario())
