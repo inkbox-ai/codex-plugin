@@ -39,7 +39,9 @@ def test_every_host_workflow_uses_bounded_codex_installer():
     installer = ROOT.joinpath("tests", "ci", "install_codex.sh").read_text()
     assert "CODEX_INSTALL_ATTEMPTS:-4" in installer
     assert "attempt * 15" in installer
-    assert "npm install -g @openai/codex@alpha && codex --version" in installer
+    assert 'npm view @openai/codex@alpha version' in installer
+    assert '"@openai/codex-$platform@npm:@openai/codex@$version-$platform"' in installer
+    assert "codex --version" in installer
 
 
 def test_live_runs_never_cancel_an_existing_shared_cycle():
@@ -73,3 +75,39 @@ def test_failure_summary_reports_only_counts_and_state(tmp_path):
     assert result["tunnel_ready"] is True
     assert result["error_lines"] == 1
     assert sensitive not in repr(result)
+
+
+def test_codex_install_retries_required_native_artifact(tmp_path):
+    import os
+    import subprocess
+
+    commands = {
+        "node": "#!/bin/sh\nprintf linux-x64\n",
+        "sleep": "#!/bin/sh\nexit 0\n",
+        "codex": "#!/bin/sh\necho codex-test\n",
+        "npm": """#!/bin/sh
+printf '%s\\n' "$*" >> "$INSTALL_LOG"
+if [ "$1" = view ]; then
+  echo 0.1.0-alpha.1
+elif [ ! -f "$INSTALL_STATE" ]; then
+  touch "$INSTALL_STATE"
+  exit 1
+fi
+""",
+    }
+    for name, content in commands.items():
+        path = tmp_path / name
+        path.write_text(content)
+        path.chmod(0o755)
+    log = tmp_path / "install.log"
+    result = subprocess.run(
+        ["bash", str(ROOT / "tests/ci/install_codex.sh")],
+        env={**os.environ, "PATH": str(tmp_path) + ":" + os.environ["PATH"],
+             "INSTALL_LOG": str(log), "INSTALL_STATE": str(tmp_path / "state")},
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    installs = [line for line in log.read_text().splitlines() if line.startswith("install ")]
+    assert len(installs) == 2
+    assert all("@openai/codex@0.1.0-alpha.1" in line for line in installs)
+    assert all("@openai/codex-linux-x64@npm:@openai/codex@0.1.0-alpha.1-linux-x64" in line for line in installs)
