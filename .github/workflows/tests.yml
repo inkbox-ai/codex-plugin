@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v7
@@ -31,7 +31,7 @@ jobs:
 
       # inkbox is mocked in the unit tests, so install only what they import.
       - name: Install test deps
-        run: pip install pytest aiohttp segno
+        run: pip install pytest httpx aiohttp segno "audioop-lts>=0.2.1; python_version >= '3.13'"
 
       - name: Run unit tests
         run: pytest -q

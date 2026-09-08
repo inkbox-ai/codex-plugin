@@ -621,6 +621,11 @@ def test_outbound_call_realtime():
         _wait_for_driver_local_speech(remote, st["number_id"], driver_call.id, deadline=deadline)
         agent_said = _wait_for_two_way_call(aut, "unused", aut_call.id, deadline=deadline)
         assert agent_said, "agent produced no speech on the outbound call"
+        negotiated_hd = (
+            f"call_id={aut_call.id} audio_format=pcm_s16le sample_rate=16000"
+            in _gateway_log_text()
+        )
+        assert negotiated_hd, "realtime call did not negotiate 16 kHz PCM audio"
 
         tts, stt = _aut_speech_mode(aut, aut_call.id)
         assert tts is False and stt is False, (
