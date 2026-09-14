@@ -18,6 +18,8 @@ Env:
   VOICE_DRIVER_PORT       local port the tunnel forwards to (default 8090)
   VOICE_DRIVER_STATE      path to write the JSON state file
   VOICE_DRIVER_LINE       the one line the driver speaks (default below)
+  VOICE_DRIVER_SPEAK_AFTER minimum seconds before speaking (default 5)
+  VOICE_DRIVER_QUIET_AFTER_TRANSCRIPT quiet seconds after agent speech (default 0)
 """
 
 from __future__ import annotations
@@ -53,6 +55,9 @@ LINE = os.environ.get(
 # does - one word, then silence - and hold the prompt until that window closes.
 GREETING = os.environ.get("VOICE_DRIVER_GREETING", "Hello?")
 SPEAK_AFTER_S = float(os.environ.get("VOICE_DRIVER_SPEAK_AFTER", "5"))
+QUIET_AFTER_TRANSCRIPT_S = float(
+    os.environ.get("VOICE_DRIVER_QUIET_AFTER_TRANSCRIPT", "0")
+)
 # Then give the agent a turn and hang up — a dropped WS does NOT end the call, so we
 # must send an explicit stop or the leg lingers until the server max-duration cap.
 LISTEN_S = float(os.environ.get("VOICE_DRIVER_LISTEN", "12"))
@@ -77,6 +82,8 @@ async def phone_media_ws(ws: WebSocket) -> None:
     ])
     log.info("call WS accepted")
     spoke = asyncio.Event()
+    transcript_changed = asyncio.Event()
+    last_transcript_at: float | None = None
     convo: asyncio.Task | None = None
 
     async def _say(text: str) -> None:
@@ -93,7 +100,22 @@ async def phone_media_ws(ws: WebSocket) -> None:
     async def _run_turn() -> None:
         # Speak one line, give the agent a turn, then hang up so the call ends fast.
         await _say(GREETING)
-        await asyncio.sleep(SPEAK_AFTER_S)
+        started_at = asyncio.get_running_loop().time()
+        while not spoke.is_set():
+            speak_at = started_at + SPEAK_AFTER_S
+            if last_transcript_at is not None:
+                speak_at = max(
+                    speak_at,
+                    last_transcript_at + QUIET_AFTER_TRANSCRIPT_S,
+                )
+            delay = speak_at - asyncio.get_running_loop().time()
+            if delay <= 0:
+                break
+            transcript_changed.clear()
+            try:
+                await asyncio.wait_for(transcript_changed.wait(), timeout=delay)
+            except TimeoutError:
+                break
         await _speak(LINE)
         await asyncio.sleep(LISTEN_S)
         try:
@@ -110,9 +132,14 @@ async def phone_media_ws(ws: WebSocket) -> None:
             if kind == "start":
                 log.info("call start: %s", ev.get("stream_id"))
                 convo = asyncio.create_task(_run_turn())
-            elif kind == "transcript" and ev.get("is_final"):
-                log.info("heard (final): %s", ev.get("text"))
-                await _speak(LINE)  # speak now if the greeting beat our timer
+            elif kind == "transcript":
+                if QUIET_AFTER_TRANSCRIPT_S > 0:
+                    last_transcript_at = asyncio.get_running_loop().time()
+                    transcript_changed.set()
+                if ev.get("is_final"):
+                    log.info("heard (final): %s", ev.get("text"))
+                    if QUIET_AFTER_TRANSCRIPT_S <= 0:
+                        await _speak(LINE)
             elif kind == "stop":
                 log.info("call stop: %s", ev.get("reason"))
                 break
