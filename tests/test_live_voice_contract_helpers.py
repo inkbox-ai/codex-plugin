@@ -22,15 +22,22 @@ def _load_voice_module():
 voice = _load_voice_module()
 
 
-def test_workflow_requires_action_first_exact_body_and_readback():
+def test_workflow_uses_one_short_hosted_action_utterance_after_quiet():
     workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
 
     assert (
-        "After we hang up, send me one SMS with this exact three-word body: "
-        "$HOSTED_MARKER. Record that post-call SMS action now. Once the action tool "
-        "succeeds, read the exact three words back to me. Do not send the SMS during "
-        "the call." in workflow
+        "Record one post-call action now to send me exactly one SMS containing only "
+        "$HOSTED_MARKER after we hang up, then say $HOSTED_MARKER." in workflow
     )
+    assert "export VOICE_DRIVER_SPEAK_AFTER=8" in workflow
+    assert "export VOICE_DRIVER_QUIET_AFTER_TRANSCRIPT=2" in workflow
+
+
+def test_hosted_call_request_primes_spoken_post_call_work():
+    assert "complete my spoken request and record its post-call action" in (
+        voice._call_me_text(hosted=True)
+    )
+    assert "post-call action" not in voice._call_me_text()
 
 
 def test_spoken_marker_normalizes_punctuation_and_case():
@@ -251,3 +258,70 @@ def test_action_gate_diagnostic_is_bounded_and_content_redacted():
         "matching_action": True,
     }
     assert "customer-secret" not in repr(diagnostic)
+
+
+def test_hosted_request_gate_requires_aut_transcript(monkeypatch):
+    monkeypatch.setattr(voice, "POLL_EVERY_S", 0)
+    marker = "victor echo juliet"
+    request = f"After this call ends, send one SMS containing {marker}."
+    driver = SimpleNamespace(
+        calls=SimpleNamespace(
+            transcripts=lambda _call_id: [SimpleNamespace(party="local", text=request)]
+        )
+    )
+    aut = SimpleNamespace(
+        calls=SimpleNamespace(
+            transcripts=lambda _call_id: [],
+            get=lambda _call_id: SimpleNamespace(
+                post_call_action_items=[{
+                    "status": "open",
+                    "action": "send_sms",
+                    "details": f"Send {marker} to the caller.",
+                }]
+            ),
+        )
+    )
+
+    with pytest.raises(pytest.fail.Exception, match="aut_transcript_ready=False"):
+        voice._wait_for_persisted_hosted_request(
+            driver,
+            "unused",
+            "driver-call",
+            aut,
+            "aut-call",
+            marker,
+            deadline=voice.time.monotonic() + 0.01,
+        )
+
+
+def test_hosted_request_gate_accepts_both_transcripts_and_action(monkeypatch):
+    monkeypatch.setattr(voice, "POLL_EVERY_S", 0)
+    marker = "victor echo juliet"
+    request = f"After this call ends, send one SMS containing {marker}."
+    driver = SimpleNamespace(
+        calls=SimpleNamespace(
+            transcripts=lambda _call_id: [SimpleNamespace(party="local", text=request)]
+        )
+    )
+    aut = SimpleNamespace(
+        calls=SimpleNamespace(
+            transcripts=lambda _call_id: [SimpleNamespace(party="remote", text=request)],
+            get=lambda _call_id: SimpleNamespace(
+                post_call_action_items=[{
+                    "status": "open",
+                    "action": "send_sms",
+                    "details": f"Send {marker} to the caller.",
+                }]
+            ),
+        )
+    )
+
+    assert voice._wait_for_persisted_hosted_request(
+        driver,
+        "unused",
+        "driver-call",
+        aut,
+        "aut-call",
+        marker,
+        deadline=voice.time.monotonic() + 1,
+    ) is None

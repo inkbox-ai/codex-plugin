@@ -15,7 +15,7 @@ jobs:
   # enough to run on every push, including draft PRs (the heavy live suite is what
   # we gate).
   unit:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -41,7 +41,7 @@ jobs:
   # method, a moved result field, a dropped notification) before it reaches a
   # user. Same suite the canary runs on a schedule; this is the per-PR gate.
   contract-pr:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 15
 
     steps:
