@@ -1268,3 +1268,19 @@ def test_env_file_honours_the_explicit_override(monkeypatch, tmp_path):
     monkeypatch.setenv("INKBOX_CODEX_ENV_FILE", str(tmp_path / "custom.env"))
 
     assert setup_wizard._env_file_path() == tmp_path / "custom.env"
+
+
+@pytest.mark.parametrize(("version", "too_old"), [("0.5.9", True), ("0.6.11", True), ("0.6.12", False), ("0.6.13", False)])
+def test_sdk_gate_requires_conditional_identity_webhook_support(monkeypatch, version, too_old):
+    import importlib.metadata
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: version)
+    assert setup_wizard._inkbox_version_too_old() is too_old
+
+
+@pytest.mark.parametrize("version", ["0.5.9", "0.6.11"])
+def test_setup_does_not_accept_importable_sdk_without_identity_webhooks(monkeypatch, version):
+    import importlib.metadata
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: version)
+    monkeypatch.setattr(setup_wizard, "_load_inkbox_symbols", lambda: {"Inkbox": object()})
+    monkeypatch.setattr(setup_wizard, "_is_interactive_stdin", lambda: False)
+    assert setup_wizard._ensure_inkbox_sdk() is None
