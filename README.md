@@ -319,7 +319,7 @@ Inbound A2A tasks acknowledge pickup immediately. While a task remains active,
 the worker sends a short progress update about every three minutes by default;
 these updates are visible in task history without starting a requester turn.
 
-The bridge requires Inkbox SDK 0.6.12 or newer.
+The bridge requires Inkbox SDK 0.7.1 or newer.
 
 On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 
