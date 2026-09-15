@@ -30,7 +30,9 @@ def test_workflow_uses_one_short_hosted_action_utterance_after_quiet():
         "$HOSTED_MARKER after we hang up, then say $HOSTED_MARKER." in workflow
     )
     assert "export VOICE_DRIVER_SPEAK_AFTER=8" in workflow
-    assert "export VOICE_DRIVER_QUIET_AFTER_TRANSCRIPT=2" in workflow
+    # The driver re-asks while the agent is idle and stops once it says the
+    # marker back, so the marker has to reach the driver.
+    assert 'export VOICE_DRIVER_ANSWER_CONTAINS="$HOSTED_MARKER"' in workflow
 
 
 def test_hosted_call_request_primes_spoken_post_call_work():
