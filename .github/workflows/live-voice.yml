@@ -158,7 +158,7 @@ jobs:
             echo "HOSTED_POST_CALL_MARKER=$HOSTED_MARKER" >> "$GITHUB_ENV"
             export VOICE_DRIVER_LINE="Record one post-call action now to send me exactly one SMS containing only $HOSTED_MARKER after we hang up, then say $HOSTED_MARKER."
             export VOICE_DRIVER_SPEAK_AFTER=8
-            export VOICE_DRIVER_QUIET_AFTER_TRANSCRIPT=2
+            export VOICE_DRIVER_ANSWER_CONTAINS="$HOSTED_MARKER"
             # The test owns hangup after both transcript and durable action-item
             # evidence exist; keep the media peer alive until then.
             export VOICE_DRIVER_LISTEN=180
