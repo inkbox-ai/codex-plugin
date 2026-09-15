@@ -64,7 +64,7 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
         import inkbox  # noqa: F401
         checks.append(("inkbox SDK", True, "installed"))
     except ImportError:
-        checks.append(("inkbox SDK", False, "pip install 'inkbox>=0.5.9,<1.0.0'"))
+        checks.append(("inkbox SDK", False, "pip install 'inkbox>=0.6.12,<1.0.0'"))
 
     try:
         import aiohttp  # noqa: F401

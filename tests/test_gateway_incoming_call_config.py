@@ -19,23 +19,12 @@ class _FakeSubscriptions:
         return list(self.existing)
 
     def create(self, **kwargs):
-        families = {event.split(".", 1)[0] for event in kwargs["event_types"]}
-        assert len(families) == 1, f"mixed subscription families: {families}"
+        assert kwargs["agent_identity_id"] == "identity-1"
         self.created.append(kwargs)
         return None
 
     def delete(self, sub_id):
         self.deleted.append(sub_id)
-
-
-class _UnsupportedA2ASubscriptions(_FakeSubscriptions):
-    def create(self, **kwargs):
-        if any(event.startswith("a2a.") for event in kwargs["event_types"]):
-            error = RuntimeError("unsupported A2A events")
-            error.status_code = 422
-            error.detail = "a2a.task.created is not a valid event type"
-            raise error
-        return super().create(**kwargs)
 
 
 class _FakePhoneNumbers:
@@ -126,8 +115,8 @@ def test_voice_ai_reconciles_hosted_incoming_action_and_completion_subscription(
         "client_websocket_url": None,
         "incoming_call_webhook_url": None,
     }]
-    assert subscriptions.created[-2]["event_types"] == gateway_mod.IMESSAGE_EVENTS
-    assert subscriptions.created[-1]["event_types"] == gateway_mod.CALL_EVENTS
+    assert len(subscriptions.created) == 1
+    assert "call.ended" in subscriptions.created[0]["event_types"]
 
 
 def test_incoming_call_config_registers_for_imessage_only_identity():
@@ -168,68 +157,27 @@ def test_legacy_sdk_without_number_cannot_configure_and_skips():
     assert gw._inkbox.phone_numbers.updates == []
 
 
-def test_a2a_subscription_falls_back_to_imessage_on_older_api():
-    subscriptions = _UnsupportedA2ASubscriptions()
-    _patched_gateway(
-        _Identity(phone=False, imessage=True),
-        subscriptions=subscriptions,
-    )
-
-    assert subscriptions.created[-2]["event_types"] == gateway_mod.IMESSAGE_EVENTS
-    assert subscriptions.created[-1]["event_types"] == gateway_mod.CALL_EVENTS
-
-
-def test_a2a_imessage_and_call_use_channel_coherent_subscriptions():
+def test_one_mixed_subscription_is_created_without_channels():
     subscriptions = _FakeSubscriptions()
-    _patched_gateway(
-        _Identity(phone=False, imessage=True),
-        subscriptions=subscriptions,
+    _patched_gateway(_Identity(phone=False, imessage=False), subscriptions=subscriptions)
+    assert len(subscriptions.created) == 1
+    assert subscriptions.created[0]["agent_identity_id"] == "identity-1"
+    assert set(subscriptions.created[0]["event_types"]) == set(
+        gateway_mod.MAIL_EVENTS + gateway_mod.TEXT_EVENTS + gateway_mod.IMESSAGE_EVENTS + gateway_mod.CALL_EVENTS + gateway_mod.A2A_EVENTS
     )
-
-    assert [created["event_types"] for created in subscriptions.created] == [
-        gateway_mod.A2A_EVENTS,
-        gateway_mod.IMESSAGE_EVENTS,
-        gateway_mod.CALL_EVENTS,
-    ]
-    assert [created["url"] for created in subscriptions.created] == [
-        "https://agent.inkboxwire.com/webhook",
-        "https://agent.inkboxwire.com/webhook",
-        "https://agent.inkboxwire.com/webhook",
-    ]
-
-
-def test_imessage_reconcile_preserves_existing_a2a_channel_subscription():
-    a2a = types.SimpleNamespace(
-        id="sub-a2a",
-        url="https://agent.inkboxwire.com/webhook",
-        event_types=gateway_mod.A2A_EVENTS,
-    )
-    subscriptions = _FakeSubscriptions([a2a])
-    _patched_gateway(
-        _Identity(phone=False, imessage=True),
-        subscriptions=subscriptions,
-    )
-
     assert subscriptions.deleted == []
-    assert subscriptions.created == [
-        {
-            "agent_identity_id": "identity-1",
-            "url": "https://agent.inkboxwire.com/webhook",
-            "event_types": gateway_mod.IMESSAGE_EVENTS,
-        },
-        {
-            "agent_identity_id": "identity-1",
-            "url": "https://agent.inkboxwire.com/webhook",
-            "event_types": gateway_mod.CALL_EVENTS,
-        },
-    ]
 
 
-def test_a2a_only_subscription_is_skipped_on_older_api():
-    subscriptions = _UnsupportedA2ASubscriptions()
-    _patched_gateway(
-        _Identity(phone=False, imessage=False),
-        subscriptions=subscriptions,
-    )
+def test_persists_first_created_signing_key_without_rotating_existing_key(monkeypatch):
+    from unittest.mock import Mock
+    from inkbox_codex import setup_wizard
 
-    assert subscriptions.created == []
+    save = Mock()
+    monkeypatch.setattr(setup_wizard, "_save", save)
+    subscriptions = _FakeSubscriptions()
+    subscriptions.create = Mock(return_value=types.SimpleNamespace(signing_key="synthetic-first-key"))
+    gw = _patched_gateway(_Identity(), subscriptions=subscriptions)
+    assert gw.cfg.signing_key == "synthetic-first-key"
+    save.assert_called_once_with("INKBOX_SIGNING_KEY", "synthetic-first-key")
+    gw._patch_identity_objects()
+    assert save.call_count == 1
