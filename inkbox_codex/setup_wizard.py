@@ -1881,7 +1881,7 @@ def _configure_project_dir() -> None:
     print_info("  Codex reads, searches, and edits files in this directory")
     print_info("  when it answers you. Point it at the repo you want it to work on.")
 
-    current = _env("CODEX_PROJECT_DIR") or _env("CLAUDE_PROJECT_DIR") or os.getcwd()
+    current = _env("CODEX_PROJECT_DIR") or os.getcwd()
     chosen = prompt("  Directory Codex should work in", current).strip() or current
     chosen = str(Path(chosen).expanduser())
     if not os.path.isdir(chosen):

@@ -24,7 +24,9 @@ INKBOX_WS_PATH = "/phone/media/ws"
 USER_AGENT_NAME = "inkbox-codex"
 DISTRIBUTION_NAME = "codex-plugin"
 DEFAULT_HOST = "0.0.0.0"
-DEFAULT_PORT = 8767
+# Deliberately different from claude-code-plugin's default (8767) so both
+# bridges can run on the same machine, side by side, with zero config.
+DEFAULT_PORT = 8768
 DEFAULT_WEBHOOK_PATH = "/webhook"
 A2A_PROGRESS_DEFAULT_INTERVAL_SECONDS = 180.0
 
@@ -235,11 +237,10 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         port=int(os.getenv("INKBOX_BRIDGE_PORT") or DEFAULT_PORT),
         project_dir=str(
             os.getenv("CODEX_PROJECT_DIR")
-            or os.getenv("CLAUDE_PROJECT_DIR")
             or extra.get("project_dir")
             or os.getcwd()
         ).strip(),
-        codex_model=str(os.getenv("CODEX_MODEL") or os.getenv("CLAUDE_MODEL") or extra.get("codex_model") or "").strip(),
+        codex_model=str(os.getenv("CODEX_MODEL") or extra.get("codex_model") or "").strip(),
         codex_bin=str(os.getenv("CODEX_BIN") or extra.get("codex_bin") or "codex").strip(),
         codex_sandbox=str(os.getenv("CODEX_SANDBOX") or extra.get("codex_sandbox") or "workspace-write").strip(),
         codex_approval_policy=str(

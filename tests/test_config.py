@@ -1,4 +1,4 @@
-from inkbox_codex.config import VoiceStack, read_config
+from inkbox_codex.config import DEFAULT_PORT, VoiceStack, read_config
 
 
 def test_read_config_defaults(monkeypatch):
@@ -8,7 +8,7 @@ def test_read_config_defaults(monkeypatch):
         "CODEX_APPROVAL_POLICY", "INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS",
         "INKBOX_BASE_URL", "CODEX_TURN_TIMEOUT_S", "CODEX_INTERRUPT_TIMEOUT_S",
         "INKBOX_CONTACT_MEMORIES_ENABLED",
-        "INKBOX_A2A_PROGRESS_INTERVAL_SECONDS",
+        "INKBOX_A2A_PROGRESS_INTERVAL_SECONDS", "INKBOX_BRIDGE_PORT",
     ):
         monkeypatch.delenv(var, raising=False)
     cfg = read_config()
@@ -22,6 +22,28 @@ def test_read_config_defaults(monkeypatch):
     assert cfg.codex_interrupt_timeout_s == 10.0
     assert cfg.contact_memories_enabled is True
     assert cfg.a2a_progress_interval_seconds == 180.0
+
+
+def test_default_port_does_not_collide_with_claude_code_plugin(monkeypatch):
+    # claude-code-plugin's bridge defaults to 8767; codex-plugin must not
+    # reuse that default so both can run on one machine with zero config.
+    monkeypatch.delenv("INKBOX_BRIDGE_PORT", raising=False)
+    assert DEFAULT_PORT != 8767
+    assert read_config().port == DEFAULT_PORT
+
+
+def test_project_dir_and_model_do_not_fall_back_to_claude_env(monkeypatch):
+    # Sharing CLAUDE_PROJECT_DIR/CLAUDE_MODEL with claude-code-plugin could
+    # silently point codex-plugin at the wrong repo/model.
+    monkeypatch.delenv("CODEX_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CODEX_MODEL", raising=False)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/some/claude/only/project")
+    monkeypatch.setenv("CLAUDE_MODEL", "claude-only-model")
+
+    cfg = read_config()
+
+    assert cfg.project_dir != "/some/claude/only/project"
+    assert cfg.codex_model == ""
 
 
 def test_read_config_env(monkeypatch):

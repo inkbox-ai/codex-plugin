@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 import sys
 import types
 
@@ -28,6 +29,8 @@ def test_voice_config_probe_failures_do_not_mark_identity_unreachable(
     inkbox_module.Inkbox = lambda **_kwargs: client
     monkeypatch.setitem(sys.modules, "inkbox", inkbox_module)
     monkeypatch.setattr(daemon, "_maybe_load_env_file", lambda: None)
+    monkeypatch.setattr(daemon, "running_pid", lambda: None)
+    monkeypatch.setattr(doctor, "_webhook_port_available", lambda _host, _port: True)
     monkeypatch.setattr(doctor.shutil, "which", lambda _name: "/usr/bin/codex")
     monkeypatch.setattr(
         doctor,
@@ -52,8 +55,63 @@ def test_voice_config_probe_failures_do_not_mark_identity_unreachable(
     assert by_name["Voice AI authority"] == (False, "authority config unavailable")
 
 
+def test_webhook_port_check_flags_port_already_in_use(monkeypatch, tmp_path):
+    monkeypatch.setattr(daemon, "_maybe_load_env_file", lambda: None)
+    monkeypatch.setattr(daemon, "running_pid", lambda: None)
+    monkeypatch.setattr(doctor.shutil, "which", lambda _name: "/usr/bin/codex")
+
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    port = blocker.getsockname()[1]
+    try:
+        monkeypatch.setattr(
+            doctor,
+            "read_config",
+            lambda: BridgeConfig(
+                identity="agent",
+                signing_key="whsec_test",
+                project_dir=str(tmp_path),
+                host="127.0.0.1",
+                port=port,
+            ),
+        )
+
+        by_name = {name: (ok, detail) for name, ok, detail in doctor.run_doctor()}
+
+        ok, detail = by_name["webhook port"]
+        assert ok is False
+        assert "already in use" in detail
+    finally:
+        blocker.close()
+
+
+def test_webhook_port_check_passes_when_bridge_already_running(monkeypatch, tmp_path):
+    monkeypatch.setattr(daemon, "_maybe_load_env_file", lambda: None)
+    monkeypatch.setattr(daemon, "running_pid", lambda: 12345)
+    monkeypatch.setattr(doctor.shutil, "which", lambda _name: "/usr/bin/codex")
+    monkeypatch.setattr(
+        doctor,
+        "read_config",
+        lambda: BridgeConfig(
+            identity="agent",
+            signing_key="whsec_test",
+            project_dir=str(tmp_path),
+            host="127.0.0.1",
+            port=8768,
+        ),
+    )
+
+    by_name = {name: (ok, detail) for name, ok, detail in doctor.run_doctor()}
+
+    assert by_name["webhook port"] == (True, "127.0.0.1:8768 (bridge already running)")
+
+
 def test_realtime_stack_reports_missing_api_key(monkeypatch, tmp_path):
     monkeypatch.setattr(daemon, "_maybe_load_env_file", lambda: None)
+    monkeypatch.setattr(daemon, "running_pid", lambda: None)
+    monkeypatch.setattr(doctor, "_webhook_port_available", lambda _host, _port: True)
     monkeypatch.setattr(doctor.shutil, "which", lambda _name: "/usr/bin/codex")
     monkeypatch.setattr(
         doctor,

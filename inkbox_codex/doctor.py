@@ -4,12 +4,33 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 from typing import List, Tuple
 
 try:
     from .config import VoiceStack, inkbox_client_kwargs, read_config
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import VoiceStack, inkbox_client_kwargs, read_config
+
+
+def _webhook_port_available(host: str, port: int) -> bool:
+    """Probe whether ``host:port`` can be bound right now.
+
+    Used to catch a port collision (e.g. a second Inkbox bridge such as
+    claude-code-plugin defaulting to the same port) before the gateway
+    itself fails to start.
+
+    Returns:
+        bool: True if the port is free to bind.
+    """
+    bind_host = host or "0.0.0.0"
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind((bind_host, port))
+        return True
+    except OSError:
+        return False
 
 
 def run_doctor() -> List[Tuple[str, bool, str]]:
@@ -22,15 +43,30 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
     # otherwise doctor reports "missing" for credentials that are on disk and
     # working, purely because this process did not inherit them.
     try:
-        from .daemon import _maybe_load_env_file
+        from .daemon import _maybe_load_env_file, running_pid
     except ImportError:  # pragma: no cover - direct local import/test fallback
-        from daemon import _maybe_load_env_file
+        from daemon import _maybe_load_env_file, running_pid
     _maybe_load_env_file()
 
     cfg = read_config()
     checks: List[Tuple[str, bool, str]] = []
 
     checks.append(("INKBOX_API_KEY", bool(cfg.api_key), "set" if cfg.api_key else "missing"))
+    if running_pid() is not None:
+        # This bridge's own background gateway already holds the port —
+        # that's expected, not a collision.
+        checks.append(("webhook port", True, f"{cfg.host}:{cfg.port} (bridge already running)"))
+    else:
+        port_free = _webhook_port_available(cfg.host, cfg.port)
+        checks.append((
+            "webhook port",
+            port_free,
+            f"{cfg.host}:{cfg.port} free" if port_free else (
+                f"{cfg.host}:{cfg.port} already in use — another process (e.g. a "
+                "second Inkbox bridge such as claude-code-plugin) may be running "
+                "there; set INKBOX_BRIDGE_PORT to a free port"
+            ),
+        ))
     checks.append(("INKBOX_IDENTITY", bool(cfg.identity), cfg.identity or "missing"))
     checks.append((
         "INKBOX_SIGNING_KEY",

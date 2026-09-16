@@ -1064,7 +1064,16 @@ class InkboxGateway:
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.cfg.host, self.cfg.port)
-        await site.start()
+        try:
+            await site.start()
+        except OSError as exc:
+            await self._runner.cleanup()
+            raise RuntimeError(
+                f"Could not bind the webhook server to {self.cfg.host}:{self.cfg.port} "
+                f"({exc}). Another Inkbox bridge (e.g. inkbox-codex or "
+                "inkbox-claude-code) or another process may already be using this "
+                "port — set INKBOX_BRIDGE_PORT to a free one."
+            ) from exc
         logger.info("[bridge] webhook server on %s:%d", self.cfg.host, self.cfg.port)
 
     async def _open_tunnel(self) -> None:

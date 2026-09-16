@@ -278,7 +278,7 @@ curl --fail-with-body --request POST 'https://your-agent-host.example/webhook' \
 | `INKBOX_TUNNEL_NAME` | no | identity handle | Tunnel name override. |
 | `INKBOX_ALLOWED_USERS` | no | - | Local allowlist (emails / E.164 numbers). Usually leave empty and use Inkbox contact rules. |
 | `INKBOX_ALLOW_ALL_USERS` | no | `false` | Allow all senders admitted by Inkbox contact rules. |
-| `INKBOX_BRIDGE_PORT` | no | `8767` | Local webhook server port. |
+| `INKBOX_BRIDGE_PORT` | no | `8768` | Local webhook server port. Running codex-plugin and claude-code-plugin bridges on the same machine? They already default to different ports (8768 vs 8767), but if you override one, make sure the two stay distinct — along with distinct `INKBOX_IDENTITY` values, since both plugins otherwise share identically-named `INKBOX_*` env vars and each reads its own `.env` (`~/.inkbox-codex/.env` vs `~/.inkbox-claude/.env`). `inkbox-codex doctor` flags a port that's already taken. |
 | `INKBOX_PERMISSION_TIMEOUT_S` | no | `600` | Seconds to wait for a permission/poll reply. |
 | `INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS` | no | `false` | Auto-accept Codex MCP prompts for Inkbox tools only. The setup wizard writes `true` when you trust the agent to send through Inkbox without per-call approval. |
 | `INKBOX_A2A_PROGRESS_INTERVAL_SECONDS` | no | `180` | Seconds between progress updates for active inbound A2A tasks. Set to `0` to disable periodic updates. |
