@@ -203,6 +203,29 @@ These match only when the whole message is exactly the command, so "please /clea
 
 **Errors.** If a turn fails, you get a short plain-language heads-up ("I hit an error while working on that and had to stop") rather than silence.
 
+## Groups, copied recipients, and contact rules
+
+Who can reach the agent, and whom it can contact, is decided by the identity's Inkbox contact rules. Each channel (mail, and phone for SMS + iMessage + calls) has an inbound and an outbound mode: `blacklist` (open), `whitelist` (allowed contacts only), or `supervised`.
+
+**Group context.** With the phone inbound mode set to `supervised`, only allowed contacts can wake the agent in a group SMS or iMessage conversation, but it still gets to read along: when an allowed contact's message wakes it, the webhook carries up to 10 messages the other participants sent since the last wake. The bridge shows them to Codex ahead of the waking message as clearly marked, untrusted background — context for understanding the message and deciding whether to stay silent, never instructions and never something to answer on its own. Attachments in that background appear as placeholders (`[image attachment]`) and are not downloaded; long messages are cut with a `[truncated]` marker. 1:1 conversations never carry it.
+
+**Email replies keep the people you copied.** The automatic reply to an email threads onto the message it answers and goes to everyone on it: the sender, plus the message's other To/Cc recipients (the agent's own address is left out). For the copied people to be reachable under a restrictive outbound mode, set mail outbound to `supervised` — it allows a message to people who are not allowed contacts as long as one recipient of that same message is. A message that copies more than 25 other people gets a sender-only reply. If contact rules still block a copied recipient, the bridge retries once as a threaded reply to the sender alone and logs that the copied recipients were dropped. Set `INKBOX_EMAIL_REPLY_ALL=false` to always reply to the sender only.
+
+**A contact-rule block is final.** When a send is refused because contact rules block the recipient (`recipient_blocked`), Codex is told not to retry, reword, or switch channels, on SMS, iMessage, and email alike. Changing who the agent may contact is the owner's call, made in the contact rules.
+
+### Only let me wake my agent
+
+Prefer contact rules over the local `INKBOX_ALLOWED_USERS` list:
+
+| Channel | Inbound | Outbound | Allow rule |
+|---|---|---|---|
+| Phone (SMS, iMessage, calls) | `supervised` | `supervised` | your number |
+| Mail | `whitelist` | `supervised` | your email address |
+
+With that setup only you can wake the agent, it can still answer in your group chats and keep the people you copy on email, and it cannot start a conversation with anyone else.
+
+The difference: `INKBOX_ALLOWED_USERS` only stops the bridge from starting a turn for other senders. Their messages are still delivered to the identity, Codex can still read them with its tools, and nothing limits whom it may contact. Contact rules are enforced by Inkbox itself, so they also control what the agent can read and whom it can reach — on every client, not just this bridge.
+
 ## Voice
 
 The setup wizard has a **Phone call voice stack** section with three choices:
@@ -273,10 +296,11 @@ curl --fail-with-body --request POST 'https://your-agent-host.example/webhook' \
 | `INKBOX_REQUIRE_SIGNATURE` | no | `true` | Refuse unsigned inbound webhooks unless `false`. |
 | `INKBOX_SKIP_WEBHOOK_RECONCILE` | no | `false` | Leave webhook subscriptions untouched on start. For deployments that provision them ahead of time, where the destination is fixed or this API key may not change it. They must already point at this bridge's webhook URL, or nothing arrives. |
 | `INKBOX_CONTACT_MEMORIES_ENABLED` | no | `true` | Add memories supplied with the matched webhook contact as background context. |
+| `INKBOX_EMAIL_REPLY_ALL` | no | `true` | Keep the people the sender copied (other To/Cc recipients) on automatic email replies. `false` replies to the sender only. Replies are threaded either way. |
 | `INKBOX_BASE_URL` | no | SDK default | Override the Inkbox API base URL. |
 | `INKBOX_PUBLIC_URL` | no | - | Public bridge URL. Omit to use an Inkbox tunnel. |
 | `INKBOX_TUNNEL_NAME` | no | identity handle | Tunnel name override. |
-| `INKBOX_ALLOWED_USERS` | no | - | Local allowlist (emails / E.164 numbers). Usually leave empty and use Inkbox contact rules. |
+| `INKBOX_ALLOWED_USERS` | no | - | Local allowlist (emails / E.164 numbers) checked against the sender of the waking message. Usually leave empty and use Inkbox contact rules — see [Only let me wake my agent](#only-let-me-wake-my-agent). |
 | `INKBOX_ALLOW_ALL_USERS` | no | `false` | Allow all senders admitted by Inkbox contact rules. |
 | `INKBOX_BRIDGE_PORT` | no | `8767` | Local webhook server port. |
 | `INKBOX_PERMISSION_TIMEOUT_S` | no | `600` | Seconds to wait for a permission/poll reply. |
