@@ -23,7 +23,9 @@ The bridge's runtime core:
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -727,6 +729,38 @@ def _mail_inbound_allowed_only(identity: Any) -> bool:
         return str(getattr(mode, "value", mode) or "").strip().lower() == "whitelist"
     except Exception:
         return False
+
+
+@functools.lru_cache(maxsize=None)
+def _accepts_idempotency_key(function: Any) -> bool:
+    """Whether an SDK send function takes ``idempotency_key`` (checked once)."""
+    try:
+        return "idempotency_key" in inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _mail_reply_idempotency(send: Any, source_id: str, audience: str, content: str) -> Dict[str, str]:
+    """Build the idempotency argument for one automatic email reply.
+
+    The key is derived from the inbound message, the audience, and the reply
+    text, so re-sending the same reply is deduplicated while a different reply
+    - or the sender-only retry of a blocked reply-all - gets its own key.
+
+    Args:
+        send (Any): The bound SDK send method about to be called.
+        source_id (str): Id of the inbound message being answered.
+        audience (str): ``all`` for a reply-all, ``sender`` for sender-only.
+        content (str): The reply text.
+
+    Returns:
+        Dict[str, str]: ``{"idempotency_key": ...}``, or empty when the inbound
+        id is unknown or the installed SDK does not take a key.
+    """
+    if not source_id or not _accepts_idempotency_key(getattr(send, "__func__", send)):
+        return {}
+    digest = hashlib.sha256(f"{source_id}\n{audience}\n{content}".encode("utf-8", "replace"))
+    return {"idempotency_key": f"auto-reply-{digest.hexdigest()[:48]}"}
 
 
 def _is_recipient_blocked_error(exc: Exception) -> bool:
@@ -3496,8 +3530,9 @@ class InkboxGateway:
 
         Returns:
             List[str]: The message's other To + Cc addresses, in order, without
-            this agent's own address(es), the sender, or duplicates (compared
-            case-insensitively). Empty when the fields are absent.
+            this agent's primary address (aliases are not known here), the
+            sender, duplicates (compared case-insensitively), or entries that
+            are not an address. Empty when the fields are absent.
         """
         seen = {address.lower() for address in self._self_addresses}
         seen.add((parseaddr(sender)[1] or sender).strip().lower())
@@ -3506,8 +3541,9 @@ class InkboxGateway:
             self._string_list_field(message, "to_addresses")
             + self._string_list_field(message, "cc_addresses")
         ):
-            address = (parseaddr(entry)[1] or entry).strip()
-            if not address or address.lower() in seen:
+            address = parseaddr(entry)[1].strip()
+            # Skip placeholders such as "undisclosed-recipients:;".
+            if "@" not in address or address.lower() in seen:
                 continue
             seen.add(address.lower())
             copied.append(address)
@@ -4878,6 +4914,9 @@ class InkboxGateway:
                         source_id,
                         subject=reply_subject,
                         body_text=content,
+                        **_mail_reply_idempotency(
+                            identity.reply_all_email, source_id, "all", content
+                        ),
                     )
                     return
                 except Exception as exc:
@@ -4906,4 +4945,5 @@ class InkboxGateway:
             rfc_message_id = str(meta.get("rfc_message_id") or "").strip()
             if rfc_message_id:
                 kwargs["in_reply_to_message_id"] = rfc_message_id
+            kwargs.update(_mail_reply_idempotency(identity.send_email, source_id, "sender", content))
             await asyncio.to_thread(identity.send_email, **kwargs)

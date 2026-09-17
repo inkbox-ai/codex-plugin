@@ -148,6 +148,23 @@ def test_inbound_without_copied_recipients_has_empty_reply_cc(fields):
     assert meta["reply_cc"] == []
 
 
+def test_entries_that_are_not_addresses_are_not_copied_recipients(caplog):
+    meta = _inbound_meta(_mail_envelope(
+        to=["undisclosed-recipients:;", "not an address", AGENT],
+        cc=["Pat <pat@example.com>"],
+    ))
+    assert meta["reply_cc"] == ["pat@example.com"]
+
+    # With nobody real copied there is nothing to keep - and nothing to log.
+    meta = _inbound_meta(_mail_envelope(to=["undisclosed-recipients:;"]))
+    assert meta["reply_cc"] == []
+    identity = _FakeIdentity(mail_inbound_filter_mode="blacklist")
+    with caplog.at_level("INFO"):
+        _send(_gw(identity), meta)
+    assert [name for name, _, _ in identity.calls] == ["send_email"]
+    assert not [r for r in caplog.records if "were not kept" in r.getMessage()]
+
+
 def test_inbound_without_ids_keeps_them_unset():
     meta = _inbound_meta(_mail_envelope(id=None, message_id=None))
     assert meta["message_id"] is None
@@ -319,3 +336,155 @@ def test_other_reply_all_errors_are_not_retried():
     with pytest.raises(RuntimeError):
         _send(_gw(identity), _meta())
     assert [name for name, _, _ in identity.calls] == ["reply_all_email"]
+
+
+# ── Idempotency (only when the installed SDK takes a key) ────────────────────
+
+
+class _KeyedIdentity(_FakeIdentity):
+    """An SDK whose mail sends accept ``idempotency_key``."""
+
+    def reply_all_email(self, message_id, *, subject=None, body_text=None, idempotency_key=None):
+        self._record("reply_all_email", (message_id,), {"idempotency_key": idempotency_key})
+
+    def send_email(self, *, to, subject, body_text=None, in_reply_to_message_id=None, idempotency_key=None):
+        self._record("send_email", (), {"idempotency_key": idempotency_key})
+
+
+def _keys(identity):
+    return [kwargs["idempotency_key"] for _, _, kwargs in identity.calls]
+
+
+def test_sdk_without_an_idempotency_parameter_is_called_without_one():
+    # The default fake takes **kwargs only, like an SDK that has no such
+    # parameter: nothing extra may be passed (asserted by the exact-call tests
+    # above); spot-check both paths here.
+    identity = _allowed_only(errors=[_Blocked()])
+    _send(_gw(identity), _meta())
+    assert all("idempotency_key" not in kwargs for _, _, kwargs in identity.calls)
+
+
+def test_same_reply_reuses_its_key_and_a_different_reply_does_not():
+    identity = _KeyedIdentity(mail_inbound_filter_mode="whitelist")
+    gw = _gw(identity)
+    _send(gw, _meta(), "Confirmed.")
+    _send(gw, _meta(), "Confirmed.")
+    _send(gw, _meta(), "Confirmed, see you at 8.")
+    _send(gw, _meta(message_id="other-uuid"), "Confirmed.")
+    first, again, reworded, other_message = _keys(identity)
+    assert first and first == again
+    assert len({first, reworded, other_message}) == 3
+
+
+def test_sender_only_retry_gets_its_own_key():
+    identity = _KeyedIdentity(errors=[_Blocked()], mail_inbound_filter_mode="whitelist")
+    _send(_gw(identity), _meta())
+    assert [name for name, _, _ in identity.calls] == ["reply_all_email", "send_email"]
+    reply_all_key, sender_key = _keys(identity)
+    assert reply_all_key and sender_key and reply_all_key != sender_key
+
+    # The same sender-only reply sent directly dedupes against that retry.
+    direct = _KeyedIdentity()
+    _send(_gw(direct), _meta(reply_cc=[]))
+    assert _keys(direct) == [sender_key]
+
+
+def test_no_key_without_an_inbound_message_id():
+    identity = _KeyedIdentity()
+    _send(_gw(identity), {"to": OWNER, "subject": "Plans"})
+    assert _keys(identity) == [None]
+
+
+# ── Each reply uses its own message's thread and audience ────────────────────
+
+
+def _queued_email_session(gw):
+    """A real session wired to the gateway, with its worker held busy so
+    inbound emails queue instead of running."""
+    from inkbox_codex.sessions import ContactSession
+
+    session = ContactSession(
+        chat_id="contact-1",
+        cfg=BridgeConfig(project_dir="/tmp"),
+        send_fn=gw.send_to_contact,
+        mcp_server_config={},
+        identity_info={"handle": "t", "email": AGENT, "phone": ""},
+    )
+    session._worker = asyncio.create_task(asyncio.sleep(10))
+    return session
+
+
+PRIVATE = {"to": OWNER, "subject": "Private", "message_id": "uuid-b",
+           "rfc_message_id": "<b@mail.example.com>", "reply_cc": []}
+SHARED = {"to": OWNER, "subject": "Shared", "message_id": "uuid-a",
+          "rfc_message_id": "<a@mail.example.com>",
+          "reply_cc": ["bob@example.com", "carol@example.com"]}
+
+
+def test_interleaved_emails_each_reply_to_their_own_message():
+    async def scenario():
+        identity = _allowed_only()
+        session = _queued_email_session(_gw(identity))
+        # A private 1:1 email, then one with people copied, before either runs.
+        await session.handle_inbound("private question", "email", dict(PRIVATE))
+        await session.handle_inbound("shared question", "email", dict(SHARED))
+        private_turn = session._queue.get_nowait()
+        shared_turn = session._queue.get_nowait()
+        assert session.reply_meta["message_id"] == "uuid-a"
+
+        await session._deliver_reply(private_turn, "private answer")
+        await session._deliver_reply(shared_turn, "shared answer")
+        session._worker.cancel()
+        return identity.calls
+
+    private_call, shared_call = asyncio.run(scenario())
+    # The private answer stays private, threaded onto its own message.
+    assert private_call == ("send_email", (), {
+        "to": [OWNER], "subject": "Re: Private", "body_text": "private answer",
+        "in_reply_to_message_id": "<b@mail.example.com>",
+    })
+    assert shared_call == (
+        "reply_all_email", ("uuid-a",), {"subject": "Re: Shared", "body_text": "shared answer"},
+    )
+
+
+def test_turns_without_their_own_email_never_inherit_a_reply_all():
+    from inkbox_codex.sessions import _Turn
+
+    async def scenario():
+        identity = _allowed_only()
+        session = _queued_email_session(_gw(identity))
+        await session.handle_inbound("shared question", "email", dict(SHARED))
+        # A recovery turn from before that email, and a plain bridge notice.
+        await session._deliver_reply(_Turn(text="[delivery failed] ...", recovery=True), "retrying")
+        await session._reply("Sorry - I hit an error.")
+        session._worker.cancel()
+        return identity.calls
+
+    calls = asyncio.run(scenario())
+    assert [name for name, _, _ in calls] == ["send_email", "send_email"]
+    for _, _, kwargs in calls:
+        assert kwargs["to"] == [OWNER]
+        assert "in_reply_to_message_id" not in kwargs
+
+
+def test_recovery_turn_keeps_the_snapshot_of_the_reply_it_resends():
+    async def scenario():
+        identity = _allowed_only(errors=[RuntimeError("temporary failure")])
+        gw = _gw(identity)
+        session = _queued_email_session(gw)
+        session.on_send_failure = gw._note_sync_send_failure
+        await session.handle_inbound("shared question", "email", dict(SHARED))
+        shared_turn = session._queue.get_nowait()
+        await session.handle_inbound("private question", "email", dict(PRIVATE))
+        session._queue.get_nowait()
+
+        await session._deliver_reply(shared_turn, "shared answer")
+        recovery = session._queue.get_nowait()
+        session._worker.cancel()
+        return recovery
+
+    recovery = asyncio.run(scenario())
+    assert recovery.recovery is True
+    assert recovery.mode == "email"
+    assert recovery.reply_meta["message_id"] == "uuid-a"

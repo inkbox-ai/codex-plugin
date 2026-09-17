@@ -206,7 +206,7 @@ def test_sync_rejection_wakes_with_rule_and_attempt():
         gw = _gw()
         session = _wired_session(gw)
 
-        async def boom(_text):
+        async def boom(_text, turn=None):
             raise _Blocked()
         session._reply = boom
 
@@ -238,7 +238,7 @@ def test_sync_contact_rule_block_wakes_with_terminal_instruction(mode):
         gw = _gw()
         session = _wired_session(gw, mode=mode)
 
-        async def boom(_text):
+        async def boom(_text, turn=None):
             raise _RecipientBlocked()
         session._reply = boom
 
@@ -269,7 +269,7 @@ def test_sync_retry_budget_caps_total_sends():
         gw = _gw()
         session = _wired_session(gw)
 
-        async def boom(_text):
+        async def boom(_text, turn=None):
             raise _Blocked()
         session._reply = boom
 
@@ -295,7 +295,7 @@ def test_failed_first_recovery_gets_optional_second_instruction_then_caps():
         gw = _gw()
         session = _wired_session(gw)
 
-        async def boom(_text):
+        async def boom(_text, turn=None):
             raise _Blocked()
         session._reply = boom
 
@@ -323,7 +323,7 @@ def test_sync_too_long_reason_flows_through():
         session = _wired_session(gw)
         reason = gateway._message_too_long_reason("SMS", "x" * 2000, gateway.SMS_MAX_LENGTH)
 
-        async def boom(_text):
+        async def boom(_text, turn=None):
             raise ValueError(reason)
         session._reply = boom
 
@@ -342,7 +342,7 @@ def test_successful_send_does_not_wake_or_count():
         gw = _gw()
         session = _wired_session(gw)
 
-        async def ok(_text):
+        async def ok(_text, turn=None):
             return None
         session._reply = ok
 
@@ -455,7 +455,7 @@ def test_sync_and_webhook_failures_share_one_budget():
         gw = _gw()
         session = _wired_session(gw)
 
-        async def boom(_text):
+        async def boom(_text, turn=None):
             raise _Blocked()
         session._reply = boom
 
