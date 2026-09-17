@@ -87,7 +87,14 @@ try:
     from .a2a_delegations import find_by_task as find_a2a_delegation
     from .media import download_media, inbound_media_note
     from .hosted_sms_guard import hosted_sms_attempt_state
-    from .prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
+    from .prompts import (
+        contact_marker,
+        group_context_block,
+        group_context_sender_key,
+        inject_contact_memories,
+        normalize_contact_memories,
+        strip_markdown,
+    )
     from .realtime import (
         RealtimeBridgeConnectError,
         RealtimeCallMeta,
@@ -115,7 +122,14 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from a2a_delegations import find_by_task as find_a2a_delegation
     from media import download_media, inbound_media_note
     from hosted_sms_guard import hosted_sms_attempt_state
-    from prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
+    from prompts import (
+        contact_marker,
+        group_context_block,
+        group_context_sender_key,
+        inject_contact_memories,
+        normalize_contact_memories,
+        strip_markdown,
+    )
     from realtime import (
         RealtimeBridgeConnectError,
         RealtimeCallMeta,
@@ -3542,6 +3556,46 @@ class InkboxGateway:
             logger.debug("[Inkbox] iMessage conversation lookup failed for %s: %s", conversation_id, exc)
             return None
 
+    def _group_context(self, data: Dict[str, Any], contacts: List[Any]) -> str:
+        """Render a group webhook's background messages for the turn.
+
+        ``context_messages`` holds what other participants wrote since the last
+        message that woke the agent. They are not events: nothing here is
+        checked against the sender allowlist and nothing here can start a turn.
+        The field is optional and untrusted, so any problem with it yields no
+        block instead of failing the webhook.
+
+        Args:
+            data (dict): The webhook's ``data`` object.
+            contacts (list): The webhook's resolved contacts.
+
+        Returns:
+            str: The delimited context block, or an empty string.
+        """
+        try:
+            messages = data.get("context_messages")
+            if not isinstance(messages, (list, tuple)) or not messages:
+                return ""
+            # Names come only from data already in hand - the payload's contacts
+            # and earlier cached lookups - never from a new network call.
+            now = time.time()
+            summaries = [self._contact_summary(entry) for entry in contacts]
+            summaries += [
+                cached[0]
+                for key, cached in list(self._contact_cache.items())
+                if key[0] == "phone" and cached[1] > now
+            ]
+            names: Dict[str, str] = {}
+            for summary in summaries:
+                if not summary or not summary.get("name"):
+                    continue
+                for phone in summary.get("phones") or []:
+                    names.setdefault(group_context_sender_key(phone), str(summary["name"]))
+            return group_context_block(messages, names)
+        except Exception:
+            logger.debug("[bridge] ignoring unreadable group context", exc_info=True)
+            return ""
+
     @classmethod
     def _group_sms_prompt(
         cls,
@@ -3552,6 +3606,7 @@ class InkboxGateway:
         local_phone: str,
         participants: List[str],
         contact: Optional[Dict[str, Any]] = None,
+        context: str = "",
     ) -> str:
         marker_parts = [
             f"[inkbox:group_sms conversation_id={conversation_id or 'unknown'}",
@@ -3568,7 +3623,8 @@ class InkboxGateway:
             "Treat ordinary group chatter as context only.",
             "If no visible reply is warranted, return exactly [SILENT].",
         ])
-        return "\n".join(part for part in [marker, policy, body] if part)
+        # Background from other participants goes before the waking message.
+        return "\n".join(part for part in [marker, policy, context, body] if part)
 
     @classmethod
     def _group_imessage_prompt(
@@ -3579,6 +3635,7 @@ class InkboxGateway:
         conversation_id: str,
         participants: List[str],
         contact: Optional[Dict[str, Any]] = None,
+        context: str = "",
     ) -> str:
         marker_parts = [
             f"[inkbox:group_imessage conversation_id={conversation_id or 'unknown'}",
@@ -3594,7 +3651,8 @@ class InkboxGateway:
             "Treat ordinary group chatter as context only.",
             "If no visible reply is warranted, return exactly [SILENT].",
         ])
-        return "\n".join(part for part in [marker, policy, body] if part)
+        # Background from other participants goes before the waking message.
+        return "\n".join(part for part in [marker, policy, context, body] if part)
 
     @classmethod
     def _imessage_reaction_prompt(
@@ -3680,12 +3738,15 @@ class InkboxGateway:
             "agentIdentities",
             "identity_agents",
         )
+        # Only a group message carries background from other participants.
+        group_context = self._group_context(data, contacts)
         is_group = (
             self._conversation_summary_is_group(conversation_summary)
             or bool(self._field(message, "isGroup", "is_group"))
             or len(participants) > 1
             or len(contacts) > 1
             or len(agent_identities) > 1
+            or bool(group_context)
         )
         contact = await self._resolve_contact_full(kind="phone", value=sender)
         payload_contact = self._matched_payload_contact(
@@ -3705,6 +3766,7 @@ class InkboxGateway:
                 local_phone=local_phone,
                 participants=participants,
                 contact=contact,
+                context=group_context,
             )
         thread_key = self._thread_key("sms", conversation_id)
         chat_id = self._chat_key(
@@ -3768,14 +3830,18 @@ class InkboxGateway:
         ):
             if entry not in participants:
                 participants.append(entry)
+        contacts = self._webhook_list(data, "contacts", "contact_list")
+        # Only a group message carries background from other participants.
+        group_context = self._group_context(data, contacts)
         is_group = (
             self._conversation_summary_is_group(conversation_summary)
             or bool(self._field(message, "isGroup", "is_group"))
             or len(participants) > 1
+            or bool(group_context)
         )
         contact = await self._resolve_contact_full(kind="phone", value=sender)
         payload_contact = self._matched_payload_contact(
-            self._webhook_list(data, "contacts", "contact_list"),
+            contacts,
             resolved_id=self._contact_id(contact),
         )
         contact_memories = self._webhook_contact_memories(payload_contact)
@@ -3795,6 +3861,7 @@ class InkboxGateway:
                 conversation_id=conversation_id,
                 participants=participants,
                 contact=contact,
+                context=group_context,
             )
         thread_key = self._thread_key("imessage", conversation_id)
         # A group is one shared context for everyone in it, so the conversation -
