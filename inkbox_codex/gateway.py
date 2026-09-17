@@ -241,7 +241,8 @@ def _delivery_failure_prompt(
             ``delivery_failed`` / ``bounced`` (async webhook).
 
     Returns:
-        str: A prompt instructing the agent to retry or switch channels.
+        str: A prompt instructing the agent to retry or switch channels, or
+        to stop when contact rules block the recipient.
     """
     quoted = f'\n\nThe message was:\n"{body}"' if body else ""
     remaining = max(0, max_attempts - attempt)
@@ -254,6 +255,15 @@ def _delivery_failure_prompt(
         reason=reason,
         attempt=attempt,
     )
+    if _is_contact_rule_block(reason):
+        # Terminal on every channel: no rewrite or channel-switch guidance.
+        return "\n".join([
+            f"[delivery failed] Your {channel} message to {recipient} was NOT sent "
+            f"(attempt {attempt}/{max_attempts}, stage {stage}).",
+            f"Reason: {reason}.{quoted}",
+            "",
+            reply_instruction,
+        ])
     return "\n".join([
         f"[delivery failed] Your {channel} message to {recipient} was NOT delivered "
         f"(attempt {attempt}/{max_attempts}, stage {stage}).",
@@ -696,6 +706,17 @@ def _sms_delivery_failure_policy(reason: Optional[str]) -> str:
     return "conditional"
 
 
+def _is_recipient_blocked_error(exc: Exception) -> bool:
+    """Whether a send was refused because contact rules block a recipient."""
+    detail = getattr(exc, "detail", None)
+    return isinstance(detail, dict) and detail.get("error") == "recipient_blocked"
+
+
+def _is_contact_rule_block(reason: Optional[str]) -> bool:
+    """Whether a send failed because contact rules block the recipient."""
+    return "recipient_blocked" in str(reason or "").strip().lower()
+
+
 def _delivery_failure_reply_instruction(
     *,
     mode: str,
@@ -703,6 +724,17 @@ def _delivery_failure_reply_instruction(
     attempt: int,
 ) -> str:
     """Give the model one non-contradictory action for this failure class."""
+    if _is_contact_rule_block(reason):
+        # The owner's contact rules decide who this agent may reach, on every
+        # channel - rewording or changing channels must not route around them.
+        label = {"sms": "SMS", "imessage": "iMessage", "email": "Email"}.get(mode, mode)
+        return (
+            f"{label} failure classification: DO NOT RETRY. This agent's contact "
+            "rules do not allow messaging this recipient, and only the agent's "
+            "owner can change them. Do not resend or reword this message, and do "
+            "not try to reach the recipient on another channel; reply exactly "
+            "[SILENT]."
+        )
     if mode != "sms":
         return (
             "Send a corrected message only when it is safe, permitted, and likely "

@@ -175,6 +175,17 @@ def _send_rejected_prompt(reply: str, reason: str) -> str:
     Returns:
         str: A prompt telling Codex to rephrase or switch channels.
     """
+    if "recipient_blocked" in reason.lower():
+        # A contact-rule block is terminal: never nudge toward another channel.
+        return "\n".join([
+            "[reply rejected] Your last reply was NOT sent - this agent's contact "
+            "rules do not allow messaging this recipient.",
+            f"Reason: {reason}",
+            "",
+            "Only the agent's owner can change those rules. Do not resend or "
+            "reword the reply, and do not try to reach the recipient on another "
+            "channel; reply exactly [SILENT].",
+        ])
     return "\n".join([
         "[reply rejected] Your last reply was NOT delivered — the messaging "
         "provider rejected it before sending.",
