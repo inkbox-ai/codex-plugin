@@ -130,7 +130,8 @@ class BridgeConfig:
     external_events_enabled: bool = False
     contact_memories_enabled: bool = True
     # Whether automatic email replies keep the people the sender copied:
-    # "trusted" (only for an allowed or saved sender), "always", or "never".
+    # "trusted" (only when inbound mail is allowed contacts only), "always", or
+    # "never".
     # A sender-only reply is still threaded.
     email_reply_all: str = "trusted"
     host: str = DEFAULT_HOST

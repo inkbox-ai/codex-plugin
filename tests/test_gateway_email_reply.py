@@ -4,7 +4,8 @@ The reply to an inbound email threads onto it and keeps the people the sender
 copied. When contact rules block a copied recipient the bridge retries once as
 a sender-only reply; a second failure goes to the normal failure handling.
 ``INKBOX_EMAIL_REPLY_ALL`` decides when copied recipients are kept: ``trusted``
-(the default - only for an allowed or saved sender), ``always``, or ``never``.
+(the default - only when inbound mail is allowed contacts only), ``always``,
+or ``never``.
 A sender-only reply is still threaded.
 """
 
@@ -57,6 +58,11 @@ class _FakeIdentity:
 
     def send_email(self, *args, **kwargs):
         self._record("send_email", args, kwargs)
+
+
+def _allowed_only(errors=()):
+    """An identity whose inbound mail mode only admits allowed contacts."""
+    return _FakeIdentity(errors, mail_inbound_filter_mode="whitelist")
 
 
 class _FakeSession:
@@ -142,18 +148,6 @@ def test_inbound_without_copied_recipients_has_empty_reply_cc(fields):
     assert meta["reply_cc"] == []
 
 
-def test_inbound_marks_a_sender_the_webhook_resolved_to_a_saved_contact():
-    assert _inbound_meta(_mail_envelope())["sender_is_contact"] is False
-
-    envelope = _mail_envelope()
-    envelope["data"]["contacts"] = [{"bucket": "from", "id": "c-1", "address": OWNER}]
-    assert _inbound_meta(envelope)["sender_is_contact"] is True
-
-    # A contact for someone else on the message says nothing about the sender.
-    envelope["data"]["contacts"] = [{"bucket": "cc", "id": "c-2", "address": "pat@example.com"}]
-    assert _inbound_meta(envelope)["sender_is_contact"] is False
-
-
 def test_inbound_without_ids_keeps_them_unset():
     meta = _inbound_meta(_mail_envelope(id=None, message_id=None))
     assert meta["message_id"] is None
@@ -170,14 +164,13 @@ def _meta(**overrides):
         "message_id": "msg-uuid",
         "rfc_message_id": RFC_ID,
         "reply_cc": ["pat@example.com"],
-        "sender_is_contact": True,
     }
     meta.update(overrides)
     return meta
 
 
 def test_reply_keeps_copied_recipients_with_a_threaded_reply_all():
-    identity = _FakeIdentity()
+    identity = _allowed_only()
     _send(_gw(identity), _meta())
     assert identity.calls == [
         ("reply_all_email", ("msg-uuid",), {"subject": "Re: Plans", "body_text": "Confirmed."}),
@@ -218,14 +211,22 @@ class _Mode:
 ])
 def test_trusted_keeps_copied_recipients_when_mail_is_allowed_contacts_only(attrs):
     identity = _FakeIdentity(**attrs)
-    _send(_gw(identity), _meta(sender_is_contact=False))
+    _send(_gw(identity), _meta())
     assert [name for name, _, _ in identity.calls] == ["reply_all_email"]
 
 
-def test_trusted_keeps_copied_recipients_for_a_saved_contact_on_open_mail():
+def test_trusted_on_open_mail_is_sender_only_even_for_a_known_contact():
+    # Contacts are also created for anyone who writes in, so a matched contact
+    # says nothing about whether the owner allowed the sender.
+    envelope = _mail_envelope(to=[AGENT], cc=["pat@example.com"])
+    envelope["data"]["contacts"] = [{"bucket": "from", "id": "c-1", "address": OWNER}]
+    meta = _inbound_meta(envelope)
+    assert meta["reply_cc"] == ["pat@example.com"]
+
     identity = _FakeIdentity(mail_inbound_filter_mode="blacklist")
-    _send(_gw(identity), _meta(sender_is_contact=True))
-    assert [name for name, _, _ in identity.calls] == ["reply_all_email"]
+    _send(_gw(identity), meta)
+    assert [name for name, _, _ in identity.calls] == ["send_email"]
+    assert identity.calls[0][2]["to"] == [OWNER]
 
 
 @pytest.mark.parametrize("attrs", [
@@ -237,10 +238,10 @@ def test_trusted_keeps_copied_recipients_for_a_saved_contact_on_open_mail():
     {},
     {"mail_inbound_filter_mode": None, "mail_filter_mode": None},
 ])
-def test_trusted_drops_copied_recipients_for_an_unknown_sender_on_open_mail(attrs, caplog):
+def test_trusted_drops_copied_recipients_on_open_mail(attrs, caplog):
     identity = _FakeIdentity(**attrs)
     with caplog.at_level("INFO"):
-        _send(_gw(identity), _meta(sender_is_contact=False))
+        _send(_gw(identity), _meta())
     assert identity.calls == [
         ("send_email", (), {
             "to": [OWNER], "subject": "Re: Plans", "body_text": "Confirmed.",
@@ -258,20 +259,20 @@ def test_unreadable_identity_mode_counts_as_not_trusted():
             raise RuntimeError("no mode")
 
     identity = _Raises()
-    _send(_gw(identity), _meta(sender_is_contact=False))
+    _send(_gw(identity), _meta())
     assert [name for name, _, _ in identity.calls] == ["send_email"]
 
 
 def test_always_keeps_copied_recipients_for_any_sender():
     identity = _FakeIdentity(mail_inbound_filter_mode="blacklist")
-    _send(_gw(identity, email_reply_all="always"), _meta(sender_is_contact=False))
+    _send(_gw(identity, email_reply_all="always"), _meta())
     assert [name for name, _, _ in identity.calls] == ["reply_all_email"]
 
 
 def test_trusted_without_copied_recipients_logs_nothing(caplog):
     identity = _FakeIdentity()
     with caplog.at_level("INFO"):
-        _send(_gw(identity), _meta(reply_cc=[], sender_is_contact=False))
+        _send(_gw(identity), _meta(reply_cc=[]))
     assert [name for name, _, _ in identity.calls] == ["send_email"]
     assert not [r for r in caplog.records if "were not kept" in r.getMessage()]
 
@@ -285,14 +286,14 @@ def test_meta_from_before_this_field_existed_sends_exactly_as_before():
 
 
 def test_too_many_copied_recipients_gets_a_sender_only_reply():
-    identity = _FakeIdentity()
+    identity = _allowed_only()
     copied = [f"p{index}@example.com" for index in range(gateway.EMAIL_REPLY_ALL_MAX_COPIED + 1)]
     _send(_gw(identity), _meta(reply_cc=copied))
     assert [name for name, _, _ in identity.calls] == ["send_email"]
 
 
 def test_blocked_copied_recipient_retries_once_to_the_sender_only(caplog):
-    identity = _FakeIdentity(errors=[_Blocked()])
+    identity = _allowed_only(errors=[_Blocked()])
     with caplog.at_level("WARNING"):
         _send(_gw(identity), _meta())
     assert [name for name, _, _ in identity.calls] == ["reply_all_email", "send_email"]
@@ -306,7 +307,7 @@ def test_blocked_copied_recipient_retries_once_to_the_sender_only(caplog):
 
 
 def test_blocked_sender_only_retry_raises_into_normal_failure_handling():
-    identity = _FakeIdentity(errors=[_Blocked(), _Blocked()])
+    identity = _allowed_only(errors=[_Blocked(), _Blocked()])
     with pytest.raises(_Blocked):
         _send(_gw(identity), _meta())
     # Exactly one retry - never a loop.
@@ -314,7 +315,7 @@ def test_blocked_sender_only_retry_raises_into_normal_failure_handling():
 
 
 def test_other_reply_all_errors_are_not_retried():
-    identity = _FakeIdentity(errors=[RuntimeError("mailbox over quota")])
+    identity = _allowed_only(errors=[RuntimeError("mailbox over quota")])
     with pytest.raises(RuntimeError):
         _send(_gw(identity), _meta())
     assert [name for name, _, _ in identity.calls] == ["reply_all_email"]

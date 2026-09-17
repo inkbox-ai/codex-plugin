@@ -211,7 +211,7 @@ Who can reach the agent, and whom it can contact, is decided by the identity's I
 
 **Email replies keep the people you copied.** The automatic reply to an email always threads onto the message it answers. Whether it also goes to the message's other To/Cc recipients (the agent's own address is left out) is set by `INKBOX_EMAIL_REPLY_ALL`:
 
-- `trusted` (default) — keep the copied people only when the sender is someone you trust: either the identity's inbound mail mode is `whitelist`, so only allowed contacts can email it at all, or the sender is a saved contact. Anyone else gets a reply addressed to them alone.
+- `trusted` (default) — keep the copied people only when the identity's inbound mail mode is `whitelist`, so everyone who can email the agent is a contact you allowed. With any other inbound mode the reply goes to the sender alone.
 - `always` — keep the copied people for every sender.
 - `never` — always reply to the sender only.
 
@@ -304,7 +304,7 @@ curl --fail-with-body --request POST 'https://your-agent-host.example/webhook' \
 | `INKBOX_REQUIRE_SIGNATURE` | no | `true` | Refuse unsigned inbound webhooks unless `false`. |
 | `INKBOX_SKIP_WEBHOOK_RECONCILE` | no | `false` | Leave webhook subscriptions untouched on start. For deployments that provision them ahead of time, where the destination is fixed or this API key may not change it. They must already point at this bridge's webhook URL, or nothing arrives. |
 | `INKBOX_CONTACT_MEMORIES_ENABLED` | no | `true` | Add memories supplied with the matched webhook contact as background context. |
-| `INKBOX_EMAIL_REPLY_ALL` | no | `trusted` | When automatic email replies keep the people the sender copied (other To/Cc recipients): `trusted` (only when inbound mail is `whitelist` or the sender is a saved contact), `always`, or `never`. Replies are threaded either way — see [Groups, copied recipients, and contact rules](#groups-copied-recipients-and-contact-rules). |
+| `INKBOX_EMAIL_REPLY_ALL` | no | `trusted` | When automatic email replies keep the people the sender copied (other To/Cc recipients): `trusted` (only when inbound mail is `whitelist`), `always`, or `never`. Replies are threaded either way — see [Groups, copied recipients, and contact rules](#groups-copied-recipients-and-contact-rules). |
 | `INKBOX_BASE_URL` | no | SDK default | Override the Inkbox API base URL. |
 | `INKBOX_PUBLIC_URL` | no | - | Public bridge URL. Omit to use an Inkbox tunnel. |
 | `INKBOX_TUNNEL_NAME` | no | identity handle | Tunnel name override. |

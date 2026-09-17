@@ -3477,8 +3477,6 @@ class InkboxGateway:
             "message_id": str(message.get("id") or "").strip() or None,
             "rfc_message_id": str(message.get("message_id") or "").strip() or None,
             "reply_cc": self._mail_reply_cc(message, sender),
-            # A saved contact is a trusted sender for keeping copied recipients.
-            "sender_is_contact": bool(payload_contact or contact),
             "contact": contact,
             "agent_identity": agent_identity,
             "contact_memories": contact_memories,
@@ -4861,14 +4859,14 @@ class InkboxGateway:
             if (
                 copied
                 and self.cfg.email_reply_all == "trusted"
-                and not meta.get("sender_is_contact")
                 and not _mail_inbound_allowed_only(identity)
             ):
                 # An agent that accepts mail from anyone must not email the
                 # people a stranger copied.
                 logger.info(
                     "[bridge] email reply for %s: copied recipients were not kept "
-                    "because the sender is not an allowed or saved contact",
+                    "because this identity accepts mail from anyone; set inbound "
+                    "mail to whitelist, or INKBOX_EMAIL_REPLY_ALL=always",
                     chat_id,
                 )
                 copied = None
