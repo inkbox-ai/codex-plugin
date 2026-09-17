@@ -7,7 +7,7 @@ def test_read_config_defaults(monkeypatch):
         "INKBOX_ALLOWED_USERS", "CODEX_BIN", "CODEX_SANDBOX",
         "CODEX_APPROVAL_POLICY", "INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS",
         "INKBOX_BASE_URL", "CODEX_TURN_TIMEOUT_S", "CODEX_INTERRUPT_TIMEOUT_S",
-        "INKBOX_CONTACT_MEMORIES_ENABLED",
+        "INKBOX_CONTACT_MEMORIES_ENABLED", "INKBOX_EMAIL_REPLY_ALL",
         "INKBOX_A2A_PROGRESS_INTERVAL_SECONDS",
     ):
         monkeypatch.delenv(var, raising=False)
@@ -21,6 +21,7 @@ def test_read_config_defaults(monkeypatch):
     assert cfg.codex_turn_timeout_s == 1800.0
     assert cfg.codex_interrupt_timeout_s == 10.0
     assert cfg.contact_memories_enabled is True
+    assert cfg.email_reply_all is True
     assert cfg.a2a_progress_interval_seconds == 180.0
 
 
@@ -52,6 +53,11 @@ def test_read_config_env(monkeypatch):
 def test_contact_memories_can_be_disabled(monkeypatch):
     monkeypatch.setenv("INKBOX_CONTACT_MEMORIES_ENABLED", "false")
     assert read_config().contact_memories_enabled is False
+
+
+def test_email_reply_all_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("INKBOX_EMAIL_REPLY_ALL", "false")
+    assert read_config().email_reply_all is False
 
 
 def _clear_realtime_env(monkeypatch):

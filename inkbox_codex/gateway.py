@@ -624,6 +624,9 @@ OUTBOUND_FAILURE_MAX_ATTEMPTS = 3
 OUTBOUND_FAILURE_STATE_TTL_SECONDS = 30 * 60.0
 # How much of the undelivered body to echo back into the wake-up turn.
 OUTBOUND_FAILURE_BODY_SNIPPET_CHARS = 400
+# An automatic email reply keeps the people the sender copied, up to this many;
+# a longer list gets a sender-only reply instead of a mass mailing.
+EMAIL_REPLY_ALL_MAX_COPIED = 25
 
 # Per-channel fix-it guidance embedded in the delivery-failure wake-up turn.
 # Text channels are usually fixable by rewriting; a mail bounce usually means
@@ -3450,6 +3453,10 @@ class InkboxGateway:
             "sender": sender,
             "subject": subject,
             "thread_id": message.get("thread_id"),
+            # What the automatic reply needs to thread and keep its audience.
+            "message_id": str(message.get("id") or "").strip() or None,
+            "rfc_message_id": str(message.get("message_id") or "").strip() or None,
+            "reply_cc": self._mail_reply_cc(message, sender),
             "contact": contact,
             "agent_identity": agent_identity,
             "contact_memories": contact_memories,
@@ -3459,6 +3466,32 @@ class InkboxGateway:
         # The channel tag (Subject included) is added by frame_inbound.
         await self.sessions.get(chat_id).handle_inbound(body_text, "email", meta)
         return web.json_response({"ok": True})
+
+    def _mail_reply_cc(self, message: Dict[str, Any], sender: str) -> List[str]:
+        """List the people the sender copied on an inbound email.
+
+        Args:
+            message (dict): The webhook's ``message`` object.
+            sender (str): The address the reply is going to.
+
+        Returns:
+            List[str]: The message's other To + Cc addresses, in order, without
+            this agent's own address(es), the sender, or duplicates (compared
+            case-insensitively). Empty when the fields are absent.
+        """
+        seen = {address.lower() for address in self._self_addresses}
+        seen.add((parseaddr(sender)[1] or sender).strip().lower())
+        copied: List[str] = []
+        for entry in (
+            self._string_list_field(message, "to_addresses")
+            + self._string_list_field(message, "cc_addresses")
+        ):
+            address = (parseaddr(entry)[1] or entry).strip()
+            if not address or address.lower() in seen:
+                continue
+            seen.add(address.lower())
+            copied.append(address)
+        return copied
 
     async def _fetch_mail_attachments(self, message: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Fetch + download an inbound email's attachments, best-effort.
@@ -4801,9 +4834,44 @@ class InkboxGateway:
             identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
             subject = str(meta.get("subject") or "").strip()
             reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}" if subject else "From your Codex agent"
-            await asyncio.to_thread(
-                identity.send_email,
-                to=[str(meta.get("to") or chat_id)],
-                subject=reply_subject,
-                body_text=content,
-            )
+            source_id = str(meta.get("message_id") or "").strip()
+            copied = meta.get("reply_cc") if self.cfg.email_reply_all else None
+            if source_id and isinstance(copied, list) and 0 < len(copied) <= EMAIL_REPLY_ALL_MAX_COPIED:
+                # The sender copied other people: reply to everyone on the
+                # inbound message. The server resolves recipients and threading.
+                try:
+                    await asyncio.to_thread(
+                        identity.reply_all_email,
+                        source_id,
+                        subject=reply_subject,
+                        body_text=content,
+                    )
+                    return
+                except Exception as exc:
+                    if not _is_recipient_blocked_error(exc):
+                        raise
+                    # One sender-only retry so the sender still gets an answer;
+                    # if that fails too, the normal failure handling takes over.
+                    logger.warning(
+                        "[bridge] email reply for %s: copied recipients were dropped "
+                        "because contact rules block them; replying to the sender "
+                        "only. The outbound \"supervised\" contact-rule mode allows "
+                        "replies to people an allowed contact copied.",
+                        chat_id,
+                    )
+            elif isinstance(copied, list) and len(copied) > EMAIL_REPLY_ALL_MAX_COPIED:
+                logger.warning(
+                    "[bridge] email reply for %s: %d copied recipients is over the "
+                    "limit of %d; replying to the sender only",
+                    chat_id, len(copied), EMAIL_REPLY_ALL_MAX_COPIED,
+                )
+            kwargs = {
+                "to": [str(meta.get("to") or chat_id)],
+                "subject": reply_subject,
+                "body_text": content,
+            }
+            # Thread the reply onto the inbound message when its id is known.
+            rfc_message_id = str(meta.get("rfc_message_id") or "").strip()
+            if rfc_message_id:
+                kwargs["in_reply_to_message_id"] = rfc_message_id
+            await asyncio.to_thread(identity.send_email, **kwargs)

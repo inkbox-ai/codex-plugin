@@ -118,6 +118,9 @@ class BridgeConfig:
     # registered third-party providers bypass it once their secret is set.
     external_events_enabled: bool = False
     contact_memories_enabled: bool = True
+    # Keep the people the sender copied on automatic email replies. Off means
+    # the reply goes to the sender only (still threaded).
+    email_reply_all: bool = True
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     # Codex side
@@ -231,6 +234,7 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         skip_webhook_reconcile=env_flag("INKBOX_SKIP_WEBHOOK_RECONCILE", False),
         external_events_enabled=env_flag("INKBOX_EXTERNAL_EVENTS_ENABLED", False),
         contact_memories_enabled=env_flag("INKBOX_CONTACT_MEMORIES_ENABLED", True),
+        email_reply_all=env_flag("INKBOX_EMAIL_REPLY_ALL", True),
         host=str(os.getenv("INKBOX_BRIDGE_HOST") or DEFAULT_HOST).strip(),
         port=int(os.getenv("INKBOX_BRIDGE_PORT") or DEFAULT_PORT),
         project_dir=str(
