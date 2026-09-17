@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from typing import Any, Dict, List, Optional
 
 # Appended to the codex system prompt preset for every bridged
@@ -293,29 +294,53 @@ def _group_context_media_notes(media: Any) -> List[str]:
     return notes
 
 
+# Characters that could break out of a quoted line or imitate a routing marker
+# are swapped for harmless look-alikes, so quoting never expands the text.
+_GROUP_CONTEXT_NEUTRALIZE = str.maketrans({
+    "[": "(", "]": ")", "\uff3b": "(", "\uff3d": ")", '"': "'", "\\": "/",
+})
+
+
+def _group_context_text(value: str) -> str:
+    """Flatten untrusted text to one plain line.
+
+    Whitespace is collapsed so a message cannot span lines; control, format
+    (bidi overrides, zero-width, BOM), surrogate, private-use and unassigned
+    characters are dropped so it cannot hide or reorder what the model reads.
+    """
+    flat = " ".join(value.split())
+    flat = "".join(ch for ch in flat if not unicodedata.category(ch).startswith("C"))
+    return " ".join(flat.translate(_GROUP_CONTEXT_NEUTRALIZE).split())
+
+
+def _group_context_name(value: Any) -> str:
+    """Reduce a display name to letters, digits, spaces and ``.'-``.
+
+    A name is shown unquoted, so it must not be able to carry a number, a
+    colon or a quote that would read as another speaker's line.
+    """
+    kept = "".join(ch for ch in str(value or "") if ch.isalnum() or ch in " .'-")
+    return " ".join(kept.split())[:64].strip()
+
+
 def _group_context_line(item: Any, names: Dict[str, str]) -> str:
     """Render one context message as a single safely quoted line."""
     if not isinstance(item, dict):
         return ""
     sender = _group_context_item_field(item, "sender_number", "sender_phone_number")
-    text = _group_context_item_field(item, "content", "text")
-    # Collapse whitespace so one message can never span or fake extra lines,
-    # and drop unpaired surrogates so the turn always encodes cleanly.
-    text = " ".join(text.split()).encode("utf-8", "replace").decode("utf-8")
+    text = _group_context_text(_group_context_item_field(item, "content", "text"))
     notes = _group_context_media_notes(item.get("media"))
     if not text and not notes:
         return ""
     handle = re.sub(r"[^0-9A-Za-z+@._-]", "", sender)[:64] or "unknown"
-    name = " ".join(re.sub(r"[\[\]]", " ", names.get(group_context_sender_key(sender), "")).split())
-    label = f"{name[:64]} ({handle})" if name else handle
+    name = _group_context_name(names.get(group_context_sender_key(sender)))
+    label = f"{name} ({handle})" if name else handle
     parts: List[str] = []
     if text:
         truncated = len(text) > GROUP_CONTEXT_MAX_TEXT_CHARS
-        quoted = (
-            json.dumps(text[:GROUP_CONTEXT_MAX_TEXT_CHARS], ensure_ascii=False)
-            .replace("[", "\\u005b")
-            .replace("]", "\\u005d")
-        )
+        # Nothing left in the text needs escaping, so the quoted form is the
+        # capped text plus its two quote marks.
+        quoted = json.dumps(text[:GROUP_CONTEXT_MAX_TEXT_CHARS], ensure_ascii=False)
         parts.append(f"{quoted} [truncated]" if truncated else quoted)
     parts.extend(notes)
     return f"{label}: {' '.join(parts)}"
@@ -324,8 +349,9 @@ def _group_context_line(item: Any, names: Dict[str, str]) -> str:
 def group_context_block(messages: Any, names: Optional[Dict[str, str]] = None) -> str:
     """Render background group messages as one delimited, size-bounded block.
 
-    Message text is JSON-quoted with its brackets escaped, so nothing a
-    participant writes can close the block or imitate a routing marker.
+    Message text is flattened to one quoted line with brackets and quotes
+    neutralized, so nothing a participant writes can close the block, imitate
+    a routing marker, or pose as another speaker.
 
     Args:
         messages (Any): The webhook's ``context_messages`` list, oldest first.
