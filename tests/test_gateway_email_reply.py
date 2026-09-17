@@ -3,7 +3,9 @@
 The reply to an inbound email threads onto it and keeps the people the sender
 copied. When contact rules block a copied recipient the bridge retries once as
 a sender-only reply; a second failure goes to the normal failure handling.
-``INKBOX_EMAIL_REPLY_ALL=false`` keeps replies sender-only (still threaded).
+``INKBOX_EMAIL_REPLY_ALL`` decides when copied recipients are kept: ``trusted``
+(the default - only for an allowed or saved sender), ``always``, or ``never``.
+A sender-only reply is still threaded.
 """
 
 import asyncio
@@ -36,9 +38,12 @@ class _Blocked(Exception):
 class _FakeIdentity:
     """Records mail sends; raises the queued errors first, one per call."""
 
-    def __init__(self, errors=()):
+    def __init__(self, errors=(), **attrs):
         self.calls = []
         self._errors = list(errors)
+        # Optional contact-rule mode attributes, as the SDK exposes them.
+        for name, value in attrs.items():
+            setattr(self, name, value)
 
     def _record(self, name, args, kwargs):
         self.calls.append((name, args, kwargs))
@@ -137,6 +142,18 @@ def test_inbound_without_copied_recipients_has_empty_reply_cc(fields):
     assert meta["reply_cc"] == []
 
 
+def test_inbound_marks_a_sender_the_webhook_resolved_to_a_saved_contact():
+    assert _inbound_meta(_mail_envelope())["sender_is_contact"] is False
+
+    envelope = _mail_envelope()
+    envelope["data"]["contacts"] = [{"bucket": "from", "id": "c-1", "address": OWNER}]
+    assert _inbound_meta(envelope)["sender_is_contact"] is True
+
+    # A contact for someone else on the message says nothing about the sender.
+    envelope["data"]["contacts"] = [{"bucket": "cc", "id": "c-2", "address": "pat@example.com"}]
+    assert _inbound_meta(envelope)["sender_is_contact"] is False
+
+
 def test_inbound_without_ids_keeps_them_unset():
     meta = _inbound_meta(_mail_envelope(id=None, message_id=None))
     assert meta["message_id"] is None
@@ -153,6 +170,7 @@ def _meta(**overrides):
         "message_id": "msg-uuid",
         "rfc_message_id": RFC_ID,
         "reply_cc": ["pat@example.com"],
+        "sender_is_contact": True,
     }
     meta.update(overrides)
     return meta
@@ -177,12 +195,85 @@ def test_reply_without_copied_recipients_is_threaded_to_the_sender():
     ]
 
 
-def test_toggle_off_replies_to_the_sender_only_still_threaded():
-    identity = _FakeIdentity()
-    _send(_gw(identity, email_reply_all=False), _meta())
+def test_never_replies_to_the_sender_only_still_threaded():
+    identity = _FakeIdentity(mail_inbound_filter_mode="whitelist")
+    _send(_gw(identity, email_reply_all="never"), _meta())
     assert [name for name, _, _ in identity.calls] == ["send_email"]
     assert identity.calls[0][2]["to"] == [OWNER]
     assert identity.calls[0][2]["in_reply_to_message_id"] == RFC_ID
+
+
+class _Mode:
+    """Stands in for an SDK enum member."""
+
+    def __init__(self, value):
+        self.value = value
+
+
+@pytest.mark.parametrize("attrs", [
+    {"mail_inbound_filter_mode": "whitelist"},
+    {"mail_inbound_filter_mode": _Mode("whitelist")},
+    # An SDK without the directional attribute: the single mail mode decides.
+    {"mail_filter_mode": _Mode("whitelist")},
+])
+def test_trusted_keeps_copied_recipients_when_mail_is_allowed_contacts_only(attrs):
+    identity = _FakeIdentity(**attrs)
+    _send(_gw(identity), _meta(sender_is_contact=False))
+    assert [name for name, _, _ in identity.calls] == ["reply_all_email"]
+
+
+def test_trusted_keeps_copied_recipients_for_a_saved_contact_on_open_mail():
+    identity = _FakeIdentity(mail_inbound_filter_mode="blacklist")
+    _send(_gw(identity), _meta(sender_is_contact=True))
+    assert [name for name, _, _ in identity.calls] == ["reply_all_email"]
+
+
+@pytest.mark.parametrize("attrs", [
+    {"mail_inbound_filter_mode": "blacklist"},
+    # The directional attribute wins over the legacy one.
+    {"mail_inbound_filter_mode": "blacklist", "mail_filter_mode": "whitelist"},
+    {"mail_filter_mode": _Mode("blacklist")},
+    # Nothing readable on the identity => not trusted.
+    {},
+    {"mail_inbound_filter_mode": None, "mail_filter_mode": None},
+])
+def test_trusted_drops_copied_recipients_for_an_unknown_sender_on_open_mail(attrs, caplog):
+    identity = _FakeIdentity(**attrs)
+    with caplog.at_level("INFO"):
+        _send(_gw(identity), _meta(sender_is_contact=False))
+    assert identity.calls == [
+        ("send_email", (), {
+            "to": [OWNER], "subject": "Re: Plans", "body_text": "Confirmed.",
+            "in_reply_to_message_id": RFC_ID,
+        }),
+    ]
+    kept = [r.getMessage() for r in caplog.records if "were not kept" in r.getMessage()]
+    assert len(kept) == 1
+
+
+def test_unreadable_identity_mode_counts_as_not_trusted():
+    class _Raises(_FakeIdentity):
+        @property
+        def mail_inbound_filter_mode(self):
+            raise RuntimeError("no mode")
+
+    identity = _Raises()
+    _send(_gw(identity), _meta(sender_is_contact=False))
+    assert [name for name, _, _ in identity.calls] == ["send_email"]
+
+
+def test_always_keeps_copied_recipients_for_any_sender():
+    identity = _FakeIdentity(mail_inbound_filter_mode="blacklist")
+    _send(_gw(identity, email_reply_all="always"), _meta(sender_is_contact=False))
+    assert [name for name, _, _ in identity.calls] == ["reply_all_email"]
+
+
+def test_trusted_without_copied_recipients_logs_nothing(caplog):
+    identity = _FakeIdentity()
+    with caplog.at_level("INFO"):
+        _send(_gw(identity), _meta(reply_cc=[], sender_is_contact=False))
+    assert [name for name, _, _ in identity.calls] == ["send_email"]
+    assert not [r for r in caplog.records if "were not kept" in r.getMessage()]
 
 
 def test_meta_from_before_this_field_existed_sends_exactly_as_before():

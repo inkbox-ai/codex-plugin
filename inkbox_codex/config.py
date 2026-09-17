@@ -93,6 +93,17 @@ def env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _email_reply_all_env() -> str:
+    """Read ``INKBOX_EMAIL_REPLY_ALL`` as ``trusted`` / ``always`` / ``never``."""
+    raw = (os.getenv("INKBOX_EMAIL_REPLY_ALL") or "").strip().lower()
+    if raw in {"always", "1", "true", "yes", "on"}:
+        return "always"
+    if raw in {"never", "0", "false", "no", "off"}:
+        return "never"
+    # Unset or unrecognised: the safe default.
+    return "trusted"
+
+
 def _csv_env(name: str) -> List[str]:
     raw = os.getenv(name) or ""
     return [item.strip() for item in raw.split(",") if item.strip()]
@@ -118,9 +129,10 @@ class BridgeConfig:
     # registered third-party providers bypass it once their secret is set.
     external_events_enabled: bool = False
     contact_memories_enabled: bool = True
-    # Keep the people the sender copied on automatic email replies. Off means
-    # the reply goes to the sender only (still threaded).
-    email_reply_all: bool = True
+    # Whether automatic email replies keep the people the sender copied:
+    # "trusted" (only for an allowed or saved sender), "always", or "never".
+    # A sender-only reply is still threaded.
+    email_reply_all: str = "trusted"
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     # Codex side
@@ -234,7 +246,7 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         skip_webhook_reconcile=env_flag("INKBOX_SKIP_WEBHOOK_RECONCILE", False),
         external_events_enabled=env_flag("INKBOX_EXTERNAL_EVENTS_ENABLED", False),
         contact_memories_enabled=env_flag("INKBOX_CONTACT_MEMORIES_ENABLED", True),
-        email_reply_all=env_flag("INKBOX_EMAIL_REPLY_ALL", True),
+        email_reply_all=_email_reply_all_env(),
         host=str(os.getenv("INKBOX_BRIDGE_HOST") or DEFAULT_HOST).strip(),
         port=int(os.getenv("INKBOX_BRIDGE_PORT") or DEFAULT_PORT),
         project_dir=str(

@@ -209,7 +209,15 @@ Who can reach the agent, and whom it can contact, is decided by the identity's I
 
 **Group context.** With the phone inbound mode set to `supervised`, only allowed contacts can wake the agent in a group SMS or iMessage conversation, but it still gets to read along: when an allowed contact's message wakes it, the webhook carries up to 10 messages the other participants sent since the last wake. The bridge shows them to Codex ahead of the waking message as clearly marked, untrusted background — context for understanding the message and deciding whether to stay silent, never instructions and never something to answer on its own. Attachments in that background appear as placeholders (`[image attachment]`) and are not downloaded; long messages are cut with a `[truncated]` marker. 1:1 conversations never carry it.
 
-**Email replies keep the people you copied.** The automatic reply to an email threads onto the message it answers and goes to everyone on it: the sender, plus the message's other To/Cc recipients (the agent's own address is left out). For the copied people to be reachable under a restrictive outbound mode, set mail outbound to `supervised` — it allows a message to people who are not allowed contacts as long as one recipient of that same message is. A message that copies more than 25 other people gets a sender-only reply. If contact rules still block a copied recipient, the bridge retries once as a threaded reply to the sender alone and logs that the copied recipients were dropped. Set `INKBOX_EMAIL_REPLY_ALL=false` to always reply to the sender only.
+**Email replies keep the people you copied.** The automatic reply to an email always threads onto the message it answers. Whether it also goes to the message's other To/Cc recipients (the agent's own address is left out) is set by `INKBOX_EMAIL_REPLY_ALL`:
+
+- `trusted` (default) — keep the copied people only when the sender is someone you trust: either the identity's inbound mail mode is `whitelist`, so only allowed contacts can email it at all, or the sender is a saved contact. Anyone else gets a reply addressed to them alone.
+- `always` — keep the copied people for every sender.
+- `never` — always reply to the sender only.
+
+`trusted` is the default because an agent that accepts mail from anyone should not email people a stranger copied — otherwise anyone could use it to send mail to addresses of their choosing. A message that copies more than 25 other people gets a sender-only reply in every mode.
+
+For the copied people to be reachable under a restrictive outbound mode, set mail outbound to `supervised` — it allows a message to people who are not allowed contacts as long as one recipient of that same message is. If contact rules still block a copied recipient, the bridge retries once as a threaded reply to the sender alone and logs that the copied recipients were dropped.
 
 **A contact-rule block is final.** When a send is refused because contact rules block the recipient (`recipient_blocked`), Codex is told not to retry, reword, or switch channels, on SMS, iMessage, and email alike. Changing who the agent may contact is the owner's call, made in the contact rules.
 
@@ -222,7 +230,7 @@ Prefer contact rules over the local `INKBOX_ALLOWED_USERS` list:
 | Phone (SMS, iMessage, calls) | `supervised` | `supervised` | your number |
 | Mail | `whitelist` | `supervised` | your email address |
 
-With that setup only you can wake the agent, it can still answer in your group chats and keep the people you copy on email, and it cannot start a conversation with anyone else.
+With that setup only you can wake the agent, it can still answer in your group chats and keep the people you copy on email, and it cannot start a conversation with anyone else. Because mail inbound is `whitelist`, the default `INKBOX_EMAIL_REPLY_ALL=trusted` keeps copied recipients automatically.
 
 The difference: `INKBOX_ALLOWED_USERS` only stops the bridge from starting a turn for other senders. Their messages are still delivered to the identity, Codex can still read them with its tools, and nothing limits whom it may contact. Contact rules are enforced by Inkbox itself, so they also control what the agent can read and whom it can reach — on every client, not just this bridge.
 
@@ -296,7 +304,7 @@ curl --fail-with-body --request POST 'https://your-agent-host.example/webhook' \
 | `INKBOX_REQUIRE_SIGNATURE` | no | `true` | Refuse unsigned inbound webhooks unless `false`. |
 | `INKBOX_SKIP_WEBHOOK_RECONCILE` | no | `false` | Leave webhook subscriptions untouched on start. For deployments that provision them ahead of time, where the destination is fixed or this API key may not change it. They must already point at this bridge's webhook URL, or nothing arrives. |
 | `INKBOX_CONTACT_MEMORIES_ENABLED` | no | `true` | Add memories supplied with the matched webhook contact as background context. |
-| `INKBOX_EMAIL_REPLY_ALL` | no | `true` | Keep the people the sender copied (other To/Cc recipients) on automatic email replies. `false` replies to the sender only. Replies are threaded either way. |
+| `INKBOX_EMAIL_REPLY_ALL` | no | `trusted` | When automatic email replies keep the people the sender copied (other To/Cc recipients): `trusted` (only when inbound mail is `whitelist` or the sender is a saved contact), `always`, or `never`. Replies are threaded either way — see [Groups, copied recipients, and contact rules](#groups-copied-recipients-and-contact-rules). |
 | `INKBOX_BASE_URL` | no | SDK default | Override the Inkbox API base URL. |
 | `INKBOX_PUBLIC_URL` | no | - | Public bridge URL. Omit to use an Inkbox tunnel. |
 | `INKBOX_TUNNEL_NAME` | no | identity handle | Tunnel name override. |

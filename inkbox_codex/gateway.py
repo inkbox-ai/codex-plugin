@@ -709,6 +709,26 @@ def _sms_delivery_failure_policy(reason: Optional[str]) -> str:
     return "conditional"
 
 
+def _mail_inbound_allowed_only(identity: Any) -> bool:
+    """Whether the identity only accepts mail from allowed contacts.
+
+    Args:
+        identity (Any): The identity object fetched for the send.
+
+    Returns:
+        bool: True when its inbound mail mode is ``whitelist``. A missing or
+        unreadable mode counts as open.
+    """
+    try:
+        mode = getattr(identity, "mail_inbound_filter_mode", None)
+        if mode is None:
+            # Older SDKs only expose the single per-channel mode.
+            mode = getattr(identity, "mail_filter_mode", None)
+        return str(getattr(mode, "value", mode) or "").strip().lower() == "whitelist"
+    except Exception:
+        return False
+
+
 def _is_recipient_blocked_error(exc: Exception) -> bool:
     """Whether a send was refused because contact rules block a recipient."""
     detail = getattr(exc, "detail", None)
@@ -3457,6 +3477,8 @@ class InkboxGateway:
             "message_id": str(message.get("id") or "").strip() or None,
             "rfc_message_id": str(message.get("message_id") or "").strip() or None,
             "reply_cc": self._mail_reply_cc(message, sender),
+            # A saved contact is a trusted sender for keeping copied recipients.
+            "sender_is_contact": bool(payload_contact or contact),
             "contact": contact,
             "agent_identity": agent_identity,
             "contact_memories": contact_memories,
@@ -4835,7 +4857,21 @@ class InkboxGateway:
             subject = str(meta.get("subject") or "").strip()
             reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}" if subject else "From your Codex agent"
             source_id = str(meta.get("message_id") or "").strip()
-            copied = meta.get("reply_cc") if self.cfg.email_reply_all else None
+            copied = meta.get("reply_cc") if self.cfg.email_reply_all != "never" else None
+            if (
+                copied
+                and self.cfg.email_reply_all == "trusted"
+                and not meta.get("sender_is_contact")
+                and not _mail_inbound_allowed_only(identity)
+            ):
+                # An agent that accepts mail from anyone must not email the
+                # people a stranger copied.
+                logger.info(
+                    "[bridge] email reply for %s: copied recipients were not kept "
+                    "because the sender is not an allowed or saved contact",
+                    chat_id,
+                )
+                copied = None
             if source_id and isinstance(copied, list) and 0 < len(copied) <= EMAIL_REPLY_ALL_MAX_COPIED:
                 # The sender copied other people: reply to everyone on the
                 # inbound message. The server resolves recipients and threading.

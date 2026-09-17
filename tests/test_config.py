@@ -1,3 +1,5 @@
+import pytest
+
 from inkbox_codex.config import VoiceStack, read_config
 
 
@@ -21,7 +23,7 @@ def test_read_config_defaults(monkeypatch):
     assert cfg.codex_turn_timeout_s == 1800.0
     assert cfg.codex_interrupt_timeout_s == 10.0
     assert cfg.contact_memories_enabled is True
-    assert cfg.email_reply_all is True
+    assert cfg.email_reply_all == "trusted"
     assert cfg.a2a_progress_interval_seconds == 180.0
 
 
@@ -55,9 +57,16 @@ def test_contact_memories_can_be_disabled(monkeypatch):
     assert read_config().contact_memories_enabled is False
 
 
-def test_email_reply_all_can_be_disabled(monkeypatch):
-    monkeypatch.setenv("INKBOX_EMAIL_REPLY_ALL", "false")
-    assert read_config().email_reply_all is False
+@pytest.mark.parametrize(("raw", "expected"), [
+    ("trusted", "trusted"), ("always", "always"), ("never", "never"),
+    (" Always ", "always"), ("", "trusted"), ("sometimes", "trusted"),
+    # Boolean spellings are accepted too.
+    ("true", "always"), ("1", "always"), ("yes", "always"), ("on", "always"),
+    ("false", "never"), ("0", "never"), ("no", "never"), ("off", "never"),
+])
+def test_email_reply_all_values(monkeypatch, raw, expected):
+    monkeypatch.setenv("INKBOX_EMAIL_REPLY_ALL", raw)
+    assert read_config().email_reply_all == expected
 
 
 def _clear_realtime_env(monkeypatch):
