@@ -4864,10 +4864,9 @@ class InkboxGateway:
                 # An agent that accepts mail from anyone must not email the
                 # people a stranger copied.
                 logger.info(
-                    "[bridge] email reply for %s: copied recipients were not kept "
+                    "[bridge] email reply: copied recipients were not kept "
                     "because this identity accepts mail from anyone; set inbound "
-                    "mail to whitelist, or INKBOX_EMAIL_REPLY_ALL=always",
-                    chat_id,
+                    "mail to whitelist, or INKBOX_EMAIL_REPLY_ALL=always"
                 )
                 copied = None
             if source_id and isinstance(copied, list) and 0 < len(copied) <= EMAIL_REPLY_ALL_MAX_COPIED:
@@ -4887,17 +4886,16 @@ class InkboxGateway:
                     # One sender-only retry so the sender still gets an answer;
                     # if that fails too, the normal failure handling takes over.
                     logger.warning(
-                        "[bridge] email reply for %s: copied recipients were dropped "
+                        "[bridge] email reply: copied recipients were dropped "
                         "because contact rules block them; replying to the sender "
                         "only. The outbound \"supervised\" contact-rule mode allows "
-                        "replies to people an allowed contact copied.",
-                        chat_id,
+                        "replies to people an allowed contact copied."
                     )
             elif isinstance(copied, list) and len(copied) > EMAIL_REPLY_ALL_MAX_COPIED:
                 logger.warning(
-                    "[bridge] email reply for %s: %d copied recipients is over the "
+                    "[bridge] email reply: %d copied recipients is over the "
                     "limit of %d; replying to the sender only",
-                    chat_id, len(copied), EMAIL_REPLY_ALL_MAX_COPIED,
+                    len(copied), EMAIL_REPLY_ALL_MAX_COPIED,
                 )
             kwargs = {
                 "to": [str(meta.get("to") or chat_id)],
