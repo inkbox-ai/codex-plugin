@@ -104,6 +104,12 @@ def _email_reply_all_env() -> str:
     return "trusted"
 
 
+def _group_wake_env() -> str:
+    """Read ``INKBOX_GROUP_WAKE`` as ``judgement`` (default) or ``mention``."""
+    raw = (os.getenv("INKBOX_GROUP_WAKE") or "").strip().lower()
+    return "mention" if raw == "mention" else "judgement"
+
+
 def _csv_env(name: str) -> List[str]:
     raw = os.getenv(name) or ""
     return [item.strip() for item in raw.split(",") if item.strip()]
@@ -134,6 +140,12 @@ class BridgeConfig:
     # "never".
     # A sender-only reply is still threaded.
     email_reply_all: str = "trusted"
+    # How the agent decides to act on group SMS / iMessage messages:
+    # "judgement" (every allowed sender's message starts a turn; the model
+    # answers or stays silent) or "mention" (only when the message mentions
+    # the agent). Extra mention tokens come from INKBOX_GROUP_WAKE_MENTIONS.
+    group_wake: str = "judgement"
+    group_wake_mentions: List[str] = field(default_factory=list)
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     # Codex side
@@ -248,6 +260,8 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         external_events_enabled=env_flag("INKBOX_EXTERNAL_EVENTS_ENABLED", False),
         contact_memories_enabled=env_flag("INKBOX_CONTACT_MEMORIES_ENABLED", True),
         email_reply_all=_email_reply_all_env(),
+        group_wake=_group_wake_env(),
+        group_wake_mentions=_csv_env("INKBOX_GROUP_WAKE_MENTIONS"),
         host=str(os.getenv("INKBOX_BRIDGE_HOST") or DEFAULT_HOST).strip(),
         port=int(os.getenv("INKBOX_BRIDGE_PORT") or DEFAULT_PORT),
         project_dir=str(

@@ -221,6 +221,17 @@ For the copied people to be reachable under a restrictive outbound mode, set mai
 
 **A contact-rule block is final.** When a send is refused because contact rules block the recipient (`recipient_blocked`), Codex is told not to retry, reword, or switch channels, on SMS, iMessage, and email alike. Changing who the agent may contact is the owner's call, made in the contact rules.
 
+### Group chats: judgement vs mention
+
+`INKBOX_GROUP_WAKE` picks how the agent decides to act in a group SMS or iMessage conversation:
+
+- `judgement` (default) — every group message from an allowed sender starts a turn. Codex reads it with the group policy and either answers or returns `[SILENT]`, so it can join in when it is clearly being addressed without being pinged.
+- `mention` — a group message starts a turn only when it mentions the agent: `@<handle>` (the identity handle) as a whole word, in any case, anywhere in the text; sentence punctuation after it is fine, while a partial handle, a bare `@`, or `@handle` inside an email address or link does not count. `INKBOX_GROUP_WAKE_MENTIONS` adds extra tokens that count the same way, e.g. `@ai,aigraham`.
+
+In `mention` mode a group message without a mention is acknowledged and held in memory for that conversation (with any context that came with it) instead of starting a turn — up to 30 items, for up to 24 hours. When a mention arrives, the held messages are rendered ahead of that turn's context block, oldest first, and the buffer is cleared, so Codex sees what led up to the question. The buffer lives in the gateway process: a restart drops unflushed chatter, and Codex can still read the whole conversation with its tools.
+
+Either way, members who are not allowed contacts can never wake the agent — contact rules block them server-side before a webhook is sent. 1:1 messages and email are not affected by this setting; email always wakes the agent.
+
 ### Only let me wake my agent
 
 Prefer contact rules over the local `INKBOX_ALLOWED_USERS` list:
@@ -304,6 +315,8 @@ curl --fail-with-body --request POST 'https://your-agent-host.example/webhook' \
 | `INKBOX_REQUIRE_SIGNATURE` | no | `true` | Refuse unsigned inbound webhooks unless `false`. |
 | `INKBOX_SKIP_WEBHOOK_RECONCILE` | no | `false` | Leave webhook subscriptions untouched on start. For deployments that provision them ahead of time, where the destination is fixed or this API key may not change it. They must already point at this bridge's webhook URL, or nothing arrives. |
 | `INKBOX_CONTACT_MEMORIES_ENABLED` | no | `true` | Add memories supplied with the matched webhook contact as background context. |
+| `INKBOX_GROUP_WAKE` | no | `judgement` | Group SMS/iMessage: `judgement` starts a turn for every allowed sender's message (Codex answers or stays silent); `mention` only when the message mentions `@<handle>` or a token from `INKBOX_GROUP_WAKE_MENTIONS`. See [Group chats: judgement vs mention](#group-chats-judgement-vs-mention). |
+| `INKBOX_GROUP_WAKE_MENTIONS` | no | - | Extra comma-separated tokens that count as a mention in `mention` mode (e.g. `@ai,aigraham`). |
 | `INKBOX_EMAIL_REPLY_ALL` | no | `trusted` | When automatic email replies keep the people the sender copied (other To/Cc recipients): `trusted` (only when inbound mail is `whitelist`), `always`, or `never`. Replies are threaded either way — see [Groups, copied recipients, and contact rules](#groups-copied-recipients-and-contact-rules). |
 | `INKBOX_BASE_URL` | no | SDK default | Override the Inkbox API base URL. |
 | `INKBOX_PUBLIC_URL` | no | - | Public bridge URL. Omit to use an Inkbox tunnel. |

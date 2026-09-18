@@ -8,6 +8,7 @@ absent or empty field leaves the prompt exactly as it was.
 """
 
 import asyncio
+import itertools
 import json
 import time
 import types
@@ -92,13 +93,16 @@ def _imessage_envelope(context=None, *, group=True, text="@agent what time is di
     return {"data": data}
 
 
+_ids = itertools.count(1)
+
+
 def _sms_item(text, sender=OTHER, **extra):
-    return {"id": "ctx", "sender_phone_number": sender, "text": text,
+    return {"id": f"ctx-{next(_ids)}", "sender_phone_number": sender, "text": text,
             "media": None, "created_at": "2026-01-01T00:00:00Z", **extra}
 
 
 def _imessage_item(text, sender=OTHER, **extra):
-    return {"id": "ctx", "sender_number": sender, "content": text,
+    return {"id": f"ctx-{next(_ids)}", "sender_number": sender, "content": text,
             "media": None, "created_at": "2026-01-01T00:00:00Z", **extra}
 
 

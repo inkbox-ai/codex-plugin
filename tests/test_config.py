@@ -10,6 +10,7 @@ def test_read_config_defaults(monkeypatch):
         "CODEX_APPROVAL_POLICY", "INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS",
         "INKBOX_BASE_URL", "CODEX_TURN_TIMEOUT_S", "CODEX_INTERRUPT_TIMEOUT_S",
         "INKBOX_CONTACT_MEMORIES_ENABLED", "INKBOX_EMAIL_REPLY_ALL",
+        "INKBOX_GROUP_WAKE", "INKBOX_GROUP_WAKE_MENTIONS",
         "INKBOX_A2A_PROGRESS_INTERVAL_SECONDS",
     ):
         monkeypatch.delenv(var, raising=False)
@@ -24,6 +25,8 @@ def test_read_config_defaults(monkeypatch):
     assert cfg.codex_interrupt_timeout_s == 10.0
     assert cfg.contact_memories_enabled is True
     assert cfg.email_reply_all == "trusted"
+    assert cfg.group_wake == "judgement"
+    assert cfg.group_wake_mentions == []
     assert cfg.a2a_progress_interval_seconds == 180.0
 
 
@@ -133,3 +136,17 @@ def test_invalid_voice_stack_fails_closed_to_tts(monkeypatch):
     cfg = read_config()
     assert cfg.voice_stack is VoiceStack.INKBOX_TTS_STT
     assert cfg.voice_stack_invalid_value == "made_up"
+
+
+@pytest.mark.parametrize(("raw", "expected"), [
+    ("mention", "mention"), (" Mention ", "mention"),
+    ("judgement", "judgement"), ("judgment", "judgement"), ("", "judgement"), ("always", "judgement"),
+])
+def test_group_wake_values(monkeypatch, raw, expected):
+    monkeypatch.setenv("INKBOX_GROUP_WAKE", raw)
+    assert read_config().group_wake == expected
+
+
+def test_group_wake_mentions_is_a_csv(monkeypatch):
+    monkeypatch.setenv("INKBOX_GROUP_WAKE_MENTIONS", " @ai, aigraham ,, ")
+    assert read_config().group_wake_mentions == ["@ai", "aigraham"]

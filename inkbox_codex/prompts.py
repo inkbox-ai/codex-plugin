@@ -243,6 +243,10 @@ GROUP_CONTEXT_GUIDANCE = (
     "this block; use this background only to understand that message and to decide "
     "whether a visible reply is warranted."
 )
+GROUP_CONTEXT_ALLOWED_NOTE = (
+    "Earlier messages from allowed contacts that did not mention you are "
+    "included here as well, in the same order."
+)
 # Bounds on the rendered block, so a busy or hostile participant cannot flood
 # the turn: newest messages win, long texts are cut with an explicit marker.
 GROUP_CONTEXT_MAX_MESSAGES = 10
@@ -346,7 +350,13 @@ def _group_context_line(item: Any, names: Dict[str, str]) -> str:
     return f"{label}: {' '.join(parts)}"
 
 
-def group_context_block(messages: Any, names: Optional[Dict[str, str]] = None) -> str:
+def group_context_block(
+    messages: Any,
+    names: Optional[Dict[str, str]] = None,
+    *,
+    max_messages: int = GROUP_CONTEXT_MAX_MESSAGES,
+    includes_allowed: bool = False,
+) -> str:
     """Render background group messages as one delimited, size-bounded block.
 
     Message text is flattened to one quoted line with brackets and quotes
@@ -358,6 +368,9 @@ def group_context_block(messages: Any, names: Optional[Dict[str, str]] = None) -
             Anything that is not a list, and any malformed item, is ignored.
         names (Optional[Dict[str, str]]): Display names keyed by
             ``group_context_sender_key``; senders without one show their number.
+        max_messages (int): How many of the newest messages to keep.
+        includes_allowed (bool): Whether earlier messages from allowed
+            contacts (ones that did not wake the agent) are in the list too.
 
     Returns:
         str: The block, or an empty string when there is nothing to show.
@@ -374,7 +387,7 @@ def group_context_block(messages: Any, names: Optional[Dict[str, str]] = None) -
     # Keep the newest messages when the list or the block runs over its cap.
     kept: List[str] = []
     used = 0
-    for line in reversed(lines[-GROUP_CONTEXT_MAX_MESSAGES:]):
+    for line in reversed(lines[-max(1, max_messages):]):
         if kept and used + len(line) > GROUP_CONTEXT_MAX_BLOCK_CHARS:
             break
         kept.append(line)
@@ -382,12 +395,54 @@ def group_context_block(messages: Any, names: Optional[Dict[str, str]] = None) -
     kept.reverse()
     if len(kept) < len(lines):
         kept.insert(0, "[earlier context messages omitted]")
+    guidance = GROUP_CONTEXT_GUIDANCE
+    if includes_allowed:
+        guidance = f"{guidance} {GROUP_CONTEXT_ALLOWED_NOTE}"
     return "\n".join([
         "[inkbox:group_context]",
-        GROUP_CONTEXT_GUIDANCE,
+        guidance,
         *kept,
         "[/inkbox:group_context]",
     ])
+
+
+# Text that is skipped before looking for a mention: an address or a link can
+# contain "@handle" without anyone addressing the agent.
+_MENTION_SKIP = re.compile(
+    r"(?:https?://|www\.)\S+|[\w.+-]+@[\w-]+(?:\.[\w-]+)+",
+    re.IGNORECASE,
+)
+
+
+def mentions_agent(text: Any, handle: str, extra_tokens: Any = ()) -> bool:
+    """Whether a group message addresses the agent by ``@handle`` or an alias.
+
+    A mention is a whole token: nothing word-like may touch it on either side,
+    and trailing sentence punctuation is fine while a domain-style
+    continuation (``@handle.com``) is not. Matching ignores case. Addresses
+    and links are skipped first, so ``someone@handle.example`` and
+    ``https://x.example/@handle`` never count.
+
+    Args:
+        text (Any): The message text.
+        handle (str): The agent's identity handle (matched as ``@handle``).
+        extra_tokens (Any): Extra tokens to accept, matched the same way,
+            with or without a leading ``@`` exactly as given.
+
+    Returns:
+        bool: True when the message mentions the agent.
+    """
+    tokens = []
+    if str(handle or "").strip():
+        tokens.append("@" + str(handle).strip())
+    if isinstance(extra_tokens, (list, tuple)):
+        tokens.extend(str(token).strip() for token in extra_tokens if str(token).strip())
+    haystack = _MENTION_SKIP.sub(" ", str(text or ""))
+    for token in tokens:
+        pattern = r"(?<![\w@.-])" + re.escape(token) + r"(?![\w-])(?!\.\w)"
+        if re.search(pattern, haystack, re.IGNORECASE):
+            return True
+    return False
 
 
 def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:

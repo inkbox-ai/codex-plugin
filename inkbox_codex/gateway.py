@@ -91,9 +91,11 @@ try:
     from .hosted_sms_guard import hosted_sms_attempt_state
     from .prompts import (
         contact_marker,
+        GROUP_CONTEXT_MAX_MESSAGES,
         group_context_block,
         group_context_sender_key,
         inject_contact_memories,
+        mentions_agent,
         normalize_contact_memories,
         strip_markdown,
     )
@@ -126,9 +128,11 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from hosted_sms_guard import hosted_sms_attempt_state
     from prompts import (
         contact_marker,
+        GROUP_CONTEXT_MAX_MESSAGES,
         group_context_block,
         group_context_sender_key,
         inject_contact_memories,
+        mentions_agent,
         normalize_contact_memories,
         strip_markdown,
     )
@@ -626,6 +630,12 @@ OUTBOUND_FAILURE_MAX_ATTEMPTS = 3
 OUTBOUND_FAILURE_STATE_TTL_SECONDS = 30 * 60.0
 # How much of the undelivered body to echo back into the wake-up turn.
 OUTBOUND_FAILURE_BODY_SNIPPET_CHARS = 400
+# Group messages that do not mention the agent (INKBOX_GROUP_WAKE=mention) are
+# held in memory per conversation until a mention flushes them into that
+# turn's context: this many newest items per conversation, for this long.
+GROUP_CHATTER_MAX_ITEMS = 30
+GROUP_CHATTER_TTL_SECONDS = 24 * 60 * 60.0
+GROUP_CHATTER_MAX_CONVERSATIONS = 500
 # An automatic email reply keeps the people the sender copied, up to this many;
 # a longer list gets a sender-only reply instead of a mass mailing.
 EMAIL_REPLY_ALL_MAX_COPIED = 25
@@ -1046,6 +1056,9 @@ class InkboxGateway:
         # ((kind, value) -> (contact summary, expires_at)); a per-inbound
         # lookup cache for repeated remote phone/email events.
         self._contact_cache: Dict[Tuple[str, str], Tuple[Optional[Dict[str, Any]], float]] = {}
+        # Unflushed group chatter under INKBOX_GROUP_WAKE=mention, keyed by
+        # "<mode>:<conversation_id>": (last update, items oldest first).
+        self._group_chatter: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
         # Failed outbound message ids we've already told the agent about, so a
         # webhook retry (or a second failure event for the same message) doesn't
         # re-notify and spin the agent in a loop.
@@ -3677,25 +3690,86 @@ class InkboxGateway:
             logger.debug("[Inkbox] iMessage conversation lookup failed for %s: %s", conversation_id, exc)
             return None
 
-    def _group_context(self, data: Dict[str, Any], contacts: List[Any]) -> str:
+    def _group_message_wakes(self, text: str) -> bool:
+        """Whether a group message starts a turn under ``INKBOX_GROUP_WAKE``."""
+        if self.cfg.group_wake != "mention":
+            return True
+        return mentions_agent(text, self.cfg.identity, self.cfg.group_wake_mentions)
+
+    def _prune_group_chatter(self) -> None:
+        now = time.time()
+        for key, (updated_at, _items) in list(self._group_chatter.items()):
+            if now - updated_at > GROUP_CHATTER_TTL_SECONDS:
+                self._group_chatter.pop(key, None)
+        if len(self._group_chatter) > GROUP_CHATTER_MAX_CONVERSATIONS:
+            oldest = sorted(self._group_chatter.items(), key=lambda item: item[1][0])
+            for key, _entry in oldest[: len(self._group_chatter) - GROUP_CHATTER_MAX_CONVERSATIONS]:
+                self._group_chatter.pop(key, None)
+
+    def _remember_group_chatter(
+        self, mode: str, conversation_id: str, items: List[Dict[str, Any]]
+    ) -> None:
+        """Hold group messages that did not wake the agent for the next mention.
+
+        Args:
+            mode (str): ``sms`` or ``imessage``.
+            conversation_id (str): The group conversation; nothing is kept
+                without one.
+            items (list): Context items in arrival order, oldest first, in the
+                same shape the webhook's ``context_messages`` use.
+
+        Returns:
+            None
+        """
+        if not conversation_id or not items:
+            return
+        key = f"{mode}:{conversation_id}"
+        _updated_at, held = self._group_chatter.get(key, (0.0, []))
+        held = (held + items)[-GROUP_CHATTER_MAX_ITEMS:]
+        self._group_chatter[key] = (time.time(), held)
+        self._prune_group_chatter()
+
+    def _take_group_chatter(self, mode: str, conversation_id: str) -> List[Dict[str, Any]]:
+        """Return and clear a conversation's held chatter (empty if none)."""
+        if not conversation_id:
+            return []
+        self._prune_group_chatter()
+        _updated_at, held = self._group_chatter.pop(f"{mode}:{conversation_id}", (0.0, []))
+        return list(held)
+
+    def _group_context(
+        self, data: Dict[str, Any], contacts: List[Any], *, mode: str = "", conversation_id: str = ""
+    ) -> str:
         """Render a group webhook's background messages for the turn.
 
         ``context_messages`` holds what other participants wrote since the last
         message that woke the agent. They are not events: nothing here is
         checked against the sender allowlist and nothing here can start a turn.
         The field is optional and untrusted, so any problem with it yields no
-        block instead of failing the webhook.
+        block instead of failing the webhook. Chatter held back under
+        ``INKBOX_GROUP_WAKE=mention`` goes first, and is cleared.
 
         Args:
             data (dict): The webhook's ``data`` object.
             contacts (list): The webhook's resolved contacts.
+            mode (str): ``sms`` or ``imessage``, for the held chatter.
+            conversation_id (str): The group conversation, for the held chatter.
 
         Returns:
             str: The delimited context block, or an empty string.
         """
         try:
-            messages = data.get("context_messages")
-            if not isinstance(messages, (list, tuple)) or not messages:
+            held = self._take_group_chatter(mode, conversation_id)
+            messages: List[Any] = list(held)
+            seen_ids = {str(item.get("id") or "") for item in held if isinstance(item, dict)}
+            seen_ids.discard("")
+            for item in self._webhook_list(data, "context_messages"):
+                item_id = str(item.get("id") or "") if isinstance(item, dict) else ""
+                if item_id and item_id in seen_ids:
+                    continue
+                seen_ids.add(item_id)
+                messages.append(item)
+            if not messages:
                 return ""
             # Names come only from data already in hand - the payload's contacts
             # and earlier cached lookups - never from a new network call.
@@ -3712,7 +3786,14 @@ class InkboxGateway:
                     continue
                 for phone in summary.get("phones") or []:
                     names.setdefault(group_context_sender_key(phone), str(summary["name"]))
-            return group_context_block(messages, names)
+            if not held:
+                return group_context_block(messages, names)
+            return group_context_block(
+                messages,
+                names,
+                max_messages=GROUP_CHATTER_MAX_ITEMS + GROUP_CONTEXT_MAX_MESSAGES,
+                includes_allowed=True,
+            )
         except Exception:
             logger.debug("[bridge] ignoring unreadable group context", exc_info=True)
             return ""
@@ -3837,7 +3918,6 @@ class InkboxGateway:
         if not self._sender_allowed(sender):
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
 
-        body = await self._with_media(text, media, prefix=f"sms-{message.get('id', '')}")
         conversation_id = str(
             message.get("conversation_id") or message.get("conversationId") or ""
         ).strip()
@@ -3860,15 +3940,27 @@ class InkboxGateway:
             "identity_agents",
         )
         # Only a group message carries background from other participants.
-        group_context = self._group_context(data, contacts)
+        context_messages = self._webhook_list(data, "context_messages")
         is_group = (
             self._conversation_summary_is_group(conversation_summary)
             or bool(self._field(message, "isGroup", "is_group"))
             or len(participants) > 1
             or len(contacts) > 1
             or len(agent_identities) > 1
-            or bool(group_context)
+            or bool(context_messages)
         )
+        if is_group and not self._group_message_wakes(text):
+            # Not addressed to the agent: hold it for the next mention.
+            self._remember_group_chatter("sms", conversation_id, context_messages + [{
+                "id": message.get("id"),
+                "sender_phone_number": sender,
+                "text": text,
+                "media": media,
+                "created_at": message.get("created_at"),
+            }])
+            return web.json_response({"ok": True, "ignored": "group-no-mention"})
+
+        body = await self._with_media(text, media, prefix=f"sms-{message.get('id', '')}")
         contact = await self._resolve_contact_full(kind="phone", value=sender)
         payload_contact = self._matched_payload_contact(
             contacts, resolved_id=self._contact_id(contact)
@@ -3887,7 +3979,9 @@ class InkboxGateway:
                 local_phone=local_phone,
                 participants=participants,
                 contact=contact,
-                context=group_context,
+                context=self._group_context(
+                    data, contacts, mode="sms", conversation_id=conversation_id
+                ),
             )
         thread_key = self._thread_key("sms", conversation_id)
         chat_id = self._chat_key(
@@ -3939,7 +4033,6 @@ class InkboxGateway:
         if not self._sender_allowed(sender):
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
 
-        body = await self._with_media(text, media, prefix=f"imsg-{message.get('id', '')}")
         conversation_id = str(
             message.get("conversation_id") or message.get("conversationId") or ""
         ).strip()
@@ -3953,13 +4046,25 @@ class InkboxGateway:
                 participants.append(entry)
         contacts = self._webhook_list(data, "contacts", "contact_list")
         # Only a group message carries background from other participants.
-        group_context = self._group_context(data, contacts)
+        context_messages = self._webhook_list(data, "context_messages")
         is_group = (
             self._conversation_summary_is_group(conversation_summary)
             or bool(self._field(message, "isGroup", "is_group"))
             or len(participants) > 1
-            or bool(group_context)
+            or bool(context_messages)
         )
+        if is_group and not self._group_message_wakes(text):
+            # Not addressed to the agent: hold it for the next mention.
+            self._remember_group_chatter("imessage", conversation_id, context_messages + [{
+                "id": message.get("id"),
+                "sender_number": sender,
+                "content": text,
+                "media": media,
+                "created_at": message.get("created_at"),
+            }])
+            return web.json_response({"ok": True, "ignored": "group-no-mention"})
+
+        body = await self._with_media(text, media, prefix=f"imsg-{message.get('id', '')}")
         contact = await self._resolve_contact_full(kind="phone", value=sender)
         payload_contact = self._matched_payload_contact(
             contacts,
@@ -3982,7 +4087,9 @@ class InkboxGateway:
                 conversation_id=conversation_id,
                 participants=participants,
                 contact=contact,
-                context=group_context,
+                context=self._group_context(
+                    data, contacts, mode="imessage", conversation_id=conversation_id
+                ),
             )
         thread_key = self._thread_key("imessage", conversation_id)
         # A group is one shared context for everyone in it, so the conversation -
