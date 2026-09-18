@@ -23,7 +23,9 @@ The bridge's runtime core:
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -87,7 +89,16 @@ try:
     from .a2a_delegations import find_by_task as find_a2a_delegation
     from .media import download_media, inbound_media_note
     from .hosted_sms_guard import hosted_sms_attempt_state
-    from .prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
+    from .prompts import (
+        contact_marker,
+        GROUP_CONTEXT_MAX_MESSAGES,
+        group_context_block,
+        group_context_sender_key,
+        inject_contact_memories,
+        mentions_agent,
+        normalize_contact_memories,
+        strip_markdown,
+    )
     from .realtime import (
         RealtimeBridgeConnectError,
         RealtimeCallMeta,
@@ -115,7 +126,16 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from a2a_delegations import find_by_task as find_a2a_delegation
     from media import download_media, inbound_media_note
     from hosted_sms_guard import hosted_sms_attempt_state
-    from prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
+    from prompts import (
+        contact_marker,
+        GROUP_CONTEXT_MAX_MESSAGES,
+        group_context_block,
+        group_context_sender_key,
+        inject_contact_memories,
+        mentions_agent,
+        normalize_contact_memories,
+        strip_markdown,
+    )
     from realtime import (
         RealtimeBridgeConnectError,
         RealtimeCallMeta,
@@ -227,7 +247,8 @@ def _delivery_failure_prompt(
             ``delivery_failed`` / ``bounced`` (async webhook).
 
     Returns:
-        str: A prompt instructing the agent to retry or switch channels.
+        str: A prompt instructing the agent to retry or switch channels, or
+        to stop when contact rules block the recipient.
     """
     quoted = f'\n\nThe message was:\n"{body}"' if body else ""
     remaining = max(0, max_attempts - attempt)
@@ -240,6 +261,15 @@ def _delivery_failure_prompt(
         reason=reason,
         attempt=attempt,
     )
+    if _is_contact_rule_block(reason):
+        # Terminal on every channel: no rewrite or channel-switch guidance.
+        return "\n".join([
+            f"[delivery failed] Your {channel} message to {recipient} was NOT sent "
+            f"(attempt {attempt}/{max_attempts}, stage {stage}).",
+            f"Reason: {reason}.{quoted}",
+            "",
+            reply_instruction,
+        ])
     return "\n".join([
         f"[delivery failed] Your {channel} message to {recipient} was NOT delivered "
         f"(attempt {attempt}/{max_attempts}, stage {stage}).",
@@ -600,6 +630,15 @@ OUTBOUND_FAILURE_MAX_ATTEMPTS = 3
 OUTBOUND_FAILURE_STATE_TTL_SECONDS = 30 * 60.0
 # How much of the undelivered body to echo back into the wake-up turn.
 OUTBOUND_FAILURE_BODY_SNIPPET_CHARS = 400
+# Group messages that do not mention the agent (INKBOX_GROUP_WAKE=mention) are
+# held in memory per conversation until a mention flushes them into that
+# turn's context: this many newest items per conversation, for this long.
+GROUP_CHATTER_MAX_ITEMS = 30
+GROUP_CHATTER_TTL_SECONDS = 24 * 60 * 60.0
+GROUP_CHATTER_MAX_CONVERSATIONS = 500
+# An automatic email reply keeps the people the sender copied, up to this many;
+# a longer list gets a sender-only reply instead of a mass mailing.
+EMAIL_REPLY_ALL_MAX_COPIED = 25
 
 # Per-channel fix-it guidance embedded in the delivery-failure wake-up turn.
 # Text channels are usually fixable by rewriting; a mail bounce usually means
@@ -682,6 +721,69 @@ def _sms_delivery_failure_policy(reason: Optional[str]) -> str:
     return "conditional"
 
 
+def _mail_inbound_allowed_only(identity: Any) -> bool:
+    """Whether the identity only accepts mail from allowed contacts.
+
+    Args:
+        identity (Any): The identity object fetched for the send.
+
+    Returns:
+        bool: True when its inbound mail mode is ``whitelist``. A missing or
+        unreadable mode counts as open.
+    """
+    try:
+        mode = getattr(identity, "mail_inbound_filter_mode", None)
+        if mode is None:
+            # Older SDKs only expose the single per-channel mode.
+            mode = getattr(identity, "mail_filter_mode", None)
+        return str(getattr(mode, "value", mode) or "").strip().lower() == "whitelist"
+    except Exception:
+        return False
+
+
+@functools.lru_cache(maxsize=None)
+def _accepts_idempotency_key(function: Any) -> bool:
+    """Whether an SDK send function takes ``idempotency_key`` (checked once)."""
+    try:
+        return "idempotency_key" in inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _mail_reply_idempotency(send: Any, source_id: str, audience: str, content: str) -> Dict[str, str]:
+    """Build the idempotency argument for one automatic email reply.
+
+    The key is derived from the inbound message, the audience, and the reply
+    text, so re-sending the same reply is deduplicated while a different reply
+    - or the sender-only retry of a blocked reply-all - gets its own key.
+
+    Args:
+        send (Any): The bound SDK send method about to be called.
+        source_id (str): Id of the inbound message being answered.
+        audience (str): ``all`` for a reply-all, ``sender`` for sender-only.
+        content (str): The reply text.
+
+    Returns:
+        Dict[str, str]: ``{"idempotency_key": ...}``, or empty when the inbound
+        id is unknown or the installed SDK does not take a key.
+    """
+    if not source_id or not _accepts_idempotency_key(getattr(send, "__func__", send)):
+        return {}
+    digest = hashlib.sha256(f"{source_id}\n{audience}\n{content}".encode("utf-8", "replace"))
+    return {"idempotency_key": f"auto-reply-{digest.hexdigest()[:48]}"}
+
+
+def _is_recipient_blocked_error(exc: Exception) -> bool:
+    """Whether a send was refused because contact rules block a recipient."""
+    detail = getattr(exc, "detail", None)
+    return isinstance(detail, dict) and detail.get("error") == "recipient_blocked"
+
+
+def _is_contact_rule_block(reason: Optional[str]) -> bool:
+    """Whether a send failed because contact rules block the recipient."""
+    return "recipient_blocked" in str(reason or "").strip().lower()
+
+
 def _delivery_failure_reply_instruction(
     *,
     mode: str,
@@ -689,6 +791,17 @@ def _delivery_failure_reply_instruction(
     attempt: int,
 ) -> str:
     """Give the model one non-contradictory action for this failure class."""
+    if _is_contact_rule_block(reason):
+        # The owner's contact rules decide who this agent may reach, on every
+        # channel - rewording or changing channels must not route around them.
+        label = {"sms": "SMS", "imessage": "iMessage", "email": "Email"}.get(mode, mode)
+        return (
+            f"{label} failure classification: DO NOT RETRY. This agent's contact "
+            "rules do not allow messaging this recipient, and only the agent's "
+            "owner can change them. Do not resend or reword this message, and do "
+            "not try to reach the recipient on another channel; reply exactly "
+            "[SILENT]."
+        )
     if mode != "sms":
         return (
             "Send a corrected message only when it is safe, permitted, and likely "
@@ -943,6 +1056,9 @@ class InkboxGateway:
         # ((kind, value) -> (contact summary, expires_at)); a per-inbound
         # lookup cache for repeated remote phone/email events.
         self._contact_cache: Dict[Tuple[str, str], Tuple[Optional[Dict[str, Any]], float]] = {}
+        # Unflushed group chatter under INKBOX_GROUP_WAKE=mention, keyed by
+        # "<mode>:<conversation_id>": (last update, items oldest first).
+        self._group_chatter: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
         # Failed outbound message ids we've already told the agent about, so a
         # webhook retry (or a second failure event for the same message) doesn't
         # re-notify and spin the agent in a loop.
@@ -3404,6 +3520,10 @@ class InkboxGateway:
             "sender": sender,
             "subject": subject,
             "thread_id": message.get("thread_id"),
+            # What the automatic reply needs to thread and keep its audience.
+            "message_id": str(message.get("id") or "").strip() or None,
+            "rfc_message_id": str(message.get("message_id") or "").strip() or None,
+            "reply_cc": self._mail_reply_cc(message, sender),
             "contact": contact,
             "agent_identity": agent_identity,
             "contact_memories": contact_memories,
@@ -3413,6 +3533,34 @@ class InkboxGateway:
         # The channel tag (Subject included) is added by frame_inbound.
         await self.sessions.get(chat_id).handle_inbound(body_text, "email", meta)
         return web.json_response({"ok": True})
+
+    def _mail_reply_cc(self, message: Dict[str, Any], sender: str) -> List[str]:
+        """List the people the sender copied on an inbound email.
+
+        Args:
+            message (dict): The webhook's ``message`` object.
+            sender (str): The address the reply is going to.
+
+        Returns:
+            List[str]: The message's other To + Cc addresses, in order, without
+            this agent's primary address (aliases are not known here), the
+            sender, duplicates (compared case-insensitively), or entries that
+            are not an address. Empty when the fields are absent.
+        """
+        seen = {address.lower() for address in self._self_addresses}
+        seen.add((parseaddr(sender)[1] or sender).strip().lower())
+        copied: List[str] = []
+        for entry in (
+            self._string_list_field(message, "to_addresses")
+            + self._string_list_field(message, "cc_addresses")
+        ):
+            address = parseaddr(entry)[1].strip()
+            # Skip placeholders such as "undisclosed-recipients:;".
+            if "@" not in address or address.lower() in seen:
+                continue
+            seen.add(address.lower())
+            copied.append(address)
+        return copied
 
     async def _fetch_mail_attachments(self, message: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Fetch + download an inbound email's attachments, best-effort.
@@ -3542,6 +3690,114 @@ class InkboxGateway:
             logger.debug("[Inkbox] iMessage conversation lookup failed for %s: %s", conversation_id, exc)
             return None
 
+    def _group_message_wakes(self, text: str) -> bool:
+        """Whether a group message starts a turn under ``INKBOX_GROUP_WAKE``."""
+        if self.cfg.group_wake != "mention":
+            return True
+        return mentions_agent(text, self.cfg.identity, self.cfg.group_wake_mentions)
+
+    def _prune_group_chatter(self) -> None:
+        now = time.time()
+        for key, (updated_at, _items) in list(self._group_chatter.items()):
+            if now - updated_at > GROUP_CHATTER_TTL_SECONDS:
+                self._group_chatter.pop(key, None)
+        if len(self._group_chatter) > GROUP_CHATTER_MAX_CONVERSATIONS:
+            oldest = sorted(self._group_chatter.items(), key=lambda item: item[1][0])
+            for key, _entry in oldest[: len(self._group_chatter) - GROUP_CHATTER_MAX_CONVERSATIONS]:
+                self._group_chatter.pop(key, None)
+
+    def _remember_group_chatter(
+        self, mode: str, conversation_id: str, items: List[Dict[str, Any]]
+    ) -> None:
+        """Hold group messages that did not wake the agent for the next mention.
+
+        Args:
+            mode (str): ``sms`` or ``imessage``.
+            conversation_id (str): The group conversation; nothing is kept
+                without one.
+            items (list): Context items in arrival order, oldest first, in the
+                same shape the webhook's ``context_messages`` use.
+
+        Returns:
+            None
+        """
+        if not conversation_id or not items:
+            return
+        key = f"{mode}:{conversation_id}"
+        _updated_at, held = self._group_chatter.get(key, (0.0, []))
+        held = (held + items)[-GROUP_CHATTER_MAX_ITEMS:]
+        self._group_chatter[key] = (time.time(), held)
+        self._prune_group_chatter()
+
+    def _take_group_chatter(self, mode: str, conversation_id: str) -> List[Dict[str, Any]]:
+        """Return and clear a conversation's held chatter (empty if none)."""
+        if not conversation_id:
+            return []
+        self._prune_group_chatter()
+        _updated_at, held = self._group_chatter.pop(f"{mode}:{conversation_id}", (0.0, []))
+        return list(held)
+
+    def _group_context(
+        self, data: Dict[str, Any], contacts: List[Any], *, mode: str = "", conversation_id: str = ""
+    ) -> str:
+        """Render a group webhook's background messages for the turn.
+
+        ``context_messages`` holds what other participants wrote since the last
+        message that woke the agent. They are not events: nothing here is
+        checked against the sender allowlist and nothing here can start a turn.
+        The field is optional and untrusted, so any problem with it yields no
+        block instead of failing the webhook. Chatter held back under
+        ``INKBOX_GROUP_WAKE=mention`` goes first, and is cleared.
+
+        Args:
+            data (dict): The webhook's ``data`` object.
+            contacts (list): The webhook's resolved contacts.
+            mode (str): ``sms`` or ``imessage``, for the held chatter.
+            conversation_id (str): The group conversation, for the held chatter.
+
+        Returns:
+            str: The delimited context block, or an empty string.
+        """
+        try:
+            held = self._take_group_chatter(mode, conversation_id)
+            messages: List[Any] = list(held)
+            seen_ids = {str(item.get("id") or "") for item in held if isinstance(item, dict)}
+            seen_ids.discard("")
+            for item in self._webhook_list(data, "context_messages"):
+                item_id = str(item.get("id") or "") if isinstance(item, dict) else ""
+                if item_id and item_id in seen_ids:
+                    continue
+                seen_ids.add(item_id)
+                messages.append(item)
+            if not messages:
+                return ""
+            # Names come only from data already in hand - the payload's contacts
+            # and earlier cached lookups - never from a new network call.
+            now = time.time()
+            summaries = [self._contact_summary(entry) for entry in contacts]
+            summaries += [
+                cached[0]
+                for key, cached in list(self._contact_cache.items())
+                if key[0] == "phone" and cached[1] > now
+            ]
+            names: Dict[str, str] = {}
+            for summary in summaries:
+                if not summary or not summary.get("name"):
+                    continue
+                for phone in summary.get("phones") or []:
+                    names.setdefault(group_context_sender_key(phone), str(summary["name"]))
+            if not held:
+                return group_context_block(messages, names)
+            return group_context_block(
+                messages,
+                names,
+                max_messages=GROUP_CHATTER_MAX_ITEMS + GROUP_CONTEXT_MAX_MESSAGES,
+                includes_allowed=True,
+            )
+        except Exception:
+            logger.debug("[bridge] ignoring unreadable group context", exc_info=True)
+            return ""
+
     @classmethod
     def _group_sms_prompt(
         cls,
@@ -3552,6 +3808,7 @@ class InkboxGateway:
         local_phone: str,
         participants: List[str],
         contact: Optional[Dict[str, Any]] = None,
+        context: str = "",
     ) -> str:
         marker_parts = [
             f"[inkbox:group_sms conversation_id={conversation_id or 'unknown'}",
@@ -3568,7 +3825,8 @@ class InkboxGateway:
             "Treat ordinary group chatter as context only.",
             "If no visible reply is warranted, return exactly [SILENT].",
         ])
-        return "\n".join(part for part in [marker, policy, body] if part)
+        # Background from other participants goes before the waking message.
+        return "\n".join(part for part in [marker, policy, context, body] if part)
 
     @classmethod
     def _group_imessage_prompt(
@@ -3579,6 +3837,7 @@ class InkboxGateway:
         conversation_id: str,
         participants: List[str],
         contact: Optional[Dict[str, Any]] = None,
+        context: str = "",
     ) -> str:
         marker_parts = [
             f"[inkbox:group_imessage conversation_id={conversation_id or 'unknown'}",
@@ -3594,7 +3853,8 @@ class InkboxGateway:
             "Treat ordinary group chatter as context only.",
             "If no visible reply is warranted, return exactly [SILENT].",
         ])
-        return "\n".join(part for part in [marker, policy, body] if part)
+        # Background from other participants goes before the waking message.
+        return "\n".join(part for part in [marker, policy, context, body] if part)
 
     @classmethod
     def _imessage_reaction_prompt(
@@ -3658,7 +3918,6 @@ class InkboxGateway:
         if not self._sender_allowed(sender):
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
 
-        body = await self._with_media(text, media, prefix=f"sms-{message.get('id', '')}")
         conversation_id = str(
             message.get("conversation_id") or message.get("conversationId") or ""
         ).strip()
@@ -3680,13 +3939,28 @@ class InkboxGateway:
             "agentIdentities",
             "identity_agents",
         )
+        # Only a group message carries background from other participants.
+        context_messages = self._webhook_list(data, "context_messages")
         is_group = (
             self._conversation_summary_is_group(conversation_summary)
             or bool(self._field(message, "isGroup", "is_group"))
             or len(participants) > 1
             or len(contacts) > 1
             or len(agent_identities) > 1
+            or bool(context_messages)
         )
+        if is_group and not self._group_message_wakes(text):
+            # Not addressed to the agent: hold it for the next mention.
+            self._remember_group_chatter("sms", conversation_id, context_messages + [{
+                "id": message.get("id"),
+                "sender_phone_number": sender,
+                "text": text,
+                "media": media,
+                "created_at": message.get("created_at"),
+            }])
+            return web.json_response({"ok": True, "ignored": "group-no-mention"})
+
+        body = await self._with_media(text, media, prefix=f"sms-{message.get('id', '')}")
         contact = await self._resolve_contact_full(kind="phone", value=sender)
         payload_contact = self._matched_payload_contact(
             contacts, resolved_id=self._contact_id(contact)
@@ -3705,6 +3979,9 @@ class InkboxGateway:
                 local_phone=local_phone,
                 participants=participants,
                 contact=contact,
+                context=self._group_context(
+                    data, contacts, mode="sms", conversation_id=conversation_id
+                ),
             )
         thread_key = self._thread_key("sms", conversation_id)
         chat_id = self._chat_key(
@@ -3756,7 +4033,6 @@ class InkboxGateway:
         if not self._sender_allowed(sender):
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
 
-        body = await self._with_media(text, media, prefix=f"imsg-{message.get('id', '')}")
         conversation_id = str(
             message.get("conversation_id") or message.get("conversationId") or ""
         ).strip()
@@ -3768,14 +4044,30 @@ class InkboxGateway:
         ):
             if entry not in participants:
                 participants.append(entry)
+        contacts = self._webhook_list(data, "contacts", "contact_list")
+        # Only a group message carries background from other participants.
+        context_messages = self._webhook_list(data, "context_messages")
         is_group = (
             self._conversation_summary_is_group(conversation_summary)
             or bool(self._field(message, "isGroup", "is_group"))
             or len(participants) > 1
+            or bool(context_messages)
         )
+        if is_group and not self._group_message_wakes(text):
+            # Not addressed to the agent: hold it for the next mention.
+            self._remember_group_chatter("imessage", conversation_id, context_messages + [{
+                "id": message.get("id"),
+                "sender_number": sender,
+                "content": text,
+                "media": media,
+                "created_at": message.get("created_at"),
+            }])
+            return web.json_response({"ok": True, "ignored": "group-no-mention"})
+
+        body = await self._with_media(text, media, prefix=f"imsg-{message.get('id', '')}")
         contact = await self._resolve_contact_full(kind="phone", value=sender)
         payload_contact = self._matched_payload_contact(
-            self._webhook_list(data, "contacts", "contact_list"),
+            contacts,
             resolved_id=self._contact_id(contact),
         )
         contact_memories = self._webhook_contact_memories(payload_contact)
@@ -3795,6 +4087,9 @@ class InkboxGateway:
                 conversation_id=conversation_id,
                 participants=participants,
                 contact=contact,
+                context=self._group_context(
+                    data, contacts, mode="imessage", conversation_id=conversation_id
+                ),
             )
         thread_key = self._thread_key("imessage", conversation_id)
         # A group is one shared context for everyone in it, so the conversation -
@@ -4702,9 +4997,60 @@ class InkboxGateway:
             identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
             subject = str(meta.get("subject") or "").strip()
             reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}" if subject else "From your Codex agent"
-            await asyncio.to_thread(
-                identity.send_email,
-                to=[str(meta.get("to") or chat_id)],
-                subject=reply_subject,
-                body_text=content,
-            )
+            source_id = str(meta.get("message_id") or "").strip()
+            copied = meta.get("reply_cc") if self.cfg.email_reply_all != "never" else None
+            if (
+                copied
+                and self.cfg.email_reply_all == "trusted"
+                and not _mail_inbound_allowed_only(identity)
+            ):
+                # An agent that accepts mail from anyone must not email the
+                # people a stranger copied.
+                logger.info(
+                    "[bridge] email reply: copied recipients were not kept "
+                    "because this identity accepts mail from anyone; set inbound "
+                    "mail to whitelist, or INKBOX_EMAIL_REPLY_ALL=always"
+                )
+                copied = None
+            if source_id and isinstance(copied, list) and 0 < len(copied) <= EMAIL_REPLY_ALL_MAX_COPIED:
+                # The sender copied other people: reply to everyone on the
+                # inbound message. The server resolves recipients and threading.
+                try:
+                    await asyncio.to_thread(
+                        identity.reply_all_email,
+                        source_id,
+                        subject=reply_subject,
+                        body_text=content,
+                        **_mail_reply_idempotency(
+                            identity.reply_all_email, source_id, "all", content
+                        ),
+                    )
+                    return
+                except Exception as exc:
+                    if not _is_recipient_blocked_error(exc):
+                        raise
+                    # One sender-only retry so the sender still gets an answer;
+                    # if that fails too, the normal failure handling takes over.
+                    logger.warning(
+                        "[bridge] email reply: copied recipients were dropped "
+                        "because contact rules block them; replying to the sender "
+                        "only. The outbound \"supervised\" contact-rule mode allows "
+                        "replies to people an allowed contact copied."
+                    )
+            elif isinstance(copied, list) and len(copied) > EMAIL_REPLY_ALL_MAX_COPIED:
+                logger.warning(
+                    "[bridge] email reply: %d copied recipients is over the "
+                    "limit of %d; replying to the sender only",
+                    len(copied), EMAIL_REPLY_ALL_MAX_COPIED,
+                )
+            kwargs = {
+                "to": [str(meta.get("to") or chat_id)],
+                "subject": reply_subject,
+                "body_text": content,
+            }
+            # Thread the reply onto the inbound message when its id is known.
+            rfc_message_id = str(meta.get("rfc_message_id") or "").strip()
+            if rfc_message_id:
+                kwargs["in_reply_to_message_id"] = rfc_message_id
+            kwargs.update(_mail_reply_idempotency(identity.send_email, source_id, "sender", content))
+            await asyncio.to_thread(identity.send_email, **kwargs)

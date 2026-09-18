@@ -57,6 +57,48 @@ def test_delivery_failure_instruction_uses_attempt_and_classification(
         assert "[SILENT]" in instruction
 
 
+@pytest.mark.parametrize("mode", ["sms", "imessage", "email"])
+@pytest.mark.parametrize("attempt", [1, 2])
+def test_contact_rule_block_is_terminal_on_every_channel(mode, attempt):
+    instruction = gateway._delivery_failure_reply_instruction(
+        mode=mode,
+        reason="[recipient_blocked] Recipient is blocked by a contact rule.",
+        attempt=attempt,
+    )
+    assert "DO NOT RETRY" in instruction
+    assert "reply exactly [SILENT]" in instruction
+    assert "do not try to reach the recipient on another channel" in instruction
+
+
+@pytest.mark.parametrize("channel", ["SMS", "iMessage", "email"])
+def test_contact_rule_block_prompt_has_no_retry_or_channel_switch_guidance(channel):
+    prompt = gateway._delivery_failure_prompt(
+        channel, "pat@example.com", "hello",
+        "[recipient_blocked] Recipient is blocked by a contact rule.",
+        attempt=1, stage="send_rejected",
+    )
+    assert "DO NOT RETRY" in prompt
+    assert "Rewrite the message" not in prompt
+    assert "reach the person on another channel" not in prompt
+    assert "If retrying" not in prompt
+
+
+@pytest.mark.parametrize("mode", ["imessage", "email"])
+@pytest.mark.parametrize("reason", [
+    "40002 Temporary spam filter rejection",
+    "[recipient_opted_out] Provider rejected",
+    "Provider rejected the message",
+])
+def test_other_failures_off_sms_keep_the_generic_instruction(mode, reason):
+    instruction = gateway._delivery_failure_reply_instruction(
+        mode=mode, reason=reason, attempt=1,
+    )
+    assert instruction == (
+        "Send a corrected message only when it is safe, permitted, and likely "
+        "to deliver. Otherwise reply exactly [SILENT]."
+    )
+
+
 @pytest.fixture(autouse=True)
 def fake_web(monkeypatch):
     """aiohttp isn't installed in tests; stub the json_response the handlers use."""
@@ -164,7 +206,7 @@ def test_sync_rejection_wakes_with_rule_and_attempt():
         gw = _gw()
         session = _wired_session(gw)
 
-        async def boom(_text):
+        async def boom(_text, turn=None):
             raise _Blocked()
         session._reply = boom
 
@@ -183,12 +225,51 @@ def test_sync_rejection_wakes_with_rule_and_attempt():
     asyncio.run(scenario())
 
 
+class _RecipientBlocked(Exception):
+    detail = {
+        "error": "recipient_blocked",
+        "message": "Recipient is blocked by a contact rule.",
+    }
+
+
+@pytest.mark.parametrize("mode", ["sms", "imessage", "email"])
+def test_sync_contact_rule_block_wakes_with_terminal_instruction(mode):
+    async def scenario():
+        gw = _gw()
+        session = _wired_session(gw, mode=mode)
+
+        async def boom(_text, turn=None):
+            raise _RecipientBlocked()
+        session._reply = boom
+
+        await session._deliver_reply(_Turn(text="orig"), "On it.")
+
+        recovery = session._queue.get_nowait()
+        assert recovery.recovery is True
+        assert "[recipient_blocked]" in recovery.text
+        assert "failure classification: DO NOT RETRY" in recovery.text
+        assert "reply exactly [SILENT]" in recovery.text
+        assert "another channel with your tools" not in recovery.text
+
+    asyncio.run(scenario())
+
+
+def test_session_fallback_prompt_is_terminal_for_contact_rule_block():
+    prompt = sessions_mod._send_rejected_prompt(
+        "On it.", "[recipient_blocked] Recipient is blocked by a contact rule."
+    )
+    assert "reply exactly [SILENT]" in prompt
+    assert "different channel" not in prompt
+    # Other rejections keep the rephrase-or-switch recovery.
+    assert "different channel" in sessions_mod._send_rejected_prompt("On it.", "spam filter")
+
+
 def test_sync_retry_budget_caps_total_sends():
     async def scenario():
         gw = _gw()
         session = _wired_session(gw)
 
-        async def boom(_text):
+        async def boom(_text, turn=None):
             raise _Blocked()
         session._reply = boom
 
@@ -214,7 +295,7 @@ def test_failed_first_recovery_gets_optional_second_instruction_then_caps():
         gw = _gw()
         session = _wired_session(gw)
 
-        async def boom(_text):
+        async def boom(_text, turn=None):
             raise _Blocked()
         session._reply = boom
 
@@ -242,7 +323,7 @@ def test_sync_too_long_reason_flows_through():
         session = _wired_session(gw)
         reason = gateway._message_too_long_reason("SMS", "x" * 2000, gateway.SMS_MAX_LENGTH)
 
-        async def boom(_text):
+        async def boom(_text, turn=None):
             raise ValueError(reason)
         session._reply = boom
 
@@ -261,7 +342,7 @@ def test_successful_send_does_not_wake_or_count():
         gw = _gw()
         session = _wired_session(gw)
 
-        async def ok(_text):
+        async def ok(_text, turn=None):
             return None
         session._reply = ok
 
@@ -374,7 +455,7 @@ def test_sync_and_webhook_failures_share_one_budget():
         gw = _gw()
         session = _wired_session(gw)
 
-        async def boom(_text):
+        async def boom(_text, turn=None):
             raise _Blocked()
         session._reply = boom
 

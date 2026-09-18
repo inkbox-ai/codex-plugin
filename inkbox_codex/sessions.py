@@ -85,6 +85,16 @@ class _Turn:
     capture_tools: bool = False
     hosted_sms_context: Optional[Dict[str, Any]] = None
     activity_handler: Optional[Callable[[str, str], None]] = None
+    # The inbound message this turn answers: its channel and its own routing
+    # metadata, captured when the turn was queued. A later message overwrites
+    # the session's reply_meta, so an email's thread and copied recipients are
+    # only ever taken from here. None for turns no inbound message started.
+    mode: Optional[str] = None
+    reply_meta: Optional[Dict[str, Any]] = None
+
+# Email routing facts that belong to one inbound message, never to the session:
+# which message a reply threads onto and who was copied on it.
+_TURN_SCOPED_META_KEYS = frozenset({"message_id", "rfc_message_id", "reply_cc"})
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Codex as a turn.
@@ -175,6 +185,17 @@ def _send_rejected_prompt(reply: str, reason: str) -> str:
     Returns:
         str: A prompt telling Codex to rephrase or switch channels.
     """
+    if "recipient_blocked" in reason.lower():
+        # A contact-rule block is terminal: never nudge toward another channel.
+        return "\n".join([
+            "[reply rejected] Your last reply was NOT sent - this agent's contact "
+            "rules do not allow messaging this recipient.",
+            f"Reason: {reason}",
+            "",
+            "Only the agent's owner can change those rules. Do not resend or "
+            "reword the reply, and do not try to reach the recipient on another "
+            "channel; reply exactly [SILENT].",
+        ])
     return "\n".join([
         "[reply rejected] Your last reply was NOT delivered — the messaging "
         "provider rejected it before sending.",
@@ -444,7 +465,11 @@ class ContactSession:
 
         # Tag the message with its channel + sender so Codex knows where it
         # is and who it's talking to (the static system prompt can't).
-        await self._queue.put(_Turn(text=frame_inbound(mode, meta, text)))
+        await self._queue.put(_Turn(
+            text=frame_inbound(mode, meta, text),
+            mode=mode,
+            reply_meta=dict(meta or {}),
+        ))
 
         # Texting again while Codex is mid-turn behaves like hitting Esc and
         # typing a new message: interrupt the running turn so the worker drops
@@ -795,22 +820,28 @@ class ContactSession:
             None
         """
         try:
-            await self._reply(reply)
+            await self._reply(reply, turn=turn)
         except Exception as exc:
             reason = _send_error_reason(exc)
             logger.warning("[session %s] reply send rejected: %s", self.chat_id, reason)
+            # A recovery turn re-sends this same reply, so it keeps this turn's
+            # routing snapshot rather than picking up a newer message's.
             if self.on_send_failure is not None:
                 prompt = self.on_send_failure(
-                    self.chat_id, self.mode, self.reply_meta, reply, reason
+                    self.chat_id, self.mode, self._reply_meta_for(turn), reply, reason
                 )
                 if prompt:
-                    await self._queue.put(_Turn(text=prompt, recovery=True))
+                    await self._queue.put(_Turn(
+                        text=prompt, recovery=True,
+                        mode=turn.mode, reply_meta=turn.reply_meta,
+                    ))
                 return
             if turn.recovery:
                 raise  # no shared budget is available to cap another attempt
-            await self._queue.put(
-                _Turn(text=_send_rejected_prompt(reply, reason), recovery=True)
-            )
+            await self._queue.put(_Turn(
+                text=_send_rejected_prompt(reply, reason), recovery=True,
+                mode=turn.mode, reply_meta=turn.reply_meta,
+            ))
 
     async def run_consult(
         self,
@@ -1035,8 +1066,39 @@ class ContactSession:
         finally:
             self.pending = None
 
-    async def _reply(self, text: str) -> None:
-        await self.send_fn(self.chat_id, text, self.mode, self.reply_meta)
+    def _reply_meta_for(self, turn: Optional[_Turn] = None) -> Dict[str, Any]:
+        """Pick the routing metadata for one outgoing message.
+
+        Replies go out on the channel the human last used, with the session's
+        latest metadata. The exception is what ties an email reply to one
+        specific inbound message - its thread and the people copied on it:
+        that is taken only from the turn's own snapshot, so a reply can never
+        land in another message's thread or reach another message's audience.
+
+        Args:
+            turn (Optional[_Turn]): The turn being answered; None for bridge
+                notices (control commands, prompts, error notices).
+
+        Returns:
+            Dict[str, Any]: Metadata to hand to the send function.
+        """
+        if (
+            self.mode == "email"
+            and turn is not None
+            and turn.mode == "email"
+            and turn.reply_meta is not None
+        ):
+            return turn.reply_meta
+        if _TURN_SCOPED_META_KEYS.isdisjoint(self.reply_meta):
+            return self.reply_meta
+        return {
+            key: value
+            for key, value in self.reply_meta.items()
+            if key not in _TURN_SCOPED_META_KEYS
+        }
+
+    async def _reply(self, text: str, turn: Optional[_Turn] = None) -> None:
+        await self.send_fn(self.chat_id, text, self.mode, self._reply_meta_for(turn))
 
     async def close(self) -> None:
         if self._client is not None:

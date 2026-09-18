@@ -283,7 +283,7 @@ def test_rejected_reply_send_spawns_one_recovery_turn():
             detail = {"error": "message_blocked_spam_filter", "rule": "crypto_content",
                       "message": "Cryptocurrency price content is restricted."}
 
-        async def boom(_text):
+        async def boom(_text, turn=None):
             raise Blocked()
         session._reply = boom
 
