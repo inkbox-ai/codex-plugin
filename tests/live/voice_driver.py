@@ -166,9 +166,10 @@ async def phone_media_ws(ws: WebSocket) -> None:
                 log.info("call start: %s", ev.get("stream_id"))
                 convo = asyncio.create_task(_run_turn())
             elif kind == "transcript":
-                state["last_heard"] = loop.time()  # agent is actively talking
+                text = ev.get("text") or ""
+                if text.strip():
+                    state["last_heard"] = loop.time()
                 if ev.get("is_final"):
-                    text = ev.get("text") or ""
                     log.info("heard (final): %s", text)
                     if answer_key and answer_key in _speech_key(text):
                         answered.set()

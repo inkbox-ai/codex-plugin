@@ -87,19 +87,21 @@ def test_continuous_peer_speech_has_bounded_wait(driver, monkeypatch):
     assert now() == 130
 
 
-def test_partial_transcript_extends_quiet_gate_before_final_transcript(driver, monkeypatch):
+@pytest.mark.parametrize("text", [None, "", " \t", "Still speaking"])
+@pytest.mark.parametrize("is_final", [False, True])
+def test_only_nonempty_transcript_extends_quiet_gate(driver, monkeypatch, text, is_final):
     observed = {}
 
     async def run():
         greeting_started = asyncio.Event()
-        partial_seen = asyncio.Event()
+        transcript_seen = asyncio.Event()
         state_seen = None
 
         async def wait_for_greeting(state):
             nonlocal state_seen
             state_seen = state
             greeting_started.set()
-            await partial_seen.wait()
+            await transcript_seen.wait()
             return False
 
         monkeypatch.setattr(driver, "_wait_for_greeting", wait_for_greeting)
@@ -127,9 +129,9 @@ def test_partial_transcript_extends_quiet_gate_before_final_transcript(driver, m
                     return json.dumps({"event": "start"})
                 if self.received == 2:
                     await greeting_started.wait()
-                    return json.dumps({"event": "transcript", "text": "Still speaking", "is_final": False})
-                observed["partial_activity"] = state_seen["last_heard"]
-                partial_seen.set()
+                    return json.dumps({"event": "transcript", "text": text, "is_final": is_final})
+                observed["transcript_activity"] = state_seen["last_heard"]
+                transcript_seen.set()
                 await self.stopped.wait()
                 return json.dumps({"event": "stop"})
 
@@ -139,6 +141,6 @@ def test_partial_transcript_extends_quiet_gate_before_final_transcript(driver, m
         observed["stopped"] = socket.stopped.is_set()
 
     asyncio.run(run())
-    assert observed["partial_activity"] > 0
+    assert (observed["transcript_activity"] > 0) == bool(text and text.strip())
     assert observed["utterances"] == [driver.GREETING]
     assert observed["stopped"]
