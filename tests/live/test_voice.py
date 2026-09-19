@@ -774,6 +774,18 @@ def test_outbound_call_voice_ai_and_post_call_completion():
             HOSTED_POST_CALL_MARKER,
             deadline=pre_hangup_deadline,
         )
+        in_call_sms = [
+            message for message in aut_outbound_sms()
+            if message.id not in before_sms
+            and (created_at := _record_created_at(message)) is not None
+            and created_at >= sms_watermark
+            and _voice_marker_key(HOSTED_POST_CALL_MARKER)
+            in _voice_marker_key(getattr(message, "text", "") or "")
+        ]
+        assert not in_call_sms, (
+            "Hosted Voice AI sent the deferred SMS before hangup "
+            f"(matching_rows={len(in_call_sms)})"
+        )
     finally:
         _hangup_fresh_calls(remote, driver_calls, before_driver)
         _hangup_fresh_calls(aut, aut_calls, before_aut)
