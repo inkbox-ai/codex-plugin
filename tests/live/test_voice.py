@@ -26,20 +26,9 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-# This suite owns the call transport and media path; natural-language routing is
-# exercised separately by test_cross_channel.py. Name the required action here so
-# model phrasing variance cannot prevent the telephony smoke test from starting.
-# A unique reference is still required because two identical no-reply SMS sends
-# to the same number trip the server's duplicate_body rule (422).
-_CALL_ME_REQUEST = "Use the inkbox_place_call tool now to call my phone number from this SMS. Do not reply by text."
-
-
-def _call_me_text(*, hosted: bool = False) -> str:
-    """An explicit call action with a fresh body for every send."""
-    request = _CALL_ME_REQUEST
-    if hosted:
-        request += " Use Voice AI to complete my spoken request and record its post-call action."
-    return f"{request} (ref {uuid.uuid4().hex[:6]})"
+# A fresh reference distinguishes repeated call requests on the same channel.
+def _call_me_text() -> str:
+    return f"Please call me now. Do not reply by text. (ref {uuid.uuid4().hex[:6]})"
 
 
 REMOTE_KEY = os.environ.get("REMOTE_INKBOX_API_KEY")
@@ -150,9 +139,9 @@ def _voice_marker_key(value: str) -> str:
     return "".join(_spoken_tokens(value))
 
 
-def _record_created_at(record):
+def _record_created_at(record, field="created_at"):
     """Return an aware server timestamp from an SDK record."""
-    value = getattr(record, "created_at", None)
+    value = getattr(record, field, None)
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=UTC)
     text = str(value or "").strip()
@@ -162,6 +151,48 @@ def _record_created_at(record):
         return datetime.fromisoformat(text)
     except ValueError:
         return None
+
+
+def _outbound_sms_since(client, number_id, start_datetime):
+    """Read all pages in the scenario's frozen inclusive window."""
+    rows = {}
+    offset = 0
+    while True:
+        page = client.texts.list(number_id, limit=200, offset=offset, start_datetime=start_datetime)
+        for message in page:
+            if str(getattr(message, "direction", "")).lower() == "outbound":
+                rows[message.id] = message
+        if len(page) < 200:
+            return list(rows.values())
+        offset += len(page)
+
+
+def _wait_for_hosted_readback(client, call_id, marker, *, deadline, party="local"):
+    """Require the selected side's persisted readback, not the opposite side."""
+    while time.monotonic() < deadline:
+        try:
+            _all, peer, local = _segments(client, "unused", call_id)
+            chosen = peer if party == "remote" else local
+            spoken = " ".join(segment.text.strip() for segment in chosen)
+            if _voice_marker_key(marker) in _voice_marker_key(spoken):
+                return
+        except Exception:
+            pass  # Speech records may not exist yet.
+        time.sleep(POLL_EVERY_S)
+    pytest.fail("Voice AI did not speak the complete requested words before hangup")
+
+
+def _assert_post_call_sms(messages, before_ids, marker, call, caller_number):
+    """Require one exact-body effect, to only the caller, after persisted hangup."""
+    current = [message for message in messages if message.id not in before_ids]
+    assert len(current) == 1, f"expected exactly one new outbound SMS, got {len(current)}"
+    message = current[0]
+    assert _sms_target_numbers(message) == {_digits(caller_number)}, "post-call SMS has the wrong recipient"
+    assert _voice_marker_key(getattr(message, "text", "") or "") == _voice_marker_key(marker), "post-call SMS body is not exact"
+    created = _record_created_at(message)
+    ended = _record_created_at(call, "ended_at")
+    assert created is not None and ended is not None, "SMS or call is missing its persisted timestamp"
+    assert created >= ended, "deferred SMS was created before the call ended"
 
 
 def _sms_target_numbers(message) -> set[str]:
@@ -688,13 +719,10 @@ def test_outbound_call_voice_ai_and_post_call_completion():
             and _digits(getattr(call, "remote_phone_number", "") or "")[-10:] == driver_tail
         ]
 
+    sms_window_start = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+
     def aut_outbound_sms():
-        return [
-            message
-            for message in aut.texts.list(aut_number_id, limit=200)
-            if (getattr(message, "direction", "") or "").lower() == "outbound"
-            and driver_number in _sms_target_numbers(message)
-        ]
+        return _outbound_sms_since(aut, aut_number_id, sms_window_start)
 
     assert HOSTED_POST_CALL_MARKER
     _sweep_matching_calls(remote, driver_calls)
@@ -719,7 +747,7 @@ def test_outbound_call_voice_ai_and_post_call_completion():
         scenario_deadline - HOSTED_POST_CALL_SETTLEMENT_S - HOSTED_DUPLICATE_GRACE_S - POLL_EVERY_S
     )
     not_before = datetime.now(UTC) - timedelta(seconds=10)
-    remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text(hosted=True))
+    remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
 
     aut_call = None
     try:
@@ -774,13 +802,15 @@ def test_outbound_call_voice_ai_and_post_call_completion():
             HOSTED_POST_CALL_MARKER,
             deadline=pre_hangup_deadline,
         )
+        _wait_for_hosted_readback(
+            aut, aut_call.id, HOSTED_POST_CALL_MARKER, deadline=pre_hangup_deadline,
+        )
+        _wait_for_hosted_readback(
+            remote, driver_call.id, HOSTED_POST_CALL_MARKER,
+            deadline=pre_hangup_deadline, party="remote",
+        )
         in_call_sms = [
-            message for message in aut_outbound_sms()
-            if message.id not in before_sms
-            and (created_at := _record_created_at(message)) is not None
-            and created_at >= sms_watermark
-            and _voice_marker_key(HOSTED_POST_CALL_MARKER)
-            in _voice_marker_key(getattr(message, "text", "") or "")
+            message for message in aut_outbound_sms() if message.id not in before_sms
         ]
         assert not in_call_sms, (
             "Hosted Voice AI sent the deferred SMS before hangup "
@@ -822,24 +852,7 @@ def test_outbound_call_voice_ai_and_post_call_completion():
         "hosted settlement left no room for the duplicate-detection grace window"
     )
     time.sleep(HOSTED_DUPLICATE_GRACE_S)
-    marker_sms = [
-        message
-        for message in aut_outbound_sms()
-        if message.id not in before_sms
-        and (created_at := _record_created_at(message)) is not None
-        and created_at >= sms_watermark
-        and _voice_marker_key(HOSTED_POST_CALL_MARKER)
-        in _voice_marker_key(getattr(message, "text", "") or "")
-    ]
-    current_candidates = [
-        message
-        for message in aut_outbound_sms()
-        if message.id not in before_sms
-        and (created_at := _record_created_at(message)) is not None
-        and created_at >= sms_watermark
-    ]
-    assert len(marker_sms) == 1, (
-        "post-call processing did not produce exactly one current-marker SMS "
-        "to the authoritative caller: "
-        f"current_rows={len(current_candidates)} marker_rows={len(marker_sms)}"
+    _assert_post_call_sms(
+        aut_outbound_sms(), before_sms, HOSTED_POST_CALL_MARKER,
+        aut.calls.get(aut_call.id), st["number"],
     )
