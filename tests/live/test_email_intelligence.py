@@ -50,19 +50,9 @@ def _digits(s: str) -> str:
 
 
 def _phone_present(phone: str, body: str) -> bool:
-    """True if the agent reported ``phone`` in ``body``.
-
-    Accepts either the full number (all digits present) or a privacy-masked
-    form the model tends to emit in formal identity listings, where it keeps a
-    leading prefix + the last 4 and masks the middle (e.g. ``+192****3235``).
-    The masked branch requires a run of mask chars immediately followed by the
-    real last-4, so it won't false-match on markdown bold (``**name:**``).
-    """
+    """Require every phone digit; punctuation and spacing may vary."""
     want = _digits(phone)
-    if want[-10:] in _digits(body):
-        return True
-    tail = re.escape(want[-4:])
-    return bool(re.search(r"[*xX•·]{2,}\D{0,2}" + tail, body))
+    return bool(want) and want in _digits(body)
 
 
 def _mailbox(client) -> str:
@@ -192,8 +182,6 @@ def test_reports_own_identity(ctx):
     )
     assert handle in body, f"reply missing handle {handle!r}\n{body[:400]}"
     assert aut_email in body, f"reply missing email {aut_email!r}\n{body[:400]}"
-    # Accept a privacy-masked phone (the model self-redacts the middle digits
-    # in formal listings) as well as full.
     assert _phone_present(aut_phone, body), f"reply missing phone {aut_phone!r}\n{body[:400]}"
 
 
@@ -217,8 +205,12 @@ def test_reports_sender_details(ctx):
     assert matches, "could not establish a contact card for the sender"
     contact = matches[0]
     name = (getattr(contact, "preferred_name", None) or getattr(contact, "given_name", None) or "")
+    named_fixture = bool(name.strip())
+    assert named_fixture, "the synthetic sender contact has no name"
     emails = [e.value for e in getattr(contact, "emails", [])]
     phones = [p.value for p in getattr(contact, "phones", [])]
+    phone_fixture = bool(phones)
+    assert phone_fixture, "the synthetic sender contact has no phone number"
 
     body = _ask(
         ctx["remote"],
@@ -228,30 +220,19 @@ def test_reports_sender_details(ctx):
         "Include my email address and phone number in full — every character "
         "and digit, with no masking, asterisks, or abbreviation.",
         accept=lambda candidate: (
-            (not name or name.lower() in candidate)
+            name.lower() in candidate
             and any(e.lower() in candidate for e in emails)
-            and (not phones or any(_phone_present(p, candidate) for p in phones))
+            and any(_phone_present(p, candidate) for p in phones)
         ),
     )
-    if name:
-        assert name.lower() in body, f"reply missing sender name {name!r}\n{body[:400]}"
+    assert name.lower() in body, f"reply missing sender name {name!r}\n{body[:400]}"
     assert any(e.lower() in body for e in emails), f"reply missing sender email {emails}\n{body[:400]}"
-    if phones:
-        # Accept full or privacy-masked (see _phone_present).
-        assert any(_phone_present(p, body) for p in phones), \
-            f"reply missing sender phone {phones}\n{body[:400]}"
+    assert any(_phone_present(p, body) for p in phones), \
+        f"reply missing sender phone {phones}\n{body[:400]}"
 
 
 def test_aware_of_inkbox_tools(ctx):
-    """Non-LLM proof the agent is wired with real tools: it discovers and names them.
-
-    Codex now defers ALL MCP tools behind its built-in tool search
-    (openai/codex#29486) — the full Inkbox tool list is never in the model's
-    context, so asking it to recite every tool from memory only yields the few
-    the bridge prompt happens to mention. Instead, force a discovery pass: the
-    contact tools are never preloaded and never prompt-mentioned, so naming
-    them proves a real tool-search round trip against the live MCP server.
-    """
+    """Report available contact capabilities without supplying their names."""
     tool_names = _plugin_tool_names()
     assert tool_names, "no inkbox_* tool names found in inkbox_codex/tools.py"
     contact_tools = {
@@ -267,10 +248,7 @@ def test_aware_of_inkbox_tools(ctx):
         ctx["remote"],
         ctx["aut_email"],
         ctx["remote_email"],
-        "Your Inkbox tools are not all preloaded into context — use your "
-        "tool search to find every available Inkbox CONTACT tool (search "
-        "for 'contact'), then reply with the exact name of each contact "
-        "tool you found, one per line. Do not omit or group similar-sounding tools.",
+        "List the exact names of your available Inkbox contact tools, one per line.",
         accept=lambda candidate: sum(t.lower() in candidate for t in contact_tools) >= 3,
     )
     hits = [t for t in tool_names if t.lower() in body]
@@ -315,9 +293,9 @@ def test_contact_crud_tool_use(ctx):
             ctx["remote"],
             ctx["aut_email"],
             ctx["remote_email"],
-            "Use inkbox_create_contact now. Create a new contact named "
-            f"{contact_name} with email {contact_email}. Do not just describe the action. "
-            f"After the tool succeeds, reply exactly: CREATED {nonce}",
+            "Create a new contact named "
+            f"{contact_name} with email {contact_email}. "
+            f"When done, reply exactly: CREATED {nonce}",
             accept=lambda candidate: "created" in candidate and nonce in candidate,
         )
         assert "created" in created and nonce in created, created[:500]
@@ -330,9 +308,9 @@ def test_contact_crud_tool_use(ctx):
             ctx["remote"],
             ctx["aut_email"],
             ctx["remote_email"],
-            "Use inkbox_update_contact now. Update contactId "
-            f"{contact_id} and set notes to {updated_notes}. Do not create a second contact. "
-            f"After the tool succeeds, reply exactly: UPDATED {nonce}",
+            f"Update the contact with email {contact_email}: set its notes to {updated_notes}. "
+            "Do not create a second contact. "
+            f"When done, reply exactly: UPDATED {nonce}",
             accept=lambda candidate: "updated" in candidate and nonce in candidate,
         )
         assert "updated" in updated and nonce in updated, updated[:500]

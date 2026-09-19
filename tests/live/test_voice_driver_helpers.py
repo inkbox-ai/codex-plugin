@@ -146,9 +146,10 @@ def test_only_nonempty_transcript_extends_quiet_gate(driver, monkeypatch, text, 
     assert observed["stopped"]
 
 
+@pytest.mark.parametrize("reply, suppress", [("", False), ("AlphaBravoCharlie", False), ("Xalpha Bravo Charlie", False), ("Alpha Bravo Charliez", False), ("Your words: ALPHA, Bravo Charlie.", True)])
 @pytest.mark.parametrize("peer_at, expected_retry", [(None, 159.0), (158.0, 164.0)])
 def test_long_request_does_not_requeue_before_playback_and_peer_quiet(
-    driver, monkeypatch, peer_at, expected_retry,
+    driver, monkeypatch, peer_at, expected_retry, reply, suppress,
 ):
     now = 100.0
     observed_state = None
@@ -182,6 +183,7 @@ def test_long_request_does_not_requeue_before_playback_and_peer_quiet(
     monkeypatch.setattr(driver, "REASK_EVERY_S", 20)
     monkeypatch.setattr(driver, "LISTEN_S", 70)
     monkeypatch.setattr(driver, "MAX_REASKS", 1)
+    monkeypatch.setattr(driver, "ANSWER_CONTAINS", "Alpha Bravo Charlie")
     loop = SimpleNamespace(time=lambda: now)
     monkeypatch.setattr(driver, "asyncio", SimpleNamespace(
         get_event_loop=lambda: loop, get_running_loop=lambda: loop,
@@ -196,6 +198,8 @@ def test_long_request_does_not_requeue_before_playback_and_peer_quiet(
 
             def __init__(self):
                 self.started = False
+                self.reply_sent = False
+                self.requested = asyncio.Event()
                 self.stopped = asyncio.Event()
                 self.spoken = []
 
@@ -206,6 +210,8 @@ def test_long_request_does_not_requeue_before_playback_and_peer_quiet(
                 event = json.loads(raw)
                 if "delta" in event:
                     self.spoken.append((now, event["delta"]))
+                    if event["delta"] == driver.LINE:
+                        self.requested.set()
                 if event["event"] == "stop":
                     self.stopped.set()
 
@@ -213,6 +219,10 @@ def test_long_request_does_not_requeue_before_playback_and_peer_quiet(
                 if not self.started:
                     self.started = True
                     return json.dumps({"event": "start"})
+                if not self.reply_sent:
+                    self.reply_sent = True
+                    await self.requested.wait()
+                    return json.dumps({"event": "transcript", "text": reply, "is_final": True})
                 await self.stopped.wait()
                 return json.dumps({"event": "stop"})
 
@@ -224,5 +234,4 @@ def test_long_request_does_not_requeue_before_playback_and_peer_quiet(
     assert spoken == [
         (100.0, driver.GREETING),
         (105.0, driver.LINE),
-        (expected_retry, driver.LINE),
-    ]
+    ] + ([] if suppress else [(expected_retry, driver.LINE)])

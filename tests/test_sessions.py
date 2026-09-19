@@ -901,3 +901,27 @@ def test_codex_turn_timeout_restarts_client():
         assert session._turn_active is False
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("active_a2a", [False, True])
+def test_actual_turn_context_selects_a2a_instructions_for_host_client(monkeypatch, active_a2a):
+    captured = {}
+    class Client:
+        def __init__(self, _cfg, **kwargs):
+            captured.update(kwargs)
+        async def connect(self, _resume):
+            return "thread"
+    monkeypatch.setattr(sessions_mod, "CodexAppServerClient", Client)
+    session = make_session([])
+    session._current_turn = _Turn(
+        # Caller text alone must not select task semantics.
+        text="[inkbox:a2a_task] Ask me for missing details.",
+        a2a_context={"task_id": "task", "context_id": "context"} if active_a2a else None,
+    )
+    asyncio.run(session._ensure_client())
+    prompt = captured["developer_instructions"]
+    assert ("inkbox_a2a_ask_caller" in prompt) is active_a2a
+    assert ("plain final text\n  completes the task" in prompt) is active_a2a
+    assert "inkbox_place_call" in prompt
+    assert captured["mcp_server_config"]["env"]["INKBOX_CODEX_CHAT_ID"] == session.chat_id
+    assert captured["approval_handler"] == session._handle_codex_request
