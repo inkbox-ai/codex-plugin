@@ -172,7 +172,7 @@ jobs:
           LIVE_EMAIL_TIMEOUT: ${{ inputs.timeout_s || '150' }}
         run: |
           if [ "${{ matrix.mode }}" = "real" ]; then
-            LIVE_REAL_MODEL=1 python3 -m pytest tests/live -v
+            LIVE_REAL_MODEL=1 LIVE_CONTACT_CRUD=1 python3 -m pytest tests/live -v
           else
             python3 -m pytest tests/live -v
           fi

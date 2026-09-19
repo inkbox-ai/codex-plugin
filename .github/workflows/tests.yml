@@ -29,9 +29,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # inkbox is mocked in the unit tests, so install only what they import.
+      # Live helper regressions exercise the SDK's real pagination offline.
       - name: Install test deps
-        run: pip install pytest httpx aiohttp segno "audioop-lts>=0.2.1; python_version >= '3.13'"
+        run: pip install pytest httpx aiohttp segno "inkbox==0.5.9" "audioop-lts>=0.2.1; python_version >= '3.13'"
 
       - name: Run unit tests
         run: pytest -q

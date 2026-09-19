@@ -156,7 +156,7 @@ jobs:
           if [ "${{ matrix.scenario }}" = "outbound_hosted" ]; then
             HOSTED_MARKER="$(python3 "$GITHUB_WORKSPACE/tests/ci/hosted_marker.py" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT")"
             echo "HOSTED_POST_CALL_MARKER=$HOSTED_MARKER" >> "$GITHUB_ENV"
-            export VOICE_DRIVER_LINE="Record one post-call action now to send me exactly one SMS containing only $HOSTED_MARKER after we hang up, then say $HOSTED_MARKER."
+            export VOICE_DRIVER_LINE="Do not text during this call. After we hang up, send me one SMS containing exactly: $HOSTED_MARKER. Save one post-call action now, with both title and details exactly: Send SMS $HOSTED_MARKER. After the tool succeeds, read back the exact three-word SMS body."
             export VOICE_DRIVER_SPEAK_AFTER=8
             export VOICE_DRIVER_ANSWER_CONTAINS="$HOSTED_MARKER"
             # The test owns hangup after both transcript and durable action-item

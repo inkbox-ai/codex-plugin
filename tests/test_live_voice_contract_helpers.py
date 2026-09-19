@@ -22,12 +22,14 @@ def _load_voice_module():
 voice = _load_voice_module()
 
 
-def test_workflow_uses_one_short_hosted_action_utterance_after_quiet():
+def test_workflow_uses_one_explicit_hosted_action_utterance_after_quiet():
     workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
 
     assert (
-        "Record one post-call action now to send me exactly one SMS containing only "
-        "$HOSTED_MARKER after we hang up, then say $HOSTED_MARKER." in workflow
+        "Do not text during this call. After we hang up, send me one SMS containing "
+        "exactly: $HOSTED_MARKER. Save one post-call action now, with both title "
+        "and details exactly: Send SMS $HOSTED_MARKER. After the tool succeeds, "
+        "read back the exact three-word SMS body." in workflow
     )
     assert "export VOICE_DRIVER_SPEAK_AFTER=8" in workflow
     # The driver re-asks while the agent is idle and stops once it says the
