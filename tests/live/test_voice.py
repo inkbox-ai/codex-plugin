@@ -136,7 +136,15 @@ def _spoken_tokens(value: str | None) -> list[str]:
 
 def _voice_marker_key(value: str) -> str:
     """Normalize punctuation/case that may change across TTS/PSTN/STT."""
-    return "".join(_spoken_tokens(value))
+    return " ".join(_spoken_tokens(value))
+
+
+def _has_spoken_marker(value, marker):
+    tokens = re.findall(r"[a-z0-9]+", (value or "").casefold())
+    expected = re.findall(r"[a-z0-9]+", (marker or "").casefold())
+    return bool(expected) and any(
+        tokens[index:index + len(expected)] == expected for index in range(len(tokens))
+    )
 
 
 def _record_created_at(record, field="created_at"):
@@ -174,7 +182,7 @@ def _wait_for_hosted_readback(client, call_id, marker, *, deadline, party="local
             _all, peer, local = _segments(client, "unused", call_id)
             chosen = peer if party == "remote" else local
             spoken = " ".join(segment.text.strip() for segment in chosen)
-            if _voice_marker_key(marker) in _voice_marker_key(spoken):
+            if _has_spoken_marker(spoken, marker):
                 return
         except Exception:
             pass  # Speech records may not exist yet.
@@ -244,7 +252,7 @@ def _matching_post_call_action(call, marker):
         value = f"{action} {details}"
         if (
             str(status).casefold() == "open"
-            and marker_key in _voice_marker_key(value)
+            and _has_spoken_marker(value, marker_key)
             and _has_sms_action_intent(value)
         ):
             return item
@@ -270,7 +278,7 @@ def _post_call_action_diagnostic(call, marker) -> dict[str, int | bool]:
             details = getattr(item, "details", "")
         value = f"{action} {details}"
         is_open = str(status).casefold() == "open"
-        has_marker = bool(marker_key) and marker_key in _voice_marker_key(value)
+        has_marker = bool(marker_key) and _has_spoken_marker(value, marker_key)
         has_sms_intent = _has_sms_action_intent(value)
         open_count += int(is_open)
         marker_count += int(has_marker)
@@ -438,12 +446,12 @@ def _wait_for_persisted_hosted_request(
             _all, _rem, loc = _segments(remote, number_id, call_id)
             text = " ".join(segment.text.strip() for segment in loc)
             driver_transcript_ready = (
-                marker_key in _voice_marker_key(text)
+                _has_spoken_marker(text, marker_key)
                 and _has_after_call_sms_intent(text)
             )
             driver_transcript_diagnostic = {
                 "segment_count": len(loc),
-                "marker_present": marker_key in _voice_marker_key(text),
+                "marker_present": _has_spoken_marker(text, marker_key),
                 "after_call_sms_intent": _has_after_call_sms_intent(text),
             }
         except Exception as exc:  # noqa: BLE001 - transcripts may not exist yet
@@ -452,12 +460,12 @@ def _wait_for_persisted_hosted_request(
             _all, caller, _local = _segments(aut, "unused", aut_call_id)
             text = " ".join(segment.text.strip() for segment in caller)
             aut_transcript_ready = (
-                marker_key in _voice_marker_key(text)
+                _has_spoken_marker(text, marker_key)
                 and _has_after_call_sms_intent(text)
             )
             aut_transcript_diagnostic = {
                 "segment_count": len(caller),
-                "marker_present": marker_key in _voice_marker_key(text),
+                "marker_present": _has_spoken_marker(text, marker_key),
                 "after_call_sms_intent": _has_after_call_sms_intent(text),
             }
         except Exception as exc:  # noqa: BLE001 - transcripts may not exist yet
@@ -840,8 +848,7 @@ def test_outbound_call_voice_ai_and_post_call_completion():
             if message.id not in before_sms
             and (created_at := _record_created_at(message)) is not None
             and created_at >= sms_watermark
-            and _voice_marker_key(HOSTED_POST_CALL_MARKER)
-            in _voice_marker_key(getattr(message, "text", "") or "")
+            and _has_spoken_marker(getattr(message, "text", "") or "", HOSTED_POST_CALL_MARKER)
         ]
         if completion in gateway_log and marker_sms:
             break

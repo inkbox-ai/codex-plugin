@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -75,8 +76,9 @@ ANSWER_CONTAINS = os.environ.get("VOICE_DRIVER_ANSWER_CONTAINS", "")
 
 
 def _speech_key(text: str) -> str:
-    """Compare speech ignoring ASR casing, spacing and punctuation."""
-    return "".join(char for char in text.casefold() if char.isalnum())
+    """Normalize case and punctuation without accepting merged or partial words."""
+    words = re.findall(r"[a-z0-9]+", text.casefold())
+    return " " + " ".join(words) + " " if words else ""
 
 
 async def _wait_for_greeting(state: dict[str, float]) -> bool:

@@ -44,7 +44,7 @@ def test_call_request_is_fresh_without_internal_tool_instructions():
 
 
 def test_spoken_marker_normalizes_punctuation_and_case():
-    assert voice._voice_marker_key("Victor-Echo, JULIET!") == "victorechojuliet"
+    assert voice._voice_marker_key("Victor-Echo, JULIET!") == "victor echo juliet"
 
 
 def test_after_call_sms_intent_requires_after_call_language():
@@ -413,3 +413,12 @@ def test_sms_window_exhausts_actual_sdk_pages_and_retains_all_targets(monkeypatc
     assert current[-1].remote_phone_number == "+15553334444"
     assert [request["offset"] for request in requests] == [0, 200, 0, 200]
     assert all(request["start_datetime"] == bound for request in requests)
+
+
+@pytest.mark.parametrize("heard", ["AlphaBravoCharlie", "Xalpha Bravo Charlie", "Alpha Bravo Charliez", "Alpha extra Bravo Charlie", "Alfa Bravo Charlie"])
+def test_spoken_marker_rejects_merged_subword_and_phonetic_substitutes(heard):
+    assert not voice._has_spoken_marker(heard, "Alpha Bravo Charlie")
+
+
+def test_spoken_marker_preserves_contiguous_word_boundaries_with_punctuation():
+    assert voice._has_spoken_marker("Your words: ALPHA, Bravo Charlie.", "Alpha Bravo Charlie")
