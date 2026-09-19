@@ -205,10 +205,12 @@ def test_reports_sender_details(ctx):
     assert matches, "could not establish a contact card for the sender"
     contact = matches[0]
     name = (getattr(contact, "preferred_name", None) or getattr(contact, "given_name", None) or "")
-    assert name.strip(), "the synthetic sender contact has no name"
+    named_fixture = bool(name.strip())
+    assert named_fixture, "the synthetic sender contact has no name"
     emails = [e.value for e in getattr(contact, "emails", [])]
     phones = [p.value for p in getattr(contact, "phones", [])]
-    assert phones, "the synthetic sender contact has no phone number"
+    phone_fixture = bool(phones)
+    assert phone_fixture, "the synthetic sender contact has no phone number"
 
     body = _ask(
         ctx["remote"],

@@ -904,6 +904,10 @@ class ContactSession:
             identity_handle=self.identity_info.get("handle", ""),
             email_address=self.identity_info.get("email", ""),
             phone_number=self.identity_info.get("phone", ""),
+            a2a_task_session=(
+                self._current_turn is not None
+                and self._current_turn.a2a_context is not None
+            ),
         )
         self._client = CodexAppServerClient(
             self.cfg,

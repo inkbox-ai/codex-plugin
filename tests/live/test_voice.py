@@ -187,10 +187,12 @@ def _assert_post_call_sms(messages, before_ids, marker, call, caller_number):
     current = [message for message in messages if message.id not in before_ids]
     assert len(current) == 1, f"expected exactly one new outbound SMS, got {len(current)}"
     message = current[0]
-    assert _sms_target_numbers(message) == {_digits(caller_number)}, "post-call SMS has the wrong recipient"
+    recipient_matches = _sms_target_numbers(message) == {_digits(caller_number)}
+    assert recipient_matches, "post-call SMS has the wrong recipient"
     actual_words = re.findall(r"[a-z0-9]+", (getattr(message, "text", "") or "").casefold())
     expected_words = re.findall(r"[a-z0-9]+", marker.casefold())
-    assert actual_words == expected_words, "post-call SMS body is not exact"
+    body_matches = actual_words == expected_words
+    assert body_matches, "post-call SMS body is not exact"
     created = _record_created_at(message)
     ended = _record_created_at(call, "ended_at")
     assert created is not None and ended is not None, "SMS or call is missing its persisted timestamp"

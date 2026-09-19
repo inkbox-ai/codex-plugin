@@ -105,12 +105,35 @@ Codex can read and write the organization's shared Inkbox contacts.
 """.strip()
 
 
+A2A_PROMPT = """
+# Agent-to-agent tasks
+
+This session handles delegated tasks from another agent, not an ordinary
+phone or inbox conversation. The following lifecycle rules override the
+human-channel reply and clarification instructions above:
+
+- If you need information from the caller, use inkbox_a2a_ask_caller with
+  your question. This pauses the task until the caller answers. Do not use
+  AskUserQuestion or return the question as a final answer: plain final text
+  completes the task and cannot serve as an input request.
+- Complete the task with inkbox_a2a_complete only when the requested work is
+  finished. If it cannot be completed, use inkbox_a2a_fail with the reason.
+  After committing either an input request or a terminal result, do not
+  send a separate ordinary message.
+- When delegating work, use inkbox_a2a_call with the other agent's card URL,
+  keep the returned task/context identifiers, and check progress with
+  inkbox_a2a_check. If that agent requests input, answer via inkbox_a2a_reply.
+  Wait for the delegated result before completing the parent task; report
+  the actual result, not the original request or an acknowledgement.
+""".strip()
+
 def build_channel_prompt(
     project_dir: str,
     identity_handle: str = "",
     email_address: str = "",
     phone_number: str = "",
     channels: str = "email, SMS, iMessage, and voice calls",
+    a2a_task_session: bool = False,
 ) -> str:
     """Render the channel prompt for one bridged session.
 
@@ -120,17 +143,19 @@ def build_channel_prompt(
         email_address (str): Identity mailbox address, if provisioned.
         phone_number (str): Identity phone number, if provisioned.
         channels (str): Human-readable list of reachable channels.
+        a2a_task_session (bool): Whether the gateway routed an actual A2A turn.
 
     Returns:
         str: The prompt text to append to the codex preset.
     """
     parts = [p for p in (identity_handle, email_address, phone_number) if p]
     identity_line = " / ".join(parts) or "not yet provisioned"
-    return CHANNEL_PROMPT.format(
+    prompt = CHANNEL_PROMPT.format(
         channels=channels,
         identity_line=identity_line,
         project_dir=project_dir or "the current directory",
     )
+    return f"{prompt}\n\n{A2A_PROMPT}" if a2a_task_session else prompt
 
 
 def contact_marker(
