@@ -188,7 +188,9 @@ def _assert_post_call_sms(messages, before_ids, marker, call, caller_number):
     assert len(current) == 1, f"expected exactly one new outbound SMS, got {len(current)}"
     message = current[0]
     assert _sms_target_numbers(message) == {_digits(caller_number)}, "post-call SMS has the wrong recipient"
-    assert _voice_marker_key(getattr(message, "text", "") or "") == _voice_marker_key(marker), "post-call SMS body is not exact"
+    actual_words = re.findall(r"[a-z0-9]+", (getattr(message, "text", "") or "").casefold())
+    expected_words = re.findall(r"[a-z0-9]+", marker.casefold())
+    assert actual_words == expected_words, "post-call SMS body is not exact"
     created = _record_created_at(message)
     ended = _record_created_at(call, "ended_at")
     assert created is not None and ended is not None, "SMS or call is missing its persisted timestamp"
