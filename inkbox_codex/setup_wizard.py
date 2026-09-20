@@ -2124,7 +2124,7 @@ def interactive_setup() -> None:
         if not prompt_yes_no("  Reconfigure Inkbox?", False):
             _configure_group_reply_mode()
             _configure_inkbox_tool_approvals()
-            print_info("  Restart a running bridge to apply the saved settings: inkbox-codex restart")
+            print_info("  Restart your running bridge or service to apply the saved settings.")
             return
 
     base_url = os.getenv("INKBOX_BASE_URL") or _env("INKBOX_BASE_URL") or INKBOX_BASE_URL_DEFAULT
