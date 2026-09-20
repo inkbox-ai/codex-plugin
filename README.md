@@ -268,11 +268,13 @@ message's reply target even if another message arrives in the same session.
 If an inbound event lacks the original message ID, the bridge cannot send an
 automatic reply-all; it does not fall back to a sender-only email.
 
-Live reply-all CI uses three distinct, dedicated test identities: the existing
-`CODEX_INKBOX_API_KEY` and `REMOTE_INKBOX_API_KEY`, plus
-`REPLY_ALL_INKBOX_API_KEY` for a non-auto-replying recipient inbox. The test requires
-real delivery to both recipients and checks To/CC and reply-thread headers; it
-fails rather than skips if the third credential is missing from a live run.
+Live reply-all CI uses the existing `CODEX_INKBOX_API_KEY` and
+`REMOTE_INKBOX_API_KEY` to verify real reply delivery, sender deduplication,
+self-exclusion, and reply-thread headers. An optional `REPLY_ALL_INKBOX_API_KEY`
+for a third, non-auto-replying dedicated inbox enables separate CC delivery
+checks (including additional original To recipients). Those two additional
+cases are explicitly skipped when the third credential is absent; two-identity
+checks do not prove independent CC delivery.
 The live channel workflow's `email_reply_all_only` input runs just these checks,
 with both deterministic and real-model gateway runs, without SMS reset traffic.
 

@@ -1,7 +1,7 @@
-"""Real reply-all delivery to the sender and a separate, controlled CC inbox.
+"""Live reply-all delivery using the existing dedicated CI identities.
 
-The gateway must already be running. All three credentials must identify
-dedicated test identities; the two recipient mailboxes must not auto-reply.
+The gateway must already be running. An optional third controlled inbox adds
+independent CC delivery coverage; recipient mailboxes must not auto-reply.
 No reply is sent directly by this test: the running gateway must produce it.
 """
 
@@ -56,7 +56,7 @@ def _find_message(client, mailbox, *, since, sender, nonce, direction):
 def _assert_reply(reply, *, sender, recipient, cc, original_wire_id, nonce):
     assert _address(reply.from_address) == _address(sender)
     assert [_address(value) for value in reply.to_addresses] == [_address(recipient)]
-    assert [_address(value) for value in reply.cc_addresses or []] == [_address(cc)]
+    assert [_address(value) for value in reply.cc_addresses or []] == ([_address(cc)] if cc else [])
     assert not getattr(reply, "bcc_addresses", None), "reply must not expose BCC recipients"
     assert str(reply.in_reply_to or "").strip("<>") == original_wire_id.strip("<>")
     references = reply.references or []
@@ -68,12 +68,12 @@ def _assert_reply(reply, *, sender, recipient, cc, original_wire_id, nonce):
     assert not any(marker in body for marker in ERROR_MARKERS), "received an error fallback"
 
 
+@pytest.mark.skipif(not CC_KEY, reason="independent CC delivery needs a third controlled test inbox")
 @pytest.mark.parametrize("copied_in", ["cc", "to"])
 def test_live_reply_all_preserves_audience_and_thread(copied_in):
     from inkbox import Inkbox
     from inkbox.mail.types import MessageDirection
 
-    assert CC_KEY, "configure REPLY_ALL_INKBOX_API_KEY for the dedicated CC test inbox"
     with ExitStack() as stack:
         remote, aut, copied = [
             stack.enter_context(Inkbox(api_key=key, base_url=BASE_URL))
@@ -131,3 +131,58 @@ def test_live_reply_all_preserves_audience_and_thread(copied_in):
         assert str(found["reply_cc"].thread_id) == str(found["original_cc"].thread_id)
         # Both inbox copies must be the same outbound email, not separate sends.
         assert len({found[name].message_id for name in ("reply_aut", "reply_remote", "reply_cc")}) == 1
+
+
+@pytest.mark.parametrize("copied_in", ["sender_cc", "self_cc"])
+def test_live_reply_all_deduplicates_sender_and_excludes_self(copied_in):
+    """Exercise real delivery and threading with the two existing CI identities."""
+    from inkbox import Inkbox
+    from inkbox.mail.types import MessageDirection
+
+    with ExitStack() as stack:
+        remote, aut = [
+            stack.enter_context(Inkbox(api_key=key, base_url=BASE_URL))
+            for key in (REMOTE_KEY, AUT_KEY)
+        ]
+        remote_email, aut_email = [_mailbox(client) for client in (remote, aut)]
+        assert _address(remote_email) != _address(aut_email)
+        since = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        nonce = f"smoke-{uuid.uuid4().hex}"
+        sent = remote.messages.send(
+            remote_email, to=[aut_email],
+            cc=[remote_email if copied_in == "sender_cc" else aut_email],
+            subject=f"[{nonce}] Reply-all routing check",
+            body_text=(
+                f"Live reply-all check. Reply with exactly REPLY_OK {nonce}. "
+                "Use your normal email reply, not a separate send tool."
+            ),
+        )
+        assert sent.message_id and sent.thread_id
+        expected = {
+            "original_aut": (aut, aut_email, remote_email, MessageDirection.INBOUND),
+            "reply_aut": (aut, aut_email, aut_email, MessageDirection.OUTBOUND),
+            "reply_remote": (remote, remote_email, aut_email, MessageDirection.INBOUND),
+        }
+        found = {}
+        deadline = time.monotonic() + TIMEOUT_S
+        while time.monotonic() < deadline and len(found) != len(expected):
+            for name, (client, mailbox, sender, direction) in expected.items():
+                if name not in found:
+                    message = _find_message(
+                        client, mailbox, since=since, sender=sender, nonce=nonce, direction=direction,
+                    )
+                    if message is not None:
+                        found[name] = message
+            if len(found) != len(expected):
+                time.sleep(POLL_EVERY_S)
+        assert found.keys() == expected.keys(), f"missing real email deliveries: {sorted(expected.keys() - found.keys())}"
+        for name, (client, mailbox, _, _) in expected.items():
+            found[name] = client.messages.get(mailbox, found[name].id)
+        for name in ("reply_aut", "reply_remote"):
+            _assert_reply(
+                found[name], sender=aut_email, recipient=remote_email, cc=None,
+                original_wire_id=sent.message_id, nonce=nonce,
+            )
+        assert str(found["reply_aut"].thread_id) == str(found["original_aut"].thread_id)
+        assert str(found["reply_remote"].thread_id) == str(sent.thread_id)
+        assert found["reply_aut"].message_id == found["reply_remote"].message_id

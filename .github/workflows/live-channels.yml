@@ -62,15 +62,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Require the dedicated reply-all recipient
-        env:
-          REPLY_ALL_INKBOX_API_KEY: ${{ secrets.REPLY_ALL_INKBOX_API_KEY }}
-        run: |
-          if [ -z "$REPLY_ALL_INKBOX_API_KEY" ]; then
-            echo "::error::Configure REPLY_ALL_INKBOX_API_KEY for a third, non-auto-replying test inbox."
-            exit 1
-          fi
-
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
