@@ -24,6 +24,7 @@ def test_explicit_mentions(text):
     "hello", "@", "@atlas", "@atlas-bot-extra", "@agents", "@@agent",
     "someone@agent.example", "https://example.com/@agent", "www.example.com/@agent",
     "@atlas-bot.example", "agent please help", "other@atlas-bot",
+    "someone+@agent", "+" * 100000,
 ])
 def test_non_mentions(text):
     assert not mentions_agent(text, "atlas-bot")

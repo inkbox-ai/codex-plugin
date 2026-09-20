@@ -502,7 +502,7 @@ class ContactSession:
                 await self._run_turn(turn)
             except Exception as exc:
                 if turn.context_only:
-                    logger.exception("[session %s] context append failed; retained for retry", self.chat_id)
+                    logger.error("[session %s] context append failed; retained for retry", self.chat_id)
                     continue
                 # An interrupt aborts the turn on purpose — the next queued
                 # message takes over, so it is not an error to report.

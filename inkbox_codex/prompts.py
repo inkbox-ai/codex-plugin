@@ -236,10 +236,10 @@ def inject_contact_memories(text: str, memories: Any) -> str:
 
 def mentions_agent(text: str, handle: str) -> bool:
     """Match explicit mentions in message text, excluding links and addresses."""
-    text = re.sub(r"(?:https?://|www\.)\S+|[\w.+-]+@[\w.-]+", " ", text, flags=re.I)
+    text = re.sub(r"(?:https?://|www\.)\S+", " ", text, flags=re.I)
     tokens = {"agent", handle.strip().lstrip("@")}
     return any(
-        re.search(r"(?<![\w@.-])@" + re.escape(token) + r"(?![\w-])(?!\.\w)", text, re.I)
+        re.search(r"(?<![\w@.+-])@" + re.escape(token) + r"(?![\w-])(?!\.\w)", text, re.I)
         for token in tokens if token
     )
 
