@@ -27,6 +27,20 @@ class CodexAppServerError(RuntimeError):
     """Raised when codex app-server returns an error or exits unexpectedly."""
 
 
+async def _read_protocol_line(reader: asyncio.StreamReader) -> bytes:
+    """Read a host line without truncating large resumed-thread histories."""
+    chunks = []
+    while True:
+        try:
+            chunks.append(await reader.readuntil(b"\n"))
+            return b"".join(chunks)
+        except asyncio.LimitOverrunError as exc:
+            chunks.append(await reader.readexactly(exc.consumed))
+        except asyncio.IncompleteReadError as exc:
+            chunks.append(exc.partial)
+            return b"".join(chunks)
+
+
 @dataclass
 class _TurnCapture:
     thread_id: str
@@ -293,6 +307,8 @@ class CodexAppServerClient:
     async def _request(self, method: str, params: Dict[str, Any]) -> Any:
         if self._proc is None or self._proc.stdin is None:
             raise CodexAppServerError("Codex app-server is not running")
+        if self._reader_task is not None and self._reader_task.done():
+            raise CodexAppServerError("Codex app-server output reader is not running")
         message_id = self._next_id
         self._next_id += 1
         loop = asyncio.get_running_loop()
@@ -310,9 +326,18 @@ class CodexAppServerClient:
         self._proc.stdin.write(json.dumps(message, separators=(",", ":")).encode() + b"\n")
 
     async def _reader_loop(self) -> None:
+        try:
+            await self._read_messages()
+        except Exception:
+            # A dead reader must reject waiters, not leave thread/resume or a
+            # model turn waiting forever. Do not include protocol payloads.
+            logger.error("Codex app-server output reader failed")
+            self._fail_all(CodexAppServerError("Codex app-server output reader failed"))
+
+    async def _read_messages(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
         while True:
-            line = await self._proc.stdout.readline()
+            line = await _read_protocol_line(self._proc.stdout)
             if not line:
                 self._fail_all(CodexAppServerError("Codex app-server exited"))
                 return
@@ -334,7 +359,7 @@ class CodexAppServerClient:
     async def _stderr_loop(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
         while True:
-            line = await self._proc.stderr.readline()
+            line = await _read_protocol_line(self._proc.stderr)
             if not line:
                 return
             logger.debug("[codex app-server] %s", line.decode(errors="replace").rstrip())

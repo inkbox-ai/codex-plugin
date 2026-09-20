@@ -232,13 +232,15 @@ def test_bridge_client_full_mock_turn(tmp_path, monkeypatch):
             await asyncio.wait_for(client.append_context(["Group context: meeting moved to Saturday."]), timeout=10)
             await asyncio.sleep(0.1)
             assert model_requests == [], "context-only append started model generation"
+            # Resuming a real turn returns its history in one JSON-RPC line.
+            await asyncio.wait_for(client.run("History seed: " + "x" * 100000), timeout=10)
         finally:
             await client.disconnect()
         # Resume the SAME thread from a fresh client — the bridge does exactly
         # this on restart (session ids persisted in sessions.json).
         client2 = CodexAppServerClient(cfg, developer_instructions="contract-test")
         try:
-            resumed_id = await client2.connect(resume_thread_id=thread_id)
+            resumed_id = await asyncio.wait_for(client2.connect(resume_thread_id=thread_id), timeout=10)
             reply = await asyncio.wait_for(client2.run("ping smoke-c0ffee42"), timeout=60)
         finally:
             await client2.disconnect()
@@ -264,10 +266,10 @@ def test_bridge_client_full_mock_turn(tmp_path, monkeypatch):
     assert "smoke-c0ffee42" in reply, f"nonce lost in the turn pipeline: {reply!r}"
     assert resumed_id == thread_id, f"thread/resume reopened {resumed_id!r}, wanted {thread_id!r}"
     assert "REPLY_OK" in tool_free_reply
-    assert len(model_requests) == 2
-    assert "meeting moved to Saturday" in json.dumps(model_requests[0]["input"])
-    assert model_requests[0]["tools"], "normal main turn unexpectedly lost its tools"
-    assert model_requests[1]["tools"] == [], (
+    assert len(model_requests) == 3
+    assert "meeting moved to Saturday" in json.dumps(model_requests[1]["input"])
+    assert model_requests[1]["tools"], "normal main turn unexpectedly lost its tools"
+    assert model_requests[2]["tools"] == [], (
         "tool-disabled auxiliary turn exposed model tools: "
         f"{model_requests[1]['tools']!r}"
     )
