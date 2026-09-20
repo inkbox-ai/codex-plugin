@@ -163,6 +163,20 @@ class CodexAppServerClient:
             if self._current_turn_id == turn_id:
                 self._current_turn_id = None
 
+    async def append_context(self, messages: list[str]) -> None:
+        """Persist background messages without starting model generation."""
+        if not self.thread_id:
+            await self.connect()
+        await self._request("thread/inject_items", {
+            "threadId": self.thread_id,
+            "items": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": text},
+                ]}
+                for text in messages
+            ],
+        })
+
     async def interrupt(self) -> None:
         """Interrupt the active turn, if app-server has accepted one."""
         if not self.thread_id or not self._current_turn_id:

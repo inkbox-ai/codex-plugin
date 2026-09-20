@@ -400,6 +400,29 @@ def test_imessage_reaction_without_contact_uses_conversation_session_key(monkeyp
     assert meta["conversation_id"] == "imconv-456"
 
 
+def test_group_reaction_keeps_group_session_and_has_no_waking_text(monkeypatch):
+    gw = _gw(monkeypatch, [])
+
+    async def summary(_conversation_id):
+        return {"is_group": True}
+
+    async def contact(**_kwargs):
+        return {"id": "contact-reactor"}
+
+    monkeypatch.setattr(gw, "_lookup_imessage_conversation_summary", summary)
+    monkeypatch.setattr(gw, "_resolve_contact_full", contact)
+    asyncio.run(gw._on_imessage_reaction_received({"data": {"reaction": {
+        "id": "reaction-group", "direction": "inbound",
+        "remote_number": "+15550000001", "conversation_id": "group-one",
+        "target_message_id": "message-one", "reaction": "question",
+    }}}))
+    assert set(gw.sessions.by_id) == {"imessage:group-one"}
+    _, _, meta = gw.sessions.by_id["imessage:group-one"].inbound[0]
+    assert meta["conversation_kind"] == "group"
+    assert meta["raw_text"] == ""
+    assert meta["conversation_id"] == "group-one"
+
+
 def test_outbound_imessage_reaction_echo_is_ignored(monkeypatch):
     gw = _gw(monkeypatch, [])
     envelope = {"data": {"reaction": {

@@ -34,7 +34,7 @@ try:
         parse_permission_reply,
         parse_poll_reply,
     )
-    from .prompts import build_channel_prompt, frame_inbound
+    from .prompts import build_channel_prompt, frame_inbound, mentions_agent
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
     from config import BridgeConfig, a2a_turn_context_path, hosted_sms_turn_context_path
@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
         parse_permission_reply,
         parse_poll_reply,
     )
-    from prompts import build_channel_prompt, frame_inbound
+    from prompts import build_channel_prompt, frame_inbound, mentions_agent
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,7 @@ class _Turn:
     the channel the human last used. A capture turn (``future`` set) hands the
     reply text back to the awaiting caller instead and never auto-replies —
     used by voice consults, post-call actions, and delivery-failure notices.
+    Context-only entries append history between turns without generation.
     """
 
     text: str
@@ -85,6 +86,7 @@ class _Turn:
     capture_tools: bool = False
     hosted_sms_context: Optional[Dict[str, Any]] = None
     activity_handler: Optional[Callable[[str, str], None]] = None
+    context_only: bool = False
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Codex as a turn.
@@ -345,7 +347,7 @@ def _record_channel_hint(chat_id: str, mode: str) -> None:
 
 
 class ContactSession:
-    """One Codex conversation bound to one remote human."""
+    """One Codex conversation bound to a contact or group conversation."""
 
     def __init__(
         self,
@@ -386,6 +388,7 @@ class ContactSession:
 
         self._client: Optional[CodexAppServerClient] = None
         self._queue: asyncio.Queue[_Turn] = asyncio.Queue()
+        self._pending_context: list[str] = []
         self._worker: Optional[asyncio.Task] = None
         self._resume_task: Optional[asyncio.Task] = None  # /resume pick in flight
         self._turn_active = False     # a Codex turn is mid-flight
@@ -407,6 +410,34 @@ class ContactSession:
         Returns:
             None
         """
+        meta = dict(meta or {})
+        raw_text = str(meta.get("raw_text", text))
+        command = _control_command(raw_text)
+        is_group = mode in {"sms", "imessage"} and meta.get("conversation_kind") == "group"
+        pending_reply = self.pending is not None and not self.pending.future.done()
+        if is_group and pending_reply:
+            pending_reply = (
+                not meta.get("reaction")
+                and meta.get("sender") == self.reply_meta.get("sender")
+                and (self.pending.kind != "permission" or parse_permission_reply(raw_text) is not None)
+            )
+        context_only = (
+            is_group
+            and self.cfg.group_reply_mode == "mention"
+            and not command
+            and not pending_reply
+            and not mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity)
+        )
+        if context_only:
+            await self._queue.put(_Turn(
+                text="Background group message; context only, not a request to act.\n"
+                     + frame_inbound(mode, meta, text),
+                context_only=True,
+            ))
+            if self._worker is None or self._worker.done():
+                self._worker = asyncio.create_task(self._drain())
+            return
+
         self.mode = mode
         self.reply_meta = dict(meta or {})
         # Mirror the modality for the tool process (channel-aware calling).
@@ -414,7 +445,6 @@ class ContactSession:
 
         # Bridge control commands (/clear, /new, /stop) steer the conversation
         # itself — handle them here instead of forwarding them to Codex.
-        command = _control_command(text)
         if command == "reset":
             await self._reset_session()
             return
@@ -437,9 +467,9 @@ class ContactSession:
 
         # A reply while an escalation is outstanding answers the escalation —
         # it does not start a new agent turn.
-        if self.pending is not None and not self.pending.future.done():
+        if pending_reply:
             logger.info("[session %s] reply consumed by pending %s", self.chat_id, self.pending.kind)
-            self.pending.future.set_result(text)
+            self.pending.future.set_result(raw_text)
             return
 
         # Tag the message with its channel + sender so Codex knows where it
@@ -465,8 +495,15 @@ class ContactSession:
         while not self._queue.empty():
             turn = await self._queue.get()
             try:
+                if turn.context_only:
+                    self._pending_context.append(turn.text)
+                    await self._flush_context()
+                    continue
                 await self._run_turn(turn)
             except Exception as exc:
+                if turn.context_only:
+                    logger.exception("[session %s] context append failed; retained for retry", self.chat_id)
+                    continue
                 # An interrupt aborts the turn on purpose — the next queued
                 # message takes over, so it is not an error to report.
                 if self._interrupting:
@@ -485,6 +522,13 @@ class ContactSession:
                 except Exception:
                     logger.exception("[session %s] could not send the error notice", self.chat_id)
 
+    async def _flush_context(self) -> None:
+        if not self._pending_context:
+            return
+        client = await self._ensure_client()
+        await client.append_context(self._pending_context)
+        self._pending_context.clear()
+
     # ------------------------------------------------------------------
     # Control commands (/clear, /new, /stop)
     # ------------------------------------------------------------------
@@ -500,6 +544,7 @@ class ContactSession:
         # Forget the resumed conversation everywhere — in memory, the live
         # client, the persisted map, and any session-scoped tool grants.
         self.resume_session_id = None
+        self._pending_context.clear()
         await self.close()
         if self.on_clear is not None:
             self.on_clear(self.chat_id)
@@ -671,6 +716,7 @@ class ContactSession:
                     tmp.unlink(missing_ok=True)
                     raise
             client = await self._ensure_client()
+            await self._flush_context()
             # Keep a typing indicator alive on the human's channel for the whole
             # turn, then always tear it down — even if the turn raises.
             self._turn_active = True
