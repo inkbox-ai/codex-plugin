@@ -72,3 +72,23 @@ jobs:
 
       - name: Contract tests vs real Codex
         run: pytest tests/contract -v
+
+  # Preview helper is not published yet. Keep the established SDK floor in the
+  # compatibility lanes above; exercise the exact public Companion SDK contract
+  # here until a released version can replace this source pin.
+  companion-sdk:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install Companion preview SDK and test dependencies
+        run: >-
+          pip install -e . pytest httpx
+          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@449966c885208d41f995d09c54072e012df9eb1a#subdirectory=sdk/python"
+      - name: Verify helper is present (do not silently skip its tests)
+        run: python -c "from inkbox.companion import CompanionResource; assert callable(CompanionResource.load_initialization)"
+      - name: Run unit suite including actual SDK pagination
+        run: pytest -q
