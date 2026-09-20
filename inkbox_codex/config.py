@@ -131,6 +131,7 @@ class BridgeConfig:
     permission_timeout_s: float = 600.0
     codex_turn_timeout_s: float = 1800.0
     codex_interrupt_timeout_s: float = 10.0
+    companion_max_bytes: int = 262144
     a2a_progress_interval_seconds: float = A2A_PROGRESS_DEFAULT_INTERVAL_SECONDS
     voice_stack: VoiceStack = VoiceStack.INKBOX_TTS_STT
     voice_stack_invalid_value: str = ""
@@ -256,6 +257,7 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         permission_timeout_s=float(os.getenv("INKBOX_PERMISSION_TIMEOUT_S") or 600.0),
         codex_turn_timeout_s=float(os.getenv("CODEX_TURN_TIMEOUT_S") or 1800.0),
         codex_interrupt_timeout_s=float(os.getenv("CODEX_INTERRUPT_TIMEOUT_S") or 10.0),
+        companion_max_bytes=int(os.getenv("INKBOX_COMPANION_MAX_BYTES") or 262144),
         a2a_progress_interval_seconds=float(
             os.getenv("INKBOX_A2A_PROGRESS_INTERVAL_SECONDS")
             or A2A_PROGRESS_DEFAULT_INTERVAL_SECONDS

@@ -84,6 +84,9 @@ try:
         inkbox_client_kwargs,
     )
     from .codex_client import CodexTurnResult
+    from .companion import (
+        CompanionClosedError, CompanionError, CompanionInbox, metadata as companion_metadata,
+    )
     from .a2a_delegations import find_by_task as find_a2a_delegation
     from .media import download_media, inbound_media_note
     from .hosted_sms_guard import hosted_sms_attempt_state
@@ -112,6 +115,9 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     )
     from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, VoiceStack, call_contexts_dir, inkbox_client_kwargs
     from codex_client import CodexTurnResult
+    from companion import (
+        CompanionClosedError, CompanionError, CompanionInbox, metadata as companion_metadata,
+    )
     from a2a_delegations import find_by_task as find_a2a_delegation
     from media import download_media, inbound_media_note
     from hosted_sms_guard import hosted_sms_attempt_state
@@ -934,6 +940,8 @@ class InkboxGateway:
         self._public_host: str = ""
         self._runner: Any = None
         self.sessions: Optional[SessionManager] = None
+        self._companion: Optional[CompanionInbox] = None
+        self._closing = False
 
         self._self_addresses: set[str] = set()
         self._recent_request_ids: Dict[str, float] = {}
@@ -983,7 +991,7 @@ class InkboxGateway:
         if not AIOHTTP_AVAILABLE:
             raise RuntimeError("aiohttp is not installed; run: pip install aiohttp")
         if not INKBOX_AVAILABLE:
-            raise RuntimeError("inkbox SDK is not installed; run: pip install 'inkbox>=0.5.9,<1.0.0'")
+            raise RuntimeError("inkbox SDK is not installed; reinstall the bridge with inkbox>=0.7.3,<1.0.0")
         if not self.cfg.api_key or not self.cfg.identity:
             raise RuntimeError("INKBOX_API_KEY and INKBOX_IDENTITY must be set (see README)")
         if self.cfg.voice_stack_invalid_value:
@@ -1042,6 +1050,9 @@ class InkboxGateway:
             health_fn=self.health_report,
             on_send_failure=self._note_sync_send_failure,
         )
+        if CompanionInbox.exists(self):
+            self._companion = CompanionInbox(self)
+            self._companion.recover()
         await asyncio.to_thread(self._patch_identity_objects)
         await self._catch_up_a2a_tasks()
         await self._recover_hosted_call_completions()
@@ -1217,7 +1228,11 @@ class InkboxGateway:
         logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
     async def _cleanup(self) -> None:
+        self._closing = True
         self._a2a_closing = True
+        if self._companion is not None:
+            await self._companion.close()
+            self._companion = None
         current = asyncio.current_task()
         admission_tasks = [
             task
@@ -1699,7 +1714,11 @@ class InkboxGateway:
         )
 
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
+        if self._closing:
+            return web.Response(status=503, text="Gateway is stopping")
         body = await request.read()
+        if self._closing:
+            return web.Response(status=503, text="Gateway is stopping")
 
         # Authenticate FIRST, then route on the verified source — never on the
         # body's claimed ``event_type``. We identify the source by its signature
@@ -1742,7 +1761,24 @@ class InkboxGateway:
         try:
             event_type = str(envelope.get("event_type") or "")
             if source == "inkbox" and self._is_known_inkbox_event(event_type, envelope):
-                response = await self._route_inkbox_event(event_type, envelope)
+                routing = companion_metadata(envelope)
+                if routing is not None:
+                    if not self.cfg.require_signature and not provider.verify(
+                        body=body, headers=dict(request.headers), url=str(request.url),
+                        secret=self.cfg.signing_key,
+                    ):
+                        self._dedup_rollback(request_id)
+                        return web.Response(status=401, text="Companion mode requires a verified Inkbox webhook")
+                    if self.sessions is None:
+                        self._dedup_rollback(request_id)
+                        return web.Response(status=503, text="Companion sessions are starting")
+                    if self._companion is None:
+                        self._companion = CompanionInbox(self)
+                        self._companion.recover()
+                    await self._companion.accept(envelope, routing)
+                    response = web.json_response({"ok": True, "companion": "queued"})
+                else:
+                    response = await self._route_inkbox_event(event_type, envelope)
             elif source is not None and source != "inkbox":
                 # A verified third-party provider (registered + its secret set).
                 # That registration is the opt-in, so deliver regardless of the
@@ -1765,6 +1801,12 @@ class InkboxGateway:
                 # a fresh session each.
                 logger.debug("[bridge] ignored event %s (source=%s)", event_type, source)
                 response = web.json_response({"ok": True, "ignored": event_type})
+        except CompanionClosedError as exc:
+            self._dedup_rollback(request_id)
+            return web.Response(status=503, text=str(exc))
+        except CompanionError as exc:
+            self._dedup_rollback(request_id)
+            return web.Response(status=422, text=str(exc))
         except Exception:
             self._dedup_rollback(request_id)
             raise
@@ -1775,6 +1817,8 @@ class InkboxGateway:
         self, event_type: str, envelope: Dict[str, Any]
     ) -> "web.Response":
         """Dispatch one verified Inkbox event to its handler."""
+        if self._companion is not None and self._companion.record_delivery_failure(event_type, envelope):
+            return web.json_response({"ok": True, "companion": "delivery-failed"})
         if not event_type:
             # Incoming-call payloads are flat (no envelope); with auto_accept
             # this is informational, but it can carry resolved contact context
@@ -4675,6 +4719,16 @@ class InkboxGateway:
         if content.strip() == "[SILENT]":
             logger.debug("[bridge] suppressing exact [SILENT] reply for %s", chat_id)
             return
+        if meta.get("companion"):
+            context = meta["reply_context"]
+            if context["channel"] == "mail":
+                identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+                await asyncio.to_thread(
+                    identity.reply_all_email, context["reply_to_message_id"], body_text=content,
+                )
+                return
+            if not meta.get("conversation_id") or mode not in {"sms", "imessage"}:
+                raise CompanionError("Companion reply requires its original conversation")
         if mode == "external":
             # External-event threads have no human behind them; the directive
             # tells the agent to act via tools, so its text reply is log-only.

@@ -11,6 +11,7 @@ survive bridge restarts.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -85,6 +86,9 @@ class _Turn:
     a2a_context: Optional[Dict[str, Any]] = None
     capture_tools: bool = False
     hosted_sms_context: Optional[Dict[str, Any]] = None
+    companion_meta: Optional[Dict[str, Any]] = None
+    before_submit: Optional[Callable[[str], Awaitable[None]]] = None
+    on_submitted: Optional[Callable[[str, str], None]] = None
     activity_handler: Optional[Callable[[str, str], None]] = None
     context_only: bool = False
     reply_mode: Optional[str] = None
@@ -709,6 +713,9 @@ class ContactSession:
             os.replace(tmp, a2a_context_path)
             a2a_context_path.chmod(0o600)
         try:
+            if turn.companion_meta is not None:
+                self.mode = turn.companion_meta["mode"]
+                self.reply_meta = copy.deepcopy(turn.companion_meta)
             if turn.hosted_sms_context is not None:
                 hosted_sms_context_path = hosted_sms_turn_context_path(self.chat_id)
                 tmp = hosted_sms_context_path.with_suffix(".tmp")
@@ -724,29 +731,22 @@ class ContactSession:
                     raise
             client = await self._ensure_client()
             await self._flush_context()
+            if turn.before_submit is not None:
+                await turn.before_submit(client.thread_id)
             # Keep a typing indicator alive on the human's channel for the whole
             # turn, then always tear it down — even if the turn raises.
             self._turn_active = True
             typing_task = asyncio.create_task(self._typing_loop())
             timeout = max(0.0, float(self.cfg.codex_turn_timeout_s or 0.0))
+            run_kwargs: Dict[str, Any] = {}
+            if turn.activity_handler is not None:
+                run_kwargs["activity_handler"] = turn.activity_handler
             if turn.capture_tools:
-                operation = (
-                    client.run_detailed(
-                        turn.text,
-                        activity_handler=turn.activity_handler,
-                    )
-                    if turn.activity_handler is not None
-                    else client.run_detailed(turn.text)
-                )
+                if turn.on_submitted is not None:
+                    run_kwargs["on_submitted"] = turn.on_submitted
+                operation = client.run_detailed(turn.text, **run_kwargs)
             else:
-                operation = (
-                    client.run(
-                        turn.text,
-                        activity_handler=turn.activity_handler,
-                    )
-                    if turn.activity_handler is not None
-                    else client.run(turn.text)
-                )
+                operation = client.run(turn.text, **run_kwargs)
             if timeout:
                 try:
                     turn_result = await asyncio.wait_for(operation, timeout=timeout)
@@ -870,6 +870,37 @@ class ContactSession:
                     reply_mode=turn.reply_mode, reply_meta=turn.reply_meta,
                 )
             )
+
+    async def run_companion(
+        self,
+        text: str,
+        meta: Dict[str, Any],
+        *,
+        before_submit: Callable[[str], Awaitable[None]],
+        on_submitted: Callable[[str, str], None],
+    ) -> CodexTurnResult:
+        """Queue conversation data without consuming controls or approvals."""
+        future = asyncio.get_running_loop().create_future()
+        await self._queue.put(_Turn(
+            text=text, future=future, capture_tools=True,
+            companion_meta=copy.deepcopy(meta), before_submit=before_submit,
+            on_submitted=on_submitted,
+        ))
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+        return await future
+
+    def answer_companion(self, text: str, sender: str, sponsor: str) -> bool:
+        """Accept a live sponsor answer only during a Companion turn."""
+        if (
+            self._current_turn is None
+            or self._current_turn.companion_meta is None
+            or not sponsor or sender.casefold() != sponsor.casefold()
+            or self.pending is None or self.pending.future.done()
+        ):
+            return False
+        self.pending.future.set_result(text)
+        return True
 
     async def run_consult(
         self,
@@ -1095,6 +1126,10 @@ class ContactSession:
             self.pending = None
 
     def _reply_route(self, turn: Optional[_Turn] = None) -> tuple[str, Dict[str, Any]]:
+        current = turn or self._current_turn
+        if current is not None and current.companion_meta is not None:
+            meta = copy.deepcopy(current.companion_meta)
+            return meta["mode"], meta
         if turn is not None and turn.reply_mode is not None and turn.reply_meta is not None:
             return turn.reply_mode, turn.reply_meta
         return self.mode, self.reply_meta

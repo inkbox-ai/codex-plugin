@@ -978,7 +978,7 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 call = identity.place_call(**call_kwargs)
             except TypeError:
                 raise RuntimeError(
-                    "configured call options require inkbox SDK 0.5.9 or newer"
+                    "configured call options require inkbox SDK 0.7.3 or newer"
                 )
             except Exception as exc:
                 if "no_shared_connection" in str(exc):

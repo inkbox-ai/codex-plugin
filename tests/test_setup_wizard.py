@@ -131,7 +131,7 @@ def test_install_command_prefers_uv_when_available(monkeypatch):
         "install",
         "--python",
         "/tmp/venv/bin/python",
-        "inkbox>=0.5.9,<1.0.0",
+        "inkbox>=0.7.3,<1.0.0",
         "aiohttp>=3.9",
     ]]
 
@@ -141,12 +141,25 @@ def test_install_command_falls_back_to_pip_and_ensurepip(monkeypatch):
     monkeypatch.setattr(setup_wizard.shutil, "which", lambda _name: None)
 
     assert setup_wizard._install_commands() == [
-        [["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.5.9,<1.0.0", "aiohttp>=3.9"]],
+        [["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.7.3,<1.0.0", "aiohttp>=3.9"]],
         [
             ["/tmp/venv/bin/python", "-m", "ensurepip", "--upgrade"],
-            ["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.5.9,<1.0.0", "aiohttp>=3.9"],
+            ["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.7.3,<1.0.0", "aiohttp>=3.9"],
         ],
     ]
+
+
+@pytest.mark.parametrize(
+    "version,outdated", [("0.5.9", True), ("0.7.2", True), ("0.7.3", False), ("0.7.4", False)]
+)
+def test_installed_sdk_threshold_requires_companion_support(monkeypatch, version, outdated):
+    import importlib.metadata
+
+    monkeypatch.setattr(importlib.metadata, "version", lambda _: version)
+    monkeypatch.setattr(setup_wizard, "_load_inkbox_symbols", lambda: {"available": True})
+    monkeypatch.setattr(setup_wizard, "_is_interactive_stdin", lambda: False)
+    assert setup_wizard._inkbox_version_too_old() is outdated
+    assert setup_wizard._ensure_inkbox_sdk() == (None if outdated else {"available": True})
 
 
 def test_missing_sdk_guidance_prints_interpreter(monkeypatch, capsys):
@@ -163,7 +176,7 @@ def test_missing_sdk_guidance_prints_interpreter(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "/tmp/venv/bin/python" in out
     assert "uv pip install --python" in out
-    assert "inkbox>=0.5.9,<1.0.0" in out
+    assert "inkbox>=0.7.3,<1.0.0" in out
 
 
 # ----------------------------------------------------------------------

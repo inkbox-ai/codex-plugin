@@ -3,6 +3,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -45,5 +46,44 @@ def test_reader_failure_rejects_pending_requests():
         await client._reader_loop()
         with pytest.raises(CodexAppServerError, match="output reader failed"):
             await asyncio.wait_for(pending, timeout=1)
+
+    asyncio.run(scenario())
+
+
+def test_submission_checkpoint_and_activity_observer_share_a_turn():
+    async def scenario():
+        client = CodexAppServerClient(BridgeConfig(), developer_instructions="test")
+        client.thread_id = "thread-1"
+        client._request = AsyncMock(return_value={"turn": {"id": "turn-1"}})
+        observed = []
+        submitted = asyncio.Event()
+
+        def checkpoint(thread_id, turn_id):
+            observed.append(("submitted", thread_id, turn_id))
+            submitted.set()
+
+        task = asyncio.create_task(client.run_detailed(
+            "One complete input",
+            on_submitted=checkpoint,
+            activity_handler=lambda *args: observed.append(("activity", *args)),
+        ))
+        await asyncio.wait_for(submitted.wait(), 1)
+        client._handle_notification({
+            "method": "item/started",
+            "params": {"turnId": "turn-1", "item": {"type": "commandExecution"}},
+        })
+        client._handle_notification({
+            "method": "turn/completed",
+            "params": {"turn": {"id": "turn-1", "status": "completed"}},
+        })
+        assert not (await task).aborted
+        assert observed == [
+            ("submitted", "thread-1", "turn-1"), ("activity", "commandExecution", ""),
+        ]
+        assert client._request.await_count == 1
+        assert client._request.call_args.args[0] == "turn/start"
+        assert client._request.call_args.args[1]["input"] == [
+            {"type": "text", "text": "One complete input"},
+        ]
 
     asyncio.run(scenario())

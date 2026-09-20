@@ -47,8 +47,8 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 
 # Packages the wizard itself needs to talk to Inkbox during setup. The
 # gateway's Codex CLI dependency is checked by doctor.
-INKBOX_REQUIREMENTS = ("inkbox>=0.5.9,<1.0.0", "aiohttp>=3.9")
-MIN_INKBOX_VERSION = (0, 5, 9)
+INKBOX_REQUIREMENTS = ("inkbox>=0.7.3,<1.0.0", "aiohttp>=3.9")
+MIN_INKBOX_VERSION = (0, 7, 3)
 _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
 
 # Bundled avatar attached to the agent's Inkbox contact card during setup.
@@ -999,7 +999,7 @@ def _configure_voice_ai(
         "get_incoming_call_action", "set_incoming_call_action",
     )
     if any(not callable(getattr(identity, method, None)) for method in required_methods):
-        print_error("  Inkbox Voice AI setup requires Inkbox SDK 0.5.9 or newer.")
+        print_error("  Inkbox Voice AI setup requires Inkbox SDK 0.7.3 or newer.")
         return False, authority_identity, ""
     try:
         hosted_before = identity.get_hosted_agent_config()

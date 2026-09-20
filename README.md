@@ -346,7 +346,32 @@ Inbound A2A tasks acknowledge pickup immediately. While a task remains active,
 the worker sends a short progress update about every three minutes by default;
 these updates are visible in task history without starting a requester turn.
 
-The bridge requires Inkbox SDK 0.5.9 or newer.
+The bridge requires Inkbox SDK >=0.7.3,<1.0.0.
+
+### Companion mode
+
+Version 0.2.14 supports Companion mode for group email, MMS, and supported dedicated-line group iMessage conversations. An administrator must enable it and select a sponsor for the identity. Installing or upgrading the bridge leaves that setting unchanged. Use a claimed identity-scoped API key and signed Inkbox webhooks. If `INKBOX_ALLOWED_USERS` is set, it must permit the sponsor's actual email address or phone number for the channel.
+
+After the sponsor sends a qualifying group message, the bridge loads the complete authorized history and trigger through the SDK and submits one combined Codex input. Live messages wait for that turn to complete. Each conversation, cohort, and activation has its own session, separate from private contact sessions. History and attachment references remain conversation data; historical commands do not reset sessions or answer approvals. Only a new live message from the sponsor can answer a pending approval. Existing Codex sandbox and approval settings still apply.
+
+Replies use the stored email reply-all parent or MMS/iMessage conversation ID. Sponsorship does not authorize private messages or another channel. Participant changes require fresh sponsorship. MMS conversations with identical participant sets share one logical conversation. Existing messaging restrictions and consent requirements still apply, so receiving history does not guarantee that a reply can be sent.
+
+`INKBOX_COMPANION_MAX_BYTES` defaults to `262144` UTF-8 bytes. It bounds SDK history loading and the final combined input, including framing. Inputs that exceed the limit pause before submission; the bridge never truncates history or splits it into multiple initialization turns. Set a lower limit if your selected model needs more room for its instructions, tools, and output. Raise it only when that model can accept the complete input.
+
+Pending history loading and queued messages survive restarts under `$INKBOX_CODEX_HOME/companion` (default `~/.inkbox-codex/companion`). Keep this directory with the session state during upgrades. Inspect progress with `inkbox-codex companion-status`; it reports logical job IDs, Codex thread/turn IDs, status, and pause reason without message contents.
+
+If loading fails before submission, correct the reported restriction or size limit, stop the gateway, and run `inkbox-codex companion-resolve JOB_ID --outcome retry`, then start it again. Authorization is checked again before the job runs.
+
+A crash, timeout, or lost acknowledgement after submission leaves the conversation paused. Webhook delivery does not guarantee exactly-once execution. Review the recorded Codex thread and any delivered reply before resolving it while the gateway is stopped:
+
+- `--outcome completed`: the turn completed; release queued messages without repeating it or its reply.
+- `--outcome not-submitted`: you verified Codex never accepted the input. This is refused if Codex already returned a turn ID.
+
+Leave the job paused when the outcome remains uncertain. Restarting or redelivering the webhook never retries an uncertain turn automatically.
+
+After a reviewed-completed initialization, live sponsor approvals reload the current scope and sponsor from Inkbox. Shutdown rejects new work and leaves accepted, unfinished messages available for recovery.
+
+Group delivery failures appear as `delivery-failed` in `companion-status`. Review delivery before retrying; these notifications never start a private contact session or switch channels automatically.
 
 On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 
@@ -360,6 +385,11 @@ On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent
 6. Call the number, ask what it's working on, hang up mid-answer, and verify the late voice tail is not silently sent as SMS or email.
 
 ## Development
+
+PR checks build SDK 0.7.3 from the public
+[`inkbox` source at `449966c885208d41f995d09c54072e012df9eb1a`](https://github.com/inkbox-ai/inkbox/tree/449966c885208d41f995d09c54072e012df9eb1a/sdk/python)
+and install its wheel alongside the bridge. This validates a source build, not a
+registry release. The package requirement remains `inkbox>=0.7.3,<1.0.0`.
 
 ```bash
 python -m pytest

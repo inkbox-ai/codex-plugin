@@ -62,6 +62,8 @@ class _Sessions:
 
 def _gateway(tmp_path):
     gateway = object.__new__(InkboxGateway)
+    gateway._companion = None
+    gateway._closing = False
     gateway._a2a_registry_path = tmp_path / "a2a.json"
     gateway._a2a_jobs = {}
     gateway._a2a_progress_jobs = {}
@@ -1327,6 +1329,31 @@ def test_a2a_closing_rejects_cancellation_and_sent_update(tmp_path, monkeypatch)
     assert gateway._a2a_canceled_messages == {}
     assert gateway.sessions.session.inbound == []
     assert gateway.replies == []
+
+
+def test_cleanup_closes_a2a_admission_before_waiting_for_companion(tmp_path):
+    gateway = _gateway(tmp_path)
+    gateway._hosted_call_jobs = {}
+    gateway._runner = gateway._tunnel = gateway.sessions = None
+
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def close_companion():
+            entered.set()
+            await release.wait()
+
+        gateway._companion = types.SimpleNamespace(close=close_companion)
+        cleanup = asyncio.create_task(gateway._cleanup())
+        await entered.wait()
+        assert gateway._closing and gateway._a2a_closing
+        response = await gateway._on_a2a_event(_event())
+        assert response.status == 503 and not gateway.replies
+        release.set()
+        await cleanup
+        assert gateway._companion is None
+
+    asyncio.run(scenario())
 
 
 def test_a2a_cleanup_waits_for_inflight_reply_thread(tmp_path):
