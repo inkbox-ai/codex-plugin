@@ -23,3 +23,6 @@ inkbox_codex = ["assets/*.png"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+  "no_sms_reset: email-only test that must not send SMS reset traffic",
+]

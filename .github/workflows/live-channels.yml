@@ -23,11 +23,20 @@ on:
         required: false
         type: boolean
         default: false
+      email_reply_all_only:
+        description: "Run only the live reply-all email checks"
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       timeout_s:
         description: "Seconds to wait for the reply"
         default: "150"
+      email_reply_all_only:
+        description: "Run only the live reply-all email checks"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -52,6 +61,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+
+      - name: Require the dedicated reply-all recipient
+        env:
+          REPLY_ALL_INKBOX_API_KEY: ${{ secrets.REPLY_ALL_INKBOX_API_KEY }}
+        run: |
+          if [ -z "$REPLY_ALL_INKBOX_API_KEY" ]; then
+            echo "::error::Configure REPLY_ALL_INKBOX_API_KEY for a third, non-auto-replying test inbox."
+            exit 1
+          fi
 
       - uses: actions/setup-python@v6
         with:
@@ -170,11 +188,17 @@ jobs:
           AUT_INKBOX_SIGNING_KEY: ${{ secrets.CODEX_INKBOX_SIGNING_KEY }}
           AUT_WEBHOOK_URL: http://127.0.0.1:8767/webhook
           LIVE_EMAIL_TIMEOUT: ${{ inputs.timeout_s || '150' }}
+          REPLY_ALL_INKBOX_API_KEY: ${{ secrets.REPLY_ALL_INKBOX_API_KEY }}
+          EMAIL_REPLY_ALL_ONLY: ${{ inputs.email_reply_all_only }}
         run: |
+          test_target=tests/live
+          if [ "$EMAIL_REPLY_ALL_ONLY" = "true" ]; then
+            test_target=tests/live/test_email_reply_all.py
+          fi
           if [ "${{ matrix.mode }}" = "real" ]; then
-            LIVE_REAL_MODEL=1 LIVE_CONTACT_CRUD=1 python3 -m pytest tests/live -v
+            LIVE_REAL_MODEL=1 LIVE_CONTACT_CRUD=1 python3 -m pytest "$test_target" -v
           else
-            python3 -m pytest tests/live -v
+            python3 -m pytest "$test_target" -v
           fi
 
       - name: Summarize runtime state on failure
