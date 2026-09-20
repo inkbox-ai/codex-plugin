@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  INKBOX_SDK_REV: 449966c885208d41f995d09c54072e012df9eb1a
+
 jobs:
   # Offline unit suite. No codex binary installed → the contract tests auto-skip,
   # and the live tests skip without API keys. Fast signal on our own code — cheap
@@ -29,9 +32,21 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - uses: astral-sh/setup-uv@v8.1.0
+        with:
+          version: "latest"
+
+      - name: Build pinned Inkbox SDK wheel
+        run: |
+          git init "$RUNNER_TEMP/inkbox-sdk"
+          git -C "$RUNNER_TEMP/inkbox-sdk" fetch --depth=1 https://github.com/inkbox-ai/inkbox "$INKBOX_SDK_REV"
+          git -C "$RUNNER_TEMP/inkbox-sdk" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/inkbox-sdk" rev-parse HEAD)" = "$INKBOX_SDK_REV"
+          uv build --wheel --out-dir "$RUNNER_TEMP/inkbox-sdk-wheel" "$RUNNER_TEMP/inkbox-sdk/sdk/python"
+
       # Live helper regressions exercise the SDK's real pagination offline.
       - name: Install test deps
-        run: pip install pytest httpx aiohttp segno "inkbox==0.7.3" "audioop-lts>=0.2.1; python_version >= '3.13'"
+        run: uv pip install --system pytest httpx aiohttp segno "$RUNNER_TEMP/inkbox-sdk-wheel/inkbox-0.7.3-py3-none-any.whl" "audioop-lts>=0.2.1; python_version >= '3.13'"
 
       - name: Run unit tests
         run: pytest -q
@@ -59,10 +74,18 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Build pinned Inkbox SDK wheel
+        run: |
+          git init "$RUNNER_TEMP/inkbox-sdk"
+          git -C "$RUNNER_TEMP/inkbox-sdk" fetch --depth=1 https://github.com/inkbox-ai/inkbox "$INKBOX_SDK_REV"
+          git -C "$RUNNER_TEMP/inkbox-sdk" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/inkbox-sdk" rev-parse HEAD)" = "$INKBOX_SDK_REV"
+          uv build --wheel --out-dir "$RUNNER_TEMP/inkbox-sdk-wheel" "$RUNNER_TEMP/inkbox-sdk/sdk/python"
+
       - name: Install bridge + test deps
         run: |
           uv pip install --system \
-            "inkbox==0.7.3" \
+            "$RUNNER_TEMP/inkbox-sdk-wheel/inkbox-0.7.3-py3-none-any.whl" \
             -e . pytest
 
       # @alpha is the prerelease channel cut from codex main near-daily — the
