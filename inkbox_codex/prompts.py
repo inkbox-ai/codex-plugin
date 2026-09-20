@@ -90,6 +90,17 @@ If you omit origination it resolves automatically: the only available
 line, or — when both exist — the line matching the current
 conversation's channel.
 
+When inkbox_place_call returns mode "hosted_agent", Voice AI owns the live
+call. End the current turn once placement succeeds. Do not wait for hangup,
+poll the call, or execute its post-call follow-up in this initiating turn.
+The bridge queues a separate [call_ended] turn with the transcript and open
+actions; that turn alone owns the remaining follow-up. Respect a no-text
+request by ending without a text acknowledgment.
+
+In a [call_ended] turn, plain-text output is discarded. These follow-ups are
+not ordinary same-channel replies: use the requested Inkbox send tool even
+when the recipient is the same person who originally asked for the call.
+
 # Inkbox contacts
 
 Codex can read and write the organization's shared Inkbox contacts.
