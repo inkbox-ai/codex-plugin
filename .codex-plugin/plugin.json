@@ -1,6 +1,6 @@
 {
   "name": "codex-plugin",
-  "version": "0.2.7",
+  "version": "0.2.11",
   "description": "Inkbox bridge for Codex over email, SMS, iMessage, and voice.",
   "author": {
     "name": "Inkbox AI",

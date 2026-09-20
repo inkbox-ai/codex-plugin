@@ -62,7 +62,7 @@ jobs:
       - name: Install bridge + test deps
         run: |
           uv pip install --system \
-            "inkbox==0.5.9" \
+            "inkbox==0.7.3" \
             -e . pytest
 
       # @alpha is the prerelease channel cut from codex main near-daily — the
@@ -71,4 +71,4 @@ jobs:
         run: bash "$GITHUB_WORKSPACE/tests/ci/install_codex.sh"
 
       - name: Contract tests vs real Codex
-        run: pytest tests/contract -v
+        run: pytest tests/contract tests/test_companion.py -v

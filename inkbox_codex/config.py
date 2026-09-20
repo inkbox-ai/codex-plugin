@@ -129,6 +129,7 @@ class BridgeConfig:
     permission_timeout_s: float = 600.0
     codex_turn_timeout_s: float = 1800.0
     codex_interrupt_timeout_s: float = 10.0
+    companion_max_bytes: int = 262144
     voice_stack: VoiceStack = VoiceStack.INKBOX_TTS_STT
     voice_stack_invalid_value: str = ""
     voice_ai_authority_mode: str = "contact_scoped"
@@ -249,6 +250,7 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         permission_timeout_s=float(os.getenv("INKBOX_PERMISSION_TIMEOUT_S") or 600.0),
         codex_turn_timeout_s=float(os.getenv("CODEX_TURN_TIMEOUT_S") or 1800.0),
         codex_interrupt_timeout_s=float(os.getenv("CODEX_INTERRUPT_TIMEOUT_S") or 10.0),
+        companion_max_bytes=int(os.getenv("INKBOX_COMPANION_MAX_BYTES") or 262144),
         voice_stack=voice_stack,
         voice_stack_invalid_value=invalid_voice_stack,
         voice_ai_authority_mode=str(

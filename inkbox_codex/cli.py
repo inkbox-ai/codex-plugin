@@ -75,8 +75,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub.add_parser("doctor", help="check configuration and dependencies")
     sub.add_parser("whoami", help="show the bridged Inkbox identity")
+    sub.add_parser("companion-status", help="list durable Companion checkpoints")
+    companion_resolve = sub.add_parser("companion-resolve", help="resolve a paused Companion job after review")
+    companion_resolve.add_argument("job_id")
+    companion_resolve.add_argument("--outcome", required=True, choices=["retry", "not-submitted", "completed"])
 
     args = parser.parse_args(argv)
+    if args.command in {"companion-status", "companion-resolve"}:
+        from .companion import inspect_jobs, resolve_job
+        if args.command == "companion-status":
+            print(json.dumps(inspect_jobs(), indent=2))
+        else:
+            try:
+                resolve_job(args.job_id, args.outcome)
+            except (OSError, ValueError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+        return 0
     if args.command == "setup":
         interactive_setup()
         return 0

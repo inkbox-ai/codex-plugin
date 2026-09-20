@@ -110,7 +110,9 @@ class CodexAppServerClient:
         """Run one turn in the current thread and return the final reply text."""
         return (await self.run_detailed(text)).text
 
-    async def run_detailed(self, text: str) -> CodexTurnResult:
+    async def run_detailed(
+        self, text: str, *, on_submitted: Optional[Callable[[str, str], None]] = None,
+    ) -> CodexTurnResult:
         """Run one turn and return its final reply and sanitized MCP outcomes."""
         if not self.thread_id:
             await self.connect()
@@ -140,6 +142,8 @@ class CodexAppServerClient:
         self._turns[turn_id] = capture
         self._current_turn_id = turn_id
         try:
+            if on_submitted is not None:
+                on_submitted(self.thread_id, turn_id)
             return await capture.future
         finally:
             self._turns.pop(turn_id, None)
@@ -216,7 +220,7 @@ class CodexAppServerClient:
                 "clientInfo": {
                     "name": "inkbox_codex",
                     "title": "Inkbox Codex Bridge",
-                    "version": "0.2.9",
+                    "version": "0.2.11",
                 },
                 "capabilities": {"experimentalApi": True},
             },

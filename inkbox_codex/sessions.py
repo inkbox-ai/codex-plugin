@@ -11,6 +11,7 @@ survive bridge restarts.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -84,6 +85,9 @@ class _Turn:
     a2a_context: Optional[Dict[str, Any]] = None
     capture_tools: bool = False
     hosted_sms_context: Optional[Dict[str, Any]] = None
+    companion_meta: Optional[Dict[str, Any]] = None
+    before_submit: Optional[Callable[[str], Awaitable[None]]] = None
+    on_submitted: Optional[Callable[[str, str], None]] = None
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Codex as a turn.
@@ -656,6 +660,9 @@ class ContactSession:
             os.replace(tmp, a2a_context_path)
             a2a_context_path.chmod(0o600)
         try:
+            if turn.companion_meta is not None:
+                self.mode = turn.companion_meta["mode"]
+                self.reply_meta = copy.deepcopy(turn.companion_meta)
             if turn.hosted_sms_context is not None:
                 hosted_sms_context_path = hosted_sms_turn_context_path(self.chat_id)
                 tmp = hosted_sms_context_path.with_suffix(".tmp")
@@ -670,13 +677,17 @@ class ContactSession:
                     tmp.unlink(missing_ok=True)
                     raise
             client = await self._ensure_client()
+            if turn.before_submit is not None:
+                await turn.before_submit(client.thread_id)
             # Keep a typing indicator alive on the human's channel for the whole
             # turn, then always tear it down — even if the turn raises.
             self._turn_active = True
             typing_task = asyncio.create_task(self._typing_loop())
             timeout = max(0.0, float(self.cfg.codex_turn_timeout_s or 0.0))
             operation = (
-                client.run_detailed(turn.text)
+                client.run_detailed(turn.text, on_submitted=turn.on_submitted)
+                if turn.companion_meta is not None
+                else client.run_detailed(turn.text)
                 if turn.capture_tools
                 else client.run(turn.text)
             )
@@ -794,6 +805,37 @@ class ContactSession:
             await self._queue.put(
                 _Turn(text=_send_rejected_prompt(reply, reason), recovery=True)
             )
+
+    async def run_companion(
+        self,
+        text: str,
+        meta: Dict[str, Any],
+        *,
+        before_submit: Callable[[str], Awaitable[None]],
+        on_submitted: Callable[[str, str], None],
+    ) -> CodexTurnResult:
+        """Queue conversation data without consuming controls or approvals."""
+        future = asyncio.get_running_loop().create_future()
+        await self._queue.put(_Turn(
+            text=text, future=future, capture_tools=True,
+            companion_meta=copy.deepcopy(meta), before_submit=before_submit,
+            on_submitted=on_submitted,
+        ))
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+        return await future
+
+    def answer_companion(self, text: str, sender: str, sponsor: str) -> bool:
+        """Accept a live sponsor answer only during a Companion turn."""
+        if (
+            self._current_turn is None
+            or self._current_turn.companion_meta is None
+            or not sponsor or sender.casefold() != sponsor.casefold()
+            or self.pending is None or self.pending.future.done()
+        ):
+            return False
+        self.pending.future.set_result(text)
+        return True
 
     async def run_consult(
         self,
@@ -1013,6 +1055,10 @@ class ContactSession:
             self.pending = None
 
     async def _reply(self, text: str) -> None:
+        if self._current_turn and self._current_turn.companion_meta is not None:
+            meta = copy.deepcopy(self._current_turn.companion_meta)
+            await self.send_fn(self.chat_id, text, meta["mode"], meta)
+            return
         await self.send_fn(self.chat_id, text, self.mode, self.reply_meta)
 
     async def close(self) -> None:
