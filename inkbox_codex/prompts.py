@@ -234,6 +234,16 @@ def inject_contact_memories(text: str, memories: Any) -> str:
     return f"{first}\n{block}{separator}{rest}"
 
 
+def mentions_agent(text: str, handle: str) -> bool:
+    """Match explicit mentions in message text, excluding links and addresses."""
+    text = re.sub(r"(?:https?://|www\.)\S+", " ", text, flags=re.I)
+    tokens = {"agent", handle.strip().lstrip("@")}
+    return any(
+        re.search(r"(?<![\w@.+-])@" + re.escape(token) + r"(?![\w-])(?!\.\w)", text, re.I)
+        for token in tokens if token
+    )
+
+
 def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
     """Prefix an inbound message with a tag naming its channel and sender.
 

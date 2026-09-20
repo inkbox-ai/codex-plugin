@@ -35,7 +35,7 @@ try:
         parse_permission_reply,
         parse_poll_reply,
     )
-    from .prompts import build_channel_prompt, frame_inbound
+    from .prompts import build_channel_prompt, frame_inbound, mentions_agent
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
     from config import BridgeConfig, a2a_turn_context_path, hosted_sms_turn_context_path
@@ -46,7 +46,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
         parse_permission_reply,
         parse_poll_reply,
     )
-    from prompts import build_channel_prompt, frame_inbound
+    from prompts import build_channel_prompt, frame_inbound, mentions_agent
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +71,11 @@ class _Turn:
 
     Everything that drives a turn — inbound messages and capture turns alike —
     goes through one queue and one worker, so two turns can never hit the
-    subprocess at once. A normal turn (``future is None``) sends its reply on
-    the channel the human last used. A capture turn (``future`` set) hands the
+    subprocess at once. A normal turn (``future is None``) keeps the reply route
+    of its inbound message. A capture turn (``future`` set) hands the
     reply text back to the awaiting caller instead and never auto-replies —
     used by voice consults, post-call actions, and delivery-failure notices.
+    Context-only entries append history between turns without generation.
     """
 
     text: str
@@ -88,6 +89,10 @@ class _Turn:
     companion_meta: Optional[Dict[str, Any]] = None
     before_submit: Optional[Callable[[str], Awaitable[None]]] = None
     on_submitted: Optional[Callable[[str, str], None]] = None
+    activity_handler: Optional[Callable[[str, str], None]] = None
+    context_only: bool = False
+    reply_mode: Optional[str] = None
+    reply_meta: Optional[Dict[str, Any]] = None
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Codex as a turn.
@@ -348,7 +353,7 @@ def _record_channel_hint(chat_id: str, mode: str) -> None:
 
 
 class ContactSession:
-    """One Codex conversation bound to one remote human."""
+    """One Codex conversation bound to a contact or group conversation."""
 
     def __init__(
         self,
@@ -389,6 +394,7 @@ class ContactSession:
 
         self._client: Optional[CodexAppServerClient] = None
         self._queue: asyncio.Queue[_Turn] = asyncio.Queue()
+        self._pending_context: list[str] = []
         self._worker: Optional[asyncio.Task] = None
         self._resume_task: Optional[asyncio.Task] = None  # /resume pick in flight
         self._turn_active = False     # a Codex turn is mid-flight
@@ -410,6 +416,34 @@ class ContactSession:
         Returns:
             None
         """
+        meta = dict(meta or {})
+        raw_text = str(meta.get("raw_text", text))
+        command = _control_command(raw_text)
+        is_group = mode in {"sms", "imessage"} and meta.get("conversation_kind") == "group"
+        pending_reply = self.pending is not None and not self.pending.future.done()
+        if is_group and pending_reply:
+            pending_reply = (
+                not meta.get("reaction")
+                and meta.get("sender") == self._reply_route(self._current_turn)[1].get("sender")
+                and (self.pending.kind != "permission" or parse_permission_reply(raw_text) is not None)
+            )
+        context_only = (
+            is_group
+            and self.cfg.group_reply_mode == "mention"
+            and not command
+            and not pending_reply
+            and not mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity)
+        )
+        if context_only:
+            await self._queue.put(_Turn(
+                text="Background group message; context only, not a request to act.\n"
+                     + frame_inbound(mode, meta, text),
+                context_only=True,
+            ))
+            if self._worker is None or self._worker.done():
+                self._worker = asyncio.create_task(self._drain())
+            return
+
         self.mode = mode
         self.reply_meta = dict(meta or {})
         # Mirror the modality for the tool process (channel-aware calling).
@@ -417,7 +451,6 @@ class ContactSession:
 
         # Bridge control commands (/clear, /new, /stop) steer the conversation
         # itself — handle them here instead of forwarding them to Codex.
-        command = _control_command(text)
         if command == "reset":
             await self._reset_session()
             return
@@ -440,14 +473,18 @@ class ContactSession:
 
         # A reply while an escalation is outstanding answers the escalation —
         # it does not start a new agent turn.
-        if self.pending is not None and not self.pending.future.done():
+        if pending_reply:
             logger.info("[session %s] reply consumed by pending %s", self.chat_id, self.pending.kind)
-            self.pending.future.set_result(text)
+            self.pending.future.set_result(raw_text)
             return
 
         # Tag the message with its channel + sender so Codex knows where it
         # is and who it's talking to (the static system prompt can't).
-        await self._queue.put(_Turn(text=frame_inbound(mode, meta, text)))
+        await self._queue.put(_Turn(
+            text=frame_inbound(mode, meta, text),
+            reply_mode=mode,
+            reply_meta=dict(meta),
+        ))
 
         # Texting again while Codex is mid-turn behaves like hitting Esc and
         # typing a new message: interrupt the running turn so the worker drops
@@ -468,8 +505,15 @@ class ContactSession:
         while not self._queue.empty():
             turn = await self._queue.get()
             try:
+                if turn.context_only:
+                    self._pending_context.append(turn.text)
+                    await self._flush_context()
+                    continue
                 await self._run_turn(turn)
             except Exception as exc:
+                if turn.context_only:
+                    logger.error("Group context append failed; retained for retry")
+                    continue
                 # An interrupt aborts the turn on purpose — the next queued
                 # message takes over, so it is not an error to report.
                 if self._interrupting:
@@ -479,14 +523,22 @@ class ContactSession:
                 try:
                     message = str(exc)
                     if "did not finish within" in message:
-                        await self._reply(f"Sorry — {message}")
+                        await self._reply(f"Sorry — {message}", turn=turn)
                     else:
                         await self._reply(
                             "Sorry — I hit an error while working on that and had to stop. "
-                            "Try sending it again."
+                            "Try sending it again.",
+                            turn=turn,
                         )
                 except Exception:
                     logger.exception("[session %s] could not send the error notice", self.chat_id)
+
+    async def _flush_context(self) -> None:
+        if not self._pending_context:
+            return
+        client = await self._ensure_client()
+        await client.append_context(self._pending_context)
+        self._pending_context.clear()
 
     # ------------------------------------------------------------------
     # Control commands (/clear, /new, /stop)
@@ -503,6 +555,7 @@ class ContactSession:
         # Forget the resumed conversation everywhere — in memory, the live
         # client, the persisted map, and any session-scoped tool grants.
         self.resume_session_id = None
+        self._pending_context.clear()
         await self.close()
         if self.on_clear is not None:
             self.on_clear(self.chat_id)
@@ -677,6 +730,7 @@ class ContactSession:
                     tmp.unlink(missing_ok=True)
                     raise
             client = await self._ensure_client()
+            await self._flush_context()
             if turn.before_submit is not None:
                 await turn.before_submit(client.thread_id)
             # Keep a typing indicator alive on the human's channel for the whole
@@ -684,13 +738,15 @@ class ContactSession:
             self._turn_active = True
             typing_task = asyncio.create_task(self._typing_loop())
             timeout = max(0.0, float(self.cfg.codex_turn_timeout_s or 0.0))
-            operation = (
-                client.run_detailed(turn.text, on_submitted=turn.on_submitted)
-                if turn.companion_meta is not None
-                else client.run_detailed(turn.text)
-                if turn.capture_tools
-                else client.run(turn.text)
-            )
+            run_kwargs: Dict[str, Any] = {}
+            if turn.activity_handler is not None:
+                run_kwargs["activity_handler"] = turn.activity_handler
+            if turn.capture_tools:
+                if turn.on_submitted is not None:
+                    run_kwargs["on_submitted"] = turn.on_submitted
+                operation = client.run_detailed(turn.text, **run_kwargs)
+            else:
+                operation = client.run(turn.text, **run_kwargs)
             if timeout:
                 try:
                     turn_result = await asyncio.wait_for(operation, timeout=timeout)
@@ -732,6 +788,9 @@ class ContactSession:
                     persisted = json.loads(a2a_context_path.read_text())
                     turn.a2a_context["reply_intent_committed"] = bool(
                         persisted.get("reply_intent_committed")
+                    )
+                    turn.a2a_context["reply_intent"] = str(
+                        persisted.get("reply_intent") or ""
                     )
                 except (FileNotFoundError, json.JSONDecodeError):
                     pass
@@ -789,21 +848,27 @@ class ContactSession:
             None
         """
         try:
-            await self._reply(reply)
+            await self._reply(reply, turn=turn)
         except Exception as exc:
             reason = _send_error_reason(exc)
             logger.warning("[session %s] reply send rejected: %s", self.chat_id, reason)
             if self.on_send_failure is not None:
                 prompt = self.on_send_failure(
-                    self.chat_id, self.mode, self.reply_meta, reply, reason
+                    self.chat_id, *self._reply_route(turn), reply, reason
                 )
                 if prompt:
-                    await self._queue.put(_Turn(text=prompt, recovery=True))
+                    await self._queue.put(_Turn(
+                        text=prompt, recovery=True,
+                        reply_mode=turn.reply_mode, reply_meta=turn.reply_meta,
+                    ))
                 return
             if turn.recovery:
                 raise  # no shared budget is available to cap another attempt
             await self._queue.put(
-                _Turn(text=_send_rejected_prompt(reply, reason), recovery=True)
+                _Turn(
+                    text=_send_rejected_prompt(reply, reason), recovery=True,
+                    reply_mode=turn.reply_mode, reply_meta=turn.reply_meta,
+                )
             )
 
     async def run_companion(
@@ -842,6 +907,7 @@ class ContactSession:
         query: str,
         *,
         a2a_context: Optional[Dict[str, Any]] = None,
+        activity_handler: Optional[Callable[[str, str], None]] = None,
     ) -> str:
         """Run one Codex turn and RETURN its text (don't send it).
 
@@ -863,7 +929,12 @@ class ContactSession:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str] = loop.create_future()
         await self._queue.put(
-            _Turn(text=query, future=future, a2a_context=a2a_context)
+            _Turn(
+                text=query,
+                future=future,
+                a2a_context=a2a_context,
+                activity_handler=activity_handler,
+            )
         )
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())
@@ -1044,7 +1115,7 @@ class ContactSession:
             questions=list(questions or []),
             tool_name=tool_name,
         )
-        await self._reply(prompt_text)
+        await self._reply(prompt_text, turn=self._current_turn)
         try:
             return await asyncio.wait_for(
                 self.pending.future, timeout=self.cfg.permission_timeout_s
@@ -1054,12 +1125,17 @@ class ContactSession:
         finally:
             self.pending = None
 
-    async def _reply(self, text: str) -> None:
-        if self._current_turn and self._current_turn.companion_meta is not None:
-            meta = copy.deepcopy(self._current_turn.companion_meta)
-            await self.send_fn(self.chat_id, text, meta["mode"], meta)
-            return
-        await self.send_fn(self.chat_id, text, self.mode, self.reply_meta)
+    def _reply_route(self, turn: Optional[_Turn] = None) -> tuple[str, Dict[str, Any]]:
+        current = turn or self._current_turn
+        if current is not None and current.companion_meta is not None:
+            meta = copy.deepcopy(current.companion_meta)
+            return meta["mode"], meta
+        if turn is not None and turn.reply_mode is not None and turn.reply_meta is not None:
+            return turn.reply_mode, turn.reply_meta
+        return self.mode, self.reply_meta
+
+    async def _reply(self, text: str, *, turn: Optional[_Turn] = None) -> None:
+        await self.send_fn(self.chat_id, text, *self._reply_route(turn))
 
     async def close(self) -> None:
         if self._client is not None:

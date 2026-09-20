@@ -15,12 +15,12 @@ jobs:
   # enough to run on every push, including draft PRs (the heavy live suite is what
   # we gate).
   unit:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v7
@@ -29,9 +29,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # inkbox is mocked in the unit tests, so install only what they import.
+      # Live helper regressions exercise the SDK's real pagination offline.
       - name: Install test deps
-        run: pip install pytest aiohttp segno
+        run: pip install pytest httpx aiohttp segno "inkbox==0.7.3" "audioop-lts>=0.2.1; python_version >= '3.13'"
 
       - name: Run unit tests
         run: pytest -q
@@ -41,7 +41,7 @@ jobs:
   # method, a moved result field, a dropped notification) before it reaches a
   # user. Same suite the canary runs on a schedule; this is the per-PR gate.
   contract-pr:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 15
 
     steps:

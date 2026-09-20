@@ -20,10 +20,25 @@ logger = logging.getLogger(__name__)
 
 
 ApprovalHandler = Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
+ActivityHandler = Callable[[str, str], None]
 
 
 class CodexAppServerError(RuntimeError):
     """Raised when codex app-server returns an error or exits unexpectedly."""
+
+
+async def _read_protocol_line(reader: asyncio.StreamReader) -> bytes:
+    """Read a host line without truncating large resumed-thread histories."""
+    chunks = []
+    while True:
+        try:
+            chunks.append(await reader.readuntil(b"\n"))
+            return b"".join(chunks)
+        except asyncio.LimitOverrunError as exc:
+            chunks.append(await reader.readexactly(exc.consumed))
+        except asyncio.IncompleteReadError as exc:
+            chunks.append(exc.partial)
+            return b"".join(chunks)
 
 
 @dataclass
@@ -34,6 +49,7 @@ class _TurnCapture:
     messages: list[Dict[str, Any]] = field(default_factory=list)
     deltas: list[str] = field(default_factory=list)
     mcp_tool_calls: list["McpToolCallResult"] = field(default_factory=list)
+    activity_handler: Optional[ActivityHandler] = None
 
 
 @dataclass(frozen=True)
@@ -71,11 +87,13 @@ class CodexAppServerClient:
         developer_instructions: str,
         mcp_server_config: Optional[Dict[str, Any]] = None,
         approval_handler: Optional[ApprovalHandler] = None,
+        tools_enabled: bool = True,
     ) -> None:
         self.cfg = cfg
         self.developer_instructions = developer_instructions
         self.mcp_server_config = dict(mcp_server_config or {})
         self.approval_handler = approval_handler
+        self.tools_enabled = tools_enabled
 
         self.thread_id: Optional[str] = None
         self._proc: Optional[asyncio.subprocess.Process] = None
@@ -106,28 +124,39 @@ class CodexAppServerClient:
         self.thread_id = thread_id
         return thread_id
 
-    async def run(self, text: str) -> str:
+    async def run(
+        self,
+        text: str,
+        *,
+        activity_handler: Optional[ActivityHandler] = None,
+    ) -> str:
         """Run one turn in the current thread and return the final reply text."""
-        return (await self.run_detailed(text)).text
+        return (await self.run_detailed(text, activity_handler=activity_handler)).text
 
     async def run_detailed(
-        self, text: str, *, on_submitted: Optional[Callable[[str, str], None]] = None,
+        self,
+        text: str,
+        *,
+        activity_handler: Optional[ActivityHandler] = None,
+        on_submitted: Optional[Callable[[str, str], None]] = None,
     ) -> CodexTurnResult:
         """Run one turn and return its final reply and sanitized MCP outcomes."""
         if not self.thread_id:
             await self.connect()
         assert self.thread_id is not None
 
-        result = await self._request(
-            "turn/start",
-            {
-                "threadId": self.thread_id,
-                "input": [{"type": "text", "text": text}],
-                "cwd": self.cfg.project_dir or None,
-                "model": self.cfg.codex_model or None,
-                "approvalPolicy": self.cfg.codex_approval_policy or "on-request",
-            },
-        )
+        params = {
+            "threadId": self.thread_id,
+            "input": [{"type": "text", "text": text}],
+            "cwd": self.cfg.project_dir or None,
+            "model": self.cfg.codex_model or None,
+            "approvalPolicy": self.cfg.codex_approval_policy or "on-request",
+        }
+        if not self.tools_enabled:
+            # A turn-level cwd override otherwise restores the default local
+            # environment after thread/start disabled it.
+            params["environments"] = []
+        result = await self._request("turn/start", params)
         turn = result.get("turn") or {}
         turn_id = str(turn.get("id") or "")
         if not turn_id:
@@ -138,6 +167,7 @@ class CodexAppServerClient:
             thread_id=self.thread_id,
             turn_id=turn_id,
             future=loop.create_future(),
+            activity_handler=activity_handler,
         )
         self._turns[turn_id] = capture
         self._current_turn_id = turn_id
@@ -149,6 +179,20 @@ class CodexAppServerClient:
             self._turns.pop(turn_id, None)
             if self._current_turn_id == turn_id:
                 self._current_turn_id = None
+
+    async def append_context(self, messages: list[str]) -> None:
+        """Persist background messages without starting model generation."""
+        if not self.thread_id:
+            await self.connect()
+        await self._request("thread/inject_items", {
+            "threadId": self.thread_id,
+            "items": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": text},
+                ]}
+                for text in messages
+            ],
+        })
 
     async def interrupt(self) -> None:
         """Interrupt the active turn, if app-server has accepted one."""
@@ -185,9 +229,9 @@ class CodexAppServerClient:
 
     def _thread_params(self) -> Dict[str, Any]:
         config: Dict[str, Any] = {}
-        if self.mcp_server_config:
+        if self.tools_enabled and self.mcp_server_config:
             config["mcp_servers"] = {"inkbox": self.mcp_server_config}
-        return {
+        params = {
             "cwd": self.cfg.project_dir or None,
             "model": self.cfg.codex_model or None,
             "approvalPolicy": self.cfg.codex_approval_policy or "on-request",
@@ -197,6 +241,41 @@ class CodexAppServerClient:
             "config": config or None,
             "serviceName": "inkbox-codex",
         }
+        if not self.tools_enabled:
+            # app-server has no single `tools: []` thread option. These are
+            # its host-native gates for every built-in/external tool source.
+            params.update(
+                {
+                    "environments": [],
+                    "dynamicTools": [],
+                    "selectedCapabilityRoots": [],
+                    "config": {
+                        "web_search": "disabled",
+                        "apps": {"_default": {"enabled": False}},
+                        "orchestrator": {
+                            "skills": {"enabled": False},
+                            "mcp": {"enabled": False},
+                        },
+                        "tools": {
+                            "update_plan": {"enabled": False},
+                            "experimental_request_user_input": {"enabled": False},
+                        },
+                        "features": {
+                            "apps": False,
+                            "goals": False,
+                            "image_generation": False,
+                            "multi_agent": False,
+                            "multi_agent_v2": False,
+                            "plugins": False,
+                            "shell_tool": False,
+                            "tool_suggest": False,
+                            "unified_exec": False,
+                            "view_image": False,
+                        },
+                    },
+                }
+            )
+        return params
 
     async def _ensure_process(self) -> None:
         if self._proc is not None and self._proc.returncode is None:
@@ -220,7 +299,7 @@ class CodexAppServerClient:
                 "clientInfo": {
                     "name": "inkbox_codex",
                     "title": "Inkbox Codex Bridge",
-                    "version": "0.2.11",
+                    "version": "0.2.14",
                 },
                 "capabilities": {"experimentalApi": True},
             },
@@ -231,6 +310,8 @@ class CodexAppServerClient:
     async def _request(self, method: str, params: Dict[str, Any]) -> Any:
         if self._proc is None or self._proc.stdin is None:
             raise CodexAppServerError("Codex app-server is not running")
+        if self._reader_task is not None and self._reader_task.done():
+            raise CodexAppServerError("Codex app-server output reader is not running")
         message_id = self._next_id
         self._next_id += 1
         loop = asyncio.get_running_loop()
@@ -248,9 +329,18 @@ class CodexAppServerClient:
         self._proc.stdin.write(json.dumps(message, separators=(",", ":")).encode() + b"\n")
 
     async def _reader_loop(self) -> None:
+        try:
+            await self._read_messages()
+        except Exception:
+            # A dead reader must reject waiters, not leave thread/resume or a
+            # model turn waiting forever. Do not include protocol payloads.
+            logger.error("Codex app-server output reader failed")
+            self._fail_all(CodexAppServerError("Codex app-server output reader failed"))
+
+    async def _read_messages(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
         while True:
-            line = await self._proc.stdout.readline()
+            line = await _read_protocol_line(self._proc.stdout)
             if not line:
                 self._fail_all(CodexAppServerError("Codex app-server exited"))
                 return
@@ -272,7 +362,7 @@ class CodexAppServerClient:
     async def _stderr_loop(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
         while True:
-            line = await self._proc.stderr.readline()
+            line = await _read_protocol_line(self._proc.stderr)
             if not line:
                 return
             logger.debug("[codex app-server] %s", line.decode(errors="replace").rstrip())
@@ -309,6 +399,17 @@ class CodexAppServerClient:
         method = message.get("method")
         params = message.get("params") or {}
         turn_id = str(params.get("turnId") or (params.get("turn") or {}).get("id") or "")
+
+        if method == "item/started":
+            capture = self._turns.get(turn_id)
+            item = params.get("item") or {}
+            if capture is not None and capture.activity_handler is not None:
+                item_type = str(item.get("type") or "")
+                tool_name = str(item.get("tool") or item.get("name") or "")
+                try:
+                    capture.activity_handler(item_type, tool_name)
+                except Exception:
+                    logger.debug("turn activity handler failed", exc_info=True)
 
         if method == "item/agentMessage/delta":
             capture = self._turns.get(turn_id)

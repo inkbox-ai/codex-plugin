@@ -18,10 +18,13 @@ Env:
   VOICE_DRIVER_PORT       local port the tunnel forwards to (default 8090)
   VOICE_DRIVER_STATE      path to write the JSON state file
   VOICE_DRIVER_LINE       the one line the driver speaks (default below)
+  VOICE_DRIVER_SPEAK_AFTER minimum seconds before speaking (default 5)
+  VOICE_DRIVER_QUIET_AFTER_TRANSCRIPT quiet seconds after agent speech (default 0)
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -52,10 +55,44 @@ LINE = os.environ.get(
 # and the call is hung up before the agent ever speaks. Answer the way a person
 # does - one word, then silence - and hold the prompt until that window closes.
 GREETING = os.environ.get("VOICE_DRIVER_GREETING", "Hello?")
+# Wait through the initial greeting before asking: speaking on a fixed timer
+# can clip the request or its marker while the other party is still talking.
 SPEAK_AFTER_S = float(os.environ.get("VOICE_DRIVER_SPEAK_AFTER", "5"))
 # Then give the agent a turn and hang up — a dropped WS does NOT end the call, so we
 # must send an explicit stop or the leg lingers until the server max-duration cap.
 LISTEN_S = float(os.environ.get("VOICE_DRIVER_LISTEN", "12"))
+# Re-ask the question this often while the agent is idle. An ask the greeting
+# talked over is otherwise never repeated and the call idles out with the agent
+# still waiting for a request. 0 disables re-asking.
+REASK_EVERY_S = float(os.environ.get("VOICE_DRIVER_REASK", "20"))
+# Never re-ask until the agent has been silent this long, so a reply or a tool
+# round-trip in progress is never talked over.
+QUIET_GAP_S = float(os.environ.get("VOICE_DRIVER_QUIET_GAP", "6"))
+MAX_REASKS = int(os.environ.get("VOICE_DRIVER_MAX_REASKS", "2"))
+# The agent saying this back means the question landed; stop re-asking so a
+# question that already took effect never turns into a second one.
+ANSWER_CONTAINS = os.environ.get("VOICE_DRIVER_ANSWER_CONTAINS", "")
+
+
+def _speech_key(text: str) -> str:
+    """Compare speech ignoring ASR casing, spacing and punctuation."""
+    return "".join(char for char in text.casefold() if char.isalnum())
+
+
+async def _wait_for_greeting(state: dict[str, float]) -> bool:
+    """Wait for a quiet peer, without leaving a continuously talking call open."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(30.0, SPEAK_AFTER_S + QUIET_GAP_S)
+    await asyncio.sleep(SPEAK_AFTER_S)
+    while True:
+        now = loop.time()
+        quiet_in = QUIET_GAP_S - (now - state["last_heard"])
+        if quiet_in <= 0:
+            return True
+        if now >= deadline:
+            return False
+        await asyncio.sleep(min(quiet_in, deadline - now))
+
 
 app = FastAPI()
 
@@ -68,15 +105,16 @@ async def health() -> dict:
 @app.websocket("/phone/media/ws")
 async def phone_media_ws(ws: WebSocket) -> None:
     """Accept the call-media WS in Inkbox STT/TTS mode and run one scripted turn."""
-    import asyncio
-
     # Opt into Inkbox-managed speech both ways → we exchange text, not audio.
     await ws.accept(headers=[
         (b"x-use-inkbox-text-to-speech", b"true"),
         (b"x-use-inkbox-speech-to-text", b"true"),
     ])
     log.info("call WS accepted")
-    spoke = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    answered = asyncio.Event()        # agent said the expected answer back
+    state = {"last_heard": 0.0}       # monotonic ts of the agent's most recent turn
+    answer_key = _speech_key(ANSWER_CONTAINS)
     convo: asyncio.Task | None = None
 
     async def _say(text: str) -> None:
@@ -84,18 +122,39 @@ async def phone_media_ws(ws: WebSocket) -> None:
         await ws.send_text(json.dumps({"event": "text", "done": True}))
         log.info("spoke: %s", text)
 
-    async def _speak(text: str) -> None:
-        if spoke.is_set():
-            return
-        spoke.set()
-        await _say(text)
-
     async def _run_turn() -> None:
         # Speak one line, give the agent a turn, then hang up so the call ends fast.
         await _say(GREETING)
-        await asyncio.sleep(SPEAK_AFTER_S)
-        await _speak(LINE)
-        await asyncio.sleep(LISTEN_S)
+        if not await _wait_for_greeting(state):
+            log.info("peer did not pause before the greeting deadline")
+            await ws.send_text(json.dumps({"event": "stop"}))
+            return
+        await _say(LINE)
+        asked_at = loop.time()
+        # text.done acknowledges submission, not completed audio playback. Give
+        # long requests 100 spoken words/minute plus the quiet gap before a
+        # retry can enqueue another copy; short asks retain the configured floor.
+        reask_after = max(REASK_EVERY_S, len(LINE.split()) * 0.6 + QUIET_GAP_S)
+        state["last_heard"] = asked_at
+        # Re-ask if the agent never got the question: the greeting routinely runs
+        # several seconds past our first ask, and a lost ask leaves the agent
+        # waiting while the call idles out. Re-ask ONLY once the agent has gone
+        # quiet and has not already answered, so neither an in-progress reply nor
+        # a question that already landed is spoken over or repeated.
+        started = loop.time()
+        reasks = 0
+        while loop.time() - started < LISTEN_S:
+            await asyncio.sleep(1.0)
+            if (
+                REASK_EVERY_S > 0
+                and not answered.is_set()
+                and reasks < MAX_REASKS
+                and loop.time() - asked_at >= reask_after
+                and loop.time() - state["last_heard"] >= QUIET_GAP_S
+            ):
+                await _say(LINE)
+                asked_at = loop.time()
+                reasks += 1
         try:
             await ws.send_text(json.dumps({"event": "stop"}))
             log.info("sent stop (hangup)")
@@ -110,9 +169,14 @@ async def phone_media_ws(ws: WebSocket) -> None:
             if kind == "start":
                 log.info("call start: %s", ev.get("stream_id"))
                 convo = asyncio.create_task(_run_turn())
-            elif kind == "transcript" and ev.get("is_final"):
-                log.info("heard (final): %s", ev.get("text"))
-                await _speak(LINE)  # speak now if the greeting beat our timer
+            elif kind == "transcript":
+                text = ev.get("text") or ""
+                if text.strip():
+                    state["last_heard"] = loop.time()
+                if ev.get("is_final"):
+                    log.info("heard (final): %s", text)
+                    if answer_key and answer_key in _speech_key(text):
+                        answered.set()
             elif kind == "stop":
                 log.info("call stop: %s", ev.get("reason"))
                 break

@@ -8,6 +8,7 @@ from inkbox_codex import sessions as sessions_mod
 from inkbox_codex.codex_client import CodexAppServerError, CodexTurnResult
 from inkbox_codex.config import (
     BridgeConfig,
+    a2a_turn_context_path,
     channel_hints_path,
     hosted_sms_turn_context_path,
 )
@@ -131,6 +132,36 @@ def test_stop_command_aborts_running_detailed_capture():
         assert result.aborted is True
         assert result.mcp_tool_calls == ()
         assert sent[-1][1] == "Stopped."
+
+    asyncio.run(scenario())
+
+
+def test_consult_preserves_activity_handler_and_a2a_turn_context():
+    async def scenario():
+        sent, observed = [], []
+        session = make_session(sent)
+        context = {"task_id": "task-1"}
+        path = a2a_turn_context_path(session.chat_id)
+
+        class Client:
+            thread_id = "thread-1"
+
+            async def run(self, text, *, activity_handler):
+                assert text == "Work" and json.loads(path.read_text()) == context
+                activity_handler("commandExecution", "")
+                path.write_text(json.dumps({
+                    **context, "reply_intent_committed": True, "reply_intent": "complete",
+                }))
+                return "Completed"
+
+        session._client = Client()
+        result = await session.run_consult(
+            "Work", a2a_context=context,
+            activity_handler=lambda *args: observed.append(args),
+        )
+        assert result == "Completed" and observed == [("commandExecution", "")]
+        assert context["reply_intent_committed"] and context["reply_intent"] == "complete"
+        assert not path.exists() and not sent
 
     asyncio.run(scenario())
 
@@ -283,9 +314,9 @@ def test_rejected_reply_send_spawns_one_recovery_turn():
             detail = {"error": "message_blocked_spam_filter", "rule": "crypto_content",
                       "message": "Cryptocurrency price content is restricted."}
 
-        async def boom(_text):
+        async def boom(_chat_id, _text, _mode, _meta):
             raise Blocked()
-        session._reply = boom
+        session.send_fn = boom
 
         # First (normal) turn's reply is rejected → one recovery turn queued.
         await session._deliver_reply(_Turn(text="orig"), "Bitcoin: $63295")

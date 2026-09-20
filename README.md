@@ -182,7 +182,11 @@ Codex never silently runs anything destructive. The bridge starts `codex app-ser
 
 ## Sessions
 
-Sessions are keyed by Inkbox contact, so one person = one conversation across channels. Codex session ids are persisted in `~/.inkbox-codex/sessions.json` and resumed across bridge restarts — your conversation picks up where it left off. Replies go out on the channel you last used. If a voice call ends before Codex finishes a voice reply, that late voice reply is dropped instead of silently switching to SMS or email.
+Direct-message sessions are keyed by Inkbox contact, so one person = one conversation across channels. Group SMS messages share a session keyed by the group conversation, separate from direct messages and other groups, while retaining each sender's contact details. Codex session ids are persisted in `~/.inkbox-codex/sessions.json` and resumed across bridge restarts — your conversation picks up where it left off. Replies go out on the channel you last used. If a voice call ends before Codex finishes a voice reply, that late voice reply is dropped instead of silently switching to SMS or email.
+
+**Group replies.** The setup wizard offers **Automatic** (default) or **Mention required** for group SMS and iMessage, saved as `INKBOX_GROUP_REPLY_MODE=auto|mention`. Automatic keeps the existing behavior: the agent decides whether to answer. Mention mode starts a reply only when the new message itself includes `@agent` or `@<agent-handle>` as a whole mention, case-insensitively; older messages, links, and email addresses do not count. Other messages and group reactions are added to Codex's context without generating a reply or a typing indicator. While a turn is running, background messages wait until it finishes before being appended. Appended context persists with the Codex thread; messages still waiting in the bridge's queue are not persisted across a restart. Direct messages are unchanged. Commands such as `/stop`, and answers to the agent's pending questions from the sender it asked, do not require a mention.
+
+Run `inkbox-codex setup` to change the choice without reconfiguring your identity, or edit `.env`, then restart the bridge to apply it. For background mode, use `inkbox-codex restart`; for a systemd installation, use `systemctl --user restart inkbox-codex.service`. Mention mode requires a Codex version supporting `thread/inject_items`.
 
 **Typing indicator.** While Codex works on a turn, the bridge keeps a typing indicator alive on your iMessage thread (refreshed every few seconds, since it expires) so you can see it's busy. SMS, email, and voice have no typing indicator, so this is iMessage-only.
 
@@ -252,6 +256,28 @@ curl --fail-with-body --request POST 'https://your-agent-host.example/webhook' \
   }'
 ```
 
+## Email replies
+
+Automatic email replies use **reply-all** on the original message. The reply goes
+to its `Reply-To` address (or sender), with the other visible To/CC recipients
+included in CC. The agent's own mailbox and BCC recipients are excluded, and the
+original email thread is preserved. No mention is required for email replies.
+Queued replies, approval prompts, and send-failure recovery retain the original
+message's reply target even if another message arrives in the same session.
+
+If an inbound event lacks the original message ID, the bridge cannot send an
+automatic reply-all; it does not fall back to a sender-only email.
+
+Live reply-all CI uses the existing `CODEX_INKBOX_API_KEY` and
+`REMOTE_INKBOX_API_KEY` to verify real reply delivery, sender deduplication,
+self-exclusion, and reply-thread headers. An optional `REPLY_ALL_INKBOX_API_KEY`
+for a third, non-auto-replying dedicated inbox enables separate CC delivery
+checks (including additional original To recipients). Those two additional
+cases are explicitly skipped when the third credential is absent; two-identity
+checks do not prove independent CC delivery.
+The live channel workflow's `email_reply_all_only` input runs just these checks,
+with both deterministic and real-model gateway runs, without SMS reset traffic.
+
 ## Media
 
 **Inbound.** When someone sends an MMS image, an iMessage attachment, or an email with files, the gateway downloads them to `~/.inkbox-codex/media/` (override with `INKBOX_CODEX_MEDIA_DIR`) and appends the local paths to the message, so Codex can open them with its Read tool — including viewing images. Media-only messages (no text) still wake the agent.
@@ -280,7 +306,9 @@ curl --fail-with-body --request POST 'https://your-agent-host.example/webhook' \
 | `INKBOX_ALLOW_ALL_USERS` | no | `false` | Allow all senders admitted by Inkbox contact rules. |
 | `INKBOX_BRIDGE_PORT` | no | `8767` | Local webhook server port. |
 | `INKBOX_PERMISSION_TIMEOUT_S` | no | `600` | Seconds to wait for a permission/poll reply. |
+| `INKBOX_GROUP_REPLY_MODE` | no | `auto` | Group SMS/iMessage replies: `auto` lets the agent decide; `mention` requires `@agent` or `@<agent-handle>` in the new message. Other messages become context without starting a turn. Also configurable in setup. |
 | `INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS` | no | `false` | Auto-accept Codex MCP prompts for Inkbox tools only. The setup wizard writes `true` when you trust the agent to send through Inkbox without per-call approval. |
+| `INKBOX_A2A_PROGRESS_INTERVAL_SECONDS` | no | `180` | Seconds between progress updates for active inbound A2A tasks. Set to `0` to disable periodic updates. |
 | `INKBOX_VOICE_STACK` | no | `inkbox_tts_stt` | `inkbox_voice_ai`, `openai_realtime`, or `inkbox_tts_stt`. When absent, legacy Realtime settings remain compatible. |
 | `INKBOX_VOICE_AI_AUTHORITY_MODE` | Voice AI | `contact_scoped` | Saved Voice AI authority selected during setup: `contact_scoped` or `yolo`. |
 | `INKBOX_VOICEMAIL_DETECTION` | no | `enabled` | Outbound-call voicemail policy: `enabled` or `disabled`. Live CI uses `disabled`. |
@@ -314,11 +342,15 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_list_a2a_tasks` · `inkbox_list_a2a_messages` — page and search this identity's inbound and outbound A2A history, with participant, task, context, role, state, and timestamp filters.
 - `inkbox_a2a_complete` · `inkbox_a2a_ask_caller` · `inkbox_a2a_fail` — commit the outcome of a verified inbound A2A task. These tools are rejected outside that task's isolated session.
 
+Inbound A2A tasks acknowledge pickup immediately. While a task remains active,
+the worker sends a short progress update about every three minutes by default;
+these updates are visible in task history without starting a requester turn.
+
 The bridge requires Inkbox SDK >=0.7.3,<1.0.0.
 
 ### Companion mode
 
-Version 0.2.11 supports Companion mode for group email, MMS, and supported dedicated-line group iMessage conversations. An administrator must enable it and select a sponsor for the identity. Installing or upgrading the bridge leaves that setting unchanged. Use a claimed identity-scoped API key and signed Inkbox webhooks. If `INKBOX_ALLOWED_USERS` is set, it must permit the sponsor's actual email address or phone number for the channel.
+Version 0.2.14 supports Companion mode for group email, MMS, and supported dedicated-line group iMessage conversations. An administrator must enable it and select a sponsor for the identity. Installing or upgrading the bridge leaves that setting unchanged. Use a claimed identity-scoped API key and signed Inkbox webhooks. If `INKBOX_ALLOWED_USERS` is set, it must permit the sponsor's actual email address or phone number for the channel.
 
 After the sponsor sends a qualifying group message, the bridge loads the complete authorized history and trigger through the SDK and submits one combined Codex input. Live messages wait for that turn to complete. Each conversation, cohort, and activation has its own session, separate from private contact sessions. History and attachment references remain conversation data; historical commands do not reset sessions or answer approvals. Only a new live message from the sponsor can answer a pending approval. Existing Codex sandbox and approval settings still apply.
 
@@ -361,6 +393,14 @@ python -m pytest
 ## Architecture notes
 
 - **Tunnel-first inbound**: with a signing key, the gateway opens an Inkbox tunnel, reconciles mail/text/iMessage plus `call.ended` subscriptions, and sets the identity's incoming-call action from the selected stack — `hosted_agent` for Voice AI or `auto_accept` plus the call WebSocket for local stacks.
-- **Contact-keyed sessions**: webhook payloads carry resolved contacts; a single resolved contact id becomes the session key, otherwise the raw address/number does. One human, one session, every channel.
+- **Session routing**: direct messages use the resolved contact id across channels, falling back to the channel conversation or raw address/number. Group SMS uses the group conversation id regardless of sender.
 - **Escalation over the active channel**: a pending permission/poll captures the contact's next inbound message as its answer, on whichever text channel they're using.
 - **Codex app-server**: each contact session owns one `codex app-server` subprocess, one Codex thread, app-server approval request handling over Inkbox, and a local stdio MCP server for the Inkbox tools.
+
+### HD realtime voice
+
+Realtime calls request 16 kHz mono PCM16 call audio. The bridge continuously
+resamples to and from the realtime session's 24 kHz PCM format, preserving audio
+across WebSocket frame boundaries. Older call streams that advertise 8 kHz μ-law
+(or omit their audio descriptor) remain supported. Call audio quality also depends
+on the remote connection. Hosted voice and managed speech modes are unchanged.

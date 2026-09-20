@@ -323,7 +323,7 @@ def test_place_call_requires_current_sdk_call_contract(monkeypatch, tmp_path):
         monkeypatch,
         tmp_path,
     )
-    assert "SDK 0.5.9 or newer" in data["error"]
+    assert "SDK 0.7.3 or newer" in data["error"]
 
 
 def test_place_call_prefers_identity_scoped_ws_url(monkeypatch, tmp_path):

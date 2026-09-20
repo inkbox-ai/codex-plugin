@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from inkbox_codex import tools as tools_mod
-from inkbox_codex.config import hosted_sms_turn_context_path
+from inkbox_codex.config import BridgeConfig, hosted_sms_turn_context_path
 from inkbox_codex.hosted_sms_guard import hosted_sms_attempt_state
 
 
@@ -159,6 +159,20 @@ def test_call_tools_are_registered():
     assert "inkbox_place_call" in names
     assert "inkbox_list_calls" in names
     assert "inkbox_get_call_transcript" in names
+
+
+def test_mcp_server_uses_codex_native_auto_approval_when_enabled():
+    server, _tool_names = tools_mod.build_inkbox_mcp_server_config(
+        BridgeConfig(auto_approve_inkbox_tools=True)
+    )
+
+    assert server["default_tools_approval_mode"] == "approve"
+
+
+def test_mcp_server_preserves_codex_approval_prompts_by_default():
+    server, _tool_names = tools_mod.build_inkbox_mcp_server_config(BridgeConfig())
+
+    assert "default_tools_approval_mode" not in server
 
 
 def test_coding_agent_tool_tier_is_registered():

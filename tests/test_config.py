@@ -1,3 +1,5 @@
+import pytest
+
 from inkbox_codex.config import VoiceStack, read_config
 
 
@@ -8,6 +10,8 @@ def test_read_config_defaults(monkeypatch):
         "CODEX_APPROVAL_POLICY", "INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS",
         "INKBOX_BASE_URL", "CODEX_TURN_TIMEOUT_S", "CODEX_INTERRUPT_TIMEOUT_S",
         "INKBOX_CONTACT_MEMORIES_ENABLED",
+        "INKBOX_GROUP_REPLY_MODE",
+        "INKBOX_A2A_PROGRESS_INTERVAL_SECONDS",
     ):
         monkeypatch.delenv(var, raising=False)
     cfg = read_config()
@@ -20,6 +24,8 @@ def test_read_config_defaults(monkeypatch):
     assert cfg.codex_turn_timeout_s == 1800.0
     assert cfg.codex_interrupt_timeout_s == 10.0
     assert cfg.contact_memories_enabled is True
+    assert cfg.group_reply_mode == "auto"
+    assert cfg.a2a_progress_interval_seconds == 180.0
 
 
 def test_read_config_env(monkeypatch):
@@ -33,6 +39,7 @@ def test_read_config_env(monkeypatch):
     monkeypatch.setenv("INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS", "true")
     monkeypatch.setenv("CODEX_TURN_TIMEOUT_S", "42")
     monkeypatch.setenv("CODEX_INTERRUPT_TIMEOUT_S", "3")
+    monkeypatch.setenv("INKBOX_A2A_PROGRESS_INTERVAL_SECONDS", "60")
     cfg = read_config()
     assert cfg.api_key == "ApiKey_test"
     assert cfg.base_url == "https://proxy.example"
@@ -43,6 +50,19 @@ def test_read_config_env(monkeypatch):
     assert cfg.auto_approve_inkbox_tools is True
     assert cfg.codex_turn_timeout_s == 42.0
     assert cfg.codex_interrupt_timeout_s == 3.0
+    assert cfg.a2a_progress_interval_seconds == 60.0
+
+
+@pytest.mark.parametrize("value,expected", [("auto", "auto"), ("mention", "mention"), (" MENTION ", "mention")])
+def test_group_reply_mode_from_env(monkeypatch, value, expected):
+    monkeypatch.setenv("INKBOX_GROUP_REPLY_MODE", value)
+    assert read_config().group_reply_mode == expected
+
+
+def test_invalid_group_reply_mode_is_rejected(monkeypatch):
+    monkeypatch.setenv("INKBOX_GROUP_REPLY_MODE", "mentions")
+    with pytest.raises(ValueError, match="INKBOX_GROUP_REPLY_MODE"):
+        read_config()
 
 
 def test_contact_memories_can_be_disabled(monkeypatch):

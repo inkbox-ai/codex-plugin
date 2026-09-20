@@ -7,7 +7,7 @@ When Realtime is configured, the gateway pre-opens an OpenAI Realtime
 WebSocket *before* accepting the Inkbox call in raw-media mode, then runs
 two pumps for the call's duration:
 
-* caller audio (Inkbox ``media`` frames, base64 μ-law) → OpenAI
+* caller audio (Inkbox ``media`` frames, base64 call audio) → OpenAI
   ``input_audio_buffer.append``; server-side VAD handles turn-taking.
 * OpenAI ``response.output_audio.delta`` → Inkbox ``media`` frames, so the
   model's own voice is what the caller hears.
@@ -38,6 +38,11 @@ except ImportError:  # pragma: no cover - aiohttp is a runtime dep
     aiohttp = None  # type: ignore
 
 try:
+    from .audio import CallAudio
+except ImportError:  # pragma: no cover - direct local import
+    from audio import CallAudio
+
+try:
     from .prompts import _escape_contact_memory_tags, contact_marker, inject_contact_memories
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from prompts import _escape_contact_memory_tags, contact_marker, inject_contact_memories
@@ -52,8 +57,8 @@ logger = logging.getLogger("inkbox_codex.realtime")
 REALTIME_URL = "wss://api.openai.com/v1/realtime"
 DEFAULT_MODEL = "gpt-realtime-2"
 DEFAULT_VOICE = "cedar"
-# μ-law telephony audio, matching the codec Inkbox bridges from the carrier.
-AUDIO_FORMAT_TELEPHONY = {"type": "audio/pcmu"}
+# Realtime PCM runs at 24 kHz; call media is negotiated independently.
+AUDIO_FORMAT_TELEPHONY = {"type": "audio/pcm", "rate": 24000}
 INPUT_TRANSCRIPTION_MODEL = "whisper-1"
 
 CONSULT_TOOL_NAME = "consult_agent"
@@ -70,6 +75,9 @@ HANGUP_CONFIRM_WINDOW_S = 60.0
 HANGUP_CLOSE_DELAY_S = 2.0
 # Never let a cancelled consult/task hold the call WebSocket cleanup forever.
 TASK_CANCEL_TIMEOUT_S = 2.0
+# Bound how long a completed consult can retain the call while the realtime
+# model produces the response that speaks its result.
+CONSULT_RESPONSE_TIMEOUT_S = 30.0
 
 
 # A consult takes live-call context plus the realtime model's request and
@@ -161,7 +169,18 @@ class RealtimeConsultResult:
 
 
 @dataclass
+class _PendingConsult:
+    call_id: str
+    response_id: Optional[str] = None
+    response_done: bool = False
+    audio_done: bool = False
+    transcript_done: bool = False
+    timeout_task: Optional["asyncio.Task[None]"] = None
+
+
+@dataclass
 class _BridgeState:
+    audio: CallAudio = field(default_factory=CallAudio)
     transcript: List[Tuple[str, str]] = field(default_factory=list)
     # Work the model asked to run after the call: [{"action", "details"}].
     post_call_actions: List[Dict[str, str]] = field(default_factory=list)
@@ -179,6 +198,15 @@ class _BridgeState:
     # OpenAI→Inkbox audio pump flowing; tracked here so call teardown can
     # cancel them.
     consult_tasks: Set["asyncio.Task[None]"] = field(default_factory=set)
+    # Accepted consult calls remain owned until the response created from their
+    # tool result has both completed and flushed its outbound audio.
+    pending_consults: Dict[str, _PendingConsult] = field(default_factory=dict)
+    awaiting_consult_responses: List[str] = field(default_factory=list)
+    # A locally requested hangup waits behind pending response-bearing work.
+    deferred_hangup: Optional[Dict[str, Any]] = None
+    hangup_in_progress: bool = False
+    hangup_sent: bool = False
+    shutdown_event: "asyncio.Event" = field(default_factory=asyncio.Event)
 
 
 # ----------------------------------------------------------------------
@@ -537,8 +565,13 @@ class OpenedRealtimeBridge:
                 ),
                 name=f"realtime-openai-pump-{self.meta.call_id}",
             )
+            shutdown_task = asyncio.create_task(
+                state.shutdown_event.wait(),
+                name=f"realtime-shutdown-{self.meta.call_id}",
+            )
             done, _pending = await asyncio.wait(
-                {inkbox_task, openai_task}, return_when=asyncio.FIRST_COMPLETED
+                {inkbox_task, openai_task, shutdown_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
             for task in done:
                 if task.cancelled():
@@ -552,6 +585,7 @@ class OpenedRealtimeBridge:
                 task for task in (
                     locals().get("inkbox_task"),
                     locals().get("openai_task"),
+                    locals().get("shutdown_task"),
                 )
                 if task is not None
             ]
@@ -631,11 +665,19 @@ async def _cancel_consult_tasks(state: _BridgeState) -> None:
     """Cancel in-flight consult tasks and let them settle."""
     tasks = list(state.consult_tasks)
     state.consult_tasks.clear()
-    if not tasks:
-        return
     for task in tasks:
         task.cancel()
     await _settle_tasks(tasks, label="consult")
+    timeout_tasks = [
+        pending.timeout_task
+        for pending in state.pending_consults.values()
+        if pending.timeout_task is not None and not pending.timeout_task.done()
+    ]
+    for task in timeout_tasks:
+        task.cancel()
+    await _settle_tasks(timeout_tasks, label="consult response")
+    state.pending_consults.clear()
+    state.awaiting_consult_responses.clear()
 
 
 async def _settle_tasks(tasks: List["asyncio.Task[Any]"], *, label: str) -> None:
@@ -650,6 +692,91 @@ async def _settle_tasks(tasks: List["asyncio.Task[Any]"], *, label: str) -> None
     except asyncio.TimeoutError:
         names = ", ".join(task.get_name() for task in tasks)
         logger.warning("[realtime] timed out waiting for %s task cancellation: %s", label, names)
+
+
+def _release_pending_consult(state: _BridgeState, call_id: str) -> None:
+    pending = state.pending_consults.pop(call_id, None)
+    state.awaiting_consult_responses = [
+        queued for queued in state.awaiting_consult_responses if queued != call_id
+    ]
+    if pending is None or pending.timeout_task is None:
+        return
+    current = asyncio.current_task()
+    if pending.timeout_task is not current and not pending.timeout_task.done():
+        pending.timeout_task.cancel()
+
+
+async def _finish_pending_consult(
+    state: _BridgeState,
+    call_id: str,
+    openai_ws: Any,
+    inkbox_ws: Any,
+) -> None:
+    _release_pending_consult(state, call_id)
+    if not state.pending_consults:
+        await _perform_deferred_hangup(openai_ws, inkbox_ws, state)
+
+
+async def _expire_pending_consult(
+    state: _BridgeState,
+    call_id: str,
+    openai_ws: Any,
+    inkbox_ws: Any,
+) -> None:
+    try:
+        await asyncio.sleep(CONSULT_RESPONSE_TIMEOUT_S)
+    except asyncio.CancelledError:
+        return
+    if call_id not in state.pending_consults:
+        return
+    logger.warning("[realtime] timed out waiting for consult response call_id=%s", call_id)
+    await _finish_pending_consult(state, call_id, openai_ws, inkbox_ws)
+
+
+def _frame_response_id(frame: Dict[str, Any]) -> str:
+    response = frame.get("response") or {}
+    return str(frame.get("response_id") or response.get("id") or "")
+
+
+async def _record_consult_response_event(
+    *,
+    frame: Dict[str, Any],
+    event: str,
+    state: _BridgeState,
+    openai_ws: Any,
+    inkbox_ws: Any,
+) -> None:
+    response_id = _frame_response_id(frame)
+    if event == "created":
+        while state.awaiting_consult_responses:
+            call_id = state.awaiting_consult_responses.pop(0)
+            pending = state.pending_consults.get(call_id)
+            if pending is not None:
+                pending.response_id = response_id
+                break
+        return
+
+    matching = [
+        pending
+        for pending in state.pending_consults.values()
+        if response_id and pending.response_id == response_id
+    ]
+    for pending in matching:
+        if event == "audio_done":
+            pending.audio_done = True
+        elif event == "transcript_done":
+            pending.transcript_done = True
+        elif event == "response_done":
+            response = frame.get("response") or {}
+            status = str(response.get("status") or frame.get("status") or "completed")
+            if status not in {"completed", "success"}:
+                await _finish_pending_consult(
+                    state, pending.call_id, openai_ws, inkbox_ws
+                )
+                continue
+            pending.response_done = True
+        if pending.response_done and pending.audio_done and pending.transcript_done:
+            await _finish_pending_consult(state, pending.call_id, openai_ws, inkbox_ws)
 
 
 # ----------------------------------------------------------------------
@@ -745,15 +872,25 @@ async def _inkbox_to_openai_pump(
             event = (frame.get("event") or "").lower()
             if event == "start":
                 state.stream_id = frame.get("stream_id") or state.stream_id
+                state.audio.configure((frame.get("start") or {}).get("media_format"))
+                logger.info(
+                    "[realtime] call_id=%s audio_format=%s sample_rate=%d",
+                    meta.call_id,
+                    "pcmu" if state.audio.inbound.decode_ulaw else "pcm_s16le",
+                    state.audio.inbound.source_rate,
+                )
                 await _maybe_send_greeting(openai_ws, state, meta)
             elif event == "media":
                 if not state.greeting_triggered:
                     await _maybe_send_greeting(openai_ws, state, meta)
                 payload_b64 = (frame.get("media") or {}).get("payload")
                 if payload_b64:
+                    converted = state.audio.inbound.convert(payload_b64)
+                    if not converted:
+                        continue
                     await openai_ws.send_str(json.dumps({
                         "type": "input_audio_buffer.append",
-                        "audio": payload_b64,
+                        "audio": converted,
                     }))
             elif event in {"stop", "closed", "hangup"}:
                 logger.info("[realtime] Inkbox WS signaled %s", event)
@@ -787,6 +924,13 @@ async def _openai_to_inkbox_pump(
         if not cid or cid in dispatched:
             return
         dispatched.add(cid)
+        if entry.get("name") == CONSULT_TOOL_NAME:
+            try:
+                consult_args = json.loads(entry.get("args") or "{}")
+            except (TypeError, ValueError):
+                consult_args = {}
+            if (consult_args.get("query") or "").strip():
+                state.pending_consults.setdefault(cid, _PendingConsult(call_id=cid))
         logger.info(
             "[realtime] dispatching tool call name=%s call_id=%s",
             entry.get("name") or "",
@@ -809,6 +953,7 @@ async def _openai_to_inkbox_pump(
         # which is exactly the async-tool flow gpt-realtime expects.
         task = asyncio.create_task(coro, name=f"realtime-consult-{cid}")
         state.consult_tasks.add(task)
+
         def _done(done_task: "asyncio.Task[None]") -> None:
             state.consult_tasks.discard(done_task)
             if done_task.cancelled():
@@ -854,9 +999,12 @@ async def _openai_to_inkbox_pump(
         if ftype in ("response.output_audio.delta", "response.audio.delta"):
             delta_b64 = frame.get("delta") or ""
             if delta_b64:
+                converted = state.audio.outbound.convert(delta_b64)
+                if not converted:
+                    continue
                 out: Dict[str, Any] = {
                     "event": "media",
-                    "media": {"payload": delta_b64, "track": "outbound"},
+                    "media": {"payload": converted, "track": "outbound"},
                 }
                 if state.stream_id:
                     out["stream_id"] = state.stream_id
@@ -868,14 +1016,41 @@ async def _openai_to_inkbox_pump(
 
         # A response's audio finished — tell Inkbox to flush/play.
         elif ftype in ("response.output_audio.done", "response.audio.done"):
+            state.audio.outbound.reset()
             done: Dict[str, Any] = {"event": "audio_done"}
             if state.stream_id:
                 done["stream_id"] = state.stream_id
             with suppress(Exception):
                 await inkbox_ws.send_str(json.dumps(done))
+            await _record_consult_response_event(
+                frame=frame,
+                event="audio_done",
+                state=state,
+                openai_ws=openai_ws,
+                inkbox_ws=inkbox_ws,
+            )
+
+        elif ftype == "response.created":
+            await _record_consult_response_event(
+                frame=frame,
+                event="created",
+                state=state,
+                openai_ws=openai_ws,
+                inkbox_ws=inkbox_ws,
+            )
+
+        elif ftype == "response.done":
+            await _record_consult_response_event(
+                frame=frame,
+                event="response_done",
+                state=state,
+                openai_ws=openai_ws,
+                inkbox_ws=inkbox_ws,
+            )
 
         # Caller started speaking (barge-in) — drop queued outbound audio.
         elif ftype == "input_audio_buffer.speech_started":
+            state.audio.outbound.reset()
             with suppress(Exception):
                 await inkbox_ws.send_str(json.dumps({"event": "clear"}))
 
@@ -888,6 +1063,13 @@ async def _openai_to_inkbox_pump(
             if text:
                 state.transcript.append(("agent", text))
                 await _relay_transcript("local", text)
+                await _record_consult_response_event(
+                    frame=frame,
+                    event="transcript_done",
+                    state=state,
+                    openai_ws=openai_ws,
+                    inkbox_ws=inkbox_ws,
+                )
         elif ftype == "conversation.item.input_audio_transcription.completed":
             text = (frame.get("transcript") or "").strip()
             if text:
@@ -953,6 +1135,30 @@ def _consult_result_text(output: Dict[str, Any]) -> str:
     return json.dumps(output)
 
 
+async def _submit_consult_output(
+    *,
+    openai_ws: Any,
+    inkbox_ws: Any,
+    call_id: str,
+    output: Dict[str, Any],
+    state: _BridgeState,
+) -> None:
+    pending = state.pending_consults.setdefault(call_id, _PendingConsult(call_id=call_id))
+    if not await _submit_tool_result(
+        openai_ws, call_id, output, create_response=False
+    ):
+        await _finish_pending_consult(state, call_id, openai_ws, inkbox_ws)
+        return
+
+    state.awaiting_consult_responses.append(call_id)
+    pending.timeout_task = asyncio.create_task(
+        _expire_pending_consult(state, call_id, openai_ws, inkbox_ws),
+        name=f"realtime-consult-response-{call_id}",
+    )
+    if not await _request_response(openai_ws):
+        await _finish_pending_consult(state, call_id, openai_ws, inkbox_ws)
+
+
 async def _dispatch_tool_call(
     *,
     openai_ws: Any,
@@ -997,6 +1203,7 @@ async def _dispatch_tool_call(
     if not query:
         await _submit_tool_result(openai_ws, call_id, {"error": "missing query argument"})
         return
+    state.pending_consults.setdefault(call_id, _PendingConsult(call_id=call_id))
 
     # Best-effort interim cue so the caller hears something while Codex works.
     with suppress(Exception):
@@ -1016,6 +1223,9 @@ async def _dispatch_tool_call(
             ),
             timeout=config.consult_timeout_s,
         )
+    except asyncio.CancelledError:
+        await _finish_pending_consult(state, call_id, openai_ws, inkbox_ws)
+        raise
     except asyncio.TimeoutError:
         output = {
             "error": "consult timed out",
@@ -1027,7 +1237,13 @@ async def _dispatch_tool_call(
             result=_consult_result_text(output),
             created_at=time.time(),
         ))
-        await _submit_tool_result(openai_ws, call_id, output)
+        await _submit_consult_output(
+            openai_ws=openai_ws,
+            inkbox_ws=inkbox_ws,
+            call_id=call_id,
+            output=output,
+            state=state,
+        )
         return
     except Exception as exc:
         logger.warning("[realtime] consult failed: %s", exc)
@@ -1041,7 +1257,13 @@ async def _dispatch_tool_call(
             result=_consult_result_text(output),
             created_at=time.time(),
         ))
-        await _submit_tool_result(openai_ws, call_id, output)
+        await _submit_consult_output(
+            openai_ws=openai_ws,
+            inkbox_ws=inkbox_ws,
+            call_id=call_id,
+            output=output,
+            state=state,
+        )
         return
 
     output = {
@@ -1060,7 +1282,13 @@ async def _dispatch_tool_call(
         result=_consult_result_text(output),
         created_at=time.time(),
     ))
-    await _submit_tool_result(openai_ws, call_id, output)
+    await _submit_consult_output(
+        openai_ws=openai_ws,
+        inkbox_ws=inkbox_ws,
+        call_id=call_id,
+        output=output,
+        state=state,
+    )
 
 
 async def _handle_register_action(
@@ -1149,7 +1377,7 @@ async def _handle_hang_up(
         })
         return
 
-    # Second attempt within the window → perform the real hangup.
+    # Second attempt within the window → request the real hangup.
     reason = (args.get("reason") or "").strip()
     # Inkbox ends the call on a `stop` event; `hangup` is ignored server-side.
     stop_frame: Dict[str, Any] = {"event": "stop"}
@@ -1163,15 +1391,42 @@ async def _handle_hang_up(
         {"status": "hangup_requested", "reason": reason, "message": "The call is ending now."},
         create_response=False,
     )
+    if state.hangup_sent or state.hangup_in_progress:
+        return
+    state.deferred_hangup = stop_frame
+    if not state.pending_consults:
+        await _perform_deferred_hangup(openai_ws, inkbox_ws, state)
+
+
+async def _perform_deferred_hangup(
+    openai_ws: Any, inkbox_ws: Any, state: _BridgeState
+) -> None:
+    stop_frame = state.deferred_hangup
+    if (
+        stop_frame is None
+        or state.pending_consults
+        or state.hangup_in_progress
+        or state.hangup_sent
+        or state.closed
+    ):
+        return
+    state.hangup_in_progress = True
     try:
-        # Let the spoken goodbye land before we drop the carrier leg.
+        # Let the last result-bearing audio flush before dropping the call.
         await asyncio.sleep(HANGUP_CLOSE_DELAY_S)
+        if state.closed:
+            return
         await inkbox_ws.send_str(json.dumps(stop_frame))
+        state.hangup_sent = True
+        state.closed = True
+        state.shutdown_event.set()
     except Exception as exc:
         logger.debug("[realtime] hangup frame send failed: %s", exc)
-    state.closed = True
-    await _maybe_close_ws(inkbox_ws)
-    await _maybe_close_ws(openai_ws)
+        # A failed local stop must not leave the bridge owned forever.
+        state.closed = True
+        state.shutdown_event.set()
+    finally:
+        state.hangup_in_progress = False
 
 
 def _action_index(args: Dict[str, Any]) -> int:
@@ -1220,7 +1475,7 @@ async def _maybe_close_ws(ws: Any) -> None:
 
 async def _submit_tool_result(
     openai_ws: Any, call_id: str, output: Dict[str, Any], *, create_response: bool = True
-) -> None:
+) -> bool:
     """Submit a function_call_output and (optionally) prompt the model to speak.
 
     Args:
@@ -1240,9 +1495,19 @@ async def _submit_tool_result(
             },
         }))
         if not create_response:
-            return
+            return True
         # Bare response.create — let the session's audio settings apply (GA
         # rejects a modalities field here).
-        await openai_ws.send_str(json.dumps({"type": "response.create"}))
+        return await _request_response(openai_ws)
     except Exception as exc:
         logger.debug("[realtime] submit_tool_result failed: %s", exc)
+        return False
+
+
+async def _request_response(openai_ws: Any) -> bool:
+    try:
+        await openai_ws.send_str(json.dumps({"type": "response.create"}))
+        return True
+    except Exception as exc:
+        logger.debug("[realtime] response.create failed: %s", exc)
+        return False

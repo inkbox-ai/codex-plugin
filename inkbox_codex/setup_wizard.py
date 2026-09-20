@@ -48,7 +48,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 # Packages the wizard itself needs to talk to Inkbox during setup. The
 # gateway's Codex CLI dependency is checked by doctor.
 INKBOX_REQUIREMENTS = ("inkbox>=0.7.3,<1.0.0", "aiohttp>=3.9")
-MIN_INKBOX_VERSION = (0, 5, 9)
+MIN_INKBOX_VERSION = (0, 7, 3)
 _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
 
 # Bundled avatar attached to the agent's Inkbox contact card during setup.
@@ -999,7 +999,7 @@ def _configure_voice_ai(
         "get_incoming_call_action", "set_incoming_call_action",
     )
     if any(not callable(getattr(identity, method, None)) for method in required_methods):
-        print_error("  Inkbox Voice AI setup requires Inkbox SDK 0.5.9 or newer.")
+        print_error("  Inkbox Voice AI setup requires Inkbox SDK 0.7.3 or newer.")
         return False, authority_identity, ""
     try:
         hosted_before = identity.get_hosted_agent_config()
@@ -1890,6 +1890,26 @@ def _configure_project_dir() -> None:
     print_success(f"  Codex will work in {chosen}")
 
 
+def _configure_group_reply_mode() -> None:
+    """Choose when group messages start a reply and retain the saved default."""
+    print()
+    print(color("  --- Group chat replies ---", Colors.CYAN))
+    print_info("  Applies to group SMS and iMessage. Direct messages are unchanged.")
+    print_info("  In mention mode, other messages are kept as context without starting a reply.")
+    current = _env("INKBOX_GROUP_REPLY_MODE").strip().lower()
+    choice = prompt_choice(
+        "  When should the agent reply in group chats?",
+        [
+            "Automatic — the agent decides when to reply (default)",
+            "Mention required — only when the message includes @agent or @<agent-handle>",
+        ],
+        1 if current == "mention" else 0,
+    )
+    mode = ("auto", "mention")[choice]
+    _save("INKBOX_GROUP_REPLY_MODE", mode)
+    print_success(f"  Group reply mode saved: {mode}.")
+
+
 def _configure_inkbox_tool_approvals() -> None:
     """Ask whether Inkbox MCP tools should run without per-call prompts."""
     print()
@@ -2102,7 +2122,9 @@ def interactive_setup() -> None:
         print()
         print_success(f"Inkbox is already configured for identity '{existing_identity}'.")
         if not prompt_yes_no("  Reconfigure Inkbox?", False):
+            _configure_group_reply_mode()
             _configure_inkbox_tool_approvals()
+            print_info("  Restart your running bridge or service to apply the saved settings.")
             return
 
     base_url = os.getenv("INKBOX_BASE_URL") or _env("INKBOX_BASE_URL") or INKBOX_BASE_URL_DEFAULT
@@ -2190,6 +2212,8 @@ def interactive_setup() -> None:
     _setup_signing_key(api_key, base_url, Inkbox)
 
     _configure_project_dir()
+
+    _configure_group_reply_mode()
 
     _configure_inkbox_tool_approvals()
 
