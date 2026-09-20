@@ -283,9 +283,9 @@ def test_rejected_reply_send_spawns_one_recovery_turn():
             detail = {"error": "message_blocked_spam_filter", "rule": "crypto_content",
                       "message": "Cryptocurrency price content is restricted."}
 
-        async def boom(_text):
+        async def boom(_chat_id, _text, _mode, _meta):
             raise Blocked()
-        session._reply = boom
+        session.send_fn = boom
 
         # First (normal) turn's reply is rejected → one recovery turn queued.
         await session._deliver_reply(_Turn(text="orig"), "Bitcoin: $63295")

@@ -164,9 +164,9 @@ def test_sync_rejection_wakes_with_rule_and_attempt():
         gw = _gw()
         session = _wired_session(gw)
 
-        async def boom(_text):
+        async def boom(_chat_id, _text, _mode, _meta):
             raise _Blocked()
-        session._reply = boom
+        session.send_fn = boom
 
         await session._deliver_reply(_Turn(text="orig"), "**Jane Doe** is on file.")
 
@@ -188,9 +188,9 @@ def test_sync_retry_budget_caps_total_sends():
         gw = _gw()
         session = _wired_session(gw)
 
-        async def boom(_text):
+        async def boom(_chat_id, _text, _mode, _meta):
             raise _Blocked()
-        session._reply = boom
+        session.send_fn = boom
 
         # Each fresh (non-recovery) reply that is rejected records one failure.
         for _ in range(MAX + 1):
@@ -214,9 +214,9 @@ def test_failed_first_recovery_gets_optional_second_instruction_then_caps():
         gw = _gw()
         session = _wired_session(gw)
 
-        async def boom(_text):
+        async def boom(_chat_id, _text, _mode, _meta):
             raise _Blocked()
-        session._reply = boom
+        session.send_fn = boom
 
         await session._deliver_reply(_Turn(text="orig"), "blocked body")
         first_recovery = session._queue.get_nowait()
@@ -242,9 +242,9 @@ def test_sync_too_long_reason_flows_through():
         session = _wired_session(gw)
         reason = gateway._message_too_long_reason("SMS", "x" * 2000, gateway.SMS_MAX_LENGTH)
 
-        async def boom(_text):
+        async def boom(_chat_id, _text, _mode, _meta):
             raise ValueError(reason)
-        session._reply = boom
+        session.send_fn = boom
 
         await session._deliver_reply(_Turn(text="orig"), "y" * 2000)
 
@@ -261,9 +261,9 @@ def test_successful_send_does_not_wake_or_count():
         gw = _gw()
         session = _wired_session(gw)
 
-        async def ok(_text):
+        async def ok(_chat_id, _text, _mode, _meta):
             return None
-        session._reply = ok
+        session.send_fn = ok
 
         await session._deliver_reply(_Turn(text="orig"), "all good")
 
@@ -374,9 +374,9 @@ def test_sync_and_webhook_failures_share_one_budget():
         gw = _gw()
         session = _wired_session(gw)
 
-        async def boom(_text):
+        async def boom(_chat_id, _text, _mode, _meta):
             raise _Blocked()
-        session._reply = boom
+        session.send_fn = boom
 
         # Failure 1 (sync) — keyed by conv-1 + +15551234567.
         await session._deliver_reply(_Turn(text="orig"), "blocked body")

@@ -70,8 +70,8 @@ class _Turn:
 
     Everything that drives a turn — inbound messages and capture turns alike —
     goes through one queue and one worker, so two turns can never hit the
-    subprocess at once. A normal turn (``future is None``) sends its reply on
-    the channel the human last used. A capture turn (``future`` set) hands the
+    subprocess at once. A normal turn (``future is None``) keeps the reply route
+    of its inbound message. A capture turn (``future`` set) hands the
     reply text back to the awaiting caller instead and never auto-replies —
     used by voice consults, post-call actions, and delivery-failure notices.
     Context-only entries append history between turns without generation.
@@ -87,6 +87,8 @@ class _Turn:
     hosted_sms_context: Optional[Dict[str, Any]] = None
     activity_handler: Optional[Callable[[str, str], None]] = None
     context_only: bool = False
+    reply_mode: Optional[str] = None
+    reply_meta: Optional[Dict[str, Any]] = None
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Codex as a turn.
@@ -418,7 +420,7 @@ class ContactSession:
         if is_group and pending_reply:
             pending_reply = (
                 not meta.get("reaction")
-                and meta.get("sender") == self.reply_meta.get("sender")
+                and meta.get("sender") == self._reply_route(self._current_turn)[1].get("sender")
                 and (self.pending.kind != "permission" or parse_permission_reply(raw_text) is not None)
             )
         context_only = (
@@ -474,7 +476,11 @@ class ContactSession:
 
         # Tag the message with its channel + sender so Codex knows where it
         # is and who it's talking to (the static system prompt can't).
-        await self._queue.put(_Turn(text=frame_inbound(mode, meta, text)))
+        await self._queue.put(_Turn(
+            text=frame_inbound(mode, meta, text),
+            reply_mode=mode,
+            reply_meta=dict(meta),
+        ))
 
         # Texting again while Codex is mid-turn behaves like hitting Esc and
         # typing a new message: interrupt the running turn so the worker drops
@@ -513,11 +519,12 @@ class ContactSession:
                 try:
                     message = str(exc)
                     if "did not finish within" in message:
-                        await self._reply(f"Sorry — {message}")
+                        await self._reply(f"Sorry — {message}", turn=turn)
                     else:
                         await self._reply(
                             "Sorry — I hit an error while working on that and had to stop. "
-                            "Try sending it again."
+                            "Try sending it again.",
+                            turn=turn,
                         )
                 except Exception:
                     logger.exception("[session %s] could not send the error notice", self.chat_id)
@@ -841,21 +848,27 @@ class ContactSession:
             None
         """
         try:
-            await self._reply(reply)
+            await self._reply(reply, turn=turn)
         except Exception as exc:
             reason = _send_error_reason(exc)
             logger.warning("[session %s] reply send rejected: %s", self.chat_id, reason)
             if self.on_send_failure is not None:
                 prompt = self.on_send_failure(
-                    self.chat_id, self.mode, self.reply_meta, reply, reason
+                    self.chat_id, *self._reply_route(turn), reply, reason
                 )
                 if prompt:
-                    await self._queue.put(_Turn(text=prompt, recovery=True))
+                    await self._queue.put(_Turn(
+                        text=prompt, recovery=True,
+                        reply_mode=turn.reply_mode, reply_meta=turn.reply_meta,
+                    ))
                 return
             if turn.recovery:
                 raise  # no shared budget is available to cap another attempt
             await self._queue.put(
-                _Turn(text=_send_rejected_prompt(reply, reason), recovery=True)
+                _Turn(
+                    text=_send_rejected_prompt(reply, reason), recovery=True,
+                    reply_mode=turn.reply_mode, reply_meta=turn.reply_meta,
+                )
             )
 
     async def run_consult(
@@ -1071,7 +1084,7 @@ class ContactSession:
             questions=list(questions or []),
             tool_name=tool_name,
         )
-        await self._reply(prompt_text)
+        await self._reply(prompt_text, turn=self._current_turn)
         try:
             return await asyncio.wait_for(
                 self.pending.future, timeout=self.cfg.permission_timeout_s
@@ -1081,8 +1094,13 @@ class ContactSession:
         finally:
             self.pending = None
 
-    async def _reply(self, text: str) -> None:
-        await self.send_fn(self.chat_id, text, self.mode, self.reply_meta)
+    def _reply_route(self, turn: Optional[_Turn] = None) -> tuple[str, Dict[str, Any]]:
+        if turn is not None and turn.reply_mode is not None and turn.reply_meta is not None:
+            return turn.reply_mode, turn.reply_meta
+        return self.mode, self.reply_meta
+
+    async def _reply(self, text: str, *, turn: Optional[_Turn] = None) -> None:
+        await self.send_fn(self.chat_id, text, *self._reply_route(turn))
 
     async def close(self) -> None:
         if self._client is not None:

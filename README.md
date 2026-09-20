@@ -262,6 +262,8 @@ Automatic email replies use **reply-all** on the original message. The reply goe
 to its `Reply-To` address (or sender), with the other visible To/CC recipients
 included in CC. The agent's own mailbox and BCC recipients are excluded, and the
 original email thread is preserved. No mention is required for email replies.
+Queued replies, approval prompts, and send-failure recovery retain the original
+message's reply target even if another message arrives in the same session.
 
 If an inbound event lacks the original message ID, the bridge cannot send an
 automatic reply-all; it does not fall back to a sender-only email.
