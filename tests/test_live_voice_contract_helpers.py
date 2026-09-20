@@ -42,6 +42,11 @@ def test_hosted_call_request_primes_spoken_post_call_work():
         voice._call_me_text(hosted=True)
     )
     assert "post-call action" not in voice._call_me_text()
+    hosted = voice._call_me_text(hosted=True)
+    assert "Do not reply by text" not in hosted
+    assert "Do not send an SMS before or during the call" in hosted
+    assert "After hangup, complete the follow-up" in hosted
+    assert "Do not reply by text" in voice._call_me_text()
 
 
 def test_spoken_marker_normalizes_punctuation_and_case():
