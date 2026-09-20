@@ -387,7 +387,9 @@ class Receiver:
     async def process(self, event):
         if event.phase == "ordinary":
             if not self.sender_allowed(event.author):
-                raise CompanionError("Companion ordinary sender is not permitted locally")
+                # Match ordinary inbound filtering: discard this input without
+                # blocking a later, permitted sponsor in the same scope.
+                return
             await self.submit(event, await self.live_text(event), self.meta(event))
             return
         saved = self.inbox.activation(event)

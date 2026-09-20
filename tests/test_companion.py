@@ -556,3 +556,22 @@ def test_local_allowlist_checks_sponsor_not_each_historical_author():
             assert '+12025550101' in text and '+12025550102' in text
         finally: await r.close()
     asyncio.run(scenario())
+
+
+def test_filtered_ordinary_event_does_not_block_later_authorized_activation():
+    async def scenario():
+        e = fixture()
+        ordinary = live(e, 1, 'not permitted', author='+12025550999')
+        ordinary['companion'].pop('activation_id')
+        ordinary['companion']['phase'] = 'ordinary'
+        r, sdk, s, sent = harness(e, allowed=lambda author: author == '+12025550103')
+        try:
+            await r.accept(ordinary)
+            await drained(r)
+            assert not sent
+            e['companion']['sequence'] = 2
+            await r.accept(e)
+            await drained(r)
+            assert len(sent) == 1
+        finally: await r.close()
+    asyncio.run(scenario())
