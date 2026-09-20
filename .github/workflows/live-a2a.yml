@@ -62,8 +62,15 @@ jobs:
           echo "CODEX_PROJECT_DIR=$RUNNER_TEMP/project" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/codex-home" "$RUNNER_TEMP/project"
 
+      - uses: astral-sh/setup-uv@v8.1.0
+        with:
+          version: "latest"
+
+      - name: Build pinned Inkbox SDK wheel
+        run: bash tests/ci/build_inkbox_sdk.sh
+
       - name: Install bridge and protocol driver
-        run: pip install -e .
+        run: uv pip install --system --no-sources "$INKBOX_SDK_WHEEL" -e .
 
       - name: Install Codex
         run: bash "$GITHUB_WORKSPACE/tests/ci/install_codex.sh"
