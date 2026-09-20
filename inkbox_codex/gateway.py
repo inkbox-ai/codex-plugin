@@ -3403,6 +3403,7 @@ class InkboxGateway:
             "to": sender,
             "sender": sender,
             "subject": subject,
+            "message_id": message.get("id"),
             "thread_id": message.get("thread_id"),
             "contact": contact,
             "agent_identity": agent_identity,
@@ -4720,12 +4721,12 @@ class InkboxGateway:
                 text=text,
             )
         else:  # email
+            message_id = str(meta.get("message_id") or "").strip()
+            if not message_id:
+                raise ValueError("Cannot reply-all without the original email message ID")
             identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
-            subject = str(meta.get("subject") or "").strip()
-            reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}" if subject else "From your Codex agent"
             await asyncio.to_thread(
-                identity.send_email,
-                to=[str(meta.get("to") or chat_id)],
-                subject=reply_subject,
+                identity.reply_all_email,
+                message_id,
                 body_text=content,
             )

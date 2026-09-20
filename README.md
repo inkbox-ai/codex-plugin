@@ -256,6 +256,16 @@ curl --fail-with-body --request POST 'https://your-agent-host.example/webhook' \
   }'
 ```
 
+## Email replies
+
+Automatic email replies use **reply-all** on the original message. The reply goes
+to its `Reply-To` address (or sender), with the other visible To/CC recipients
+included in CC. The agent's own mailbox and BCC recipients are excluded, and the
+original email thread is preserved. No mention is required for email replies.
+
+If an inbound event lacks the original message ID, the bridge cannot send an
+automatic reply-all; it does not fall back to a sender-only email.
+
 ## Media
 
 **Inbound.** When someone sends an MMS image, an iMessage attachment, or an email with files, the gateway downloads them to `~/.inkbox-codex/media/` (override with `INKBOX_CODEX_MEDIA_DIR`) and appends the local paths to the message, so Codex can open them with its Read tool — including viewing images. Media-only messages (no text) still wake the agent.
