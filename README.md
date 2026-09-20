@@ -182,7 +182,7 @@ Codex never silently runs anything destructive. The bridge starts `codex app-ser
 
 ## Sessions
 
-Sessions are keyed by Inkbox contact, so one person = one conversation across channels. Codex session ids are persisted in `~/.inkbox-codex/sessions.json` and resumed across bridge restarts — your conversation picks up where it left off. Replies go out on the channel you last used. If a voice call ends before Codex finishes a voice reply, that late voice reply is dropped instead of silently switching to SMS or email.
+Direct-message sessions are keyed by Inkbox contact, so one person = one conversation across channels. Group SMS messages share a session keyed by the group conversation, separate from direct messages and other groups, while retaining each sender's contact details. Codex session ids are persisted in `~/.inkbox-codex/sessions.json` and resumed across bridge restarts — your conversation picks up where it left off. Replies go out on the channel you last used. If a voice call ends before Codex finishes a voice reply, that late voice reply is dropped instead of silently switching to SMS or email.
 
 **Typing indicator.** While Codex works on a turn, the bridge keeps a typing indicator alive on your iMessage thread (refreshed every few seconds, since it expires) so you can see it's busy. SMS, email, and voice have no typing indicator, so this is iMessage-only.
 
@@ -341,7 +341,7 @@ python -m pytest
 ## Architecture notes
 
 - **Tunnel-first inbound**: with a signing key, the gateway opens an Inkbox tunnel, reconciles mail/text/iMessage plus `call.ended` subscriptions, and sets the identity's incoming-call action from the selected stack — `hosted_agent` for Voice AI or `auto_accept` plus the call WebSocket for local stacks.
-- **Contact-keyed sessions**: webhook payloads carry resolved contacts; a single resolved contact id becomes the session key, otherwise the raw address/number does. One human, one session, every channel.
+- **Session routing**: direct messages use the resolved contact id across channels, falling back to the channel conversation or raw address/number. Group SMS uses the group conversation id regardless of sender.
 - **Escalation over the active channel**: a pending permission/poll captures the contact's next inbound message as its answer, on whichever text channel they're using.
 - **Codex app-server**: each contact session owns one `codex app-server` subprocess, one Codex thread, app-server approval request handling over Inkbox, and a local stdio MCP server for the Inkbox tools.
 

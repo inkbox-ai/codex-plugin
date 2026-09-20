@@ -3687,6 +3687,8 @@ class InkboxGateway:
             or len(contacts) > 1
             or len(agent_identities) > 1
         )
+        if is_group and not conversation_id:
+            return web.json_response({"ok": True, "ignored": "missing-conversation-id"})
         contact = await self._resolve_contact_full(kind="phone", value=sender)
         payload_contact = self._matched_payload_contact(
             contacts, resolved_id=self._contact_id(contact)
@@ -3707,12 +3709,16 @@ class InkboxGateway:
                 contact=contact,
             )
         thread_key = self._thread_key("sms", conversation_id)
-        chat_id = self._chat_key(
-            data,
-            sender,
-            thread_key,
-            contact=contact,
-            allow_webhook_contact=False,
+        chat_id = (
+            thread_key
+            if is_group
+            else self._chat_key(
+                data,
+                sender,
+                thread_key,
+                contact=contact,
+                allow_webhook_contact=False,
+            )
         )
         meta = {
             "conversation_id": conversation_id or None,
