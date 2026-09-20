@@ -292,6 +292,65 @@ def test_group_sms_injects_silent_policy(monkeypatch):
     assert meta["conversation_kind"] == "group"
 
 
+@pytest.mark.parametrize("known_contacts", [False, True])
+def test_group_sms_shares_conversation_session_and_keeps_direct_chats_separate(
+    monkeypatch, known_contacts
+):
+    gw = _gw(monkeypatch, [])
+    senders = ["+15550000001", "+15550000002"]
+    contacts = {phone: {"id": f"contact-{index}"} for index, phone in enumerate(senders)}
+
+    async def resolve_contact(*, kind, value):
+        return contacts[value] if known_contacts else None
+
+    monkeypatch.setattr(gw, "_resolve_contact_full", resolve_contact)
+
+    async def receive():
+        for index, (sender, conversation, is_group) in enumerate([
+            (senders[0], "group-a", True),
+            (senders[1], "group-a", True),
+            (senders[0], "group-b", True),
+            (senders[0], "direct-a", False),
+        ]):
+            await gw._on_text_received({"data": {"text_message": {
+                "id": f"text-{index}",
+                "direction": "inbound",
+                "sender_phone_number": sender,
+                "conversation_id": conversation,
+                "is_group": is_group,
+                "text": f"Message {index}",
+            }}})
+
+    asyncio.run(receive())
+
+    direct_key = "contact-0" if known_contacts else "sms:direct-a"
+    assert set(gw.sessions.by_id) == {"sms:group-a", "sms:group-b", direct_key}
+    turns = gw.sessions.by_id["sms:group-a"].inbound
+    assert len(turns) == 2
+    assert [meta["sender"] for _, _, meta in turns] == senders
+    for index, (_, mode, meta) in enumerate(turns):
+        assert mode == "sms"
+        assert meta["conversation_id"] == "group-a"
+        assert meta["conversation_kind"] == "group"
+        assert meta["contact"] == (contacts[senders[index]] if known_contacts else None)
+    assert len(gw.sessions.by_id["sms:group-b"].inbound) == 1
+    assert len(gw.sessions.by_id[direct_key].inbound) == 1
+
+
+def test_group_sms_without_conversation_id_does_not_enter_personal_session(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    response = asyncio.run(gw._on_text_received({"data": {"text_message": {
+        "id": "group-no-id",
+        "direction": "inbound",
+        "sender_phone_number": "+15550000001",
+        "is_group": True,
+        "text": "Hello",
+    }}}))
+
+    assert json.loads(response.text)["ignored"] == "missing-conversation-id"
+    assert not gw.sessions.by_id
+
+
 def test_imessage_reaction_injects_silent_policy(monkeypatch):
     gw = _gw(monkeypatch, [])
     envelope = {"data": {
@@ -339,6 +398,29 @@ def test_imessage_reaction_without_contact_uses_conversation_session_key(monkeyp
     assert mode == "imessage"
     assert "reaction=like" in body
     assert meta["conversation_id"] == "imconv-456"
+
+
+def test_group_reaction_keeps_group_session_and_has_no_waking_text(monkeypatch):
+    gw = _gw(monkeypatch, [])
+
+    async def summary(_conversation_id):
+        return {"is_group": True}
+
+    async def contact(**_kwargs):
+        return {"id": "contact-reactor"}
+
+    monkeypatch.setattr(gw, "_lookup_imessage_conversation_summary", summary)
+    monkeypatch.setattr(gw, "_resolve_contact_full", contact)
+    asyncio.run(gw._on_imessage_reaction_received({"data": {"reaction": {
+        "id": "reaction-group", "direction": "inbound",
+        "remote_number": "+15550000001", "conversation_id": "group-one",
+        "target_message_id": "message-one", "reaction": "question",
+    }}}))
+    assert set(gw.sessions.by_id) == {"imessage:group-one"}
+    _, _, meta = gw.sessions.by_id["imessage:group-one"].inbound[0]
+    assert meta["conversation_kind"] == "group"
+    assert meta["raw_text"] == ""
+    assert meta["conversation_id"] == "group-one"
 
 
 def test_outbound_imessage_reaction_echo_is_ignored(monkeypatch):

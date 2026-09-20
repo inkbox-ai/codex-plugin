@@ -245,11 +245,15 @@ def _try_send(send_fn) -> bool:
 
 
 @pytest.fixture(autouse=True)
-def _reset_conversation_health(request, _reset_channel):
+def _reset_conversation_health(request):
     """Reset the opener's conversation window only when it's running low.
 
     See the module docstring for the who-opens / which-window logic.
     """
+    if request.node.get_closest_marker("no_sms_reset"):
+        yield
+        return
+    _reset_channel = request.getfixturevalue("_reset_channel")
     if _reset_channel is None:
         yield
         return

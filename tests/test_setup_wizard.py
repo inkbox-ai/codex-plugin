@@ -69,6 +69,44 @@ def test_save_skips_empty_value(tmp_path, monkeypatch):
     assert not env_file.exists()
 
 
+@pytest.mark.parametrize("saved,choice,default,expected", [
+    ("", 0, 0, "auto"), ("", 1, 0, "mention"),
+    ("mention", 1, 1, "mention"), ("mention", 0, 1, "auto"),
+])
+def test_group_reply_choice_persists_and_preserves_default(
+    tmp_path, monkeypatch, saved, choice, default, expected
+):
+    path = tmp_path / ".env"
+    path.write_text(f"INKBOX_GROUP_REPLY_MODE={saved}\n")
+    monkeypatch.setenv("INKBOX_CODEX_ENV_FILE", str(path))
+    monkeypatch.delenv("INKBOX_GROUP_REPLY_MODE", raising=False)
+
+    def choose(question, options, selected):
+        assert "group chats" in question
+        assert len(options) == 2
+        assert selected == default
+        return choice
+
+    monkeypatch.setattr(setup_wizard, "prompt_choice", choose)
+    setup_wizard._configure_group_reply_mode()
+    assert f"INKBOX_GROUP_REPLY_MODE={expected}" in path.read_text()
+    assert setup_wizard._env("INKBOX_GROUP_REPLY_MODE") == expected
+
+
+def test_existing_setup_can_change_group_reply_mode_without_reconfiguring(monkeypatch):
+    monkeypatch.setattr(setup_wizard, "_ensure_inkbox_sdk", lambda: dict.fromkeys([
+        "Inkbox", "InkboxAPIError", "IdentityPhoneNumberCreateOptions", "WhoamiApiKeyResponse",
+        "ADMIN_SCOPED", "AGENT_CLAIMED", "AGENT_UNCLAIMED",
+    ]))
+    monkeypatch.setattr(setup_wizard, "_env", lambda name: "configured")
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **kw: False)
+    calls = []
+    monkeypatch.setattr(setup_wizard, "_configure_group_reply_mode", lambda: calls.append("group"))
+    monkeypatch.setattr(setup_wizard, "_configure_inkbox_tool_approvals", lambda: calls.append("approvals"))
+    setup_wizard.interactive_setup()
+    assert calls == ["group", "approvals"]
+
+
 def test_env_reads_quoted_value_from_file(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     env_file.write_text('INKBOX_API_KEY="ApiKey_abc"\n')
@@ -1043,6 +1081,9 @@ def test_wizard_walks_imessage_before_dedicated_number(monkeypatch):
         setup_wizard, "_configure_project_dir", lambda: calls.append("project_dir")
     )
     monkeypatch.setattr(
+        setup_wizard, "_configure_group_reply_mode", lambda: calls.append("group_replies")
+    )
+    monkeypatch.setattr(
         setup_wizard,
         "_configure_inkbox_tool_approvals",
         lambda: calls.append("approvals"),
@@ -1060,6 +1101,7 @@ def test_wizard_walks_imessage_before_dedicated_number(monkeypatch):
         ("voice_stack", True),  # iMessage result threaded into the voice-stack gate
         "signing_key",
         "project_dir",
+        "group_replies",
         "approvals",
         "autostart",
     ]

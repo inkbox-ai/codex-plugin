@@ -118,6 +118,7 @@ class BridgeConfig:
     # registered third-party providers bypass it once their secret is set.
     external_events_enabled: bool = False
     contact_memories_enabled: bool = True
+    group_reply_mode: str = "auto"
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     # Codex side
@@ -208,6 +209,9 @@ def _read_realtime_config(voice_stack: VoiceStack) -> RealtimeConfig:
 
 def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
     extra = extra or {}
+    group_reply_mode = (os.getenv("INKBOX_GROUP_REPLY_MODE") or "auto").strip().lower()
+    if group_reply_mode not in {"auto", "mention"}:
+        raise ValueError("INKBOX_GROUP_REPLY_MODE must be auto or mention")
     realtime_api_key = str(
         os.getenv("INKBOX_REALTIME_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
     ).strip()
@@ -231,6 +235,7 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         skip_webhook_reconcile=env_flag("INKBOX_SKIP_WEBHOOK_RECONCILE", False),
         external_events_enabled=env_flag("INKBOX_EXTERNAL_EVENTS_ENABLED", False),
         contact_memories_enabled=env_flag("INKBOX_CONTACT_MEMORIES_ENABLED", True),
+        group_reply_mode=group_reply_mode,
         host=str(os.getenv("INKBOX_BRIDGE_HOST") or DEFAULT_HOST).strip(),
         port=int(os.getenv("INKBOX_BRIDGE_PORT") or DEFAULT_PORT),
         project_dir=str(

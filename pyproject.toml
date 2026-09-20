@@ -1,6 +1,6 @@
 [project]
 name = "codex-plugin"
-version = "0.2.12"
+version = "0.2.13"
 description = "Inkbox bridge for Codex — talk to your coding agent over email, SMS, iMessage, and voice"
 requires-python = ">=3.11"
 dependencies = [
@@ -23,3 +23,6 @@ inkbox_codex = ["assets/*.png"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+  "no_sms_reset: email-only test that must not send SMS reset traffic",
+]

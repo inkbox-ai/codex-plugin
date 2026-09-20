@@ -28,8 +28,8 @@ _NONCE = re.compile(r"smoke-[0-9a-f]{6,}")
 
 
 def _reply_text(req: dict) -> str:
-    m = _NONCE.search(json.dumps(req))
-    tag = m.group(0) if m else "no-nonce"
+    matches = _NONCE.findall(json.dumps(req))
+    tag = matches[-1] if matches else "no-nonce"
     return f"REPLY_OK {tag} — automated reachability reply from the agent."
 
 

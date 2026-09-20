@@ -3403,6 +3403,7 @@ class InkboxGateway:
             "to": sender,
             "sender": sender,
             "subject": subject,
+            "message_id": message.get("id"),
             "thread_id": message.get("thread_id"),
             "contact": contact,
             "agent_identity": agent_identity,
@@ -3687,6 +3688,8 @@ class InkboxGateway:
             or len(contacts) > 1
             or len(agent_identities) > 1
         )
+        if is_group and not conversation_id:
+            return web.json_response({"ok": True, "ignored": "missing-conversation-id"})
         contact = await self._resolve_contact_full(kind="phone", value=sender)
         payload_contact = self._matched_payload_contact(
             contacts, resolved_id=self._contact_id(contact)
@@ -3707,18 +3710,23 @@ class InkboxGateway:
                 contact=contact,
             )
         thread_key = self._thread_key("sms", conversation_id)
-        chat_id = self._chat_key(
-            data,
-            sender,
-            thread_key,
-            contact=contact,
-            allow_webhook_contact=False,
+        chat_id = (
+            thread_key
+            if is_group
+            else self._chat_key(
+                data,
+                sender,
+                thread_key,
+                contact=contact,
+                allow_webhook_contact=False,
+            )
         )
         meta = {
             "conversation_id": conversation_id or None,
             "to": sender,
             "sender": sender,
             "conversation_kind": "group" if is_group else "direct",
+            "raw_text": text,
             "contact": contact,
             "agent_identity": agent_identity,
             "contact_memories": contact_memories,
@@ -3817,6 +3825,7 @@ class InkboxGateway:
             "agent_identity": agent_identity,
             "contact_memories": contact_memories,
             "conversation_kind": "group" if is_group else "direct",
+            "raw_text": text,
         }
         # A fresh inbound starts a fresh logical reply — reset its failed-send budget.
         self._clear_outbound_failures("imessage", conversation_id, sender, chat_id=chat_id)
@@ -3842,6 +3851,13 @@ class InkboxGateway:
                     response = web.json_response({"ok": True, "ignored": "sender-not-allowed"})
                 else:
                     conversation_id = str(reaction.get("conversation_id") or "").strip()
+                    summary = await self._lookup_imessage_conversation_summary(conversation_id)
+                    is_group = (
+                        self._conversation_summary_is_group(summary)
+                        or bool(self._field(reaction, "isGroup", "is_group"))
+                        or len(self._string_list_field(summary, "participants")) > 1
+                        or len(self._string_list_field(reaction, "participants")) > 1
+                    )
                     target_message_id = str(reaction.get("target_message_id") or "").strip()
                     reaction_type = str(reaction.get("reaction") or "").strip().lower()
                     custom_emoji = str(reaction.get("custom_emoji") or "").strip()
@@ -3875,12 +3891,16 @@ class InkboxGateway:
                         contact=contact,
                         agent_identity=agent_identity,
                     )
-                    chat_id = self._chat_key(
-                        data,
-                        sender,
-                        self._thread_key("imessage", conversation_id),
-                        contact=contact,
-                        allow_webhook_contact=False,
+                    chat_id = (
+                        self._thread_key("imessage", conversation_id)
+                        if is_group and conversation_id
+                        else self._chat_key(
+                            data,
+                            sender,
+                            self._thread_key("imessage", conversation_id),
+                            contact=contact,
+                            allow_webhook_contact=False,
+                        )
                     )
                     meta = {
                         "conversation_id": conversation_id or None,
@@ -3888,6 +3908,8 @@ class InkboxGateway:
                         "message_id": reaction_id or target_message_id,
                         "reply_to_id": target_message_id or reaction_id,
                         "reaction": reaction_label,
+                        "conversation_kind": "group" if is_group else "direct",
+                        "raw_text": "",
                         "typing": reaction_label == "question",
                         "contact": contact,
                         "contact_memories": contact_memories,
@@ -4699,12 +4721,12 @@ class InkboxGateway:
                 text=text,
             )
         else:  # email
+            message_id = str(meta.get("message_id") or "").strip()
+            if not message_id:
+                raise ValueError("Cannot reply-all without the original email message ID")
             identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
-            subject = str(meta.get("subject") or "").strip()
-            reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}" if subject else "From your Codex agent"
             await asyncio.to_thread(
-                identity.send_email,
-                to=[str(meta.get("to") or chat_id)],
-                subject=reply_subject,
+                identity.reply_all_email,
+                message_id,
                 body_text=content,
             )
