@@ -163,6 +163,12 @@ def test_live_reply_all_deduplicates_sender_and_excludes_self(copied_in):
             "reply_aut": (aut, aut_email, aut_email, MessageDirection.OUTBOUND),
             "reply_remote": (remote, remote_email, aut_email, MessageDirection.INBOUND),
         }
+        if copied_in == "sender_cc":
+            # A self-copy is a separate inbound original in the sender mailbox.
+            # Replies resolve against that wire Message-ID, not the sent row.
+            expected["original_remote"] = (
+                remote, remote_email, remote_email, MessageDirection.INBOUND,
+            )
         found = {}
         deadline = time.monotonic() + TIMEOUT_S
         while time.monotonic() < deadline and len(found) != len(expected):
@@ -184,5 +190,6 @@ def test_live_reply_all_deduplicates_sender_and_excludes_self(copied_in):
                 original_wire_id=sent.message_id, nonce=nonce,
             )
         assert str(found["reply_aut"].thread_id) == str(found["original_aut"].thread_id)
-        assert str(found["reply_remote"].thread_id) == str(sent.thread_id)
+        remote_parent = found.get("original_remote", sent)
+        assert str(found["reply_remote"].thread_id) == str(remote_parent.thread_id)
         assert found["reply_aut"].message_id == found["reply_remote"].message_id
