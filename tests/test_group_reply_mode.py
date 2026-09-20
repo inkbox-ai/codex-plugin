@@ -134,7 +134,7 @@ def test_background_waits_for_active_reply_without_changing_its_target():
     asyncio.run(scenario())
 
 
-def test_failed_context_append_is_retried_before_the_next_model_turn():
+def test_failed_context_append_is_retried_before_the_next_model_turn(caplog):
     async def scenario():
         sent = []
         session = make_session(sent)
@@ -153,6 +153,8 @@ def test_failed_context_append_is_retried_before_the_next_model_turn():
         await session.handle_inbound("Background", "sms", meta("Background"))
         await session._worker
         assert not sent and session._pending_context
+        assert session.chat_id not in caplog.text
+        assert "Background" not in caplog.text
         await session.handle_inbound("@agent summarize", "sms", meta("@agent summarize"))
         await session._worker
         assert [event[0] for event in client.events] == ["context", "run"]
