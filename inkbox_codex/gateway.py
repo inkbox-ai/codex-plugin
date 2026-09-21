@@ -4736,6 +4736,8 @@ class InkboxGateway:
                 kwargs["conversation_id"] = conversation_id
             else:
                 kwargs["to"] = str(meta.get("to") or chat_id)
+            if meta.get("companion"):
+                self._companion().reply_sending(meta)
             await asyncio.to_thread(identity.send_text, **kwargs)
         elif mode == "imessage":
             text = strip_markdown(content)
@@ -4747,6 +4749,8 @@ class InkboxGateway:
                 conversation_id = str(chat_id).split(":", 1)[1]
             if not conversation_id:
                 raise ValueError(f"No iMessage conversation id for chat {chat_id}")
+            if meta.get("companion"):
+                self._companion().reply_sending(meta)
             await asyncio.to_thread(
                 identity.send_imessage,
                 conversation_id=conversation_id,
@@ -4757,6 +4761,8 @@ class InkboxGateway:
             if not message_id:
                 raise ValueError("Cannot reply-all without the original email message ID")
             identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+            if meta.get("companion"):
+                self._companion().reply_sending(meta)
             await asyncio.to_thread(
                 identity.reply_all_email,
                 message_id,

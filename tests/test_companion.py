@@ -7,6 +7,7 @@ from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+import httpx
 
 from inkbox_codex.companion import CompanionError, Event, Inbox, Receiver
 from inkbox_codex.config import BridgeConfig
@@ -299,7 +300,11 @@ def test_fail_closed_without_partial_or_duplicate_turn(failure):
         if failure == 'scope': sdk.c['scope_id'] = sdk.c['conversation_id']
         if failure == 'oversize': sdk.c['history'][0]['text'] = 'x' * (8 * 1024 * 1024)
         if failure == 'trigger': sdk.c['history'][-1]['is_trigger'] = False
-        if failure == 'send': s.send_fn = AsyncMock(side_effect=TimeoutError('ambiguous send'))
+        if failure == 'send':
+            async def ambiguous_send(*args):
+                r.reply_sending(args[3])
+                raise TimeoutError('ambiguous send')
+            s.send_fn = ambiguous_send
         try:
             await r.accept(e)
             await drained(r)
@@ -507,8 +512,199 @@ def test_revoked_while_model_runs_never_sends():
             await drained(r)
             identity.send_text.assert_not_called()
             assert len(s._client.events) == 1
-            assert r.inbox.db.execute('SELECT state FROM events').fetchone()[0] == 'uncertain'
+            assert r.inbox.db.execute('SELECT state FROM events').fetchone()[0] == 'reply_pending'
+            assert not r.retries
         finally: await r.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('channel', ['phone', 'imessage', 'mail'])
+@pytest.mark.parametrize('preflight', ['authorization', 'identity'])
+def test_completed_reply_retries_preflight_without_replaying_model(channel, preflight):
+    async def scenario():
+        e = fixture(channel)
+        r, sdk, s, _ = harness(e)
+        gw = InkboxGateway(s.cfg)
+        identity = Mock()
+        gw._inkbox = NS(get_identity=Mock(return_value=identity))
+        gw._companion_receiver, gw.sessions = r, r.sessions
+        s.send_fn = gw.send_to_contact
+        original = s._client.run
+        async def timeout_after_model(text):
+            result = await original(text)
+            if preflight == 'authorization':
+                authorize = sdk.activation_messages
+                sdk.activation_messages = Mock(side_effect=[httpx.ReadTimeout('read failed'), authorize('', '')])
+            else:
+                gw._inkbox.get_identity.side_effect = [httpx.ReadTimeout('read failed'), identity]
+            return result
+        s._client.run = timeout_after_model
+        try:
+            await r.accept(e)
+            await drained(r)
+            assert r.inbox.db.execute('SELECT state FROM events').fetchone()[0] == 'reply_pending'
+            assert r.inbox.activation(Event.parse(e))[2] == 'initialized'
+            assert r.inbox.source_submitted(Event.parse(e))
+            assert r.inbox.db.execute('SELECT content FROM replies').fetchone()[0] == 'Answer'
+            assert not identity.mock_calls
+            assert r.retries
+            # Exercise the scheduled retry itself, with no redelivery or operator reset.
+            async def finished():
+                while r.inbox.db.execute('SELECT state FROM events').fetchone()[0] != 'done':
+                    await asyncio.sleep(.01)
+            await asyncio.wait_for(finished(), 4)
+            method = {'phone': 'send_text', 'imessage': 'send_imessage', 'mail': 'reply_all_email'}[channel]
+            getattr(identity, method).assert_called_once()
+            assert len(s._client.events) == 1
+            assert not r.inbox.db.execute('SELECT 1 FROM replies').fetchone()
+        finally:
+            await r.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('live_first', [False, True])
+def test_saved_reply_survives_restart_and_releases_later_inputs(live_first):
+    async def scenario():
+        e = fixture()
+        r, sdk, s, _ = harness(e)
+        gw = InkboxGateway(s.cfg)
+        gw._inkbox = NS(get_identity=Mock(side_effect=httpx.ReadTimeout('read failed')))
+        gw._companion_receiver, gw.sessions = r, r.sessions
+        s.send_fn = gw.send_to_contact
+        first = live(e) if live_first else e
+        await r.accept(first)
+        await drained(r)
+        await r.accept(live(e, 3))
+        await drained(r)
+        assert len(s._client.events) == 1
+        await r.close()
+        r, sdk, s, sent = harness(e)
+        try:
+            r.recover()
+            await drained(r)
+            assert len(sent) == (3 if live_first else 2)
+            assert len(s._client.events) == (2 if live_first else 1)
+            assert sdk.loads == 0
+            assert all(row[0] == 'done' for row in r.inbox.db.execute('SELECT state FROM events'))
+        finally:
+            await r.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('channel', ['phone', 'imessage', 'mail'])
+def test_actual_send_timeout_remains_uncertain_across_restart(channel):
+    async def scenario():
+        e = fixture(channel)
+        r, sdk, s, _ = harness(e)
+        gw = InkboxGateway(s.cfg)
+        identity = Mock()
+        method = {'phone': 'send_text', 'imessage': 'send_imessage', 'mail': 'reply_all_email'}[channel]
+        getattr(identity, method).side_effect = httpx.ReadTimeout('send outcome unknown')
+        gw._inkbox = NS(get_identity=Mock(return_value=identity))
+        gw._companion_receiver, gw.sessions = r, r.sessions
+        s.send_fn = gw.send_to_contact
+        await r.accept(e)
+        await drained(r)
+        assert r.inbox.db.execute('SELECT state FROM events').fetchone()[0] == 'uncertain'
+        assert not r.retries
+        getattr(identity, method).assert_called_once()
+        await r.close()
+        r, sdk, s, sent = harness(e)
+        try:
+            await r.accept(e)
+            await r.accept(live(e))
+            await drained(r)
+            assert not sent
+            assert not s._client.events
+        finally:
+            await r.close()
+    asyncio.run(scenario())
+
+
+def test_saved_reply_revalidates_audience_and_local_sponsor():
+    async def scenario():
+        e = fixture()
+        r, sdk, s, _ = harness(e)
+        gw = InkboxGateway(s.cfg)
+        identity = Mock()
+        gw._inkbox = NS(get_identity=Mock(side_effect=httpx.ReadTimeout('read failed')))
+        gw._companion_receiver, gw.sessions = r, r.sessions
+        s.send_fn = gw.send_to_contact
+        try:
+            await r.accept(e)
+            await drained(r)
+            gw._inkbox.get_identity.side_effect = None
+            gw._inkbox.get_identity.return_value = identity
+            r.sender_allowed = lambda _: False
+            await r.accept(e)
+            await drained(r)
+            assert not identity.mock_calls
+            r.sender_allowed = lambda _: True
+            sdk.c['reply_context']['conversation_id'] = sdk.c['scope_id']
+            await r.accept(e)
+            await drained(r)
+            assert not identity.mock_calls
+            assert len(s._client.events) == 1
+        finally:
+            await r.close()
+    asyncio.run(scenario())
+
+
+def test_saved_reply_keeps_retrying_long_read_outage_with_capped_backoff():
+    async def scenario():
+        e = fixture()
+        r, sdk, s, _ = harness(e)
+        gw = InkboxGateway(s.cfg)
+        identity = Mock()
+        gw._inkbox = NS(get_identity=Mock(side_effect=httpx.ReadTimeout('read failed')))
+        gw._companion_receiver, gw.sessions = r, r.sessions
+        s.send_fn = gw.send_to_contact
+        try:
+            await r.accept(e)
+            await drained(r)
+            for _ in range(6):
+                r.recover()
+                await drained(r)
+            timer = r.retries[Event.parse(e).scope]
+            assert 55 < timer.when() - asyncio.get_running_loop().time() <= 60
+            assert r.inbox.db.execute('SELECT state FROM events').fetchone()[0] == 'reply_pending'
+            assert len(s._client.events) == 1
+            gw._inkbox.get_identity.side_effect = None
+            gw._inkbox.get_identity.return_value = identity
+            r.recover()
+            await drained(r)
+            identity.send_text.assert_called_once()
+            assert not r.retries
+        finally:
+            await r.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('boundary', ['preflight', 'sending'])
+def test_restart_during_reply_distinguishes_read_from_send(boundary):
+    async def scenario():
+        e = fixture()
+        r, sdk, s, _ = harness(e)
+        entered = asyncio.Event()
+        async def blocked(*args):
+            if boundary == 'sending':
+                r.reply_sending(args[3])
+            entered.set()
+            await asyncio.Event().wait()
+        s.send_fn = blocked
+        await r.accept(e)
+        await asyncio.wait_for(entered.wait(), 2)
+        await r.close()
+        r, sdk, s, sent = harness(e)
+        try:
+            r.recover()
+            await drained(r)
+            assert len(sent) == int(boundary == 'preflight')
+            assert not s._client.events
+            assert r.inbox.db.execute('SELECT state FROM events').fetchone()[0] == (
+                'done' if boundary == 'preflight' else 'uncertain')
+        finally:
+            await r.close()
     asyncio.run(scenario())
 
 

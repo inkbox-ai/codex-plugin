@@ -13,6 +13,7 @@ import sqlite3
 from typing import Any, Callable
 from uuid import UUID
 
+import httpx
 
 logger = logging.getLogger(__name__)
 MAX_BYTES = 8 * 1024 * 1024
@@ -144,10 +145,14 @@ class Inbox:
                 scope TEXT NOT NULL, activation TEXT NOT NULL, source_id TEXT NOT NULL,
                 PRIMARY KEY(scope, activation, source_id)
             );
+            CREATE TABLE IF NOT EXISTS replies (
+                event_id TEXT PRIMARY KEY, content TEXT NOT NULL,
+                meta TEXT NOT NULL, next_state TEXT NOT NULL
+            );
         """)
         # A lost host acknowledgement cannot safely be inferred from a receipt.
         with self.db:
-            self.db.execute("UPDATE events SET state='uncertain' WHERE state='submitting'")
+            self.db.execute("UPDATE events SET state='uncertain' WHERE state IN ('submitting','sending')")
             self.db.execute("UPDATE activations SET state='uncertain' WHERE state='submitting'")
 
     def accept(self, event: Event) -> bool:
@@ -166,7 +171,7 @@ class Inbox:
                     raise CompanionError("Conflicting Companion event ID or sequence")
                 return False
             if self.db.execute(
-                "SELECT 1 FROM events WHERE scope=? AND sequence>? AND state IN ('submitting','uncertain','done') LIMIT 1",
+                "SELECT 1 FROM events WHERE scope=? AND sequence>? AND state!='pending' LIMIT 1",
                 (event.scope, event.sequence),
             ).fetchone():
                 raise CompanionError("A later Companion sequence was already submitted; reconcile this late event")
@@ -180,7 +185,7 @@ class Inbox:
     def next(self, scope: str) -> Event | None:
         row = self.db.execute("SELECT payload,state,sequence FROM events WHERE scope=? AND state!='done' ORDER BY sequence LIMIT 1",
                               (scope,)).fetchone()
-        if not row or row[1] != "pending":
+        if not row or row[1] not in {"pending", "reply_pending"}:
             return None
         # The signed delivery stream is ordered, not contiguous: a cancelled
         # delivery or a subscription change can leave a permanent numeric gap.
@@ -274,6 +279,9 @@ class Receiver:
         self.inbox.close()
 
     async def _drain(self, scope):
+        timer = self.retries.pop(scope, None)
+        if timer:
+            timer.cancel()
         while not self.closing:
             event = self.inbox.next(scope)
             if event is None:
@@ -288,21 +296,62 @@ class Receiver:
                 # Keep the receipt. Never retry a possibly accepted model turn
                 # or send automatically; other conversation workers can continue.
                 row = self.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (event.event_id,)).fetchone()
-                if row[0] == "submitting":
+                retrying_reply = False
+                if row[0] in {"submitting", "sending"}:
                     self.inbox.state(event.event_id, "uncertain")
-                elif row[0] == "pending":
+                elif row[0] == "pending" or (row[0] == "reply_pending" and self.retryable_read(exc)):
                     attempt = self.attempts.get(scope, 0) + 1
                     self.attempts[scope] = attempt
-                    if attempt <= 5 and not self.closing:
+                    if (row[0] == "reply_pending" or attempt <= 5) and not self.closing:
                         old = self.retries.pop(scope, None)
                         if old:
                             old.cancel()
                         self.retries[scope] = asyncio.get_running_loop().call_later(
-                            min(60, 2 ** attempt), self.schedule, scope,
+                            min(60, 2 ** min(attempt, 6)), self.schedule, scope,
                         )
-                logger.error("Companion input paused (%s); receipt %s retained for recovery",
-                             type(exc).__name__, event.event_id)
+                        retrying_reply = row[0] == "reply_pending"
+                if retrying_reply:
+                    logger.warning("Companion reply preflight failed (%s); saved answer will retry for receipt %s",
+                                   type(exc).__name__, event.event_id)
+                else:
+                    logger.error("Companion input paused (%s); receipt %s retained for recovery",
+                                 type(exc).__name__, event.event_id)
                 return
+
+    @staticmethod
+    def retryable_read(exc):
+        status = getattr(exc, "status_code", None)
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+        return (isinstance(exc, (httpx.TransportError, TimeoutError, ConnectionError))
+                or status == 429 or (isinstance(status, int) and 500 <= status < 600))
+
+    def reply_sending(self, meta):
+        """Checkpoint immediately before the channel's first send side effect."""
+        event_id = meta.get("companion_reply_event_id")
+        if event_id is None:
+            return  # An in-turn escalation is not a completed answer.
+        with self.inbox.db:
+            changed = self.inbox.db.execute(
+                "UPDATE events SET state='sending' WHERE event_id=? AND state='reply_pending'",
+                (event_id,),
+            ).rowcount
+            if changed != 1:
+                raise CompanionError("Companion reply is not awaiting delivery")
+
+    async def deliver_reply(self, event):
+        row = self.inbox.db.execute(
+            "SELECT content,meta,next_state FROM replies WHERE event_id=?", (event.event_id,),
+        ).fetchone()
+        if row is None:
+            return
+        session = self.sessions.get(event.session_key(self.namespace))
+        meta = json.loads(row[1])
+        meta["companion_reply_event_id"] = event.event_id
+        await session.send_fn(session.chat_id, row[0], event.mode, meta)
+        with self.inbox.db:
+            self.inbox.db.execute("DELETE FROM replies WHERE event_id=?", (event.event_id,))
+            self.inbox.db.execute("UPDATE events SET state=? WHERE event_id=?", (row[2], event.event_id))
 
     async def load(self, event):
         result = await asyncio.to_thread(self.resource().load_initialization,
@@ -407,7 +456,7 @@ class Receiver:
                 if trigger:
                     self.inbox.db.execute("INSERT INTO activations VALUES(?,?,?,?,?) ON CONFLICT(scope,activation) DO UPDATE SET state=excluded.state",
                                           (event.scope, event.activation, trigger["id"], trigger["author"], "submitting"))
-        await session.submit_companion(text, event.mode, meta, before_submit=before_submit)
+        reply = await session.submit_companion(text, event.mode, meta, before_submit=before_submit)
         # Initialization and its receipt transition atomically. Live-first needs
         # another input, but a completed live turn must never become pending.
         with self.inbox.db:
@@ -420,9 +469,16 @@ class Receiver:
                     (event.scope, event.activation),
                 )
             state = "pending" if trigger and event.phase == "live" and trigger["id"] != event.source_id else "done"
+            if reply and reply.strip() != "[SILENT]":
+                self.inbox.db.execute("INSERT INTO replies VALUES(?,?,?,?)",
+                                      (event.event_id, reply, json.dumps(meta), state))
+                state = "reply_pending"
             self.inbox.db.execute("UPDATE events SET state=? WHERE event_id=?", (state, event.event_id))
+        await self.deliver_reply(event)
 
     async def process(self, event):
+        # Retry only the saved answer, never the already acknowledged input.
+        await self.deliver_reply(event)
         if self.inbox.source_submitted(event):
             return
         if event.phase == "ordinary":

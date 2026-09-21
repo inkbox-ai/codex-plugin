@@ -89,7 +89,7 @@ class _Turn:
     context_only: bool = False
     reply_mode: Optional[str] = None
     reply_meta: Optional[Dict[str, Any]] = None
-    completion: Optional["asyncio.Future[None]"] = None
+    completion: Optional["asyncio.Future[Optional[str]]"] = None
     before_submit: Optional[Callable[[], Awaitable[None]]] = None
 
 # Leading slash-commands the human can text to steer the conversation itself.
@@ -417,7 +417,7 @@ class ContactSession:
         self.pending.future.set_result(text)
         return True
 
-    async def submit_companion(self, text: str, mode: str, meta: Dict[str, Any], *, before_submit) -> None:
+    async def submit_companion(self, text: str, mode: str, meta: Dict[str, Any], *, before_submit) -> Optional[str]:
         """One acknowledged input; historical text never enters command parsers.
 
         Mention detection examines only the current trigger, not the combined
@@ -442,7 +442,7 @@ class ContactSession:
         ))
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())
-        await completion
+        return await completion
 
     async def handle_inbound(self, text: str, mode: str, meta: Dict[str, Any]) -> None:
         """Route one inbound message: answer a pending escalation, or queue a turn.
@@ -890,6 +890,12 @@ class ContactSession:
                     )
             return
         if self._interrupting:
+            return
+        if turn.completion is not None:
+            # The receiver checkpoints the finished answer before attempting
+            # delivery, so a read-only preflight failure cannot replay the model.
+            if not turn.completion.done():
+                turn.completion.set_result(reply)
             return
         if reply:
             await self._deliver_reply(turn, reply)

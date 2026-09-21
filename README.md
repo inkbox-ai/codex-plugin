@@ -231,7 +231,11 @@ permissions and one receiver owner per environment/identity. Pending pre-submiss
 failures retry up to five times with backoff, and resume after restart or webhook
 redelivery. A retry may refresh its delivery timestamp or inline history preview
 without creating another input. Stable event IDs and acknowledged snapshot/live source-message IDs
-are deduplicated across restarts within their scope and activation. An interrupted host
+are deduplicated across restarts within their scope and activation. Completed answers
+are saved before delivery.
+Transient read failures during reply authorization or identity lookup retry with capped
+backoff, including after restart, without rerunning the model. Every attempt revalidates
+the current sponsor and audience. An interrupted host
 submission or uncertain reply send pauses that scope rather than risking another
 model turn or duplicate send. The log identifies the retained receipt. Inspect the
 scoped Codex thread and channel delivery before operator recovery; **do not delete
