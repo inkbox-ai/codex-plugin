@@ -1,0 +1,76 @@
+{
+  "id": "evt_30000000000040008000000000000001",
+  "event_type": "message.received",
+  "timestamp": "2026-09-20T12:02:00+00:00",
+  "data": {
+    "message": {
+      "id": "30000000-0000-4000-8000-000000000103",
+      "mailbox_id": "30000000-0000-4000-8000-000000000004",
+      "email_address": "agent@example.com",
+      "thread_id": "30000000-0000-4000-8000-000000000003",
+      "message_id": "<planning-trigger@example.com>",
+      "from_address": "sponsor@example.com",
+      "to_addresses": [
+        "agent@example.com",
+        "fred@example.com",
+        "nancy@example.com"
+      ],
+      "cc_addresses": [],
+      "subject": "Re: Planning tomorrow",
+      "direction": "inbound",
+      "body": "Agent, please help us pick a time."
+    },
+    "contacts": [],
+    "agent_identities": []
+  },
+  "companion": {
+    "scope_id": "30000000-0000-4000-8000-000000000001",
+    "activation_id": "30000000-0000-4000-8000-000000000002",
+    "conversation_id": "30000000-0000-4000-8000-000000000003",
+    "channel": "mail",
+    "phase": "initialization",
+    "sequence": 1,
+    "history": [
+      {
+        "id": "30000000-0000-4000-8000-000000000101",
+        "author": "fred@example.com",
+        "occurred_at": "2026-09-20T12:00:00+00:00",
+        "text": "Can we meet tomorrow afternoon?",
+        "historical": true,
+        "is_trigger": false,
+        "attachments": []
+      },
+      {
+        "id": "30000000-0000-4000-8000-000000000102",
+        "author": "nancy@example.com",
+        "occurred_at": "2026-09-20T12:01:00+00:00",
+        "text": "I am free after 2 PM.",
+        "historical": true,
+        "is_trigger": false,
+        "attachments": []
+      },
+      {
+        "id": "30000000-0000-4000-8000-000000000103",
+        "author": "sponsor@example.com",
+        "occurred_at": "2026-09-20T12:02:00+00:00",
+        "text": "Agent, please help us pick a time.",
+        "historical": false,
+        "is_trigger": true,
+        "attachments": []
+      }
+    ],
+    "history_complete": true,
+    "history_next_cursor": null,
+    "reply_context": {
+      "channel": "mail",
+      "conversation_id": "30000000-0000-4000-8000-000000000003",
+      "reply_to_message_id": "30000000-0000-4000-8000-000000000103",
+      "to": [
+        "fred@example.com",
+        "nancy@example.com",
+        "sponsor@example.com"
+      ],
+      "cc": []
+    }
+  }
+}

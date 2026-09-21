@@ -61,7 +61,7 @@ jobs:
       - name: Install bridge + test deps
         run: |
           pip install \
-            "inkbox==0.5.9" \
+            "inkbox==0.7.3" \
             -e . pytest
 
       # @alpha is the prerelease channel cut from codex main near-daily — the

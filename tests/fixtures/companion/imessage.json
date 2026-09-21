@@ -1,0 +1,62 @@
+{
+  "id": "evt_20000000000040008000000000000001",
+  "event_type": "imessage.received",
+  "timestamp": "2026-09-20T12:02:00+00:00",
+  "data": {
+    "message": {
+      "id": "20000000-0000-4000-8000-000000000103",
+      "conversation_id": "20000000-0000-4000-8000-000000000003",
+      "direction": "inbound",
+      "remote_number": "+12025550103",
+      "sender_number": "+12025550103",
+      "is_group": true,
+      "content": "Agent, please help us pick a time.",
+      "service": "imessage"
+    },
+    "contacts": [],
+    "agent_identities": []
+  },
+  "companion": {
+    "scope_id": "20000000-0000-4000-8000-000000000001",
+    "activation_id": "20000000-0000-4000-8000-000000000002",
+    "conversation_id": "20000000-0000-4000-8000-000000000003",
+    "channel": "imessage",
+    "phase": "initialization",
+    "sequence": 1,
+    "history": [
+      {
+        "id": "20000000-0000-4000-8000-000000000101",
+        "author": "+12025550101",
+        "occurred_at": "2026-09-20T12:00:00+00:00",
+        "text": "Can we meet tomorrow afternoon?",
+        "historical": true,
+        "is_trigger": false,
+        "attachments": []
+      },
+      {
+        "id": "20000000-0000-4000-8000-000000000102",
+        "author": "+12025550102",
+        "occurred_at": "2026-09-20T12:01:00+00:00",
+        "text": "I am free after 2 PM.",
+        "historical": true,
+        "is_trigger": false,
+        "attachments": []
+      },
+      {
+        "id": "20000000-0000-4000-8000-000000000103",
+        "author": "+12025550103",
+        "occurred_at": "2026-09-20T12:02:00+00:00",
+        "text": "Agent, please help us pick a time.",
+        "historical": false,
+        "is_trigger": true,
+        "attachments": []
+      }
+    ],
+    "history_complete": true,
+    "history_next_cursor": null,
+    "reply_context": {
+      "channel": "imessage",
+      "conversation_id": "20000000-0000-4000-8000-000000000003"
+    }
+  }
+}

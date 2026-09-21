@@ -1894,7 +1894,7 @@ def _configure_group_reply_mode() -> None:
     """Choose when group messages start a reply and retain the saved default."""
     print()
     print(color("  --- Group chat replies ---", Colors.CYAN))
-    print_info("  Applies to group SMS and iMessage. Direct messages are unchanged.")
+    print_info("  Applies to group SMS/iMessage and Companion email. Ordinary direct messages are unchanged.")
     print_info("  In mention mode, other messages are kept as context without starting a reply.")
     current = _env("INKBOX_GROUP_REPLY_MODE").strip().lower()
     choice = prompt_choice(

@@ -186,6 +186,66 @@ Direct-message sessions are keyed by Inkbox contact, so one person = one convers
 
 **Group replies.** The setup wizard offers **Automatic** (default) or **Mention required** for group SMS and iMessage, saved as `INKBOX_GROUP_REPLY_MODE=auto|mention`. Automatic keeps the existing behavior: the agent decides whether to answer. Mention mode starts a reply only when the new message itself includes `@agent` or `@<agent-handle>` as a whole mention, case-insensitively; older messages, links, and email addresses do not count. Other messages and group reactions are added to Codex's context without generating a reply or a typing indicator. While a turn is running, background messages wait until it finishes before being appended. Appended context persists with the Codex thread; messages still waiting in the bridge's queue are not persisted across a restart. Direct messages are unchanged. Commands such as `/stop`, and answers to the agent's pending questions from the sender it asked, do not require a mention.
 
+### Companion conversations (preview)
+
+Verified SMS/MMS, iMessage and email webhooks may include a **top-level**
+`companion` object. Webhooks without it (or with `null`) retain normal routing.
+The bridge loads the full authorized initialization snapshot using the Inkbox
+SDK, including every page, and submits **one combined input**. The sponsor trigger
+is included once; historical messages, attachment descriptors, and history notices remain
+conversation data, never individual turns or slash commands.
+
+`INKBOX_GROUP_REPLY_MODE=auto|mention` also applies to Companion email. In `auto`,
+the agent decides whether to answer the trigger. In `mention`, only the trigger's
+own text can wake it (`@agent` or `@<agent-handle>`); otherwise the **entire batch**
+is appended to the Codex thread without model generation. Historical mentions do
+not count. The setup wizard configures the same setting.
+
+- Sessions are isolated by API environment, identity, channel, server scope, and
+  activation, separate from ordinary contact sessions. A new activation starts
+  a fresh session with its authorized snapshot. Each new released snapshot must have a
+  distinct activation ID; replaying an immutable activation is not a new batch.
+- Initialization completes before queued live messages run. A first-seen live
+  event loads initialization first. Pending events run in sequence order; numeric
+  gaps do not stall the conversation. Late unseen events older than an already
+  submitted input require reconciliation instead of running out of order.
+  `phase="ordinary"` uses a separate scoped session and never loads hidden history.
+- Replies use the original group conversation ID, or the SDK-approved email
+  reply context's **stored message UUID** with canonical reply-all. They never
+  fall back to privately messaging the latest author. Local sponsor restrictions
+  remain in force. Live turns and replies use the signed conversation scope and
+  saved sponsor message without additional activation lookups. Replies reuse the
+  identity loaded at startup.
+- Only a live reply by the prompted, locally allowed sender can answer an
+  approval request. Historical approval-looking text cannot. Sponsor slash
+  controls on subsequent live messages remain local commands.
+
+**SDK requirement:** The bridge requires Inkbox SDK **0.7.3 or newer**, including
+`client.companion.load_initialization` and `activation_messages`. Installation
+resolves the published SDK; CI tests the released `inkbox==0.7.3` minimum across
+unit, real-host, and live-channel lanes. No preview source checkout is needed.
+An unsupported SDK produces an explicit webhook error; the bridge never falls
+back to submitting only the trigger.
+
+**Delivery and recovery:** receipts and initialization checkpoints live under
+`$INKBOX_CODEX_HOME/companion/` (default `~/.inkbox-codex/companion/`), with private
+permissions and one receiver owner per environment/identity. Transient reads before
+submission retry with capped backoff while the gateway runs; other pre-submission
+failures retry up to five times. Pending inputs resume after restart or webhook
+redelivery. A retry may refresh its delivery timestamp or inline history preview
+without creating another input. Stable event IDs and acknowledged snapshot/live source-message IDs
+are deduplicated across restarts within their scope and activation. Completed answers
+are saved before delivery.
+Transient read failures while preparing delivery retry with capped backoff, including
+after restart, without rerunning the model. An interrupted host
+submission or uncertain reply send pauses that scope rather than risking another
+model turn or duplicate send. The log identifies the retained receipt. Inspect the
+scoped Codex thread and channel delivery before operator recovery; **do not delete
+receipts or blindly replay uncertain events**. This is at-most-once automatic
+retry behavior at ambiguous boundaries, not an exactly-once transport claim.
+Initialization above 8 MiB fails explicitly rather than truncating. The preview
+uses POSIX file locking (Linux/macOS).
+
 Run `inkbox-codex setup` to change the choice without reconfiguring your identity, or edit `.env`, then restart the bridge to apply it. For background mode, use `inkbox-codex restart`; for a systemd installation, use `systemctl --user restart inkbox-codex.service`. Mention mode requires a Codex version supporting `thread/inject_items`.
 
 **Typing indicator.** While Codex works on a turn, the bridge keeps a typing indicator alive on your iMessage thread (refreshed every few seconds, since it expires) so you can see it's busy. SMS, email, and voice have no typing indicator, so this is iMessage-only.
@@ -306,7 +366,7 @@ with both deterministic and real-model gateway runs, without SMS reset traffic.
 | `INKBOX_ALLOW_ALL_USERS` | no | `false` | Allow all senders admitted by Inkbox contact rules. |
 | `INKBOX_BRIDGE_PORT` | no | `8767` | Local webhook server port. |
 | `INKBOX_PERMISSION_TIMEOUT_S` | no | `600` | Seconds to wait for a permission/poll reply. |
-| `INKBOX_GROUP_REPLY_MODE` | no | `auto` | Group SMS/iMessage replies: `auto` lets the agent decide; `mention` requires `@agent` or `@<agent-handle>` in the new message. Other messages become context without starting a turn. Also configurable in setup. |
+| `INKBOX_GROUP_REPLY_MODE` | no | `auto` | Group SMS/iMessage and Companion email replies: `auto` lets the agent decide; `mention` requires `@agent` or `@<agent-handle>` in the new message. Other messages become context without starting a turn. Also configurable in setup. |
 | `INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS` | no | `false` | Auto-accept Codex MCP prompts for Inkbox tools only. The setup wizard writes `true` when you trust the agent to send through Inkbox without per-call approval. |
 | `INKBOX_A2A_PROGRESS_INTERVAL_SECONDS` | no | `180` | Seconds between progress updates for active inbound A2A tasks. Set to `0` to disable periodic updates. |
 | `INKBOX_VOICE_STACK` | no | `inkbox_tts_stt` | `inkbox_voice_ai`, `openai_realtime`, or `inkbox_tts_stt`. When absent, legacy Realtime settings remain compatible. |
@@ -346,7 +406,7 @@ Inbound A2A tasks acknowledge pickup immediately. While a task remains active,
 the worker sends a short progress update about every three minutes by default;
 these updates are visible in task history without starting a requester turn.
 
-The bridge requires Inkbox SDK 0.5.9 or newer.
+The bridge requires Inkbox SDK 0.7.3 or newer.
 
 On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 
