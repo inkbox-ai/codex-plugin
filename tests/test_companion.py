@@ -650,7 +650,8 @@ def test_saved_reply_revalidates_audience_and_local_sponsor():
     asyncio.run(scenario())
 
 
-def test_saved_reply_keeps_retrying_long_read_outage_with_capped_backoff():
+@pytest.mark.parametrize('before_model', [False, True])
+def test_read_outage_keeps_retrying_with_capped_backoff(before_model):
     async def scenario():
         e = fixture()
         r, sdk, s, _ = harness(e)
@@ -659,6 +660,9 @@ def test_saved_reply_keeps_retrying_long_read_outage_with_capped_backoff():
         gw._inkbox = NS(get_identity=Mock(side_effect=httpx.ReadTimeout('read failed')))
         gw._companion_receiver, gw.sessions = r, r.sessions
         s.send_fn = gw.send_to_contact
+        load = sdk.load_initialization
+        if before_model:
+            sdk.load_initialization = Mock(side_effect=httpx.ReadTimeout('read failed'))
         try:
             await r.accept(e)
             await drained(r)
@@ -667,13 +671,16 @@ def test_saved_reply_keeps_retrying_long_read_outage_with_capped_backoff():
                 await drained(r)
             timer = r.retries[Event.parse(e).scope]
             assert 55 < timer.when() - asyncio.get_running_loop().time() <= 60
-            assert r.inbox.db.execute('SELECT state FROM events').fetchone()[0] == 'reply_pending'
-            assert len(s._client.events) == 1
+            assert r.inbox.db.execute('SELECT state FROM events').fetchone()[0] == (
+                'pending' if before_model else 'reply_pending')
+            assert len(s._client.events) == (0 if before_model else 1)
+            sdk.load_initialization = load
             gw._inkbox.get_identity.side_effect = None
             gw._inkbox.get_identity.return_value = identity
             r.recover()
             await drained(r)
             identity.send_text.assert_called_once()
+            assert len(s._client.events) == 1
             assert not r.retries
         finally:
             await r.close()

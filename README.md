@@ -227,8 +227,9 @@ back to submitting only the trigger.
 
 **Delivery and recovery:** receipts and initialization checkpoints live under
 `$INKBOX_CODEX_HOME/companion/` (default `~/.inkbox-codex/companion/`), with private
-permissions and one receiver owner per environment/identity. Pending pre-submission
-failures retry up to five times with backoff, and resume after restart or webhook
+permissions and one receiver owner per environment/identity. Transient reads before
+submission retry with capped backoff while the gateway runs; other pre-submission
+failures retry up to five times. Pending inputs resume after restart or webhook
 redelivery. A retry may refresh its delivery timestamp or inline history preview
 without creating another input. Stable event IDs and acknowledged snapshot/live source-message IDs
 are deduplicated across restarts within their scope and activation. Completed answers

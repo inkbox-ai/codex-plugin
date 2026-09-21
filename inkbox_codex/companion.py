@@ -302,7 +302,7 @@ class Receiver:
                 elif row[0] == "pending" or (row[0] == "reply_pending" and self.retryable_read(exc)):
                     attempt = self.attempts.get(scope, 0) + 1
                     self.attempts[scope] = attempt
-                    if (row[0] == "reply_pending" or attempt <= 5) and not self.closing:
+                    if (self.retryable_read(exc) or attempt <= 5) and not self.closing:
                         old = self.retries.pop(scope, None)
                         if old:
                             old.cancel()
