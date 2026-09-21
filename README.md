@@ -213,7 +213,9 @@ not count. The setup wizard configures the same setting.
 - Replies use the original group conversation ID, or the SDK-approved email
   reply context's **stored message UUID** with canonical reply-all. They never
   fall back to privately messaging the latest author. Local sponsor restrictions
-  remain in force; access is rechecked before submission and automatic replies.
+  remain in force. Live turns and replies use the signed conversation scope and
+  saved sponsor message without additional activation lookups. Replies reuse the
+  identity loaded at startup.
 - Only a live reply by the prompted, locally allowed sender can answer an
   approval request. Historical approval-looking text cannot. Sponsor slash
   controls on subsequent live messages remain local commands.
@@ -234,9 +236,8 @@ redelivery. A retry may refresh its delivery timestamp or inline history preview
 without creating another input. Stable event IDs and acknowledged snapshot/live source-message IDs
 are deduplicated across restarts within their scope and activation. Completed answers
 are saved before delivery.
-Transient read failures during reply authorization or identity lookup retry with capped
-backoff, including after restart, without rerunning the model. Every attempt revalidates
-the current sponsor and audience. An interrupted host
+Transient read failures while preparing delivery retry with capped backoff, including
+after restart, without rerunning the model. An interrupted host
 submission or uncertain reply send pauses that scope rather than risking another
 model turn or duplicate send. The log identifies the retained receipt. Inspect the
 scoped Codex thread and channel delivery before operator recovery; **do not delete

@@ -4687,6 +4687,11 @@ class InkboxGateway:
         except Exception:
             logger.debug("[bridge] typing indicator failed", exc_info=True)
 
+    async def _reply_identity(self, meta):
+        if meta.get("companion") and self._identity is not None:
+            return self._identity
+        return await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+
     async def send_to_contact(
         self, chat_id: str, content: str, mode: str, meta: Dict[str, Any]
     ) -> None:
@@ -4706,7 +4711,7 @@ class InkboxGateway:
             logger.debug("[bridge] suppressing exact [SILENT] reply for %s", chat_id)
             return
         if meta.get("companion"):
-            await self._companion().authorize_reply(meta)
+            self._companion().check_reply_route(meta)
         if mode == "external":
             # External-event threads have no human behind them; the directive
             # tells the agent to act via tools, so its text reply is log-only.
@@ -4727,7 +4732,7 @@ class InkboxGateway:
             text = strip_markdown(content)
             if len(text) > SMS_MAX_LENGTH:
                 raise ValueError(_message_too_long_reason("SMS", text, SMS_MAX_LENGTH))
-            identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+            identity = await self._reply_identity(meta)
             kwargs: Dict[str, Any] = {"text": text}
             conversation_id = str(meta.get("conversation_id") or "").strip()
             if not conversation_id and str(chat_id).startswith("sms:"):
@@ -4743,7 +4748,7 @@ class InkboxGateway:
             text = strip_markdown(content)
             if len(text) > IMESSAGE_MAX_LENGTH:
                 raise ValueError(_message_too_long_reason("iMessage", text, IMESSAGE_MAX_LENGTH))
-            identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+            identity = await self._reply_identity(meta)
             conversation_id = str(meta.get("conversation_id") or "").strip()
             if not conversation_id and str(chat_id).startswith("imessage:"):
                 conversation_id = str(chat_id).split(":", 1)[1]
@@ -4760,7 +4765,7 @@ class InkboxGateway:
             message_id = str(meta.get("message_id") or "").strip()
             if not message_id:
                 raise ValueError("Cannot reply-all without the original email message ID")
-            identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+            identity = await self._reply_identity(meta)
             if meta.get("companion"):
                 self._companion().reply_sending(meta)
             await asyncio.to_thread(

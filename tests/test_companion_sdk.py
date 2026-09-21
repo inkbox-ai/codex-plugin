@@ -61,7 +61,7 @@ def test_actual_sdk_paginates_deduplicates_revalidates_before_one_host_input(cha
             text = s._client.events[0][1]
             for entry in fixture(channel)['companion']['history']:
                 assert text.count(entry['text']) == 1
-            assert [p.get('cursor') for _, p in http.calls] == [None, 'opaque/+==?cursor', None, None]
+            assert [p.get('cursor') for _, p in http.calls] == [None, 'opaque/+==?cursor', None]
             assert all('/companion/activations/' in path for path, _ in http.calls)
         finally: await r.close()
     asyncio.run(scenario())
@@ -191,7 +191,7 @@ def test_later_allowed_sender_does_not_replace_original_activation_sponsor():
             assert len(s._client.events) == len(sent) == 2
             assert sent[-1][3]['sender'] == other
             assert sent[-1][3]['companion_sponsor'] == sponsor
-            assert all(params['limit'] == 1 for _, params in http.calls[loads:])
+            assert len(http.calls) == loads
         finally:
             await r.close()
     asyncio.run(scenario())

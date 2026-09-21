@@ -371,6 +371,7 @@ def test_live_approval_from_sponsor_bypasses_initialization_barrier():
         waiting = asyncio.Event()
         original = s._client.run
         async def approving(text):
+            sdk.activation_messages = Mock(side_effect=AssertionError('unexpected approval read'))
             s.pending = PendingInteraction(kind='permission', prompt_text='approve?', future=asyncio.get_running_loop().create_future())
             waiting.set()
             answer = await asyncio.wait_for(s.pending.future, 2)
@@ -493,34 +494,66 @@ def test_live_first_source_already_in_snapshot_only_submits_initialization():
     asyncio.run(scenario())
 
 
-def test_revoked_while_model_runs_never_sends():
+@pytest.mark.parametrize('channel', ['phone', 'imessage', 'mail'])
+def test_companion_turns_and_replies_do_not_refetch_activation_or_identity(channel):
     async def scenario():
-        e = fixture()
-        r, sdk, s, sent = harness(e)
+        e = fixture(channel)
+        r, sdk, s, _ = harness(e)
         gw = InkboxGateway(s.cfg)
         identity = Mock()
-        gw._inkbox = NS(get_identity=Mock(return_value=identity))
+        gw._identity = identity
+        gw._inkbox = NS(get_identity=Mock(side_effect=AssertionError('unexpected identity read')))
         gw._companion_receiver, gw.sessions = r, r.sessions
         s.send_fn = gw.send_to_contact
-        original = s._client.run
-        async def revoking(text):
-            sdk.denied = True
-            return await original(text)
-        s._client.run = revoking
+        load = sdk.load_initialization
+        def initialize(*args, **kwargs):
+            result = load(*args, **kwargs)
+            sdk.activation_messages = Mock(side_effect=AssertionError('unexpected activation read'))
+            sdk.load_initialization = Mock(side_effect=AssertionError('unexpected snapshot reload'))
+            return result
+        sdk.load_initialization = initialize
         try:
             await r.accept(e)
             await drained(r)
-            identity.send_text.assert_not_called()
+            s.cfg.group_reply_mode = 'mention'
+            await r.accept(live(e, 2, 'background context'))
+            await drained(r)
+            await r.accept(live(e, 3))
+            await drained(r)
+            assert [kind for kind, _ in s._client.events] == ['run', 'context', 'run']
+            sdk.activation_messages.assert_not_called()
+            sdk.load_initialization.assert_not_called()
+            gw._inkbox.get_identity.assert_not_called()
+            method = {'phone': 'send_text', 'imessage': 'send_imessage', 'mail': 'reply_all_email'}[channel]
+            assert getattr(identity, method).call_count == 2
+            if channel == 'mail':
+                assert all(call.args[0] == e['companion']['reply_context']['reply_to_message_id']
+                           for call in identity.reply_all_email.call_args_list)
+            else:
+                assert all(call.kwargs['conversation_id'] == e['companion']['conversation_id']
+                           for call in getattr(identity, method).call_args_list)
+        finally:
+            await r.close()
+        r, sdk, s, _ = harness(e)
+        gw._companion_receiver, gw.sessions = r, r.sessions
+        s.send_fn = gw.send_to_contact
+        sdk.activation_messages = Mock(side_effect=AssertionError('unexpected activation read'))
+        sdk.load_initialization = Mock(side_effect=AssertionError('unexpected snapshot reload'))
+        try:
+            await r.accept(live(e, 4))
+            await drained(r)
             assert len(s._client.events) == 1
-            assert r.inbox.db.execute('SELECT state FROM events').fetchone()[0] == 'reply_pending'
-            assert not r.retries
-        finally: await r.close()
+            sdk.activation_messages.assert_not_called()
+            sdk.load_initialization.assert_not_called()
+            gw._inkbox.get_identity.assert_not_called()
+            assert getattr(identity, method).call_count == 3
+        finally:
+            await r.close()
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize('channel', ['phone', 'imessage', 'mail'])
-@pytest.mark.parametrize('preflight', ['authorization', 'identity'])
-def test_completed_reply_retries_preflight_without_replaying_model(channel, preflight):
+def test_completed_reply_retries_identity_lookup_without_replaying_model(channel):
     async def scenario():
         e = fixture(channel)
         r, sdk, s, _ = harness(e)
@@ -532,11 +565,7 @@ def test_completed_reply_retries_preflight_without_replaying_model(channel, pref
         original = s._client.run
         async def timeout_after_model(text):
             result = await original(text)
-            if preflight == 'authorization':
-                authorize = sdk.activation_messages
-                sdk.activation_messages = Mock(side_effect=[httpx.ReadTimeout('read failed'), authorize('', '')])
-            else:
-                gw._inkbox.get_identity.side_effect = [httpx.ReadTimeout('read failed'), identity]
+            gw._inkbox.get_identity.side_effect = [httpx.ReadTimeout('read failed'), identity]
             return result
         s._client.run = timeout_after_model
         try:
@@ -621,7 +650,7 @@ def test_actual_send_timeout_remains_uncertain_across_restart(channel):
     asyncio.run(scenario())
 
 
-def test_saved_reply_revalidates_audience_and_local_sponsor():
+def test_saved_reply_keeps_group_route_and_local_sender_settings():
     async def scenario():
         e = fixture()
         r, sdk, s, _ = harness(e)
@@ -640,10 +669,11 @@ def test_saved_reply_revalidates_audience_and_local_sponsor():
             await drained(r)
             assert not identity.mock_calls
             r.sender_allowed = lambda _: True
-            sdk.c['reply_context']['conversation_id'] = sdk.c['scope_id']
+            sdk.activation_messages = Mock(side_effect=AssertionError('unexpected activation read'))
             await r.accept(e)
             await drained(r)
-            assert not identity.mock_calls
+            identity.send_text.assert_called_once_with(text='Answer', conversation_id=e['companion']['conversation_id'])
+            sdk.activation_messages.assert_not_called()
             assert len(s._client.events) == 1
         finally:
             await r.close()

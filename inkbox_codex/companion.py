@@ -230,7 +230,7 @@ class Receiver:
 
     def resource(self):
         resource = getattr(self.client, "companion", None)
-        if not all(callable(getattr(resource, name, None)) for name in ("load_initialization", "activation_messages")):
+        if not callable(getattr(resource, "load_initialization", None)):
             raise CompanionError("Companion events require an Inkbox SDK with load_initialization support; upgrade the SDK")
         return resource
 
@@ -245,7 +245,6 @@ class Receiver:
         if receipt_state == "pending" and event.phase == "live" and not self.inbox.source_submitted(event):
             session = self.sessions.get(event.session_key(self.namespace))
             if session.pending is not None and self.sender_allowed(event.author):
-                await self.authorize(event)
                 if session.companion_answer(event.text, self.meta(event)):
                     with self.inbox.db:
                         self.inbox.remember_sources(event, [event.source_id])
@@ -408,26 +407,15 @@ class Receiver:
             "raw_text": event.text if text is None else text,
         }
 
-    async def authorize(self, event):
-        page = await asyncio.to_thread(self.resource().activation_messages,
-                                      self.cfg.identity, event.activation, limit=1)
-        if (str(page.scope_id), str(page.activation_id), str(page.conversation_id), page.channel) != (
-            event.scope, event.activation, event.conversation, event.channel,
-        ):
-            raise CompanionError("Companion scope changed before submission or reply")
-        reply = _dict(page.reply_context)
-        self.validate_reply(event, reply)
-        return reply
-
-    async def authorize_reply(self, meta):
+    def check_reply_route(self, meta):
         event = Event.parse(meta["companion_envelope"])
         if event.activation:
             if not self.sender_allowed(meta.get("companion_sponsor") or meta.get("sender")):
                 raise CompanionError("Companion sponsor is no longer permitted locally")
-            reply = await self.authorize(event)
-            expected = meta.get("companion_reply_context")
-            if expected is not None and reply != expected:
-                raise CompanionError("Companion reply audience changed")
+            if event.channel == "mail":
+                saved = self.inbox.activation(event)
+                if saved is None or meta.get("message_id") != saved[0]:
+                    raise CompanionError("Companion email reply lost its sponsor message")
         elif not self.sender_allowed(event.author):
             raise CompanionError("Companion ordinary sender is no longer permitted")
         if meta.get("conversation_id") != event.conversation:
@@ -444,9 +432,6 @@ class Receiver:
             if event.activation:
                 if not self.sender_allowed(meta["companion_sponsor"]):
                     raise CompanionError("Companion sponsor is no longer permitted locally")
-                reply = await self.authorize(event)
-                if meta.get("companion_reply_context") != reply:
-                    raise CompanionError("Companion reply audience changed before submission")
             with self.inbox.db:
                 thread_id = getattr(session._client, "thread_id", None)
                 if thread_id:
@@ -503,13 +488,9 @@ class Receiver:
             if saved[0] != event.source_id:
                 raise CompanionError("A new Companion history batch requires a distinct activation ID")
             return
-        # The complete snapshot is loaded only for initialization; later live
-        # messages retain their own source and are authorized again at submission.
+        # Live messages use their signed scope and the saved sponsor reply anchor.
         saved = self.inbox.activation(event)
-        if not self.sender_allowed(saved[1]):
-            raise CompanionError("Companion sponsor is no longer permitted locally")
-        reply = await self.authorize(event)
-        await self.submit(event, await self.live_text(event), self.meta(event, reply=reply))
+        await self.submit(event, await self.live_text(event), self.meta(event, source_id=saved[0]))
 
     async def live_text(self, event):
         message = event.envelope["data"]["text_message" if event.channel == "phone" else "message"]
