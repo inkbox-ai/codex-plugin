@@ -31,7 +31,7 @@ jobs:
 
       # Live helper regressions exercise the SDK's real pagination offline.
       - name: Install test deps
-        run: pip install pytest httpx aiohttp segno "inkbox==0.5.9" "audioop-lts>=0.2.1; python_version >= '3.13'"
+        run: pip install pytest httpx aiohttp segno "inkbox==0.7.3" "audioop-lts>=0.2.1; python_version >= '3.13'"
 
       - name: Run unit tests
         run: pytest -q
@@ -62,7 +62,7 @@ jobs:
       - name: Install bridge + test deps
         run: |
           uv pip install --system \
-            "inkbox==0.5.9" \
+            "inkbox==0.7.3" \
             -e . pytest
 
       # @alpha is the prerelease channel cut from codex main near-daily — the
@@ -73,9 +73,8 @@ jobs:
       - name: Contract tests vs real Codex
         run: pytest tests/contract -v
 
-  # Preview helper is not published yet. Keep the established SDK floor in the
-  # compatibility lanes above; exercise the exact public Companion SDK contract
-  # here until a released version can replace this source pin.
+  # Exercise complete Companion initialization with the released SDK and real
+  # host, using the same supported SDK floor as the other verification lanes.
   companion-sdk:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
@@ -87,10 +86,10 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
-      - name: Install Companion preview SDK and test dependencies
+      - name: Install released SDK and test dependencies
         run: >-
           pip install -e . pytest httpx
-          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@3047d4603050c65df9db4c5d45fd518d20d8842b#subdirectory=sdk/python"
+          "inkbox==0.7.3"
       - name: Verify helper is present (do not silently skip its tests)
         run: python -c "from inkbox.companion import CompanionResource; assert callable(CompanionResource.load_initialization)"
       - name: Install Codex (freshest main prerelease)

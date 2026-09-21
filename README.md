@@ -218,15 +218,12 @@ not count. The setup wizard configures the same setting.
   approval request. Historical approval-looking text cannot. Sponsor slash
   controls on subsequent live messages remain local commands.
 
-**SDK prerequisite:** Companion initialization requires
-`client.companion.load_initialization` and `activation_messages`. The preview
-contract is tested against SDK source commit
-[`3047d460`](https://github.com/inkbox-ai/inkbox/commit/3047d4603050c65df9db4c5d45fd518d20d8842b).
-That helper is not in the currently published SDK used by the compatibility CI
-lane. Install a compatible SDK before enabling Companion delivery. An unsupported
-SDK produces an explicit webhook error; the bridge never falls back to submitting
-only the trigger. Ordinary messaging remains compatible with the existing SDK
-floor. Switch the preview CI pin to the released SDK before graduating this feature.
+**SDK requirement:** The bridge requires Inkbox SDK **0.7.3 or newer**, including
+`client.companion.load_initialization` and `activation_messages`. Installation
+resolves the published SDK; CI tests the released `inkbox==0.7.3` minimum across
+unit, real-host, and live-channel lanes. No preview source checkout is needed.
+An unsupported SDK produces an explicit webhook error; the bridge never falls
+back to submitting only the trigger.
 
 **Delivery and recovery:** receipts and initialization checkpoints live under
 `$INKBOX_CODEX_HOME/companion/` (default `~/.inkbox-codex/companion/`), with private
@@ -403,7 +400,7 @@ Inbound A2A tasks acknowledge pickup immediately. While a task remains active,
 the worker sends a short progress update about every three minutes by default;
 these updates are visible in task history without starting a requester turn.
 
-The bridge requires Inkbox SDK 0.5.9 or newer.
+The bridge requires Inkbox SDK 0.7.3 or newer.
 
 On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 
