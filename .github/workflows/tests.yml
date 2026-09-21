@@ -84,11 +84,16 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
       - name: Install Companion preview SDK and test dependencies
         run: >-
           pip install -e . pytest httpx
-          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@449966c885208d41f995d09c54072e012df9eb1a#subdirectory=sdk/python"
+          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@3047d4603050c65df9db4c5d45fd518d20d8842b#subdirectory=sdk/python"
       - name: Verify helper is present (do not silently skip its tests)
         run: python -c "from inkbox.companion import CompanionResource; assert callable(CompanionResource.load_initialization)"
-      - name: Run unit suite including actual SDK pagination
+      - name: Install Codex (freshest main prerelease)
+        run: bash "$GITHUB_WORKSPACE/tests/ci/install_codex.sh"
+      - name: Run unit and host suites including actual SDK pagination
         run: pytest -q

@@ -192,7 +192,7 @@ Verified SMS/MMS, iMessage and email webhooks may include a **top-level**
 `companion` object. Webhooks without it (or with `null`) retain normal routing.
 The bridge loads the full authorized initialization snapshot using the Inkbox
 SDK, including every page, and submits **one combined input**. The sponsor trigger
-is included once; historical messages and attachment descriptors remain
+is included once; historical messages, attachment descriptors, and history notices remain
 conversation data, never individual turns or slash commands.
 
 `INKBOX_GROUP_REPLY_MODE=auto|mention` also applies to Companion email. In `auto`,
@@ -201,12 +201,14 @@ own text can wake it (`@agent` or `@<agent-handle>`); otherwise the **entire bat
 is appended to the Codex thread without model generation. Historical mentions do
 not count. The setup wizard configures the same setting.
 
-- Sessions are isolated by API environment, identity, channel and server scope,
-  separate from ordinary contact sessions. A new activation in the same scope
-  continues that scope's conversation. Each new released snapshot must have a
+- Sessions are isolated by API environment, identity, channel, server scope, and
+  activation, separate from ordinary contact sessions. A new activation starts
+  a fresh session with its authorized snapshot. Each new released snapshot must have a
   distinct activation ID; replaying an immutable activation is not a new batch.
 - Initialization completes before queued live messages run. A first-seen live
-  event loads initialization first. Known sequence gaps wait for missing events.
+  event loads initialization first. Pending events run in sequence order; numeric
+  gaps do not stall the conversation. Late unseen events older than an already
+  submitted input require reconciliation instead of running out of order.
   `phase="ordinary"` uses a separate scoped session and never loads hidden history.
 - Replies use the original group conversation ID, or the SDK-approved email
   reply context's **stored message UUID** with canonical reply-all. They never
@@ -219,7 +221,7 @@ not count. The setup wizard configures the same setting.
 **SDK prerequisite:** Companion initialization requires
 `client.companion.load_initialization` and `activation_messages`. The preview
 contract is tested against SDK source commit
-[`449966c`](https://github.com/inkbox-ai/inkbox/commit/449966c885208d41f995d09c54072e012df9eb1a).
+[`3047d460`](https://github.com/inkbox-ai/inkbox/commit/3047d4603050c65df9db4c5d45fd518d20d8842b).
 That helper is not in the currently published SDK used by the compatibility CI
 lane. Install a compatible SDK before enabling Companion delivery. An unsupported
 SDK produces an explicit webhook error; the bridge never falls back to submitting
@@ -230,7 +232,9 @@ floor. Switch the preview CI pin to the released SDK before graduating this feat
 `$INKBOX_CODEX_HOME/companion/` (default `~/.inkbox-codex/companion/`), with private
 permissions and one receiver owner per environment/identity. Pending pre-submission
 failures retry up to five times with backoff, and resume after restart or webhook
-redelivery. Stable event IDs are deduplicated across restarts. An interrupted host
+redelivery. A retry may refresh its delivery timestamp or inline history preview
+without creating another input. Stable event IDs and acknowledged snapshot/live source-message IDs
+are deduplicated across restarts within their scope and activation. An interrupted host
 submission or uncertain reply send pauses that scope rather than risking another
 model turn or duplicate send. The log identifies the retained receipt. Inspect the
 scoped Codex thread and channel delivery before operator recovery; **do not delete

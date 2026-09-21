@@ -18,7 +18,12 @@ pytestmark = pytest.mark.skipif(CODEX_BIN is None, reason='requires real codex C
 
 @pytest.mark.parametrize('channel', ['phone', 'imessage', 'mail'])
 @pytest.mark.parametrize('reply_mode', ['auto', 'mention'])
-def test_companion_one_host_turn_or_quiet_context_then_resume(tmp_path, monkeypatch, channel, reply_mode):
+@pytest.mark.parametrize('actual_sdk', [False, True])
+def test_companion_one_host_turn_or_quiet_context_then_resume(tmp_path, monkeypatch, channel, reply_mode, actual_sdk):
+    resource = None
+    if actual_sdk:
+        resource = pytest.importorskip('inkbox.companion')
+        from tests.test_companion_sdk import HTTP
     requests = []
     class Handler(mock_openai.Handler):
         def _respond_responses(self, request):
@@ -37,6 +42,8 @@ def test_companion_one_host_turn_or_quiet_context_then_resume(tmp_path, monkeypa
     async def scenario():
         e = fixture(channel)
         r, sdk, s, sent = harness(e, reply_mode=reply_mode)
+        if resource is not None:
+            r.client.companion = resource.CompanionResource(HTTP(e))
         s.cfg.project_dir = str(tmp_path)
         s.cfg.codex_bin, s.cfg.codex_model, s.cfg.codex_sandbox = CODEX_BIN, 'mock-model', 'read-only'
         host = CodexAppServerClient(s.cfg, developer_instructions='contract-test')

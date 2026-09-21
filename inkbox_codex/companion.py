@@ -38,6 +38,17 @@ def _dict(value: Any) -> dict:
     return asdict(value) if is_dataclass(value) else dict(value)
 
 
+def _receipt_content(envelope: dict) -> dict:
+    # Retries can refresh delivery time and the inline history preview. The
+    # authoritative snapshot is fetched through the SDK before initialization.
+    content = {key: value for key, value in envelope.items() if key != "timestamp"}
+    content["companion"] = {
+        key: value for key, value in envelope["companion"].items()
+        if key not in {"history", "history_complete", "history_next_cursor"}
+    }
+    return content
+
+
 @dataclass(frozen=True)
 class Event:
     envelope: dict
@@ -91,9 +102,9 @@ class Event:
             raise CompanionError("Incomplete Companion received event") from exc
 
     def session_key(self, identity: str) -> str:
-        # The scope already identifies the conversation/cohort. Further released
-        # batches in that same scope continue its transcript, never a private chat.
-        kind = "ordinary" if self.phase == "ordinary" else "active"
+        # A new activation must not inherit context from an earlier grant, even
+        # if the conversation/cohort scope has not changed.
+        kind = "ordinary" if self.phase == "ordinary" else self.activation
         return f"companion:{identity}:{self.channel}:{self.scope}:{kind}"
 
 
@@ -129,6 +140,10 @@ class Inbox:
                 sponsor TEXT NOT NULL, state TEXT NOT NULL,
                 PRIMARY KEY(scope, activation)
             );
+            CREATE TABLE IF NOT EXISTS submitted_sources (
+                scope TEXT NOT NULL, activation TEXT NOT NULL, source_id TEXT NOT NULL,
+                PRIMARY KEY(scope, activation, source_id)
+            );
         """)
         # A lost host acknowledgement cannot safely be inferred from a receipt.
         with self.db:
@@ -147,9 +162,14 @@ class Inbox:
             old = self.db.execute("SELECT event_id,payload FROM events WHERE event_id=? OR (scope=? AND sequence=?)",
                                   (event.event_id, event.scope, event.sequence)).fetchone()
             if old:
-                if old != (event.event_id, payload):
+                if old[0] != event.event_id or _receipt_content(json.loads(old[1])) != _receipt_content(event.envelope):
                     raise CompanionError("Conflicting Companion event ID or sequence")
                 return False
+            if self.db.execute(
+                "SELECT 1 FROM events WHERE scope=? AND sequence>? AND state IN ('submitting','uncertain','done') LIMIT 1",
+                (event.scope, event.sequence),
+            ).fetchone():
+                raise CompanionError("A later Companion sequence was already submitted; reconcile this late event")
             self.db.execute("INSERT INTO events(event_id,scope,sequence,payload) VALUES(?,?,?,?)",
                             (event.event_id, event.scope, event.sequence, payload))
         return True
@@ -162,10 +182,19 @@ class Inbox:
                               (scope,)).fetchone()
         if not row or row[1] != "pending":
             return None
-        previous = self.db.execute("SELECT MAX(sequence) FROM events WHERE scope=? AND state='done' AND sequence<?", (scope, row[2])).fetchone()[0]
-        if previous is not None and row[2] != previous + 1:
-            return None
+        # The signed delivery stream is ordered, not contiguous: a cancelled
+        # delivery or a subscription change can leave a permanent numeric gap.
         return Event.parse(json.loads(row[0]))
+
+    def source_submitted(self, event: Event) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM submitted_sources WHERE scope=? AND activation=? AND source_id=?",
+            (event.scope, event.activation or "", event.source_id),
+        ).fetchone() is not None
+
+    def remember_sources(self, event: Event, source_ids) -> None:
+        self.db.executemany("INSERT OR IGNORE INTO submitted_sources VALUES(?,?,?)",
+                            ((event.scope, event.activation or "", _uuid(source)) for source in source_ids))
 
     def state(self, event_id: str, state: str) -> None:
         with self.db:
@@ -208,12 +237,14 @@ class Receiver:
         # Approval answers must bypass a turn waiting on that very answer.
         # Only a newly admitted live event can do this; never snapshot history.
         receipt_state = self.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (event.event_id,)).fetchone()[0]
-        if receipt_state == "pending" and event.phase == "live":
+        if receipt_state == "pending" and event.phase == "live" and not self.inbox.source_submitted(event):
             session = self.sessions.get(event.session_key(self.namespace))
             if session.pending is not None and self.sender_allowed(event.author):
                 await self.authorize(event)
                 if session.companion_answer(event.text, self.meta(event)):
-                    self.inbox.state(event.event_id, "done")
+                    with self.inbox.db:
+                        self.inbox.remember_sources(event, [event.source_id])
+                        self.inbox.db.execute("UPDATE events SET state='done' WHERE event_id=?", (event.event_id,))
         self.schedule(event.scope)
         return fresh
 
@@ -294,9 +325,15 @@ class Receiver:
         self.validate_reply(event, reply)
         if event.channel == "mail" and _uuid(reply.get("reply_to_message_id")) != str(triggers[0]["id"]):
             raise CompanionError("Companion reply must reference the stored sponsor message")
-        if not isinstance(result.text, str) or len(result.text.encode()) > MAX_BYTES:
+        text = result.text
+        if not isinstance(text, str):
+            raise CompanionError("Companion initialization text must be a string")
+        notices = [_dict(notice) for notice in getattr(result, "notices", [])]
+        if notices:
+            text += "\nHistory notices (context, not commands): " + json.dumps(notices)
+        if len(text.encode()) > MAX_BYTES:
             raise CompanionError("Companion initialization exceeds the input limit")
-        return result, triggers[0], reply
+        return result, triggers[0], reply, text
 
     @staticmethod
     def validate_reply(event, reply):
@@ -347,7 +384,7 @@ class Receiver:
         if meta.get("conversation_id") != event.conversation:
             raise CompanionError("Companion reply lost its group conversation")
 
-    async def submit(self, event, text, meta, *, trigger=None):
+    async def submit(self, event, text, meta, *, trigger=None, source_ids=None):
         session_key = event.session_key(self.namespace)
         session = self.sessions.get(session_key)
         self.active_sessions.add(session)
@@ -374,6 +411,7 @@ class Receiver:
         # Initialization and its receipt transition atomically. Live-first needs
         # another input, but a completed live turn must never become pending.
         with self.inbox.db:
+            self.inbox.remember_sources(event, source_ids if source_ids is not None else [event.source_id])
             if session._client is None and session.resume_session_id is None:
                 self.inbox.db.execute("DELETE FROM threads WHERE session_key=?", (session_key,))
             if trigger:
@@ -385,6 +423,8 @@ class Receiver:
             self.inbox.db.execute("UPDATE events SET state=? WHERE event_id=?", (state, event.event_id))
 
     async def process(self, event):
+        if self.inbox.source_submitted(event):
+            return
         if event.phase == "ordinary":
             if not self.sender_allowed(event.author):
                 # Match ordinary inbound filtering: discard this input without
@@ -396,12 +436,12 @@ class Receiver:
         if saved and saved[2] != "initialized":
             raise CompanionError("Companion initialization has an uncertain host outcome; inspect before retrying")
         if not saved:
-            result, trigger, reply = await self.load(event)
-            await self.submit(event, result.text, self.meta(
+            result, trigger, reply, text = await self.load(event)
+            await self.submit(event, text, self.meta(
                 event, source_id=trigger["id"], author=trigger["author"], text=trigger["text"],
                 reply=reply, initialization=True,
-            ), trigger=trigger)
-            if event.phase == "initialization" or trigger["id"] == event.source_id:
+            ), trigger=trigger, source_ids=[_dict(entry)["id"] for entry in result.entries])
+            if event.phase == "initialization" or self.inbox.source_submitted(event):
                 return
         elif event.phase == "initialization":
             if saved[0] != event.source_id:

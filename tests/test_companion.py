@@ -194,10 +194,15 @@ def test_history_cannot_execute_commands_or_answer_approval():
     asyncio.run(scenario())
 
 
-def test_successive_batches_share_scope_but_deduplicate_activations():
+def test_successive_activations_use_separate_sessions_in_the_same_scope():
     async def scenario():
         e = fixture()
         r, sdk, s, sent = harness(e)
+        second_session = make_session(sent)
+        second_session.cfg = s.cfg
+        second_session._client = Client()
+        first_key = Event.parse(e).session_key(r.namespace)
+        r.sessions.get.side_effect = lambda key: s if key == first_key else second_session
         try:
             await r.accept(e)
             await drained(r)
@@ -210,7 +215,8 @@ def test_successive_batches_share_scope_but_deduplicate_activations():
             await drained(r)
             assert sdk.loads == 2
             assert len(sent) == 2
-            assert len({c.args[0] for c in r.sessions.get.call_args_list}) == 1
+            assert len({c.args[0] for c in r.sessions.get.call_args_list}) == 2
+            assert len(s._client.events) == len(second_session._client.events) == 1
         finally:
             await r.close()
     asyncio.run(scenario())
@@ -396,7 +402,7 @@ def test_wrong_sender_cannot_answer_sponsor_approval():
     asyncio.run(scenario())
 
 
-def test_sequence_gap_waits_for_missing_event():
+def test_delivery_sequence_gap_does_not_stall_authorized_messages():
     async def scenario():
         e = fixture()
         r, sdk, s, sent = harness(e)
@@ -405,13 +411,80 @@ def test_sequence_gap_waits_for_missing_event():
             await drained(r)
             await r.accept(live(e, 3, 'third'))
             await drained(r)
+            assert len(sent) == 2
+            assert 'third' in s._client.events[1][1]
+            with pytest.raises(CompanionError, match='already submitted'):
+                await r.accept(live(e, 2, 'second'))
+        finally: await r.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('channel', ['phone', 'imessage', 'mail'])
+def test_snapshot_and_live_sources_are_deduplicated_across_restart(channel):
+    async def scenario():
+        e = fixture(channel)
+        r, _, s, sent = harness(e)
+        await r.accept(e)
+        await drained(r)
+        assert len(sent) == 1
+        await r.close()
+        r, _, s, sent = harness(e)
+        try:
+            for sequence, source in enumerate(e['companion']['history'], start=2):
+                duplicate = live(e, sequence, source['text'], source['author'])
+                message = duplicate['data'].get('text_message') or duplicate['data']['message']
+                message['id'] = source['id']
+                await r.accept(duplicate)
+                await drained(r)
+            assert not sent
+            assert not s._client.events
+            fresh = live(e, 5, '@agent new request')
+            await r.accept(fresh)
+            await drained(r)
+            duplicate = deepcopy(fresh)
+            duplicate['id'] += '-new-delivery'
+            duplicate['companion']['sequence'] = 6
+            await r.accept(duplicate)
+            await drained(r)
             assert len(sent) == 1
-            await r.accept(live(e, 2, 'second'))
+            assert len(s._client.events) == 1
+        finally:
+            await r.close()
+    asyncio.run(scenario())
+
+
+def test_queued_events_keep_sequence_order_without_requiring_contiguous_numbers():
+    async def scenario():
+        e = fixture()
+        r, _, s, sent = harness(e)
+        try:
+            await r.accept(e)
+            await drained(r)
+            r.inbox.accept(Event.parse(live(e, 5, 'fifth')))
+            r.inbox.accept(Event.parse(live(e, 3, 'third')))
+            r.recover()
             await drained(r)
             assert len(sent) == 3
-            assert 'second' in s._client.events[1][1]
-            assert 'third' in s._client.events[2][1]
-        finally: await r.close()
+            assert 'third' in s._client.events[1][1]
+            assert 'fifth' in s._client.events[2][1]
+        finally:
+            await r.close()
+    asyncio.run(scenario())
+
+
+def test_live_first_source_already_in_snapshot_only_submits_initialization():
+    async def scenario():
+        e = fixture()
+        source = e['companion']['history'][0]
+        first = live(e, 8, source['text'], source['author'])
+        first['data']['text_message']['id'] = source['id']
+        r, sdk, s, sent = harness(e)
+        try:
+            await r.accept(first)
+            await drained(r)
+            assert sdk.loads == len(s._client.events) == len(sent) == 1
+        finally:
+            await r.close()
     asyncio.run(scenario())
 
 
@@ -514,6 +587,30 @@ def test_repeat_initialization_with_new_transport_event_id_does_not_wake_again()
             assert sdk.loads == 1
             assert len(sent) == 1
         finally: await r.close()
+    asyncio.run(scenario())
+
+
+def test_retry_timestamp_and_inline_page_refresh_do_not_repeat_initialization():
+    async def scenario():
+        e = fixture('mail')
+        r, sdk, s, sent = harness(e)
+        try:
+            await r.accept(e)
+            await drained(r)
+            retry = deepcopy(e)
+            retry['timestamp'] = '2026-09-21T12:03:00+00:00'
+            retry['companion']['history'] = retry['companion']['history'][:1]
+            retry['companion']['history_complete'] = False
+            retry['companion']['history_next_cursor'] = 'new-inline-preview'
+            assert not await r.accept(retry)
+            await drained(r)
+            assert sdk.loads == len(s._client.events) == len(sent) == 1
+            conflicting = deepcopy(retry)
+            conflicting['data']['message']['body'] = 'different message'
+            with pytest.raises(CompanionError, match='Conflicting'):
+                await r.accept(conflicting)
+        finally:
+            await r.close()
     asyncio.run(scenario())
 
 
