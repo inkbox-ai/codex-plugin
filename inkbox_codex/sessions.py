@@ -17,6 +17,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from email.utils import getaddresses
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
@@ -410,9 +411,23 @@ class ContactSession:
         return (
             not meta.get("companion_context_only")
             and (self.cfg.companion_response_mode == "relaxed" or meta.get("sender_access") == "direct")
-            and (self.cfg.group_reply_mode != "mention" or mentions_agent(
-                str(meta.get("raw_text") or ""), self.identity_info.get("handle") or self.cfg.identity,
-            ))
+            and (self.cfg.group_reply_mode != "mention" or self._companion_mentioned(meta))
+        )
+
+    def _companion_mentioned(self, meta: Dict[str, Any]) -> bool:
+        """Current text mentions or email To recipients can address the agent."""
+        if mentions_agent(str(meta.get("raw_text") or ""), self.identity_info.get("handle") or self.cfg.identity):
+            return True
+        envelope = meta.get("companion_envelope") or {}
+        if envelope.get("event_type") != "message.received":
+            return False
+        address = (self.identity_info.get("email") or "").strip().casefold()
+        recipients = envelope.get("data", {}).get("message", {}).get("to_addresses")
+        if not address or not isinstance(recipients, list):
+            return False
+        return any(
+            recipient.casefold() == address
+            for _, recipient in getaddresses([item for item in recipients if isinstance(item, str)])
         )
 
     def _companion_control_text(self, text: str) -> str:
@@ -1186,8 +1201,13 @@ class ContactSession:
             questions=list(questions or []),
             tool_name=tool_name,
         )
-        if self._reply_route(self._current_turn)[1].get("companion") and self.cfg.group_reply_mode == "mention":
-            prompt_text += "\nInclude @agent before your answer (for example, @agent allow)."
+        reply_mode, reply_meta = self._reply_route(self._current_turn)
+        if reply_meta.get("companion") and self.cfg.group_reply_mode == "mention":
+            prompt_text += (
+                "\nKeep the agent in To or include @agent before your answer."
+                if reply_mode == "email"
+                else "\nInclude @agent before your answer (for example, @agent allow)."
+            )
         await self._reply(prompt_text, turn=self._current_turn)
         try:
             return await asyncio.wait_for(

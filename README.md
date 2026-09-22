@@ -208,7 +208,11 @@ existing identity:
   Companion email. **Automatic** lets an eligible message start a turn; the
   agent decides whether a reply is warranted. **Mention required** additionally
   requires `@agent` or `@<agent-handle>` in the current message's own text.
-  Historical mentions, notices, and attachment metadata do not count.
+  For Companion email, putting the agent's mailbox in the current message's
+  **To** recipients also counts as a mention. Address matching is case-insensitive
+  and supports display names; **Cc/Bcc alone do not count**. Quoted headers,
+  historical mentions, notices, and attachment metadata do not count.
+  Reply-all may retain the agent in To and therefore satisfy this gate again.
 
 The signed webhook supplies `sender_access` on `data.text_message` for SMS/MMS
 or `data.message` for iMessage/email. `direct` means contact rules permitted the
@@ -226,6 +230,10 @@ These rules apply equally to SMS/MMS, iMessage, and email Companion inputs.
 | Safe (default) | Mention | Context | Wake | Context | Context |
 | Relaxed | Auto | Wake | Wake | Wake | Wake |
 | Relaxed | Mention | Context | Wake | Context | Wake |
+
+For email, the table's **mention** includes the agent being in **To**. This
+does not override sender access: sponsored and unknown-access messages remain
+context-only in Safe mode even when addressed To the agent. Auto is unchanged.
 
 Context-only messages are retained for later eligible turns. For initialization,
 the entire snapshot is appended together; only the current received message can
@@ -253,7 +261,7 @@ and are unaffected by the Companion response setting.
 - Only a live reply by the prompted, locally allowed sender that passes both
   response gates can answer an approval request. Historical or context-only
   approval-looking text cannot. Sponsor slash controls also require both gates.
-  In Mention mode, prefix answers and controls with `@agent`, for example
+  In Mention mode, address email To the agent or prefix answers and controls with `@agent`, for example
   `@agent allow` or `@agent /stop`; escalation prompts remind you of this.
 
 **SDK requirement:** The bridge requires Inkbox SDK **0.7.3 or newer**, including

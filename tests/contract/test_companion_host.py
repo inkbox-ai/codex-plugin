@@ -16,11 +16,11 @@ CODEX_BIN = shutil.which('codex')
 pytestmark = pytest.mark.skipif(CODEX_BIN is None, reason='requires real codex CLI')
 
 
-@pytest.mark.parametrize('channel', ['phone', 'imessage', 'mail'])
+@pytest.mark.parametrize('channel,email_to', [('phone', False), ('imessage', False), ('mail', False), ('mail', True)])
 @pytest.mark.parametrize('reply_mode', ['auto', 'mention'])
 @pytest.mark.parametrize('actual_sdk', [False, True])
 @pytest.mark.parametrize('response_mode,access', [('safe', 'direct'), ('safe', 'sponsored'), ('relaxed', 'sponsored')])
-def test_companion_one_host_turn_or_quiet_context_then_resume(tmp_path, monkeypatch, channel, reply_mode, actual_sdk, response_mode, access):
+def test_companion_one_host_turn_or_quiet_context_then_resume(tmp_path, monkeypatch, channel, email_to, reply_mode, actual_sdk, response_mode, access):
     resource = None
     if actual_sdk:
         resource = pytest.importorskip('inkbox.companion')
@@ -46,6 +46,11 @@ def test_companion_one_host_turn_or_quiet_context_then_resume(tmp_path, monkeypa
         message['sender_access'] = access
         e['companion']['history'][-1]['sender_access'] = access
         r, sdk, s, sent = harness(e, reply_mode=reply_mode, response_mode=response_mode)
+        if channel == 'mail':
+            s.identity_info['email'] = 'agent@example.com'
+            if not email_to:
+                message['to_addresses'].remove('agent@example.com')
+                message['cc_addresses'] = ['agent@example.com']
         if resource is not None:
             r.client.companion = resource.CompanionResource(HTTP(e))
         s.cfg.project_dir = str(tmp_path)
@@ -56,7 +61,7 @@ def test_companion_one_host_turn_or_quiet_context_then_resume(tmp_path, monkeypa
             thread_id = await host.connect()
             await r.accept(e)
             await asyncio.wait_for(asyncio.gather(*r.tasks.values()), 30)
-            if reply_mode == 'mention' or (response_mode == 'safe' and access == 'sponsored'):
+            if (reply_mode == 'mention' and not email_to) or (response_mode == 'safe' and access == 'sponsored'):
                 assert not requests
                 assert not sent
                 # A fresh app-server resumes the quiet context from disk.

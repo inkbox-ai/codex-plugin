@@ -1901,7 +1901,7 @@ def _configure_group_reply_mode() -> None:
         "  When should the agent reply in group chats?",
         [
             "Automatic — the agent decides when to reply (default)",
-            "Mention required — only when the message includes @agent or @<agent-handle>",
+            "Mention required — @agent / @<agent-handle>, or Companion email addressed To the agent",
         ],
         1 if current == "mention" else 0,
     )
