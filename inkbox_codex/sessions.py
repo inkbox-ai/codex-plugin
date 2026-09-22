@@ -1081,7 +1081,7 @@ class ContactSession:
             email_address=self.identity_info.get("email", ""),
             phone_number=self.identity_info.get("phone", ""),
         )
-        self._client = CodexAppServerClient(
+        client = CodexAppServerClient(
             self.cfg,
             developer_instructions=developer_instructions,
             mcp_server_config=self.mcp_server_config,
@@ -1090,7 +1090,17 @@ class ContactSession:
         # Capture what we resumed from before it's overwritten with the new
         # thread id below — otherwise the log claims every session resumed.
         resumed_from = self.resume_session_id
-        thread_id = await self._client.connect(resumed_from or None)
+        try:
+            thread_id = await client.connect(resumed_from or None)
+        except BaseException:
+            # Failed or cancelled startup is not a usable session. Keep the
+            # resume ID so the next attempt reconnects to the same history.
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            raise
+        self._client = client
         if self.on_session_id:
             self.resume_session_id = thread_id
             self.on_session_id(self.chat_id, thread_id)
