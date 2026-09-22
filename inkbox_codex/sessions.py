@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 try:
     from .codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
+    from .companion import same_author
     from .config import (
         BridgeConfig,
         a2a_turn_context_path,
@@ -37,6 +38,7 @@ try:
     from .prompts import build_channel_prompt, frame_inbound, mentions_agent
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
+    from companion import same_author
     from config import BridgeConfig, a2a_turn_context_path, hosted_sms_turn_context_path
     from escalation import (
         PendingInteraction,
@@ -423,7 +425,7 @@ class ContactSession:
 
     def companion_answer(self, text: str, meta: Dict[str, Any]) -> bool:
         """Only a live reply by the prompted sponsor may answer an escalation."""
-        route = self._reply_route(self._current_turn)[1]
+        mode, route = self._reply_route(self._current_turn)
         text = self._companion_control_text(text)
         if (not self._companion_wakes(meta)
                 or self.pending is None or self.pending.future.done()
@@ -431,7 +433,7 @@ class ContactSession:
                 or meta.get("companion_initialization")
                 or meta.get("companion_scope_id") != route.get("companion_scope_id")
                 or meta.get("companion_activation_id") != route.get("companion_activation_id")
-                or meta.get("sender") != route.get("sender")
+                or not same_author(mode, meta.get("sender"), route.get("sender"))
                 or (self.pending.kind == "permission" and parse_permission_reply(text) is None)):
             return False
         self.pending.future.set_result(text)
@@ -446,7 +448,7 @@ class ContactSession:
         quiet = not self._companion_wakes(meta)
         control_text = self._companion_control_text(str(meta.get("raw_text") or ""))
         if (not quiet and not meta.get("companion_initialization")
-                and meta.get("sender") == meta.get("companion_sponsor")
+                and same_author(mode, meta.get("sender"), meta.get("companion_sponsor"))
                 and _control_command(control_text)):
             await before_submit()
             await self.handle_inbound(control_text, mode, {**meta, "raw_text": control_text})

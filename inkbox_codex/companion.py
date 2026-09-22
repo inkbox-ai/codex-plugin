@@ -28,6 +28,15 @@ class CompanionError(ValueError):
     """The event cannot be accepted or submitted as a complete scoped input."""
 
 
+def same_author(channel: str, left: str | None, right: str | None) -> bool:
+    """Compare email authors without case; phone authors remain exact matches."""
+    if not left or not right:
+        return False
+    if channel in {"mail", "email"}:
+        return left.strip().casefold() == right.strip().casefold()
+    return left == right
+
+
 def _uuid(value: Any) -> str:
     try:
         return str(UUID(value))
@@ -368,7 +377,8 @@ class Receiver:
         if len(triggers) != 1 or triggers[0].get("historical") is not False:
             raise CompanionError("Companion snapshot needs exactly one current trigger")
         if event.phase == "initialization" and (
-            str(triggers[0]["id"]) != event.source_id or triggers[0]["author"] != event.author
+            str(triggers[0]["id"]) != event.source_id
+            or not same_author(event.channel, triggers[0]["author"], event.author)
         ):
             raise CompanionError("Companion snapshot trigger does not match the received message")
         if not self.sender_allowed(triggers[0]["author"]):
@@ -488,7 +498,8 @@ class Receiver:
             result, trigger, reply, text = await self.load(event)
             entries = [_dict(entry) for entry in result.entries]
             source_ids = [entry["id"] for entry in entries]
-            if any(entry["id"] == event.source_id and entry["author"] != event.author for entry in entries):
+            if any(entry["id"] == event.source_id and not same_author(event.channel, entry["author"], event.author)
+                   for entry in entries):
                 raise CompanionError("Companion snapshot author does not match the received message")
             # A live-first receipt must not generate a separate historical turn.
             # If already in the snapshot, that receipt gates the combined input.

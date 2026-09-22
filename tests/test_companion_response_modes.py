@@ -161,6 +161,50 @@ def test_live_first_snapshot_author_must_match_current_source():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('phase', ['initialization', 'live'])
+@pytest.mark.parametrize('author,matches', [
+    ('sponsor@example.com', True), ('Sponsor@Example.COM', True),
+    ('different@example.com', False),
+])
+def test_mail_snapshot_matches_authors_case_insensitively(phase, author, matches):
+    async def scenario():
+        e = fixture('mail')
+        current = e if phase == 'initialization' else live(e)
+        message(current)['id'] = e['companion']['history'][-1]['id']
+        message(current)['from_address'] = author
+        r, _, session, sent = harness(e)
+        try:
+            await r.accept(current)
+            await drained(r)
+            assert [kind for kind, _ in session._client.events] == (['run'] if matches else [])
+            assert len(sent) == int(matches)
+            assert r.inbox.db.execute('SELECT state FROM events').fetchone()[0] == ('done' if matches else 'pending')
+        finally:
+            await r.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('reply_mode', ['auto', 'mention'])
+def test_mail_approval_matches_sender_case_without_accepting_other_senders(reply_mode):
+    async def scenario():
+        from inkbox_codex.sessions import _Turn
+        e = fixture('mail')
+        r, _, session, _ = harness(e, reply_mode=reply_mode)
+        pending = asyncio.get_running_loop().create_future()
+        session.pending = PendingInteraction(kind='permission', prompt_text='Allow?', future=pending)
+        session._current_turn = _Turn(text='running', reply_mode='email', reply_meta=r.meta(Event.parse(e)))
+        try:
+            wrong = Event.parse(live(e, text='@agent allow', author='different@example.com'))
+            assert not session.companion_answer(wrong.text, r.meta(wrong))
+            assert not pending.done()
+            same = Event.parse(live(e, 3, text='@agent allow', author='Sponsor@Example.COM'))
+            assert session.companion_answer(same.text, r.meta(same))
+            assert pending.result() == 'allow'
+        finally:
+            await r.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('reply_mode,text,access', [
     ('auto', 'allow', 'sponsored'), ('auto', 'allow', None),
     ('mention', '@agent allow', 'sponsored'), ('mention', 'allow', 'direct'),
@@ -208,9 +252,10 @@ def test_context_only_reply_cannot_resolve_pending_approval(reply_mode, text, ac
     ('direct', 'mention', '@agent /clear', True),
     ('direct', 'auto', '/clear', True),
 ])
-def test_local_commands_cannot_bypass_response_gates(access, reply_mode, text, executes):
+@pytest.mark.parametrize('channel', ['phone', 'imessage', 'mail'])
+def test_local_commands_cannot_bypass_response_gates(access, reply_mode, text, executes, channel):
     async def scenario():
-        e = fixture()
+        e = fixture(channel)
         r, _, session, sent = harness(e, reply_mode=reply_mode)
         try:
             await r.accept(e)
@@ -218,7 +263,8 @@ def test_local_commands_cannot_bypass_response_gates(access, reply_mode, text, e
             session._reset_session = AsyncMock()
             session._client.events.clear()
             sent.clear()
-            await r.accept(set_input(live(e), access, text))
+            current = live(e, author='Sponsor@Example.COM' if channel == 'mail' else None)
+            await r.accept(set_input(current, access, text))
             await drained(r)
             assert session._reset_session.await_count == int(executes)
             assert [kind for kind, _ in session._client.events] == ([] if executes else ['context'])
