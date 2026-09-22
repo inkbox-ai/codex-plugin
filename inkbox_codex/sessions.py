@@ -394,6 +394,7 @@ class ContactSession:
         self.always_allowed: set[str] = set()
 
         self._client: Optional[CodexAppServerClient] = None
+        self._connecting_client: Optional[CodexAppServerClient] = None
         self._queue: asyncio.Queue[_Turn] = asyncio.Queue()
         self._pending_context: list[str] = []
         self._worker: Optional[asyncio.Task] = None
@@ -1081,7 +1082,7 @@ class ContactSession:
             email_address=self.identity_info.get("email", ""),
             phone_number=self.identity_info.get("phone", ""),
         )
-        self._client = CodexAppServerClient(
+        client = CodexAppServerClient(
             self.cfg,
             developer_instructions=developer_instructions,
             mcp_server_config=self.mcp_server_config,
@@ -1090,7 +1091,23 @@ class ContactSession:
         # Capture what we resumed from before it's overwritten with the new
         # thread id below — otherwise the log claims every session resumed.
         resumed_from = self.resume_session_id
-        thread_id = await self._client.connect(resumed_from or None)
+        self._connecting_client = client
+        try:
+            thread_id = await client.connect(resumed_from or None)
+            if self._connecting_client is not client:
+                raise CodexAppServerError("Codex session closed during startup")
+        except BaseException:
+            # Failed or cancelled startup is not a usable session. Keep the
+            # resume ID so the next attempt reconnects to the same history.
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            raise
+        finally:
+            if self._connecting_client is client:
+                self._connecting_client = None
+        self._client = client
         if self.on_session_id:
             self.resume_session_id = thread_id
             self.on_session_id(self.chat_id, thread_id)
@@ -1227,12 +1244,15 @@ class ContactSession:
         await self.send_fn(self.chat_id, text, *self._reply_route(turn))
 
     async def close(self) -> None:
-        if self._client is not None:
+        clients = (self._client, self._connecting_client)
+        self._client = self._connecting_client = None
+        for client in clients:
+            if client is None:
+                continue
             try:
-                await self._client.disconnect()
+                await client.disconnect()
             except Exception:
                 pass
-            self._client = None
 
 
 class SessionManager:

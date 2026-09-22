@@ -102,6 +102,8 @@ class CodexAppServerClient:
         self._next_id = 1
         self._pending: Dict[int, "asyncio.Future[Any]"] = {}
         self._turns: Dict[str, _TurnCapture] = {}
+        self._starting_turns: Dict[int, _TurnCapture] = {}
+        self._early_notifications: Dict[str, list[Dict[str, Any]]] = {}
         self._current_turn_id: Optional[str] = None
         self._initialized = False
 
@@ -155,26 +157,23 @@ class CodexAppServerClient:
             # A turn-level cwd override otherwise restores the default local
             # environment after thread/start disabled it.
             params["environments"] = []
-        result = await self._request("turn/start", params)
-        turn = result.get("turn") or {}
-        turn_id = str(turn.get("id") or "")
-        if not turn_id:
-            raise CodexAppServerError(f"app-server did not return a turn id: {result!r}")
-
         loop = asyncio.get_running_loop()
         capture = _TurnCapture(
             thread_id=self.thread_id,
-            turn_id=turn_id,
+            turn_id="",
             future=loop.create_future(),
             activity_handler=activity_handler,
         )
-        self._turns[turn_id] = capture
-        self._current_turn_id = turn_id
         try:
+            await self._request("turn/start", params, turn_capture=capture)
             return await capture.future
         finally:
-            self._turns.pop(turn_id, None)
-            if self._current_turn_id == turn_id:
+            self._turns.pop(capture.turn_id, None)
+            if not capture.future.done():
+                capture.future.cancel()
+            elif not capture.future.cancelled():
+                capture.future.exception()
+            if self._current_turn_id == capture.turn_id:
                 self._current_turn_id = None
 
     async def append_context(self, messages: list[str]) -> None:
@@ -304,7 +303,10 @@ class CodexAppServerClient:
         await self._notify("initialized", {})
         self._initialized = True
 
-    async def _request(self, method: str, params: Dict[str, Any]) -> Any:
+    async def _request(
+        self, method: str, params: Dict[str, Any], *,
+        turn_capture: Optional[_TurnCapture] = None,
+    ) -> Any:
         if self._proc is None or self._proc.stdin is None:
             raise CodexAppServerError("Codex app-server is not running")
         if self._reader_task is not None and self._reader_task.done():
@@ -314,8 +316,16 @@ class CodexAppServerClient:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
         self._pending[message_id] = future
-        self._write({"id": message_id, "method": method, "params": params})
-        return await future
+        if turn_capture is not None:
+            self._starting_turns[message_id] = turn_capture
+        try:
+            self._write({"id": message_id, "method": method, "params": params})
+            return await future
+        finally:
+            self._pending.pop(message_id, None)
+            self._starting_turns.pop(message_id, None)
+            if not self._starting_turns:
+                self._early_notifications.clear()
 
     async def _notify(self, method: str, params: Dict[str, Any]) -> None:
         self._write({"method": method, "params": params})
@@ -365,14 +375,33 @@ class CodexAppServerClient:
             logger.debug("[codex app-server] %s", line.decode(errors="replace").rstrip())
 
     def _handle_response(self, message: Dict[str, Any]) -> None:
-        future = self._pending.pop(int(message["id"]), None)
+        message_id = int(message["id"])
+        future = self._pending.pop(message_id, None)
         if future is None or future.done():
             return
         if "error" in message:
             error = message.get("error") or {}
-            future.set_exception(CodexAppServerError(str(error.get("message") or error)))
+            detail = error.get("message") or error if isinstance(error, dict) else error
+            future.set_exception(CodexAppServerError(str(detail)))
         else:
-            future.set_result(message.get("result"))
+            result = message.get("result")
+            capture = self._starting_turns.pop(message_id, None)
+            notifications = []
+            if capture is not None:
+                turn = result.get("turn") if isinstance(result, dict) else None
+                turn_id = str(turn.get("id") or "") if isinstance(turn, dict) else ""
+                if not turn_id:
+                    future.set_exception(CodexAppServerError("app-server did not return a turn id"))
+                    return
+                # Bind before reading another line: the completion can already
+                # be buffered behind this response, before run_detailed resumes.
+                capture.turn_id = turn_id
+                self._turns[turn_id] = capture
+                self._current_turn_id = turn_id
+                notifications = self._early_notifications.pop(turn_id, [])
+            future.set_result(result)
+            for notification in notifications:
+                self._handle_notification(notification)
 
     async def _handle_server_request(self, message: Dict[str, Any]) -> None:
         method = str(message.get("method") or "")
@@ -396,6 +425,13 @@ class CodexAppServerClient:
         method = message.get("method")
         params = message.get("params") or {}
         turn_id = str(params.get("turnId") or (params.get("turn") or {}).get("id") or "")
+
+        if (turn_id and turn_id not in self._turns and self._starting_turns
+                and method in {"item/started", "item/agentMessage/delta", "item/completed", "turn/completed"}):
+            # Some hosts emit turn notifications before acknowledging turn/start.
+            # Retain them only while starts are outstanding, keyed by turn ID.
+            self._early_notifications.setdefault(turn_id, []).append(message)
+            return
 
         if method == "item/started":
             capture = self._turns.get(turn_id)
