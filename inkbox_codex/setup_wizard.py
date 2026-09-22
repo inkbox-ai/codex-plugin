@@ -1901,13 +1901,34 @@ def _configure_group_reply_mode() -> None:
         "  When should the agent reply in group chats?",
         [
             "Automatic — the agent decides when to reply (default)",
-            "Mention required — only when the message includes @agent or @<agent-handle>",
+            "Mention required — @agent / @<agent-handle>, or Companion email addressed To the agent",
         ],
         1 if current == "mention" else 0,
     )
     mode = ("auto", "mention")[choice]
     _save("INKBOX_GROUP_REPLY_MODE", mode)
     print_success(f"  Group reply mode saved: {mode}.")
+
+
+def _configure_companion_response_mode() -> None:
+    """Choose which Companion senders may trigger a turn, preserving saved settings."""
+    print()
+    print(color("  --- Companion responses ---", Colors.CYAN))
+    print_info("  Applies to Companion SMS/MMS, iMessage, and email conversations.")
+    print_info("  Both modes follow your Automatic / Mention required setting.")
+    print_info("  Messages that do not trigger a turn are still added to conversation context.")
+    current = _env("INKBOX_COMPANION_RESPONSE_MODE").strip().lower()
+    choice = prompt_choice(
+        "  Which Companion messages can wake the agent?",
+        [
+            "Safe — only direct-access messages; sponsored or unknown access stays context-only (default)",
+            "Relaxed — any delivered message can trigger a response, including sponsored messages",
+        ],
+        1 if current == "relaxed" else 0,
+    )
+    mode = ("safe", "relaxed")[choice]
+    _save("INKBOX_COMPANION_RESPONSE_MODE", mode)
+    print_success(f"  Companion response mode saved: {mode}.")
 
 
 def _configure_inkbox_tool_approvals() -> None:
@@ -2123,6 +2144,7 @@ def interactive_setup() -> None:
         print_success(f"Inkbox is already configured for identity '{existing_identity}'.")
         if not prompt_yes_no("  Reconfigure Inkbox?", False):
             _configure_group_reply_mode()
+            _configure_companion_response_mode()
             _configure_inkbox_tool_approvals()
             print_info("  Restart your running bridge or service to apply the saved settings.")
             return
@@ -2214,6 +2236,8 @@ def interactive_setup() -> None:
     _configure_project_dir()
 
     _configure_group_reply_mode()
+
+    _configure_companion_response_mode()
 
     _configure_inkbox_tool_approvals()
 

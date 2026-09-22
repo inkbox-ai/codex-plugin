@@ -18,7 +18,8 @@
       "cc_addresses": [],
       "subject": "Re: Planning tomorrow",
       "direction": "inbound",
-      "body": "Agent, please help us pick a time."
+      "body": "Agent, please help us pick a time.",
+      "sender_access": "direct"
     },
     "contacts": [],
     "agent_identities": []
@@ -38,7 +39,8 @@
         "text": "Can we meet tomorrow afternoon?",
         "historical": true,
         "is_trigger": false,
-        "attachments": []
+        "attachments": [],
+        "sender_access": "sponsored"
       },
       {
         "id": "30000000-0000-4000-8000-000000000102",
@@ -47,7 +49,8 @@
         "text": "I am free after 2 PM.",
         "historical": true,
         "is_trigger": false,
-        "attachments": []
+        "attachments": [],
+        "sender_access": "sponsored"
       },
       {
         "id": "30000000-0000-4000-8000-000000000103",
@@ -56,7 +59,8 @@
         "text": "Agent, please help us pick a time.",
         "historical": false,
         "is_trigger": true,
-        "attachments": []
+        "attachments": [],
+        "sender_access": "direct"
       }
     ],
     "history_complete": true,

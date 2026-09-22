@@ -119,6 +119,7 @@ class BridgeConfig:
     external_events_enabled: bool = False
     contact_memories_enabled: bool = True
     group_reply_mode: str = "auto"
+    companion_response_mode: str = "safe"
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     # Codex side
@@ -212,6 +213,9 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
     group_reply_mode = (os.getenv("INKBOX_GROUP_REPLY_MODE") or "auto").strip().lower()
     if group_reply_mode not in {"auto", "mention"}:
         raise ValueError("INKBOX_GROUP_REPLY_MODE must be auto or mention")
+    companion_response_mode = (os.getenv("INKBOX_COMPANION_RESPONSE_MODE") or "safe").strip().lower()
+    if companion_response_mode not in {"safe", "relaxed"}:
+        raise ValueError("INKBOX_COMPANION_RESPONSE_MODE must be safe or relaxed")
     realtime_api_key = str(
         os.getenv("INKBOX_REALTIME_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
     ).strip()
@@ -236,6 +240,7 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         external_events_enabled=env_flag("INKBOX_EXTERNAL_EVENTS_ENABLED", False),
         contact_memories_enabled=env_flag("INKBOX_CONTACT_MEMORIES_ENABLED", True),
         group_reply_mode=group_reply_mode,
+        companion_response_mode=companion_response_mode,
         host=str(os.getenv("INKBOX_BRIDGE_HOST") or DEFAULT_HOST).strip(),
         port=int(os.getenv("INKBOX_BRIDGE_PORT") or DEFAULT_PORT),
         project_dir=str(

@@ -273,6 +273,10 @@ def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
 
     sender = str(meta.get("sender") or "").strip()
     from_part = f" from={sender}" if sender else ""
+    if meta.get("companion"):
+        access = meta.get("sender_access")
+        access = access if access in ("direct", "sponsored") else "unknown"
+        from_part += f" sender_access={access} source_message_id={meta.get('source_message_id', '')}"
     marker = contact_marker(meta.get("contact"), meta.get("agent_identity"))
     if mode == "email":
         subject = str(meta.get("subject") or "").strip()

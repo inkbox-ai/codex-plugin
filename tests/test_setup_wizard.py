@@ -93,6 +93,32 @@ def test_group_reply_choice_persists_and_preserves_default(
     assert setup_wizard._env("INKBOX_GROUP_REPLY_MODE") == expected
 
 
+@pytest.mark.parametrize("saved,choice,default,expected", [
+    ("", 0, 0, "safe"), ("", 1, 0, "relaxed"),
+    ("relaxed", 1, 1, "relaxed"), ("relaxed", 0, 1, "safe"),
+    ("invalid", 0, 0, "safe"),
+])
+def test_companion_response_choice_persists_and_preserves_default(
+    tmp_path, monkeypatch, saved, choice, default, expected
+):
+    path = tmp_path / ".env"
+    path.write_text(f"INKBOX_COMPANION_RESPONSE_MODE={saved}\nINKBOX_GROUP_REPLY_MODE=mention\n")
+    monkeypatch.setenv("INKBOX_CODEX_ENV_FILE", str(path))
+    monkeypatch.delenv("INKBOX_COMPANION_RESPONSE_MODE", raising=False)
+
+    def choose(question, options, selected):
+        assert "Companion" in question
+        assert len(options) == 2
+        assert selected == default
+        return choice
+
+    monkeypatch.setattr(setup_wizard, "prompt_choice", choose)
+    setup_wizard._configure_companion_response_mode()
+    assert f"INKBOX_COMPANION_RESPONSE_MODE={expected}" in path.read_text()
+    assert setup_wizard._env("INKBOX_COMPANION_RESPONSE_MODE") == expected
+    assert "INKBOX_GROUP_REPLY_MODE=mention" in path.read_text()
+
+
 def test_existing_setup_can_change_group_reply_mode_without_reconfiguring(monkeypatch):
     monkeypatch.setattr(setup_wizard, "_ensure_inkbox_sdk", lambda: dict.fromkeys([
         "Inkbox", "InkboxAPIError", "IdentityPhoneNumberCreateOptions", "WhoamiApiKeyResponse",
@@ -102,9 +128,10 @@ def test_existing_setup_can_change_group_reply_mode_without_reconfiguring(monkey
     monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **kw: False)
     calls = []
     monkeypatch.setattr(setup_wizard, "_configure_group_reply_mode", lambda: calls.append("group"))
+    monkeypatch.setattr(setup_wizard, "_configure_companion_response_mode", lambda: calls.append("companion"))
     monkeypatch.setattr(setup_wizard, "_configure_inkbox_tool_approvals", lambda: calls.append("approvals"))
     setup_wizard.interactive_setup()
-    assert calls == ["group", "approvals"]
+    assert calls == ["group", "companion", "approvals"]
 
 
 def test_env_reads_quoted_value_from_file(tmp_path, monkeypatch):
@@ -1084,6 +1111,9 @@ def test_wizard_walks_imessage_before_dedicated_number(monkeypatch):
         setup_wizard, "_configure_group_reply_mode", lambda: calls.append("group_replies")
     )
     monkeypatch.setattr(
+        setup_wizard, "_configure_companion_response_mode", lambda: calls.append("companion_responses")
+    )
+    monkeypatch.setattr(
         setup_wizard,
         "_configure_inkbox_tool_approvals",
         lambda: calls.append("approvals"),
@@ -1102,6 +1132,7 @@ def test_wizard_walks_imessage_before_dedicated_number(monkeypatch):
         "signing_key",
         "project_dir",
         "group_replies",
+        "companion_responses",
         "approvals",
         "autostart",
     ]
