@@ -11,6 +11,7 @@ def test_read_config_defaults(monkeypatch):
         "INKBOX_BASE_URL", "CODEX_TURN_TIMEOUT_S", "CODEX_INTERRUPT_TIMEOUT_S",
         "INKBOX_CONTACT_MEMORIES_ENABLED",
         "INKBOX_GROUP_REPLY_MODE",
+        "INKBOX_COMPANION_RESPONSE_MODE",
         "INKBOX_A2A_PROGRESS_INTERVAL_SECONDS",
     ):
         monkeypatch.delenv(var, raising=False)
@@ -25,6 +26,7 @@ def test_read_config_defaults(monkeypatch):
     assert cfg.codex_interrupt_timeout_s == 10.0
     assert cfg.contact_memories_enabled is True
     assert cfg.group_reply_mode == "auto"
+    assert cfg.companion_response_mode == "safe"
     assert cfg.a2a_progress_interval_seconds == 180.0
 
 
@@ -62,6 +64,19 @@ def test_group_reply_mode_from_env(monkeypatch, value, expected):
 def test_invalid_group_reply_mode_is_rejected(monkeypatch):
     monkeypatch.setenv("INKBOX_GROUP_REPLY_MODE", "mentions")
     with pytest.raises(ValueError, match="INKBOX_GROUP_REPLY_MODE"):
+        read_config()
+
+
+@pytest.mark.parametrize("value,expected", [("", "safe"), ("safe", "safe"), ("relaxed", "relaxed"), (" RELAXED ", "relaxed")])
+def test_companion_response_mode_from_env(monkeypatch, value, expected):
+    monkeypatch.setenv("INKBOX_COMPANION_RESPONSE_MODE", value)
+    assert read_config().companion_response_mode == expected
+
+
+@pytest.mark.parametrize("value", ["relax", "direct", "true", " "])
+def test_invalid_companion_response_mode_is_rejected(monkeypatch, value):
+    monkeypatch.setenv("INKBOX_COMPANION_RESPONSE_MODE", value)
+    with pytest.raises(ValueError, match="INKBOX_COMPANION_RESPONSE_MODE"):
         read_config()
 
 

@@ -195,3 +195,49 @@ def test_later_allowed_sender_does_not_replace_original_activation_sponsor():
         finally:
             await r.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('channel', ['phone', 'imessage', 'mail'])
+def test_actual_sdk_live_first_sponsored_history_is_quiet_then_direct_can_wake(channel):
+    async def scenario():
+        e = fixture(channel)
+        r, _, s, sent = harness(e)
+        http = HTTP(e)
+        r.client = NS(companion=companion.CompanionResource(http))
+        sponsored = live(e)
+        message = sponsored['data'].get('text_message') or sponsored['data']['message']
+        message['sender_access'] = 'sponsored'
+        try:
+            await r.accept(sponsored)
+            await drained(r)
+            assert [kind for kind, _ in s._client.events] == ['context', 'context']
+            assert not sent
+            assert 'sender_access=sponsored' in s._client.events[-1][1]
+            reads = len(http.calls)
+            await r.accept(live(e, 3))
+            await drained(r)
+            assert [kind for kind, _ in s._client.events] == ['context', 'context', 'run']
+            assert len(sent) == 1
+            assert len(http.calls) == reads
+        finally:
+            await r.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('channel', ['phone', 'imessage', 'mail'])
+def test_actual_sdk_snapshot_does_not_upgrade_missing_current_sender_access(channel):
+    async def scenario():
+        e = fixture(channel)
+        message = e['data'].get('text_message') or e['data']['message']
+        message.pop('sender_access')
+        r, _, s, sent = harness(e)
+        r.client = NS(companion=companion.CompanionResource(HTTP(e)))
+        try:
+            await r.accept(e)
+            await drained(r)
+            assert [kind for kind, _ in s._client.events] == ['context']
+            assert 'sender_access=unknown' in s._client.events[0][1]
+            assert not sent
+        finally:
+            await r.close()
+    asyncio.run(scenario())

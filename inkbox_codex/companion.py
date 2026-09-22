@@ -64,6 +64,7 @@ class Event:
     source_id: str
     author: str
     text: str
+    sender_access: str | None
 
     @classmethod
     def parse(cls, envelope: dict) -> Event:
@@ -97,8 +98,11 @@ class Event:
             text = message.get(text_field) or ""
             if not isinstance(text, str):
                 raise CompanionError("Companion message text must be a string")
+            access = message.get("sender_access")
+            if access not in ("direct", "sponsored"):
+                access = None
             return cls(envelope, event_id, scope, activation, conversation, channel, mode,
-                       phase, sequence, _uuid(message["id"]), author.strip(), text)
+                       phase, sequence, _uuid(message["id"]), author.strip(), text, access)
         except (KeyError, TypeError) as exc:
             raise CompanionError("Incomplete Companion received event") from exc
 
@@ -392,12 +396,16 @@ class Receiver:
             if not (reply.get("to") or reply.get("cc")):
                 raise CompanionError("Companion email reply requires its approved audience")
 
-    def meta(self, event, *, source_id=None, author=None, text=None, reply=None, initialization=False):
+    def meta(self, event, *, source_id=None, author=None, text=None, reply=None, initialization=False,
+             sponsor=None, context_only=False):
         return {
             "companion": True, "companion_scope_id": event.scope,
             "companion_activation_id": event.activation, "companion_sequence": event.sequence,
             "companion_initialization": initialization,
-            "companion_sponsor": (self.inbox.activation(event) or (None, author or event.author))[1],
+            "companion_sponsor": (self.inbox.activation(event) or (None, sponsor or author or event.author))[1],
+            "companion_context_only": context_only,
+            "source_message_id": event.source_id,
+            "sender_access": event.sender_access,
             "companion_reply_context": reply,
             "companion_envelope": event.envelope,
             "conversation_kind": "group", "conversation_id": event.conversation,
@@ -478,10 +486,17 @@ class Receiver:
             raise CompanionError("Companion initialization has an uncertain host outcome; inspect before retrying")
         if not saved:
             result, trigger, reply, text = await self.load(event)
+            entries = [_dict(entry) for entry in result.entries]
+            source_ids = [entry["id"] for entry in entries]
+            if any(entry["id"] == event.source_id and entry["author"] != event.author for entry in entries):
+                raise CompanionError("Companion snapshot author does not match the received message")
+            # A live-first receipt must not generate a separate historical turn.
+            # If already in the snapshot, that receipt gates the combined input.
             await self.submit(event, text, self.meta(
-                event, source_id=trigger["id"], author=trigger["author"], text=trigger["text"],
+                event, source_id=trigger["id"], sponsor=trigger["author"],
                 reply=reply, initialization=True,
-            ), trigger=trigger, source_ids=[_dict(entry)["id"] for entry in result.entries])
+                context_only=event.phase == "live" and event.source_id not in source_ids,
+            ), trigger=trigger, source_ids=source_ids)
             if event.phase == "initialization" or self.inbox.source_submitted(event):
                 return
         elif event.phase == "initialization":

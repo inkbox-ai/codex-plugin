@@ -19,7 +19,8 @@ pytestmark = pytest.mark.skipif(CODEX_BIN is None, reason='requires real codex C
 @pytest.mark.parametrize('channel', ['phone', 'imessage', 'mail'])
 @pytest.mark.parametrize('reply_mode', ['auto', 'mention'])
 @pytest.mark.parametrize('actual_sdk', [False, True])
-def test_companion_one_host_turn_or_quiet_context_then_resume(tmp_path, monkeypatch, channel, reply_mode, actual_sdk):
+@pytest.mark.parametrize('response_mode,access', [('safe', 'direct'), ('safe', 'sponsored'), ('relaxed', 'sponsored')])
+def test_companion_one_host_turn_or_quiet_context_then_resume(tmp_path, monkeypatch, channel, reply_mode, actual_sdk, response_mode, access):
     resource = None
     if actual_sdk:
         resource = pytest.importorskip('inkbox.companion')
@@ -41,7 +42,10 @@ def test_companion_one_host_turn_or_quiet_context_then_resume(tmp_path, monkeypa
     monkeypatch.setenv('CODEX_HOME', str(home))
     async def scenario():
         e = fixture(channel)
-        r, sdk, s, sent = harness(e, reply_mode=reply_mode)
+        message = e['data'].get('text_message') or e['data']['message']
+        message['sender_access'] = access
+        e['companion']['history'][-1]['sender_access'] = access
+        r, sdk, s, sent = harness(e, reply_mode=reply_mode, response_mode=response_mode)
         if resource is not None:
             r.client.companion = resource.CompanionResource(HTTP(e))
         s.cfg.project_dir = str(tmp_path)
@@ -52,7 +56,7 @@ def test_companion_one_host_turn_or_quiet_context_then_resume(tmp_path, monkeypa
             thread_id = await host.connect()
             await r.accept(e)
             await asyncio.wait_for(asyncio.gather(*r.tasks.values()), 30)
-            if reply_mode == 'mention':
+            if reply_mode == 'mention' or (response_mode == 'safe' and access == 'sponsored'):
                 assert not requests
                 assert not sent
                 # A fresh app-server resumes the quiet context from disk.
@@ -60,11 +64,15 @@ def test_companion_one_host_turn_or_quiet_context_then_resume(tmp_path, monkeypa
                 host = CodexAppServerClient(s.cfg, developer_instructions='contract-test')
                 await host.connect(resume_thread_id=thread_id)
                 s._client = host
-                await r.accept(live(e))
+                next_event = live(e)
+                next_message = next_event['data'].get('text_message') or next_event['data']['message']
+                next_message['sender_access'] = 'direct'
+                await r.accept(next_event)
                 await asyncio.wait_for(asyncio.gather(*r.tasks.values()), 30)
             assert len(requests) == 1
             assert len(sent) == 1
             model_input = json.dumps(requests[0]['input'])
+            assert f'sender_access={access}' in model_input
             for entry in e['companion']['history']:
                 assert model_input.count(entry['text']) == 1
                 assert entry['author'] in model_input

@@ -195,18 +195,52 @@ SDK, including every page, and submits **one combined input**. The sponsor trigg
 is included once; historical messages, attachment descriptors, and history notices remain
 conversation data, never individual turns or slash commands.
 
-`INKBOX_GROUP_REPLY_MODE=auto|mention` also applies to Companion email. In `auto`,
-the agent decides whether to answer the trigger. In `mention`, only the trigger's
-own text can wake it (`@agent` or `@<agent-handle>`); otherwise the **entire batch**
-is appended to the Codex thread without model generation. Historical mentions do
-not count. The setup wizard configures the same setting.
+The setup wizard offers two independent settings, including when rerun for an
+existing identity:
+
+- **Companion responses:** `INKBOX_COMPANION_RESPONSE_MODE=safe|relaxed`.
+  **Safe** (default) allows only messages with `sender_access="direct"` to wake
+  the agent. Sponsored messages, or messages with missing/unrecognized access,
+  are appended to context without model generation, typing, or a reply.
+  **Relaxed** allows any delivered message to wake the agent, including sponsored
+  and unknown-access messages.
+- **Group replies:** `INKBOX_GROUP_REPLY_MODE=auto|mention`, also applied to
+  Companion email. **Automatic** lets an eligible message start a turn; the
+  agent decides whether a reply is warranted. **Mention required** additionally
+  requires `@agent` or `@<agent-handle>` in the current message's own text.
+  Historical mentions, notices, and attachment metadata do not count.
+
+The signed webhook supplies `sender_access` on `data.text_message` for SMS/MMS
+or `data.message` for iMessage/email. `direct` means contact rules permitted the
+message without sponsorship, including allowed-by-default senders; `sponsored`
+means delivery was authorized through sponsorship. Neither value grants command
+permissions or establishes permanent trust. Access is not inferred from the
+sender's contact record, sponsor identity, or Companion phase.
+
+**Wake** below means context plus a model turn; **Context** means context only.
+These rules apply equally to SMS/MMS, iMessage, and email Companion inputs.
+
+| Companion mode | Group replies | Direct, no mention | Direct, mention | Sponsored, no mention | Sponsored, mention |
+|---|---|---|---|---|---|
+| Safe (default) | Auto | Wake | Wake | Context | Context |
+| Safe (default) | Mention | Context | Wake | Context | Context |
+| Relaxed | Auto | Wake | Wake | Wake | Wake |
+| Relaxed | Mention | Context | Wake | Context | Wake |
+
+Context-only messages are retained for later eligible turns. For initialization,
+the entire snapshot is appended together; only the current received message can
+trigger generation. Webhooks without Companion metadata retain normal routing
+and are unaffected by the Companion response setting.
 
 - Sessions are isolated by API environment, identity, channel, server scope, and
   activation, separate from ordinary contact sessions. A new activation starts
   a fresh session with its authorized snapshot. Each new released snapshot must have a
   distinct activation ID; replaying an immutable activation is not a new batch.
 - Initialization completes before queued live messages run. A first-seen live
-  event loads initialization first. Pending events run in sequence order; numeric
+  event loads history as context, without a separate historical sponsor turn;
+  only the live message can wake the agent. If that message is already in the
+  snapshot, the combined input uses its access and mention instead of repeating it.
+  Pending events run in sequence order; numeric
   gaps do not stall the conversation. Late unseen events older than an already
   submitted input require reconciliation instead of running out of order.
   `phase="ordinary"` uses a separate scoped session and never loads hidden history.
@@ -216,9 +250,11 @@ not count. The setup wizard configures the same setting.
   remain in force. Live turns and replies use the signed conversation scope and
   saved sponsor message without additional activation lookups. Replies reuse the
   identity loaded at startup.
-- Only a live reply by the prompted, locally allowed sender can answer an
-  approval request. Historical approval-looking text cannot. Sponsor slash
-  controls on subsequent live messages remain local commands.
+- Only a live reply by the prompted, locally allowed sender that passes both
+  response gates can answer an approval request. Historical or context-only
+  approval-looking text cannot. Sponsor slash controls also require both gates.
+  In Mention mode, prefix answers and controls with `@agent`, for example
+  `@agent allow` or `@agent /stop`; escalation prompts remind you of this.
 
 **SDK requirement:** The bridge requires Inkbox SDK **0.7.3 or newer**, including
 `client.companion.load_initialization` and `activation_messages`. Installation
@@ -226,6 +262,12 @@ resolves the published SDK; CI tests the released `inkbox==0.7.3` minimum across
 unit, real-host, and live-channel lanes. No preview source checkout is needed.
 An unsupported SDK produces an explicit webhook error; the bridge never falls
 back to submitting only the trigger.
+
+Wake decisions use the signed current-message access and do not require extra
+SDK lookups. Older SDKs may omit per-entry access labels from rendered history;
+those historical entries remain context, never independent triggers. Safe mode
+on webhooks that omit `sender_access` is context-only; no missing field is treated
+as direct access.
 
 **Delivery and recovery:** receipts and initialization checkpoints live under
 `$INKBOX_CODEX_HOME/companion/` (default `~/.inkbox-codex/companion/`), with private
@@ -367,6 +409,7 @@ with both deterministic and real-model gateway runs, without SMS reset traffic.
 | `INKBOX_BRIDGE_PORT` | no | `8767` | Local webhook server port. |
 | `INKBOX_PERMISSION_TIMEOUT_S` | no | `600` | Seconds to wait for a permission/poll reply. |
 | `INKBOX_GROUP_REPLY_MODE` | no | `auto` | Group SMS/iMessage and Companion email replies: `auto` lets the agent decide; `mention` requires `@agent` or `@<agent-handle>` in the new message. Other messages become context without starting a turn. Also configurable in setup. |
+| `INKBOX_COMPANION_RESPONSE_MODE` | no | `safe` | Companion SMS/MMS, iMessage, and email: `safe` wakes only for direct access; `relaxed` permits any delivered sender. Both honor Auto/Mention. Sponsored and unknown access stays context-only in Safe mode. Also configurable in setup. |
 | `INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS` | no | `false` | Auto-accept Codex MCP prompts for Inkbox tools only. The setup wizard writes `true` when you trust the agent to send through Inkbox without per-call approval. |
 | `INKBOX_A2A_PROGRESS_INTERVAL_SECONDS` | no | `180` | Seconds between progress updates for active inbound A2A tasks. Set to `0` to disable periodic updates. |
 | `INKBOX_VOICE_STACK` | no | `inkbox_tts_stt` | `inkbox_voice_ai`, `openai_realtime`, or `inkbox_tts_stt`. When absent, legacy Realtime settings remain compatible. |

@@ -68,11 +68,12 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
 
 
-def harness(envelope, *, reply_mode='auto', allowed=lambda _: True):
+def harness(envelope, *, reply_mode='auto', response_mode='safe', allowed=lambda _: True):
     sdk = SDK(envelope)
     sent = []
     session = make_session(sent)
     session.cfg.group_reply_mode = reply_mode
+    session.cfg.companion_response_mode = response_mode
     session._client = Client()
     session.cfg.identity = 'test-agent'
     sessions = NS(get=Mock(return_value=session))
@@ -133,15 +134,16 @@ def test_mentions_only_trigger_then_live_wake(channel):
     asyncio.run(scenario())
 
 
-def test_live_first_loads_snapshot_once_then_live_once():
+def test_live_first_loads_snapshot_as_context_then_live_once():
     async def scenario():
         e = fixture()
         r, sdk, s, sent = harness(e)
         try:
             await r.accept(live(e))
             await drained(r)
-            assert len(sent) == 2
+            assert len(sent) == 1
             assert sdk.loads == 1
+            assert [kind for kind, _ in s._client.events] == ['context', 'run']
             assert 'Can we meet' in s._client.events[0][1]
             assert '@agent next' in s._client.events[1][1]
             assert 'Can we meet' not in s._client.events[1][1]
@@ -605,14 +607,14 @@ def test_saved_reply_survives_restart_and_releases_later_inputs(live_first):
         await drained(r)
         await r.accept(live(e, 3))
         await drained(r)
-        assert len(s._client.events) == 1
+        assert [kind for kind, _ in s._client.events] == (['context', 'run'] if live_first else ['run'])
         await r.close()
         r, sdk, s, sent = harness(e)
         try:
             r.recover()
             await drained(r)
-            assert len(sent) == (3 if live_first else 2)
-            assert len(s._client.events) == (2 if live_first else 1)
+            assert len(sent) == 2
+            assert len(s._client.events) == 1
             assert sdk.loads == 0
             assert all(row[0] == 'done' for row in r.inbox.db.execute('SELECT state FROM events'))
         finally:
