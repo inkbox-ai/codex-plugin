@@ -284,6 +284,8 @@ submission retry with capped backoff while the gateway runs; other pre-submissio
 failures retry up to five times. Pending inputs resume after restart or webhook
 redelivery. Failed Codex startup or resume attempts release the incomplete client
 and retry with the same saved thread; they do not count as submitted model turns.
+Closing or clearing a session also disposes its connecting client, so a late
+startup response cannot restore a cleared conversation.
 A retry may refresh its delivery timestamp or inline history preview
 without creating another input. Stable event IDs and acknowledged snapshot/live source-message IDs
 are deduplicated across restarts within their scope and activation. Completed answers

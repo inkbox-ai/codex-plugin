@@ -224,3 +224,54 @@ def test_failed_submitted_turn_still_pauses_without_replay(tmp_path, monkeypatch
             await r.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('reset', [False, True], ids=['shutdown', 'clear'])
+@pytest.mark.parametrize('connected', [False, True], ids=['connecting', 'response-ready'])
+def test_close_during_startup_cannot_restore_closed_thread(tmp_path, monkeypatch, reset, connected):
+    monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
+
+    async def scenario():
+        entered, finish = asyncio.Event(), asyncio.Event()
+        clients, persisted = [], []
+
+        class Client:
+            def __init__(self, *args, **kwargs):
+                self.closed = False
+                clients.append(self)
+
+            async def connect(self, resume):
+                entered.set()
+                await finish.wait()
+                # A successful response may already be queued when close runs.
+                return resume
+
+            async def disconnect(self):
+                self.closed = True
+
+        monkeypatch.setattr(sessions_mod, 'CodexAppServerClient', Client)
+        session = make_session([])
+        session.resume_session_id = 'previous-thread'
+        session.on_session_id = lambda *args: persisted.append(args)
+        task = asyncio.create_task(session._ensure_client())
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            if connected:
+                finish.set()
+            if reset:
+                await session.handle_inbound('/clear', 'sms', {'to': '+15551112222'})
+            else:
+                await session.close()
+            assert clients[0].closed
+            finish.set()
+            with pytest.raises(CodexAppServerError, match='closed'):
+                await asyncio.wait_for(task, 1)
+            assert session._client is None
+            assert not persisted
+            assert session.resume_session_id == (None if reset else 'previous-thread')
+        finally:
+            finish.set()
+            await asyncio.gather(task, return_exceptions=True)
+            await session.close()
+
+    asyncio.run(scenario())
