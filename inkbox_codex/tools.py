@@ -1281,8 +1281,9 @@ def _place_call_tool_entry(voice_stack: VoiceStack) -> Dict[str, Any]:
         "name": "inkbox_place_call",
         "description": (
             "Ask Inkbox Voice AI to place an outbound call and complete the stated "
-            "task over either of the identity's two lines. Codex is notified "
-            "after the call ends."
+            "task over either of the identity's two lines. Return after placement; "
+            "do not poll or wait for the call to end. A separate call-ended turn "
+            "receives the transcript and owns any post-call follow-up."
             if hosted else
             "Place an outbound voice call over either of the identity's two lines, "
             "handled by this Codex agent through the configured local voice stack."

@@ -377,7 +377,7 @@ def test_plain_elicitation_question_still_asks_human():
             {"message": "Which account should I use?"},
         )
 
-        assert result == {"action": "accept", "content": {"text": ""}}
+        assert result == {"action": "cancel", "content": None}
         assert sent and sent[0][1] == "Which account should I use?"
 
     asyncio.run(scenario())

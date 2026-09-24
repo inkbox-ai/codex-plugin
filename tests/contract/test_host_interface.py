@@ -241,9 +241,13 @@ def test_bridge_client_full_mock_turn(tmp_path, monkeypatch):
         client2 = CodexAppServerClient(cfg, developer_instructions="contract-test")
         try:
             resumed_id = await asyncio.wait_for(client2.connect(resume_thread_id=thread_id), timeout=10)
-            reply = await asyncio.wait_for(client2.run("ping smoke-c0ffee42"), timeout=60)
+            reply = await asyncio.wait_for(client2.run("Companion receipt: contract-recovery-token\nping smoke-c0ffee42"), timeout=60)
         finally:
             await client2.disconnect()
+        from inkbox_codex.codex_client import recover_saved_answer
+        recovered = await recover_saved_answer(cfg, thread_id, 'contract-recovery-token')
+        assert recovered == reply, 'Saved completed turn could not be reconciled without generation'
+        assert len(model_requests) == 2, 'Recovery must only read history, not run the model'
         tool_free = CodexAppServerClient(
             cfg,
             developer_instructions="contract-test",

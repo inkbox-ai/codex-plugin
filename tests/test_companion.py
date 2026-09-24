@@ -68,6 +68,18 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
 
 
+class ReconnectingClient(Client):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+    async def connect(self, resume=None):
+        self.thread_id = resume or 'thread-group'
+        return self.thread_id
+
+    async def disconnect(self):
+        pass
+
+
 def harness(envelope, *, reply_mode='auto', response_mode='safe', allowed=lambda _: True):
     sdk = SDK(envelope)
     sent = []
@@ -259,7 +271,7 @@ def test_invalid_envelope_rejected_before_receipt(bad):
     with pytest.raises(CompanionError): Event.parse(e)
 
 
-def test_inbox_restart_dedup_conflict_and_ambiguous_pause(tmp_path):
+def test_inbox_restart_dedup_conflict_and_ambiguous_reconciliation(tmp_path):
     path = tmp_path / 'db.sqlite3'
     e = Event.parse(fixture())
     db = Inbox(path)
@@ -270,7 +282,8 @@ def test_inbox_restart_dedup_conflict_and_ambiguous_pause(tmp_path):
     db = Inbox(path)
     try:
         assert not db.accept(e)
-        assert db.next(e.scope) is None
+        assert db.next(e.scope) == e
+        assert db.db.execute('SELECT state FROM events').fetchone()[0] == 'uncertain'
         conflict = deepcopy(e.envelope)
         conflict['id'] += '-conflict'
         with pytest.raises(CompanionError, match='Conflicting'): db.accept(Event.parse(conflict))
@@ -307,14 +320,15 @@ def test_fail_closed_without_partial_or_duplicate_turn(failure):
                 r.reply_sending(args[3])
                 raise TimeoutError('ambiguous send')
             s.send_fn = ambiguous_send
+        original = s._client
         try:
             await r.accept(e)
             await drained(r)
             assert not sent
-            assert len(s._client.events) == (1 if failure == 'send' else 0)
+            assert len(original.events) == (1 if failure == 'send' else 0)
             await r.accept(e)
             await drained(r)
-            assert len(s._client.events) == (1 if failure == 'send' else 0)
+            assert len(original.events) == (1 if failure == 'send' else 0)
         finally: await r.close()
     asyncio.run(scenario())
 
@@ -623,7 +637,9 @@ def test_saved_reply_survives_restart_and_releases_later_inputs(live_first):
 
 
 @pytest.mark.parametrize('channel', ['phone', 'imessage', 'mail'])
-def test_actual_send_timeout_remains_uncertain_across_restart(channel):
+def test_actual_send_timeout_is_not_replayed_but_fresh_messages_continue(channel, monkeypatch):
+    from inkbox_codex import sessions
+    monkeypatch.setattr(sessions, 'CodexAppServerClient', ReconnectingClient)
     async def scenario():
         e = fixture(channel)
         r, sdk, s, _ = harness(e)
@@ -637,7 +653,7 @@ def test_actual_send_timeout_remains_uncertain_across_restart(channel):
         await r.accept(e)
         await drained(r)
         assert r.inbox.db.execute('SELECT state FROM events').fetchone()[0] == 'uncertain'
-        assert not r.retries
+        assert r.retries  # Automatic reconciliation, never a blind resend.
         getattr(identity, method).assert_called_once()
         await r.close()
         r, sdk, s, sent = harness(e)
@@ -645,8 +661,12 @@ def test_actual_send_timeout_remains_uncertain_across_restart(channel):
             await r.accept(e)
             await r.accept(live(e))
             await drained(r)
-            assert not sent
-            assert not s._client.events
+            assert len(sent) == 1
+            assert [kind for kind, _ in s._client.events] == ['run']
+            assert '@agent next' in s._client.events[0][1]
+            assert r.inbox.db.execute('SELECT state FROM events WHERE event_id=?', (e['id'],)).fetchone()[0] == 'quarantined'
+            assert r.inbox.db.execute('SELECT content FROM replies WHERE event_id=?', (e['id'],)).fetchone()[0] == 'Answer'
+            getattr(identity, method).assert_called_once()
         finally:
             await r.close()
     asyncio.run(scenario())
@@ -735,13 +755,14 @@ def test_restart_during_reply_distinguishes_read_from_send(boundary):
         await asyncio.wait_for(entered.wait(), 2)
         await r.close()
         r, sdk, s, sent = harness(e)
+        original = s._client
         try:
             r.recover()
             await drained(r)
             assert len(sent) == int(boundary == 'preflight')
-            assert not s._client.events
+            assert not original.events
             assert r.inbox.db.execute('SELECT state FROM events').fetchone()[0] == (
-                'done' if boundary == 'preflight' else 'uncertain')
+                'done' if boundary == 'preflight' else 'quarantined')
         finally:
             await r.close()
     asyncio.run(scenario())
@@ -770,7 +791,9 @@ def test_absent_companion_keeps_original_channel_handler(monkeypatch, channel):
     asyncio.run(scenario())
 
 
-def test_shutdown_stops_host_before_releasing_receiver_ownership():
+def test_shutdown_stops_host_before_releasing_receiver_ownership(monkeypatch):
+    from inkbox_codex import companion
+    monkeypatch.setattr(companion, 'recover_saved_answer', AsyncMock(return_value=None))
     async def scenario():
         e = fixture()
         r, sdk, s, sent = harness(e)
@@ -786,11 +809,12 @@ def test_shutdown_stops_host_before_releasing_receiver_ownership():
         assert worker.done()
         assert not sent
         r2, _, s2, sent2 = harness(e)
+        original = s2._client
         try:
             r2.recover()
             await drained(r2)
             assert not sent2
-            assert not s2._client.events
+            assert not original.events
         finally: await r2.close()
     asyncio.run(scenario())
 

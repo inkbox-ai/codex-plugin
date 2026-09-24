@@ -205,20 +205,24 @@ def test_cancelled_startup_disposes_client_and_preserves_resume(tmp_path, monkey
     asyncio.run(scenario())
 
 
-def test_failed_submitted_turn_still_pauses_without_replay(tmp_path, monkeypatch):
+def test_failed_submitted_turn_is_quarantined_without_replay(tmp_path, monkeypatch):
+    from inkbox_codex import companion
+    monkeypatch.setattr(companion, 'recover_saved_answer', AsyncMock(return_value=None))
     monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
 
     async def scenario():
         e = fixture()
         r, _, session, sent = harness(e)
-        session._client.run = AsyncMock(side_effect=CodexAppServerError('Turn failed after submission'))
+        original = session._client
+        original.run = AsyncMock(side_effect=CodexAppServerError('Turn failed after submission'))
         try:
             await r.accept(e)
             await drained(r)
             assert r.inbox.db.execute('SELECT state FROM events').fetchone()[0] == 'uncertain'
             await r.accept(e)
             await drained(r)
-            session._client.run.assert_awaited_once()
+            original.run.assert_awaited_once()
+            assert r.inbox.db.execute('SELECT state FROM events').fetchone()[0] == 'quarantined'
             assert not sent
         finally:
             await r.close()

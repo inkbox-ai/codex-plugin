@@ -8,6 +8,7 @@ from inkbox_codex.codex_client import CodexTurnResult, McpToolCallResult
 from inkbox_codex.config import BridgeConfig
 from inkbox_codex.gateway import InkboxGateway
 from inkbox_codex.hosted_sms_guard import (
+    hosted_sms_attempt_state,
     reserve_hosted_sms_attempt,
     settle_hosted_sms_attempt,
 )
@@ -899,5 +900,80 @@ def test_exact_sms_body_survives_post_call_prompt_without_accepted_send_replay(t
         await gateway._on_hosted_call_ended(payload)
         await _drain(gateway)
         assert len(session.prompts) == 1
+
+    asyncio.run(scenario())
+
+
+def test_successful_sms_receipt_prevents_correction_when_host_summary_is_missing(tmp_path, monkeypatch):
+    class ReceiptSession(_Session):
+        async def run_consult_detailed(self, prompt, **kwargs):
+            self.prompts.append(prompt)
+            context = kwargs['hosted_sms_context']
+            assert reserve_hosted_sms_attempt(context['call_id'], context['attempt'], context['remote_phone'])
+            settle_hosted_sms_attempt(context['call_id'], context['attempt'], 'success')
+            return CodexTurnResult(text='Done', mcp_tool_calls=())
+
+    async def scenario():
+        session = ReceiptSession()
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+        assert len(session.prompts) == 1, 'an accepted send must never be corrected with another send'
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())['call-1']
+        assert entry['state'] == 'completed'
+
+    asyncio.run(scenario())
+
+
+def test_correction_attempt_cannot_follow_an_accepted_or_ambiguous_send(tmp_path, monkeypatch):
+    monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
+    for state in ('success', 'pending', 'terminal'):
+        call_id = 'call-' + state
+        assert reserve_hosted_sms_attempt(call_id, 1, '+12025550142')
+        settle_hosted_sms_attempt(call_id, 1, state)
+        if state == 'success':
+            settle_hosted_sms_attempt(call_id, 1, 'terminal')
+            assert hosted_sms_attempt_state(call_id, 1) == 'success'
+        assert not reserve_hosted_sms_attempt(call_id, 2, '+12025550142')
+    assert reserve_hosted_sms_attempt('rejected', 1, '+12025550142')
+    settle_hosted_sms_attempt('rejected', 1, 'recoverable')
+    assert reserve_hosted_sms_attempt('rejected', 2, '+12025550142')
+    assert not reserve_hosted_sms_attempt('rejected', 2, '+12025550142')
+
+
+def test_concurrent_initial_and_correction_reserve_only_one_provider_send(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
+    ready = Barrier(2)
+
+    def reserve(attempt):
+        ready.wait(timeout=2)
+        return reserve_hosted_sms_attempt('concurrent-call', attempt, '+12025550142')
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(reserve, 1)
+        second = pool.submit(reserve, 2)
+        assert sum((first.result(timeout=3), second.result(timeout=3))) == 1
+
+
+def test_pending_receipt_blocks_correction_when_host_summary_is_missing(tmp_path, monkeypatch):
+    class PendingSession(_Session):
+        async def run_consult_detailed(self, prompt, **kwargs):
+            self.prompts.append(prompt)
+            context = kwargs['hosted_sms_context']
+            reserve_hosted_sms_attempt(context['call_id'], context['attempt'], context['remote_phone'])
+            return CodexTurnResult(text='', mcp_tool_calls=())
+
+    async def scenario():
+        session = PendingSession()
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+        assert len(session.prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())['call-1']
+        assert entry['state'] == 'failed'
+        assert entry['retryable'] is False
 
     asyncio.run(scenario())

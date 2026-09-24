@@ -31,14 +31,20 @@ import pytest
 # model phrasing variance cannot prevent the telephony smoke test from starting.
 # A unique reference is still required because two identical no-reply SMS sends
 # to the same number trip the server's duplicate_body rule (422).
-_CALL_ME_REQUEST = "Use the inkbox_place_call tool now to call my phone number from this SMS. Do not reply by text."
+_CALL_ME_REQUEST = "Use the inkbox_place_call tool now to call my phone number from this SMS."
 
 
 def _call_me_text(*, hosted: bool = False) -> str:
     """An explicit call action with a fresh body for every send."""
     request = _CALL_ME_REQUEST
     if hosted:
-        request += " Use Voice AI to complete my spoken request and record its post-call action."
+        request += (
+            " Do not send an SMS before or during the call."
+            " Use Voice AI to complete my spoken request and record its post-call action."
+            " After hangup, complete the follow-up I explicitly requested during the call."
+        )
+    else:
+        request += " Do not reply by text."
     return f"{request} (ref {uuid.uuid4().hex[:6]})"
 
 

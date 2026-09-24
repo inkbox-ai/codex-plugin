@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+from unittest.mock import AsyncMock
 
 from inkbox_codex import daemon, doctor
 from inkbox_codex.config import BridgeConfig, RealtimeConfig, VoiceStack
@@ -28,7 +29,8 @@ def test_voice_config_probe_failures_do_not_mark_identity_unreachable(
     inkbox_module.Inkbox = lambda **_kwargs: client
     monkeypatch.setitem(sys.modules, "inkbox", inkbox_module)
     monkeypatch.setattr(daemon, "_maybe_load_env_file", lambda: None)
-    monkeypatch.setattr(doctor.shutil, "which", lambda _name: "/usr/bin/codex")
+    monkeypatch.setattr(doctor, "probe_codex", AsyncMock(return_value=(True, "initialize succeeded")))
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
     monkeypatch.setattr(
         doctor,
         "read_config",
@@ -54,7 +56,8 @@ def test_voice_config_probe_failures_do_not_mark_identity_unreachable(
 
 def test_realtime_stack_reports_missing_api_key(monkeypatch, tmp_path):
     monkeypatch.setattr(daemon, "_maybe_load_env_file", lambda: None)
-    monkeypatch.setattr(doctor.shutil, "which", lambda _name: "/usr/bin/codex")
+    monkeypatch.setattr(doctor, "probe_codex", AsyncMock(return_value=(True, "initialize succeeded")))
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
     monkeypatch.setattr(
         doctor,
         "read_config",

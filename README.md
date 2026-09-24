@@ -315,17 +315,79 @@ Run `inkbox-codex setup` to change the choice without reconfiguring your identit
 - `/resume` — texts you back a numbered list of recent Codex conversations (each with a short summary and timestamp); reply with a number to reopen that one. Like `/resume` in the Codex CLI.
 - `/status` — reports what the bridge is doing for you right now (working, waiting on a reply, or idle) and whether you're in a fresh or ongoing conversation. Read-only; doesn't disturb a running turn.
 - `/usage` — reports Codex rate-limit windows and token summary from app-server account endpoints.
-- `/health` — reports bridge health: whether Inkbox is reachable (live identity check + which channels are live), the inbound tunnel is connected, and Codex is ready to run (CLI present, authenticated).
+- `/health` — reports identity reachability, tunnel connectivity, the latest Codex startup check, and Companion queue readiness.
 
 These match only when the whole message is exactly the command, so "please /clear the cache" is still a normal turn.
 
-**Errors.** If a turn fails, you get a short plain-language heads-up ("I hit an error while working on that and had to stop") rather than silence.
+**Errors.** Ordinary turns send a short plain-language failure notice. Companion
+failures are recovered automatically without replaying possibly accepted work; see below.
+
+### Automatic recovery and readiness
+
+The bridge automatically retries inputs that failed before a model turn or
+message send could start, with backoff capped at one minute. Retry does not stop
+after a fixed number of failures, and a recovered Codex runtime wakes waiting
+conversations without requiring another message or a restart. Saved answers
+retry delivery without running the model again.
+
+If the selected npm Codex launcher cannot find Node, the bridge uses the matching
+native executable already included in that same Codex installation. It does not
+change your configuration, download a replacement, or select an unrelated
+installation. Explicit native `CODEX_BIN` paths and working launchers are kept.
+
+For an ambiguous turn outcome, the bridge stops the old session and checks saved
+Codex history for a completed turn matching its receipt. A positively matched
+answer can be delivered without repeating the model turn. When the outcome
+cannot be established—or delivery may already have happened—the original input
+is retained as unconfirmed and is **not** automatically replayed. Later messages
+continue in the conversation; the next reply can explain the earlier uncertainty.
+An interrupted initialization does not replay its old trigger. Payloads,
+deduplication records, and saved conversation threads are preserved across restart.
+
+Outstanding approval prompts are canceled when their Codex connection closes,
+so the next message can start fresh work. For manual MCP tool approvals, an
+explicit yes allows the tool, no declines it, and a timeout or unrecognized
+answer cancels the request. Trusted Inkbox tool auto-approval remains optional.
+
+`inkbox-codex doctor` checks the effective Codex launcher with a bounded app-server
+initialization handshake, using the same saved environment as the gateway.
+Recognized startup failures include an exit code and a bounded diagnostic summary,
+without raw stderr. HTTP `/health` remains a liveness endpoint (`ok: true`, HTTP
+200) with separate `ready`, `codex`, and `companion` fields. HTTP `/ready` returns
+503 while startup cannot be verified or a conversation is still blocked.
+
+Startup checks refresh in the background every minute; HTTP health requests do
+not start new processes. Queue diagnostics distinguish active blockage from
+retained unconfirmed outcomes (`quarantined_count`), which do not block new input.
+They also show unfinished counts and oldest receipt age (unknown for older
+receipts). These checks do **not** prove model generation or end-to-end delivery.
+Verify recovery with a fresh message and its reply in the same conversation.
+
+#### Optional receipt inspection
+
+Automatic recovery does not require an operator command. To inspect retained
+receipts without message content, use `inkbox-codex inbox list`. After inspecting
+an unconfirmed outcome, an operator can explicitly request retry or retirement
+with the gateway stopped:
+
+```bash
+inkbox-codex stop
+# Choose one action for the receipt:
+inkbox-codex inbox recover EVENT_ID --action retire --reason "Inspected; skip stale input"
+# OR acknowledge that explicitly retrying uncertain work may duplicate effects:
+inkbox-codex inbox recover EVENT_ID --action retry --reason "Inspected; retry intended" --acknowledge-duplicate-risk
+inkbox-codex start
+```
+
+Each explicit decision records its reason, timestamp, and previous/new state.
+Retirement does not claim that processing or delivery succeeded; retry uses a
+saved answer when available. Recovery commands refuse to race a running gateway.
 
 ## Voice
 
 The setup wizard has a **Phone call voice stack** section with three choices:
 
-- **Inkbox Voice AI**: Inkbox handles the audio and conversation on Codex's behalf. Choose contact-scoped or YOLO authority during setup. Hosted outbound calls carry a task reason, inherit that saved authority by omitting a per-call override, and notify Codex through a signed `call.ended` event. Codex then fetches the authoritative transcript and executes any remaining post-call commitments in a side-effect-only turn; its plain model prose is never sent after hangup.
+- **Inkbox Voice AI**: Inkbox handles the audio and conversation on Codex's behalf. Choose contact-scoped or YOLO authority during setup. Hosted outbound calls carry a task reason, inherit that saved authority by omitting a per-call override, and notify Codex through a signed `call.ended` event. The initiating turn ends after call placement; the separate call-ended turn owns the follow-up. Codex then fetches the authoritative transcript and executes any remaining post-call commitments in a side-effect-only turn; its plain model prose is never sent after hangup. Saved SMS receipts prevent a correction from repeating an accepted or uncertain send, even when Codex omits the tool result from its summary.
 
 - **OpenAI Realtime** (when configured): the bridge pre-opens an OpenAI Realtime session and accepts the call in raw-media mode, so a natural, low-latency voice handles the conversation. It runs the call itself and has these tools:
   - `consult_agent` — do real work *now* in the project; runs in the *same* contact-keyed session as your SMS/iMessage and its answer is spoken back.
