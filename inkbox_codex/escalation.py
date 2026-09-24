@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 # Words accepted as a yes/no on a permission text. Numbers map to the
 # options in the order they are printed.
-_ALLOW_WORDS = {"y", "yes", "ok", "okay", "sure", "approve", "allow", "go", "1"}
+_ALLOW_WORDS = {"y", "yes", "ok", "okay", "sure", "approve", "approved", "yes approved", "allow", "go", "1"}
 _ALWAYS_WORDS = {"always", "allow always", "yes always", "2"}
 _DENY_WORDS = {"n", "no", "deny", "stop", "block", "don't", "dont", "3"}
 
@@ -127,7 +127,7 @@ def parse_permission_reply(reply: str) -> Optional[str]:
     Returns:
         Optional[str]: "allow", "always", or "deny"; None if unparseable.
     """
-    word = (reply or "").strip().lower().rstrip(".!")
+    word = " ".join((reply or "").strip().lower().rstrip(".!").replace(",", " ").split())
     if word in _ALWAYS_WORDS:
         return "always"
     if word in _ALLOW_WORDS:

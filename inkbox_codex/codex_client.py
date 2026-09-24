@@ -184,6 +184,7 @@ class CodexAppServerClient:
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
+        self._server_requests: set[asyncio.Task] = set()
         self._next_id = 1
         self._pending: Dict[int, "asyncio.Future[Any]"] = {}
         self._turns: Dict[str, _TurnCapture] = {}
@@ -297,6 +298,9 @@ class CodexAppServerClient:
 
     async def disconnect(self) -> None:
         """Terminate the app-server process."""
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+        await self._cancel_server_requests()
         for future in list(self._pending.values()):
             if not future.done():
                 future.set_exception(CodexAppServerError("Codex app-server disconnected"))
@@ -484,6 +488,15 @@ class CodexAppServerClient:
             # model turn waiting forever. Do not include protocol payloads.
             logger.error("Codex app-server output reader failed")
             self._fail_all(CodexAppServerError("Codex app-server output reader failed"))
+        finally:
+            await self._cancel_server_requests()
+
+    async def _cancel_server_requests(self) -> None:
+        # Human interactions belong to this transport, not its replacement.
+        tasks = [task for task in self._server_requests if task is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _read_messages(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
@@ -514,7 +527,9 @@ class CodexAppServerClient:
                 self._handle_response(message)
                 continue
             if "id" in message and "method" in message:
-                asyncio.create_task(self._handle_server_request(message))
+                task = asyncio.create_task(self._handle_server_request(message))
+                self._server_requests.add(task)
+                task.add_done_callback(self._server_requests.discard)
                 continue
             if "method" in message:
                 self._handle_notification(message)
@@ -574,15 +589,19 @@ class CodexAppServerClient:
             if self.approval_handler is None:
                 raise CodexAppServerError(f"no handler for app-server request {method}")
             result = await self.approval_handler(method, params)
-            self._write({"id": request_id, "result": result})
+            response = {"id": request_id, "result": result}
         except Exception as exc:
-            self._write({
+            response = {
                 "id": request_id,
                 "error": {
                     "code": -32000,
                     "message": str(exc),
                 },
-            })
+            }
+        try:
+            self._write(response)
+        except (OSError, CodexAppServerError):
+            logger.debug("Discarded response for a closed app-server request")
 
     def _handle_notification(self, message: Dict[str, Any]) -> None:
         method = message.get("method")

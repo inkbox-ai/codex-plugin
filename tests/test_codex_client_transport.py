@@ -3,11 +3,56 @@
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from inkbox_codex.codex_client import CodexAppServerClient, CodexAppServerError
 from inkbox_codex.config import BridgeConfig
+
+
+@pytest.mark.parametrize('failure', ['eof', 'reader-error', 'disconnect'])
+def test_closed_transport_cancels_its_pending_approval(failure, tmp_path, monkeypatch):
+    from tests.test_sessions import make_session
+    monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
+
+    async def scenario():
+        session = make_session([])
+        prompted = asyncio.Event()
+        async def send(*args):
+            prompted.set()
+        session.send_fn = send
+        client = CodexAppServerClient(
+            session.cfg, developer_instructions='test', approval_handler=session._handle_codex_request,
+        )
+        session._client = client
+        reader = asyncio.StreamReader()
+        writes = []
+        client._proc = SimpleNamespace(
+            stdout=reader, stdin=SimpleNamespace(write=writes.append), returncode=0,
+            wait=AsyncMock(return_value=0),
+        )
+        client._reader_task = asyncio.create_task(client._reader_loop())
+        reader.feed_data((json.dumps({
+            'id': 10, 'method': 'mcpServer/elicitation/request',
+            'params': {'message': 'Allow the inkbox MCP server to run tool "inkbox_lookup"?'},
+        }) + '\n').encode())
+        try:
+            await asyncio.wait_for(prompted.wait(), 1)
+            assert session.pending is not None
+            if failure == 'disconnect':
+                await client.disconnect()
+            else:
+                if failure == 'eof':
+                    reader.feed_eof()
+                else:
+                    reader.set_exception(OSError('Synthetic broken pipe'))
+                await asyncio.wait_for(client._reader_task, 1)
+            assert session.pending is None
+            assert not writes, 'A closed host must not receive a late approval response'
+        finally:
+            await session.close()
+    asyncio.run(scenario())
 
 
 def test_large_response_and_following_response_are_read_separately():

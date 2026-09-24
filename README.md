@@ -344,6 +344,11 @@ continue in the conversation; the next reply can explain the earlier uncertainty
 An interrupted initialization does not replay its old trigger. Payloads,
 deduplication records, and saved conversation threads are preserved across restart.
 
+Outstanding approval prompts are canceled when their Codex connection closes,
+so the next message can start fresh work. For manual MCP tool approvals, an
+explicit yes allows the tool, no declines it, and a timeout or unrecognized
+answer cancels the request. Trusted Inkbox tool auto-approval remains optional.
+
 `inkbox-codex doctor` checks the effective Codex launcher with a bounded app-server
 initialization handshake, using the same saved environment as the gateway.
 Recognized startup failures include an exit code and a bounded diagnostic summary,

@@ -150,6 +150,16 @@ def _is_inkbox_mcp_tool_elicitation(params: Dict[str, Any]) -> bool:
     return "run tool" in message and ("inkbox mcp server" in message or "inkbox_" in message)
 
 
+def _is_mcp_tool_approval(params: Dict[str, Any]) -> bool:
+    metadata = params.get("_meta")
+    if isinstance(metadata, dict) and metadata.get("codex_approval_kind") == "mcp_tool_call":
+        return True
+    message = " ".join(str(params.get("message") or params.get("prompt") or "").lower().split())
+    return _is_inkbox_mcp_tool_elicitation(params) or bool(
+        re.match(r"allow the .+ mcp server to run tool\b", message)
+    )
+
+
 def _send_error_reason(exc: Exception) -> str:
     """Pull a human reason out of a send exception.
 
@@ -1188,6 +1198,14 @@ class ContactSession:
                 logger.info("[session %s] Auto-approved Inkbox MCP tool elicitation: %s", self.chat_id, message)
                 return {"action": "accept", "content": {"text": "yes"}}
             reply = await self._escalate("poll", message)
+            if not reply or not reply.strip():
+                return {"action": "cancel", "content": None}
+            if _is_mcp_tool_approval(params):
+                decision = parse_permission_reply(reply)
+                if decision == "deny":
+                    return {"action": "decline", "content": None}
+                if decision not in {"allow", "always"}:
+                    return {"action": "cancel", "content": None}
             return {"action": "accept", "content": {"text": reply or ""}}
 
         if method in {
@@ -1234,13 +1252,14 @@ class ContactSession:
             Optional[str]: The human's reply text, or None on timeout.
         """
         loop = asyncio.get_running_loop()
-        self.pending = PendingInteraction(
+        pending = PendingInteraction(
             kind=kind,
             prompt_text=prompt_text,
             future=loop.create_future(),
             questions=list(questions or []),
             tool_name=tool_name,
         )
+        self.pending = pending
         reply_mode, reply_meta = self._reply_route(self._current_turn)
         if reply_meta.get("companion") and self.cfg.group_reply_mode == "mention":
             prompt_text += (
@@ -1248,15 +1267,18 @@ class ContactSession:
                 if reply_mode == "email"
                 else "\nInclude @agent before your answer (for example, @agent allow)."
             )
-        await self._reply(prompt_text, turn=self._current_turn)
         try:
+            await self._reply(prompt_text, turn=self._current_turn)
             return await asyncio.wait_for(
-                self.pending.future, timeout=self.cfg.permission_timeout_s
+                pending.future, timeout=self.cfg.permission_timeout_s
             )
         except asyncio.TimeoutError:
             return None
         finally:
-            self.pending = None
+            if not pending.future.done():
+                pending.future.cancel()
+            if self.pending is pending:
+                self.pending = None
 
     def _reply_route(self, turn: Optional[_Turn] = None) -> tuple[str, Dict[str, Any]]:
         if turn is not None and turn.reply_mode is not None and turn.reply_meta is not None:
@@ -1267,6 +1289,9 @@ class ContactSession:
         await self.send_fn(self.chat_id, text, *self._reply_route(turn))
 
     async def close(self) -> None:
+        pending, self.pending = self.pending, None
+        if pending is not None and not pending.future.done():
+            pending.future.set_result(None)
         clients = (self._client, self._connecting_client)
         self._client = self._connecting_client = None
         for client in clients:
