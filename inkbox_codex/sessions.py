@@ -1075,7 +1075,18 @@ class ContactSession:
 
     async def _ensure_client(self) -> CodexAppServerClient:
         if self._client is not None:
-            return self._client
+            if getattr(self._client, "is_alive", True):
+                return self._client
+            client, self._client = self._client, None
+            self.resume_session_id = client.thread_id or self.resume_session_id
+            self._connecting_client = client
+            try:
+                await client.disconnect()
+                if self._connecting_client is not client:
+                    raise CodexAppServerError("Codex session closed during reconnect")
+            finally:
+                if self._connecting_client is client:
+                    self._connecting_client = None
         developer_instructions = build_channel_prompt(
             project_dir=self.cfg.project_dir,
             identity_handle=self.identity_info.get("handle", ""),

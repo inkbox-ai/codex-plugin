@@ -315,11 +315,60 @@ Run `inkbox-codex setup` to change the choice without reconfiguring your identit
 - `/resume` — texts you back a numbered list of recent Codex conversations (each with a short summary and timestamp); reply with a number to reopen that one. Like `/resume` in the Codex CLI.
 - `/status` — reports what the bridge is doing for you right now (working, waiting on a reply, or idle) and whether you're in a fresh or ongoing conversation. Read-only; doesn't disturb a running turn.
 - `/usage` — reports Codex rate-limit windows and token summary from app-server account endpoints.
-- `/health` — reports bridge health: whether Inkbox is reachable (live identity check + which channels are live), the inbound tunnel is connected, and Codex is ready to run (CLI present, authenticated).
+- `/health` — reports identity reachability, tunnel connectivity, the latest Codex startup check, and Companion queue readiness.
 
 These match only when the whole message is exactly the command, so "please /clear the cache" is still a normal turn.
 
-**Errors.** If a turn fails, you get a short plain-language heads-up ("I hit an error while working on that and had to stop") rather than silence.
+**Errors.** Ordinary turns send a short plain-language failure notice. Companion
+failures retain the input for safe retry or operator recovery; see below.
+
+### Readiness and Companion recovery
+
+`inkbox-codex doctor` checks the configured `CODEX_BIN` by starting its app-server
+and completing a bounded initialization handshake. A launcher being on `PATH`
+is not enough: a JavaScript launcher also needs Node available to the gateway.
+If necessary, set `CODEX_BIN` to a working native Codex executable. Doctor loads
+the same saved environment as the gateway. Recognized startup failures include
+the process exit code and a bounded diagnostic summary, without raw stderr.
+
+HTTP `/health` remains a liveness endpoint (`ok: true`, HTTP 200), and includes
+separate `ready`, `codex`, and `companion` fields. HTTP `/ready` returns 503 while
+the startup check is unavailable, stale, or failing, or a Companion conversation
+is blocked. The launcher check refreshes in the background every minute; health
+requests do not start new processes. Queue diagnostics report unfinished counts,
+blocked conversations, and oldest unfinished age (unknown for older receipts).
+These checks do **not** prove model generation or end-to-end message delivery.
+
+Companion receipts with an ambiguous turn or delivery outcome remain `uncertain`
+across restarts and block later inputs in that conversation. They are never
+automatically replayed. Known pre-submission failures may retry safely; exhausted
+or permanent preflight failures are reported as `failed` and can be rechecked on
+a new delivery or restart. Inspect unfinished receipts without message content:
+
+```bash
+inkbox-codex inbox list
+```
+
+After inspecting the affected conversation, stop the gateway and explicitly
+choose **one** recovery action for its oldest unfinished receipt:
+
+```bash
+inkbox-codex stop
+# Skip the stale input or saved reply, without claiming it was delivered:
+inkbox-codex inbox recover EVENT_ID --action retire --reason "Inspected; skip stale input"
+# OR retry; uncertain work requires acknowledgement of possible duplicate effects:
+inkbox-codex inbox recover EVENT_ID --action retry --reason "Inspected; retry intended" --acknowledge-duplicate-risk
+inkbox-codex start
+```
+
+Recovery is refused while another gateway owns the inbox. Each decision is
+recorded locally with its reason, timestamp, and previous/new receipt states.
+Payloads, deduplication records, and saved conversation threads are preserved.
+Retry uses a saved answer when available instead of generating it again.
+Retiring an initialization continues later live inputs from the saved thread and
+reply anchor without replaying its old trigger; missing historical context is
+not reconstructed. Retirement does not prove successful processing or delivery.
+Verify recovery with a new message and its reply in the same conversation.
 
 ## Voice
 

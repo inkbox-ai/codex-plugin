@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import threading
 import time
 import uuid
@@ -83,8 +84,8 @@ try:
         call_contexts_dir,
         inkbox_client_kwargs,
     )
-    from .companion import Receiver as CompanionReceiver, CompanionError
-    from .codex_client import CodexTurnResult
+    from .companion import Receiver as CompanionReceiver, CompanionError, inbox_summary
+    from .codex_client import CodexTurnResult, probe_codex
     from .a2a_delegations import find_by_task as find_a2a_delegation
     from .media import download_media, inbound_media_note
     from .hosted_sms_guard import hosted_sms_attempt_state
@@ -112,8 +113,8 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
         try_acquire_a2a_progress_gate,
     )
     from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, VoiceStack, call_contexts_dir, inkbox_client_kwargs
-    from companion import Receiver as CompanionReceiver, CompanionError
-    from codex_client import CodexTurnResult
+    from companion import Receiver as CompanionReceiver, CompanionError, inbox_summary
+    from codex_client import CodexTurnResult, probe_codex
     from a2a_delegations import find_by_task as find_a2a_delegation
     from media import download_media, inbound_media_note
     from hosted_sms_guard import hosted_sms_attempt_state
@@ -881,18 +882,18 @@ def _message_too_long_reason(channel: str, content: str, max_chars: int) -> str:
     )
 
 
-def _codex_health() -> str:
-    """Describe whether Codex can run: CLI present and auth available.
+def _codex_health(cfg: Optional[BridgeConfig] = None) -> str:
+    """Describe launcher and credential configuration, not model execution.
 
     Returns:
         str: A short readiness description (no token is spent).
     """
-    if not shutil.which("codex"):
+    if not shutil.which(os.path.expanduser((cfg.codex_bin if cfg else "") or "codex")):
         return "codex CLI missing — install Codex first"
     if os.environ.get("OPENAI_API_KEY") or os.environ.get("CODEX_API_KEY") or os.environ.get("CODEX_ACCESS_TOKEN"):
-        return "ready (API key billing)"
+        return "credentials configured (API key billing)"
     if (Path(os.getenv("CODEX_HOME") or Path.home() / ".codex") / "auth.json").exists():
-        return "ready (subscription login)"
+        return "credentials configured (subscription login)"
     return "NOT authenticated — run codex login or set OPENAI_API_KEY/CODEX_API_KEY"
 
 
@@ -937,6 +938,9 @@ class InkboxGateway:
         self._runner: Any = None
         self.sessions: Optional[SessionManager] = None
         self._companion_receiver = None
+        self._codex_ready: Optional[bool] = None
+        self._codex_readiness_detail = "startup has not been checked"
+        self._codex_checked_at: Optional[float] = None
 
         self._self_addresses: set[str] = set()
         self._recent_request_ids: Dict[str, float] = {}
@@ -1051,7 +1055,7 @@ class InkboxGateway:
         await self._recover_hosted_call_completions()
 
         logger.info(
-            "[bridge] ready — %s / %s / %s → Codex in %s",
+            "[bridge] serving — %s / %s / %s → Codex in %s; readiness at /ready",
             identity_info["handle"], identity_info["email"] or "(no mailbox)",
             identity_info["phone"] or "(no phone)", self.cfg.project_dir,
         )
@@ -1062,7 +1066,9 @@ class InkboxGateway:
 
     async def _start_http_server(self) -> None:
         app = web.Application()
+        app.cleanup_ctx.append(self._readiness_monitor)
         app.router.add_get("/health", self._handle_health)
+        app.router.add_get("/ready", self._handle_ready)
         app.router.add_post(DEFAULT_WEBHOOK_PATH, self._handle_webhook)
         app.router.add_get(INKBOX_WS_PATH, self._handle_call_ws)
         self._runner = web.AppRunner(app)
@@ -1070,6 +1076,28 @@ class InkboxGateway:
         site = web.TCPSite(self._runner, self.cfg.host, self.cfg.port)
         await site.start()
         logger.info("[bridge] webhook server on %s:%d", self.cfg.host, self.cfg.port)
+
+    async def _readiness_monitor(self, app):
+        task = asyncio.create_task(self._check_codex_readiness())
+        try:
+            yield
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _check_codex_readiness(self) -> None:
+        while True:
+            try:
+                ok, detail = await probe_codex(self.cfg)
+            except Exception:
+                ok, detail = False, "startup check failed; run inkbox-codex doctor"
+            if ok != self._codex_ready:
+                log = logger.info if ok else logger.error
+                log("[bridge] Codex startup check: %s", detail)
+            self._codex_ready = ok
+            self._codex_readiness_detail = detail
+            self._codex_checked_at = time.time()
+            await asyncio.sleep(60)
 
     async def _open_tunnel(self) -> None:
         if not INKBOX_TUNNEL_AVAILABLE:
@@ -1265,7 +1293,29 @@ class InkboxGateway:
     # ------------------------------------------------------------------
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        return web.json_response({"ok": True, "identity": self.cfg.identity})
+        return web.json_response({"ok": True, "identity": self.cfg.identity, **await self._readiness()})
+
+    async def _handle_ready(self, request: "web.Request") -> "web.Response":
+        status = await self._readiness()
+        return web.json_response({"ok": status["ready"], **status}, status=200 if status["ready"] else 503)
+
+    async def _readiness(self) -> dict:
+        try:
+            summary = await asyncio.to_thread(inbox_summary, self.cfg)
+            inbox = {"readable": True, **summary}
+        except (OSError, sqlite3.Error):
+            inbox = {"readable": False}
+        checked_at = self._codex_checked_at
+        startup_ok = bool(self._codex_ready and checked_at and time.time() - checked_at < 120)
+        ready = bool(
+            self.sessions is not None and self._companion_receiver is not None
+            and startup_ok and inbox["readable"] and not inbox.get("blocked_conversations")
+        )
+        return {
+            "ready": ready,
+            "codex": {"startup_ok": startup_ok, "checked_at": checked_at},
+            "companion": inbox,
+        }
 
     def _prune_dedup_ids(self) -> None:
         now = time.time()
@@ -4661,7 +4711,14 @@ class InkboxGateway:
         else:
             lines.append("Inbound: not connected")
 
-        lines.append(f"Codex: {_codex_health()}")
+        lines.append(f"Codex: {_codex_health(self.cfg)}; {self._codex_readiness_detail}")
+        status = await self._readiness()
+        inbox = status["companion"]
+        if inbox["readable"]:
+            lines.append(f"Companion: {inbox['unfinished_count']} unfinished receipts; {inbox['blocked_conversations']} blocked conversations")
+        else:
+            lines.append("Companion: receipt state unavailable")
+        lines.append(f"Readiness: {'ready' if status['ready'] else 'degraded'} (startup and queue checks only)")
         return "\n".join(lines)
 
     async def send_typing(self, chat_id: str, mode: str, meta: Dict[str, Any]) -> None:

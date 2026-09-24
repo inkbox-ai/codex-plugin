@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import os
+import signal
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional
 
@@ -17,6 +19,8 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from delivery_policy import sms_tool_failure_kind
 
 logger = logging.getLogger(__name__)
+STARTUP_TIMEOUT_SECONDS = 15.0
+SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
 ApprovalHandler = Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
@@ -25,6 +29,43 @@ ActivityHandler = Callable[[str, str], None]
 
 class CodexAppServerError(RuntimeError):
     """Raised when codex app-server returns an error or exits unexpectedly."""
+
+
+class CodexStartupError(CodexAppServerError):
+    """A failure before any thread or turn submission, with safe diagnostics."""
+
+
+def _startup_diagnostic(line: str) -> str | None:
+    # Raw stderr can contain credentials, config, and message content. Retain
+    # only recognized diagnostic categories, never the original line.
+    text = line.lower()
+    if "node" in text and any(part in text for part in ("no such file", "not found", "not recognized")):
+        return "Node interpreter not found on PATH; use a working CODEX_BIN or install Node"
+    if "permission denied" in text:
+        return "permission denied while launching Codex"
+    if "exec format error" in text or "bad cpu type" in text:
+        return "Codex executable is incompatible with this platform"
+    if "error loading shared" in text or "library not loaded" in text:
+        return "Codex runtime library is missing"
+    if "no such file or directory" in text:
+        return "Codex launcher dependency or executable is missing"
+    return None
+
+
+async def probe_codex(cfg: BridgeConfig) -> tuple[bool, str]:
+    """Check the effective launcher's handshake without creating a thread/turn."""
+    client = CodexAppServerClient(cfg, developer_instructions="", tools_enabled=False,
+                                 isolate_process_group=True)
+    try:
+        await client._ensure_process()
+        await client._initialize()
+        return True, "app-server initialized (model execution not tested)"
+    except CodexStartupError as exc:
+        return False, str(exc)
+    except Exception:
+        return False, "Codex app-server readiness check failed"
+    finally:
+        await client.disconnect()
 
 
 async def _read_protocol_line(reader: asyncio.StreamReader) -> bytes:
@@ -88,12 +129,14 @@ class CodexAppServerClient:
         mcp_server_config: Optional[Dict[str, Any]] = None,
         approval_handler: Optional[ApprovalHandler] = None,
         tools_enabled: bool = True,
+        isolate_process_group: bool = False,
     ) -> None:
         self.cfg = cfg
         self.developer_instructions = developer_instructions
         self.mcp_server_config = dict(mcp_server_config or {})
         self.approval_handler = approval_handler
         self.tools_enabled = tools_enabled
+        self._isolated_process_group = isolate_process_group and os.name == "posix"
 
         self.thread_id: Optional[str] = None
         self._proc: Optional[asyncio.subprocess.Process] = None
@@ -106,6 +149,12 @@ class CodexAppServerClient:
         self._early_notifications: Dict[str, list[Dict[str, Any]]] = {}
         self._current_turn_id: Optional[str] = None
         self._initialized = False
+        self._stderr_tail: deque[str] = deque(maxlen=8)
+
+    @property
+    def is_alive(self) -> bool:
+        return (self._proc is not None and self._proc.returncode is None
+                and self._reader_task is not None and not self._reader_task.done())
 
     async def connect(self, resume_thread_id: Optional[str] = None) -> str:
         """Start app-server and create or resume a Codex thread."""
@@ -210,18 +259,40 @@ class CodexAppServerClient:
                 capture.future.set_exception(CodexAppServerError("Codex app-server disconnected"))
         self._turns.clear()
 
-        if self._proc is not None and self._proc.returncode is None:
-            self._proc.terminate()
+        proc = self._proc
+        if proc is not None and (proc.returncode is None or self._isolated_process_group):
+            def stop(sig):
+                try:
+                    if self._isolated_process_group:
+                        os.killpg(proc.pid, sig)
+                    elif sig == signal.SIGTERM:
+                        proc.terminate()
+                    else:
+                        proc.kill()
+                except ProcessLookupError:
+                    pass
+
+            stop(signal.SIGTERM)
             try:
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                self._proc.kill()
-                await self._proc.wait()
+                await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_TIMEOUT_SECONDS)
+            except TimeoutError:
+                pass
+            # A dedicated probe owns its launcher descendants too. Ordinary
+            # sessions keep their existing user-tool lifecycle semantics.
+            if proc.returncode is None or self._isolated_process_group:
+                stop(signal.SIGKILL)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=1)
+                except TimeoutError:
+                    logger.warning("Codex process cleanup exceeded its deadline")
         if self._reader_task is not None:
             self._reader_task.cancel()
         if self._stderr_task is not None:
             self._stderr_task.cancel()
+        await asyncio.gather(*(task for task in (self._reader_task, self._stderr_task)
+                               if task is not None), return_exceptions=True)
         self._proc = None
+        self._initialized = False
 
     def _thread_params(self) -> Dict[str, Any]:
         config: Dict[str, Any] = {}
@@ -277,18 +348,40 @@ class CodexAppServerClient:
         if self._proc is not None and self._proc.returncode is None:
             return
         env = os.environ.copy()
-        self._proc = await asyncio.create_subprocess_exec(
-            self.cfg.codex_bin or "codex",
-            "app-server",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
+        self._stderr_tail.clear()
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                os.path.expanduser(self.cfg.codex_bin or "codex"),
+                "app-server",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                start_new_session=self._isolated_process_group,
+            )
+        except OSError as exc:
+            detail = ("configured executable not found" if isinstance(exc, FileNotFoundError)
+                      else "configured executable is not runnable")
+            raise CodexStartupError(f"Codex startup failed: {detail}; check CODEX_BIN") from None
         self._reader_task = asyncio.create_task(self._reader_loop())
         self._stderr_task = asyncio.create_task(self._stderr_loop())
 
     async def _initialize(self) -> None:
+        try:
+            await asyncio.wait_for(self._initialize_request(), timeout=STARTUP_TIMEOUT_SECONDS)
+        except (TimeoutError, CodexAppServerError, OSError) as exc:
+            reason = "initialize timed out" if isinstance(exc, TimeoutError) else "initialize failed"
+            code = getattr(self._proc, "returncode", None)
+            detail = "; ".join(self._stderr_tail)
+            message = f"Codex startup failed: {reason}"
+            if code is not None:
+                message += f" (exit code {code})"
+            if detail:
+                message += f"; {detail}"
+            logger.error("%s", message)
+            raise CodexStartupError(message) from None
+
+    async def _initialize_request(self) -> None:
         await self._request(
             "initialize",
             {
@@ -349,6 +442,18 @@ class CodexAppServerClient:
         while True:
             line = await _read_protocol_line(self._proc.stdout)
             if not line:
+                # stderr and stdout use independent pipes; collect the bounded
+                # diagnostic tail before reporting an early process exit.
+                if self._stderr_task is not None:
+                    try:
+                        await asyncio.wait_for(asyncio.shield(self._stderr_task), timeout=0.2)
+                    except (TimeoutError, OSError):
+                        pass
+                if callable(getattr(self._proc, "wait", None)):
+                    try:
+                        await asyncio.wait_for(self._proc.wait(), timeout=0.2)
+                    except TimeoutError:
+                        pass
                 self._fail_all(CodexAppServerError("Codex app-server exited"))
                 return
             try:
@@ -368,11 +473,21 @@ class CodexAppServerClient:
 
     async def _stderr_loop(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
+        pending = b""
         while True:
-            line = await _read_protocol_line(self._proc.stderr)
-            if not line:
+            chunk = await self._proc.stderr.read(4096)
+            pending += chunk
+            while b"\n" in pending or len(pending) >= 4096 or (pending and not chunk):
+                if b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                else:
+                    line, pending = pending[:4096], pending[4096:]
+                detail = _startup_diagnostic(line.decode(errors="replace"))
+                if detail:
+                    self._stderr_tail.append(detail)
+                    logger.debug("[codex app-server] %s", detail)
+            if not chunk:
                 return
-            logger.debug("[codex app-server] %s", line.decode(errors="replace").rstrip())
 
     def _handle_response(self, message: Dict[str, Any]) -> None:
         message_id = int(message["id"])

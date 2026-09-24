@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
-import shutil
+import sqlite3
 from typing import List, Tuple
 
 try:
     from .config import VoiceStack, inkbox_client_kwargs, read_config
+    from .codex_client import probe_codex
+    from .companion import inbox_summary
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import VoiceStack, inkbox_client_kwargs, read_config
+    from codex_client import probe_codex
+    from companion import inbox_summary
 
 
 def run_doctor() -> List[Tuple[str, bool, str]]:
@@ -72,12 +77,21 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
     except ImportError:
         checks.append(("aiohttp", False, "pip install 'aiohttp>=3.9'"))
 
-    codex_bin = shutil.which("codex")
-    checks.append((
-        "codex CLI",
-        bool(codex_bin),
-        codex_bin or "not on PATH — install Codex first",
-    ))
+    codex_ok, codex_detail = asyncio.run(probe_codex(cfg))
+    checks.append(("codex CLI", codex_ok, codex_detail))
+    try:
+        summary = inbox_summary(cfg)
+    except (OSError, sqlite3.Error):
+        checks.append(("Companion inbox", False, "cannot read receipt state"))
+    else:
+        blocked = summary["blocked_conversations"]
+        age = summary["oldest_unfinished_age_s"]
+        detail = f"{summary['unfinished_count']} unfinished receipts; {blocked} blocked conversations"
+        if age is not None:
+            detail += f"; oldest {int(age)}s"
+        if blocked:
+            detail += "; inspect with inkbox-codex inbox list"
+        checks.append(("Companion inbox", not blocked, detail))
 
     codex_home = os.getenv("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
     has_api_key = bool(os.getenv("OPENAI_API_KEY") or os.getenv("CODEX_API_KEY") or os.getenv("CODEX_ACCESS_TOKEN"))

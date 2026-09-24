@@ -10,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 import sqlite3
+import time
 from typing import Any, Callable
 from uuid import UUID
 
@@ -26,6 +27,44 @@ CHANNELS = {
 
 class CompanionError(ValueError):
     """The event cannot be accepted or submitted as a complete scoped input."""
+
+
+def inbox_path(cfg) -> Path:
+    namespace = hashlib.sha256(f"{cfg.base_url}|{cfg.identity}".encode()).hexdigest()
+    root = Path(os.getenv("INKBOX_CODEX_HOME") or Path.home() / ".inkbox-codex")
+    return root / "companion" / namespace / "inbox.sqlite3"
+
+
+def inbox_summary(cfg) -> dict:
+    """Read queue readiness without opening a writer or changing receipts."""
+    summary = {"unfinished_count": 0, "pending_count": 0,
+               "blocked_conversations": 0, "oldest_unfinished_age_s": None}
+    path = inbox_path(cfg)
+    if not path.exists():
+        return summary
+    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+    try:
+        columns = {row[1] for row in db.execute("PRAGMA table_info(events)")}
+        received = "received_at" if "received_at" in columns else "NULL"
+        has_activations = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='activations'").fetchone()
+        activation = "a.state" if has_activations else "NULL"
+        join = (" LEFT JOIN activations a ON a.scope=e.scope AND a.activation=json_extract(e.payload,'$.companion.activation_id')"
+                if has_activations else "")
+        rows = db.execute(f"SELECT e.scope,e.state,{received},{activation} FROM events e{join} WHERE e.state!='done' ORDER BY e.scope,e.sequence").fetchall()
+    finally:
+        db.close()
+    heads = {}
+    for scope, state, _, activation in rows:
+        heads.setdefault(scope, (state, activation))
+    summary.update(unfinished_count=len(rows),
+                   pending_count=sum(state in {"pending", "reply_pending"} for _, state, _, _ in rows),
+                   blocked_conversations=sum(
+                       state in {"uncertain", "failed"} or
+                       (state in {"pending", "reply_pending"} and activation in {"submitting", "uncertain"})
+                       for state, activation in heads.values()))
+    if rows and all(row[2] is not None for row in rows):
+        summary["oldest_unfinished_age_s"] = max(0, int(time.time() - min(row[2] for row in rows)))
+    return summary
 
 
 def same_author(channel: str, left: str | None, right: str | None) -> bool:
@@ -162,7 +201,14 @@ class Inbox:
                 event_id TEXT PRIMARY KEY, content TEXT NOT NULL,
                 meta TEXT NOT NULL, next_state TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS recovery_actions (
+                id INTEGER PRIMARY KEY, event_id TEXT NOT NULL, action TEXT NOT NULL,
+                previous_state TEXT NOT NULL, next_state TEXT NOT NULL,
+                reason TEXT NOT NULL, created_at REAL NOT NULL
+            );
         """)
+        if "received_at" not in {row[1] for row in self.db.execute("PRAGMA table_info(events)")}:
+            self.db.execute("ALTER TABLE events ADD COLUMN received_at REAL")
         # A lost host acknowledgement cannot safely be inferred from a receipt.
         with self.db:
             self.db.execute("UPDATE events SET state='uncertain' WHERE state IN ('submitting','sending')")
@@ -188,8 +234,8 @@ class Inbox:
                 (event.scope, event.sequence),
             ).fetchone():
                 raise CompanionError("A later Companion sequence was already submitted; reconcile this late event")
-            self.db.execute("INSERT INTO events(event_id,scope,sequence,payload) VALUES(?,?,?,?)",
-                            (event.event_id, event.scope, event.sequence, payload))
+            self.db.execute("INSERT INTO events(event_id,scope,sequence,payload,received_at) VALUES(?,?,?,?,?)",
+                            (event.event_id, event.scope, event.sequence, payload, time.time()))
         return True
 
     def scopes(self) -> list[str]:
@@ -198,7 +244,7 @@ class Inbox:
     def next(self, scope: str) -> Event | None:
         row = self.db.execute("SELECT payload,state,sequence FROM events WHERE scope=? AND state!='done' ORDER BY sequence LIMIT 1",
                               (scope,)).fetchone()
-        if not row or row[1] not in {"pending", "reply_pending"}:
+        if not row or row[1] not in {"pending", "reply_pending", "failed"}:
             return None
         # The signed delivery stream is ordered, not contiguous: a cancelled
         # delivery or a subscription change can leave a permanent numeric gap.
@@ -222,6 +268,47 @@ class Inbox:
         return self.db.execute("SELECT trigger_id,sponsor,state FROM activations WHERE scope=? AND activation=?",
                                (event.scope, event.activation)).fetchone()
 
+    def recover_receipt(self, event_id: str, *, action: str, reason: str,
+                        acknowledge_duplicate_risk: bool = False) -> str:
+        """Resolve one receipt while exclusively owning the stopped inbox.
+
+        Retirement records an operator decision, not successful delivery.
+        Retrying an uncertain turn or send can duplicate its external effects.
+        """
+        if action not in {"retry", "retire"} or not reason.strip() or len(reason) > 1000:
+            raise CompanionError("Recovery requires retry or retire and a reason of 1–1000 characters")
+        with self.db:
+            row = self.db.execute("SELECT payload,state FROM events WHERE event_id=?", (event_id,)).fetchone()
+            if row is None or row[1] == "done":
+                raise CompanionError("Receipt does not exist or is already complete")
+            event, previous = Event.parse(json.loads(row[0])), row[1]
+            head = self.db.execute("SELECT event_id FROM events WHERE scope=? AND state!='done' ORDER BY sequence LIMIT 1",
+                                   (event.scope,)).fetchone()
+            if head[0] != event_id:
+                raise CompanionError("Recover the oldest unfinished receipt in this conversation first")
+            activation = self.activation(event)
+            ambiguous = previous == "uncertain" or (activation and activation[2] in {"submitting", "uncertain"})
+            if action == "retry" and ambiguous and not acknowledge_duplicate_risk:
+                raise CompanionError("Retry may duplicate a turn or delivery; pass --acknowledge-duplicate-risk after inspection")
+            reply = self.db.execute("SELECT 1 FROM replies WHERE event_id=?", (event_id,)).fetchone()
+            next_state = "done" if action == "retire" else "reply_pending" if reply else "pending"
+            if activation and activation[2] in {"submitting", "uncertain"}:
+                if action == "retire":
+                    # Continue from the saved thread/anchor without replaying an
+                    # ambiguous initialization trigger on the next live input.
+                    self.db.execute("UPDATE activations SET state='retired' WHERE scope=? AND activation=?",
+                                    (event.scope, event.activation))
+                elif not reply:
+                    self.db.execute("DELETE FROM activations WHERE scope=? AND activation=?",
+                                    (event.scope, event.activation))
+            elif action == "retire" and activation is None and event.phase == "initialization":
+                self.db.execute("INSERT INTO activations VALUES(?,?,?,?,?)",
+                                (event.scope, event.activation, event.source_id, event.author, "retired"))
+            self.db.execute("UPDATE events SET state=? WHERE event_id=?", (next_state, event_id))
+            self.db.execute("INSERT INTO recovery_actions(event_id,action,previous_state,next_state,reason,created_at) VALUES(?,?,?,?,?,?)",
+                            (event_id, action, previous, next_state, reason.strip(), time.time()))
+        return next_state
+
     def close(self):
         self.db.close()
         self._lock.close()
@@ -233,8 +320,7 @@ class Receiver:
         self.sender_allowed, self.mail_body = sender_allowed, mail_body
         namespace = hashlib.sha256(f"{cfg.base_url}|{cfg.identity}".encode()).hexdigest()
         self.namespace = namespace
-        root = Path(os.getenv("INKBOX_CODEX_HOME") or Path.home() / ".inkbox-codex")
-        self.inbox = Inbox(root / "companion" / namespace / "inbox.sqlite3")
+        self.inbox = Inbox(inbox_path(cfg))
         self.tasks: dict[str, asyncio.Task] = {}
         self.active_sessions: set = set()
         self.closing = False
@@ -299,6 +385,12 @@ class Receiver:
             if event is None:
                 return
             try:
+                # A new delivery or restart may recheck a proven preflight
+                # failure, but never an ambiguous submission or send.
+                state = self.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (event.event_id,)).fetchone()[0]
+                if state == "failed":
+                    reply = self.inbox.db.execute("SELECT 1 FROM replies WHERE event_id=?", (event.event_id,)).fetchone()
+                    self.inbox.state(event.event_id, "reply_pending" if reply else "pending")
                 await self.process(event)
                 self.inbox.state(event.event_id, "done")
                 self.attempts.pop(scope, None)
@@ -322,12 +414,17 @@ class Receiver:
                             min(60, 2 ** min(attempt, 6)), self.schedule, scope,
                         )
                         retrying_reply = row[0] == "reply_pending"
+                    elif not self.closing:
+                        self.inbox.state(event.event_id, "failed")
+                elif row[0] == "reply_pending":
+                    self.inbox.state(event.event_id, "failed")
                 if retrying_reply:
                     logger.warning("Companion reply preflight failed (%s); saved answer will retry for receipt %s",
                                    type(exc).__name__, event.event_id)
                 else:
                     logger.error("Companion input paused (%s); receipt %s retained for recovery",
                                  type(exc).__name__, event.event_id)
+                logger.error("Companion recovery: run inkbox-codex inbox list; inspect before retrying or retiring a receipt")
                 return
 
     @staticmethod
@@ -492,7 +589,7 @@ class Receiver:
             await self.submit(event, await self.live_text(event), self.meta(event))
             return
         saved = self.inbox.activation(event)
-        if saved and saved[2] != "initialized":
+        if saved and saved[2] not in {"initialized", "retired"}:
             raise CompanionError("Companion initialization has an uncertain host outcome; inspect before retrying")
         if not saved:
             result, trigger, reply, text = await self.load(event)

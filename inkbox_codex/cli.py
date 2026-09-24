@@ -39,6 +39,56 @@ def _cmd_whoami() -> int:
     return 0
 
 
+def _cmd_inbox(args) -> int:
+    from .companion import CompanionError, Inbox, inbox_path, inbox_summary
+    import sqlite3
+
+    daemon._maybe_load_env_file()
+    cfg = read_config()
+    path = inbox_path(cfg)
+    if not cfg.identity:
+        print("Set INKBOX_IDENTITY before inspecting its inbox.")
+        return 1
+    if args.inbox_command == "list":
+        try:
+            summary = inbox_summary(cfg)
+            rows = []
+            if path.exists():
+                db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+                try:
+                    rows = [dict(zip(("event_id", "state", "sequence"), row)) for row in db.execute(
+                        "SELECT event_id,state,sequence FROM events WHERE state!='done' ORDER BY scope,sequence")]
+                finally:
+                    db.close()
+            print(json.dumps({**summary, "receipts": rows}, indent=2))
+            return 0
+        except sqlite3.Error:
+            print("Could not read the Companion inbox.")
+            return 1
+    if not path.exists():
+        print("No Companion inbox exists for this identity.")
+        return 1
+    if daemon.running_pid():
+        print("Stop the gateway before recovering receipts.")
+        return 1
+    inbox = None
+    try:
+        # The inbox lock also excludes foreground gateways without a PID file.
+        inbox = Inbox(path)
+        state = inbox.recover_receipt(args.event_id, action=args.action, reason=args.reason,
+                                      acknowledge_duplicate_risk=args.acknowledge_duplicate_risk)
+        print(f"Receipt {args.event_id}: {state}. Recovery recorded; restart the gateway to continue.")
+        if args.action == "retire":
+            print("Retired by operator; this does not mean a reply was delivered.")
+        return 0
+    except (CompanionError, sqlite3.Error) as exc:
+        print(str(exc) if isinstance(exc, CompanionError) else "Could not update the Companion inbox.")
+        return 1
+    finally:
+        if inbox is not None:
+            inbox.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI dispatcher.
 
@@ -75,6 +125,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub.add_parser("doctor", help="check configuration and dependencies")
     sub.add_parser("whoami", help="show the bridged Inkbox identity")
+    inbox_parser = sub.add_parser("inbox", help="inspect and recover Companion receipts")
+    inbox_sub = inbox_parser.add_subparsers(dest="inbox_command", required=True)
+    inbox_sub.add_parser("list", help="list unfinished receipts without message content")
+    recover_parser = inbox_sub.add_parser("recover", help="recover one receipt with the gateway stopped")
+    recover_parser.add_argument("event_id")
+    recover_parser.add_argument("--action", choices=("retry", "retire"), required=True)
+    recover_parser.add_argument("--reason", required=True)
+    recover_parser.add_argument("--acknowledge-duplicate-risk", action="store_true",
+                                help="confirm inspected uncertain turns or sends may run again")
 
     args = parser.parse_args(argv)
     if args.command == "setup":
@@ -105,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
         return print_doctor()
     if args.command == "whoami":
         return _cmd_whoami()
+    if args.command == "inbox":
+        return _cmd_inbox(args)
     return 2
 
 
