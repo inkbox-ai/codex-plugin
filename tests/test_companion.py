@@ -201,7 +201,9 @@ def test_history_cannot_execute_commands_or_answer_approval():
         try:
             await r.accept(e)
             await drained(r)
-            assert not pending.done()
+            # The unrelated turn's completion cancels an orphaned question;
+            # neither the history's "allow" nor "/clear" is executed.
+            assert pending.done() and pending.result() is None
             s._reset_session.assert_not_called()
             assert len(sent) == 1
         finally:

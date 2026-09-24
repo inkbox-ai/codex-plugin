@@ -14,14 +14,12 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-# Words accepted as a yes/no on a permission text. Numbers map to the
-# options in the order they are printed.
-_ALLOW_WORDS = {"y", "yes", "ok", "okay", "sure", "approve", "approved", "yes approved", "allow", "go", "1"}
-_ALWAYS_WORDS = {"always", "allow always", "yes always", "2"}
-_DENY_WORDS = {"n", "no", "deny", "stop", "block", "don't", "dont", "3"}
-
+try:
+    from .elicitation import parse_approval_reply
+except ImportError:  # pragma: no cover
+    from elicitation import parse_approval_reply
 
 @dataclass
 class PendingInteraction:
@@ -33,6 +31,7 @@ class PendingInteraction:
     questions: List[Dict[str, Any]] = field(default_factory=list)
     tool_name: str = ""
     created_at: float = field(default_factory=time.time)
+    validate_reply: Optional[Callable[[str], bool]] = None
 
 
 def _one_line(value: Any, limit: int = 160) -> str:
@@ -79,8 +78,8 @@ def format_permission_request(tool_name: str, input_data: Dict[str, Any]) -> str
     summary = summarize_tool_call(tool_name, input_data)
     return (
         f"Codex wants to {summary}\n\n"
-        "Reply 1 (or YES) to allow once, 2 (or ALWAYS) to allow this kind "
-        "of action for the rest of the session, 3 (or NO) to block it."
+        "Reply 1 (or YES) to allow once, 2 (or SESSION) to allow for this "
+        "session, 3 (or NO) to deny this request. /stop cancels the entire task."
     )
 
 
@@ -113,8 +112,8 @@ def format_codex_approval_request(method: str, params: Dict[str, Any]) -> str:
         summary = f"continue after {method} with {_one_line(json.dumps(params, ensure_ascii=False), 180)}"
     return (
         f"Codex wants to {summary}\n\n"
-        "Reply 1 (or YES) to allow once, 2 (or ALWAYS) to allow this kind "
-        "of action for the rest of the session, 3 (or NO) to block it."
+        "Reply 1 (or YES) to allow once, 2 (or SESSION) to allow for this "
+        "session, 3 (or NO) to deny this request. /stop cancels the entire task."
     )
 
 
@@ -125,16 +124,9 @@ def parse_permission_reply(reply: str) -> Optional[str]:
         reply (str): Raw inbound message text from the human.
 
     Returns:
-        Optional[str]: "allow", "always", or "deny"; None if unparseable.
+        Optional[str]: "allow", "session", "always", "deny", or "cancel".
     """
-    word = " ".join((reply or "").strip().lower().rstrip(".!").replace(",", " ").split())
-    if word in _ALWAYS_WORDS:
-        return "always"
-    if word in _ALLOW_WORDS:
-        return "allow"
-    if word in _DENY_WORDS:
-        return "deny"
-    return None
+    return parse_approval_reply(reply)
 
 
 def format_poll(questions: List[Dict[str, Any]]) -> str:

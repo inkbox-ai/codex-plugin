@@ -338,7 +338,7 @@ def test_inkbox_mcp_elicitation_auto_approves_when_trusted():
             {"message": 'Allow the inkbox MCP server to run tool "inkbox_send_email"?'},
         )
 
-        assert result == {"action": "accept", "content": {"text": "yes"}}
+        assert result == {"action": "accept", "content": None}
         assert sent == []
         assert session.pending is None
 
@@ -361,7 +361,7 @@ def test_non_inkbox_mcp_elicitation_still_prompts():
         assert sent and "github MCP server" in sent[0][1]
 
         await session.handle_inbound("yes", "sms", {"conversation_id": "c1"})
-        assert await task == {"action": "accept", "content": {"text": "yes"}}
+        assert await task == {"action": "accept", "content": None}
 
     asyncio.run(scenario())
 
@@ -378,7 +378,7 @@ def test_plain_elicitation_question_still_asks_human():
         )
 
         assert result == {"action": "cancel", "content": None}
-        assert sent and sent[0][1] == "Which account should I use?"
+        assert sent and "Which account should I use?" in sent[0][1]
 
     asyncio.run(scenario())
 

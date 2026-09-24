@@ -21,7 +21,7 @@ def test_summarize_edit_truncates():
 def test_permission_request_mentions_options():
     text = format_permission_request("Bash", {"command": "rm -rf build"})
     assert "rm -rf build" in text
-    assert "ALWAYS" in text
+    assert "SESSION" in text
 
 
 def test_parse_permission_replies():
@@ -29,7 +29,7 @@ def test_parse_permission_replies():
     assert parse_permission_reply("1") == "allow"
     assert parse_permission_reply("OK!") == "allow"
     assert parse_permission_reply("Always") == "always"
-    assert parse_permission_reply("2") == "always"
+    assert parse_permission_reply("2") == "session"
     assert parse_permission_reply("no") == "deny"
     assert parse_permission_reply("3") == "deny"
     assert parse_permission_reply("hmm what does it do") is None

@@ -358,8 +358,8 @@ class Receiver:
         receipt_state = self.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (event.event_id,)).fetchone()[0]
         if receipt_state == "pending" and event.phase == "live" and not self.inbox.source_submitted(event):
             session = self.sessions.get(event.session_key(self.namespace))
-            if session.pending is not None and self.sender_allowed(event.author):
-                if session.companion_answer(event.text, self.meta(event)):
+            if self.sender_allowed(event.author):
+                if await session.companion_interaction(event.text, self.meta(event)):
                     with self.inbox.db:
                         self.inbox.remember_sources(event, [event.source_id])
                         self.inbox.db.execute("UPDATE events SET state='done' WHERE event_id=?", (event.event_id,))

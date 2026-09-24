@@ -11,7 +11,7 @@ from inkbox_codex.codex_client import CodexAppServerClient, CodexAppServerError
 from inkbox_codex.config import BridgeConfig
 
 
-@pytest.mark.parametrize('failure', ['eof', 'reader-error', 'disconnect'])
+@pytest.mark.parametrize('failure', ['eof', 'reader-error', 'disconnect', 'resolved', 'turn-ended'])
 def test_closed_transport_cancels_its_pending_approval(failure, tmp_path, monkeypatch):
     from tests.test_sessions import make_session
     monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
@@ -35,12 +35,25 @@ def test_closed_transport_cancels_its_pending_approval(failure, tmp_path, monkey
         client._reader_task = asyncio.create_task(client._reader_loop())
         reader.feed_data((json.dumps({
             'id': 10, 'method': 'mcpServer/elicitation/request',
-            'params': {'message': 'Allow the inkbox MCP server to run tool "inkbox_lookup"?'},
+            'params': {'turnId': 'turn-approval', 'message': 'Allow the inkbox MCP server to run tool "inkbox_lookup"?'},
         }) + '\n').encode())
         try:
             await asyncio.wait_for(prompted.wait(), 1)
             assert session.pending is not None
-            if failure == 'disconnect':
+            if failure in {'resolved', 'turn-ended'}:
+                notification = (
+                    {'method': 'serverRequest/resolved', 'params': {'requestId': 10}}
+                    if failure == 'resolved' else
+                    {'method': 'turn/completed', 'params': {'turn': {'id': 'turn-approval', 'status': 'interrupted'}}}
+                )
+                reader.feed_data((json.dumps(notification) + '\n').encode())
+                async def cleared():
+                    while session.pending is not None:
+                        await asyncio.sleep(0)
+                await asyncio.wait_for(cleared(), 1)
+                reader.feed_eof()
+                await asyncio.wait_for(client._reader_task, 1)
+            elif failure == 'disconnect':
                 await client.disconnect()
             else:
                 if failure == 'eof':

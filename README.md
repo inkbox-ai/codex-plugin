@@ -75,7 +75,7 @@ you (phone)  ── SMS / iMessage / email / call ──▶  Inkbox  ──▶  
 
   > Codex wants to run the command: npm test
   >
-  > Reply 1 (or YES) to allow once, 2 (or ALWAYS) to allow this kind of action for the rest of the session, 3 (or NO) to block it.
+  > Reply 1 (or YES) to allow once, 2 (or SESSION) to allow for this session, 3 (or NO) to deny. /stop cancels the task.
 
 - When Codex needs you to pick between options (the `AskUserQuestion` tool), you get a numbered poll on whatever channel you're on, and your reply is fed back as the answer.
 - Each message you send is tagged with its channel, so Codex knows whether it's on SMS, iMessage, email, or a call.
@@ -173,12 +173,32 @@ Then, from your phone:
 
 ## How escalation works
 
-Codex never silently runs anything destructive. The bridge starts `codex app-server` and answers its approval requests over your active Inkbox channel:
+The bridge honors Codex's configured approval policy and relays its requests over your active Inkbox channel:
 
 - Commands, file changes, permission-profile changes, and request-user-input prompts block the agent mid-turn while the bridge texts you a one-line plain-language summary.
-- Your **next message answers the escalation** instead of starting a new turn — reply `1`/`yes`, `2`/`always` (session-scoped grant), or `3`/`no`.
+- Tool approvals use the fixed choices below. A different instruction cancels the pending approval turn and becomes fresh work instead of being consumed as an approval answer.
 - Request-user-input prompts are formatted as numbered options; reply with the number or free text.
-- No reply within `INKBOX_PERMISSION_TIMEOUT_S` (default 10 min) → the request is denied or answered empty and Codex carries on as best it can.
+- No reply within `INKBOX_PERMISSION_TIMEOUT_S` (default 10 min) cancels an MCP request; command/file approvals are denied.
+
+| Reply | Decision |
+|---|---|
+| `1` / `YES` | Allow once |
+| `2` / `SESSION` | Allow for this session, when offered by Codex |
+| `3` / `NO` | Deny this request |
+| `4` / `ALWAYS` | Remember approval across sessions, when offered by Codex |
+| `/stop` / `/cancel` | Cancel the entire task |
+
+Session and permanent approval are distinct: an unavailable scope is never
+silently changed to allow-once. Advertised MCP persistence scopes are forwarded
+through Codex's native protocol, not a bridge-wide allow list. Other tools still
+require their own approval when Inkbox tool auto-approval is enabled.
+
+Clear replies such as “yes, proceed” are accepted. A natural cancellation such as
+“please cancel my request” stops the task. Companion answers and controls retain
+sender and mention gates. Structured MCP questions show their actual fields and
+return typed answers; unsupported forms require using Codex directly or canceling
+the interaction. URL-based requests require completing the displayed URL step
+before replying `DONE`.
 
 ## Sessions
 
@@ -344,10 +364,10 @@ continue in the conversation; the next reply can explain the earlier uncertainty
 An interrupted initialization does not replay its old trigger. Payloads,
 deduplication records, and saved conversation threads are preserved across restart.
 
-Outstanding approval prompts are canceled when their Codex connection closes,
-so the next message can start fresh work. For manual MCP tool approvals, an
-explicit yes allows the tool, no declines it, and a timeout or unrecognized
-answer cancels the request. Trusted Inkbox tool auto-approval remains optional.
+Outstanding approval prompts are canceled when their Codex connection closes or
+their host request is resolved. Only one question is displayed at a time, and
+canceling a task clears its queued questions. New instructions during a tool
+approval become fresh work. Trusted Inkbox tool auto-approval remains optional.
 
 `inkbox-codex doctor` checks the effective Codex launcher with a bounded app-server
 initialization handshake, using the same saved environment as the gateway.

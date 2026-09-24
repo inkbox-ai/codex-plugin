@@ -184,7 +184,8 @@ class CodexAppServerClient:
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
-        self._server_requests: set[asyncio.Task] = set()
+        self._server_requests: dict[asyncio.Task, tuple[Any, str]] = {}
+        self._finished_turns: set[str] = set()
         self._next_id = 1
         self._pending: Dict[int, "asyncio.Future[Any]"] = {}
         self._turns: Dict[str, _TurnCapture] = {}
@@ -527,9 +528,13 @@ class CodexAppServerClient:
                 self._handle_response(message)
                 continue
             if "id" in message and "method" in message:
+                params = message.get("params") or {}
+                turn_id = str(params.get("turnId") or "")
+                if turn_id and turn_id in self._finished_turns:
+                    continue
                 task = asyncio.create_task(self._handle_server_request(message))
-                self._server_requests.add(task)
-                task.add_done_callback(self._server_requests.discard)
+                self._server_requests[task] = (message["id"], turn_id)
+                task.add_done_callback(lambda done: self._server_requests.pop(done, None))
                 continue
             if "method" in message:
                 self._handle_notification(message)
@@ -608,6 +613,12 @@ class CodexAppServerClient:
         params = message.get("params") or {}
         turn_id = str(params.get("turnId") or (params.get("turn") or {}).get("id") or "")
 
+        if method == "serverRequest/resolved":
+            for task, (request_id, _) in list(self._server_requests.items()):
+                if request_id == params.get("requestId"):
+                    task.cancel()
+            return
+
         if (turn_id and turn_id not in self._turns and self._starting_turns
                 and method in {"item/started", "item/agentMessage/delta", "item/completed", "turn/completed"}):
             # Some hosts emit turn notifications before acknowledging turn/start.
@@ -642,6 +653,11 @@ class CodexAppServerClient:
             return
 
         if method == "turn/completed":
+            if turn_id:
+                self._finished_turns.add(turn_id)
+            for task, (_, request_turn) in list(self._server_requests.items()):
+                if turn_id and request_turn == turn_id:
+                    task.cancel()
             capture = self._turns.get(turn_id)
             if capture is None or capture.future.done():
                 return
