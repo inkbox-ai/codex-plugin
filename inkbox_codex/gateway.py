@@ -431,6 +431,24 @@ def _hosted_requires_sms(
 def _hosted_sms_settlement(
     result: CodexTurnResult,
     remote_phone: str,
+    *,
+    call_id: str = "",
+    attempt: int = 1,
+) -> str:
+    """Combine host summaries with the tool process's durable send receipt."""
+    settlement = _hosted_sms_tool_settlement(result, remote_phone)
+    receipt = hosted_sms_attempt_state(call_id, attempt) if call_id else None
+    if settlement in {"missing", "recoverable"}:
+        if receipt == "success":
+            return "success"
+        if receipt is not None and receipt != "recoverable":
+            return "terminal"
+    return settlement
+
+
+def _hosted_sms_tool_settlement(
+    result: CodexTurnResult,
+    remote_phone: str,
 ) -> str:
     """Classify a required SMS as success, recoverable, missing, or terminal."""
     if result.aborted:
@@ -1611,7 +1629,7 @@ class InkboxGateway:
                     "remote_phone": remote,
                 },
             )
-            if _hosted_sms_settlement(corrected, remote) != "success":
+            if _hosted_sms_settlement(corrected, remote, call_id=call_id, attempt=2) != "success":
                 raise _HostedToolSettlementError(
                     "recovered hosted SMS correction did not complete safely"
                 )
@@ -2060,7 +2078,7 @@ class InkboxGateway:
                         "remote_phone": remote_phone,
                     },
                 )
-                settlement = _hosted_sms_settlement(result, remote_phone)
+                settlement = _hosted_sms_settlement(result, remote_phone, call_id=call_id)
                 if settlement in {"missing", "recoverable"}:
                     correction = _hosted_sms_correction_prompt(
                         remote_phone,
@@ -2074,7 +2092,7 @@ class InkboxGateway:
                             "remote_phone": remote_phone,
                         },
                     )
-                    settlement = _hosted_sms_settlement(corrected, remote_phone)
+                    settlement = _hosted_sms_settlement(corrected, remote_phone, call_id=call_id, attempt=2)
                 if settlement != "success":
                     raise _HostedToolSettlementError(
                         "required hosted SMS did not reach a confirmed safe completion"

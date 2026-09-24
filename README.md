@@ -387,7 +387,7 @@ saved answer when available. Recovery commands refuse to race a running gateway.
 
 The setup wizard has a **Phone call voice stack** section with three choices:
 
-- **Inkbox Voice AI**: Inkbox handles the audio and conversation on Codex's behalf. Choose contact-scoped or YOLO authority during setup. Hosted outbound calls carry a task reason, inherit that saved authority by omitting a per-call override, and notify Codex through a signed `call.ended` event. Codex then fetches the authoritative transcript and executes any remaining post-call commitments in a side-effect-only turn; its plain model prose is never sent after hangup.
+- **Inkbox Voice AI**: Inkbox handles the audio and conversation on Codex's behalf. Choose contact-scoped or YOLO authority during setup. Hosted outbound calls carry a task reason, inherit that saved authority by omitting a per-call override, and notify Codex through a signed `call.ended` event. The initiating turn ends after call placement; the separate call-ended turn owns the follow-up. Codex then fetches the authoritative transcript and executes any remaining post-call commitments in a side-effect-only turn; its plain model prose is never sent after hangup. Saved SMS receipts prevent a correction from repeating an accepted or uncertain send, even when Codex omits the tool result from its summary.
 
 - **OpenAI Realtime** (when configured): the bridge pre-opens an OpenAI Realtime session and accepts the call in raw-media mode, so a natural, low-latency voice handles the conversation. It runs the call itself and has these tools:
   - `consult_agent` — do real work *now* in the project; runs in the *same* contact-keyed session as your SMS/iMessage and its answer is spoken back.
