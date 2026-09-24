@@ -320,55 +320,63 @@ Run `inkbox-codex setup` to change the choice without reconfiguring your identit
 These match only when the whole message is exactly the command, so "please /clear the cache" is still a normal turn.
 
 **Errors.** Ordinary turns send a short plain-language failure notice. Companion
-failures retain the input for safe retry or operator recovery; see below.
+failures are recovered automatically without replaying possibly accepted work; see below.
 
-### Readiness and Companion recovery
+### Automatic recovery and readiness
 
-`inkbox-codex doctor` checks the configured `CODEX_BIN` by starting its app-server
-and completing a bounded initialization handshake. A launcher being on `PATH`
-is not enough: a JavaScript launcher also needs Node available to the gateway.
-If necessary, set `CODEX_BIN` to a working native Codex executable. Doctor loads
-the same saved environment as the gateway. Recognized startup failures include
-the process exit code and a bounded diagnostic summary, without raw stderr.
+The bridge automatically retries inputs that failed before a model turn or
+message send could start, with backoff capped at one minute. Retry does not stop
+after a fixed number of failures, and a recovered Codex runtime wakes waiting
+conversations without requiring another message or a restart. Saved answers
+retry delivery without running the model again.
 
-HTTP `/health` remains a liveness endpoint (`ok: true`, HTTP 200), and includes
-separate `ready`, `codex`, and `companion` fields. HTTP `/ready` returns 503 while
-the startup check is unavailable, stale, or failing, or a Companion conversation
-is blocked. The launcher check refreshes in the background every minute; health
-requests do not start new processes. Queue diagnostics report unfinished counts,
-blocked conversations, and oldest unfinished age (unknown for older receipts).
-These checks do **not** prove model generation or end-to-end message delivery.
+If the selected npm Codex launcher cannot find Node, the bridge uses the matching
+native executable already included in that same Codex installation. It does not
+change your configuration, download a replacement, or select an unrelated
+installation. Explicit native `CODEX_BIN` paths and working launchers are kept.
 
-Companion receipts with an ambiguous turn or delivery outcome remain `uncertain`
-across restarts and block later inputs in that conversation. They are never
-automatically replayed. Known pre-submission failures may retry safely; exhausted
-or permanent preflight failures are reported as `failed` and can be rechecked on
-a new delivery or restart. Inspect unfinished receipts without message content:
+For an ambiguous turn outcome, the bridge stops the old session and checks saved
+Codex history for a completed turn matching its receipt. A positively matched
+answer can be delivered without repeating the model turn. When the outcome
+cannot be established—or delivery may already have happened—the original input
+is retained as unconfirmed and is **not** automatically replayed. Later messages
+continue in the conversation; the next reply can explain the earlier uncertainty.
+An interrupted initialization does not replay its old trigger. Payloads,
+deduplication records, and saved conversation threads are preserved across restart.
 
-```bash
-inkbox-codex inbox list
-```
+`inkbox-codex doctor` checks the effective Codex launcher with a bounded app-server
+initialization handshake, using the same saved environment as the gateway.
+Recognized startup failures include an exit code and a bounded diagnostic summary,
+without raw stderr. HTTP `/health` remains a liveness endpoint (`ok: true`, HTTP
+200) with separate `ready`, `codex`, and `companion` fields. HTTP `/ready` returns
+503 while startup cannot be verified or a conversation is still blocked.
 
-After inspecting the affected conversation, stop the gateway and explicitly
-choose **one** recovery action for its oldest unfinished receipt:
+Startup checks refresh in the background every minute; HTTP health requests do
+not start new processes. Queue diagnostics distinguish active blockage from
+retained unconfirmed outcomes (`quarantined_count`), which do not block new input.
+They also show unfinished counts and oldest receipt age (unknown for older
+receipts). These checks do **not** prove model generation or end-to-end delivery.
+Verify recovery with a fresh message and its reply in the same conversation.
+
+#### Optional receipt inspection
+
+Automatic recovery does not require an operator command. To inspect retained
+receipts without message content, use `inkbox-codex inbox list`. After inspecting
+an unconfirmed outcome, an operator can explicitly request retry or retirement
+with the gateway stopped:
 
 ```bash
 inkbox-codex stop
-# Skip the stale input or saved reply, without claiming it was delivered:
+# Choose one action for the receipt:
 inkbox-codex inbox recover EVENT_ID --action retire --reason "Inspected; skip stale input"
-# OR retry; uncertain work requires acknowledgement of possible duplicate effects:
+# OR acknowledge that explicitly retrying uncertain work may duplicate effects:
 inkbox-codex inbox recover EVENT_ID --action retry --reason "Inspected; retry intended" --acknowledge-duplicate-risk
 inkbox-codex start
 ```
 
-Recovery is refused while another gateway owns the inbox. Each decision is
-recorded locally with its reason, timestamp, and previous/new receipt states.
-Payloads, deduplication records, and saved conversation threads are preserved.
-Retry uses a saved answer when available instead of generating it again.
-Retiring an initialization continues later live inputs from the saved thread and
-reply anchor without replaying its old trigger; missing historical context is
-not reconstructed. Retirement does not prove successful processing or delivery.
-Verify recovery with a new message and its reply in the same conversation.
+Each explicit decision records its reason, timestamp, and previous/new state.
+Retirement does not claim that processing or delivery succeeded; retry uses a
+saved answer when available. Recovery commands refuse to race a running gateway.
 
 ## Voice
 

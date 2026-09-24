@@ -1094,6 +1094,11 @@ class InkboxGateway:
             if ok != self._codex_ready:
                 log = logger.info if ok else logger.error
                 log("[bridge] Codex startup check: %s", detail)
+            if ok and self._companion_receiver is not None:
+                try:
+                    self._companion_receiver.recover()
+                except Exception:
+                    logger.error("Companion recovery scheduling failed; will retry automatically")
             self._codex_ready = ok
             self._codex_readiness_detail = detail
             self._codex_checked_at = time.time()
@@ -4716,6 +4721,8 @@ class InkboxGateway:
         inbox = status["companion"]
         if inbox["readable"]:
             lines.append(f"Companion: {inbox['unfinished_count']} unfinished receipts; {inbox['blocked_conversations']} blocked conversations")
+            if inbox.get("quarantined_count"):
+                lines.append(f"Companion: {inbox['quarantined_count']} earlier inputs have unconfirmed outcomes; new messages can continue")
         else:
             lines.append("Companion: receipt state unavailable")
         lines.append(f"Readiness: {'ready' if status['ready'] else 'degraded'} (startup and queue checks only)")

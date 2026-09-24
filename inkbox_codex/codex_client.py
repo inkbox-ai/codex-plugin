@@ -14,9 +14,11 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 try:
     from .config import BridgeConfig
     from .delivery_policy import sms_tool_failure_kind
+    from .launcher import resolve_codex_launcher
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import BridgeConfig
     from delivery_policy import sms_tool_failure_kind
+    from launcher import resolve_codex_launcher
 
 logger = logging.getLogger(__name__)
 STARTUP_TIMEOUT_SECONDS = 15.0
@@ -64,6 +66,44 @@ async def probe_codex(cfg: BridgeConfig) -> tuple[bool, str]:
         return False, str(exc)
     except Exception:
         return False, "Codex app-server readiness check failed"
+    finally:
+        await client.disconnect()
+
+
+async def recover_saved_answer(cfg: BridgeConfig, thread_id: str, receipt_token: str) -> Optional[str]:
+    """Recover only a positively matched completed turn, without rerunning it."""
+    client = CodexAppServerClient(cfg, developer_instructions="", tools_enabled=False,
+                                 isolate_process_group=True)
+    try:
+        await client._ensure_process()
+        await client._initialize()
+        try:
+            result = await asyncio.wait_for(client._request("thread/read", {
+                "threadId": thread_id, "includeTurns": True,
+            }), timeout=STARTUP_TIMEOUT_SECONDS)
+        except (CodexAppServerError, TimeoutError):
+            return None
+        if not isinstance(result, dict) or not isinstance(result.get("thread"), dict):
+            return None
+        thread = result["thread"]
+        if thread.get("id") != thread_id or not isinstance(thread.get("turns"), list):
+            return None
+        marker = f"Companion receipt: {receipt_token}\n"
+        def objects(value):
+            return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+        matches = [turn for turn in objects(thread["turns"]) if any(
+            item.get("type") == "userMessage" and any(
+                entry.get("type") == "text" and marker in str(entry.get("text") or "")
+                for entry in objects(item.get("content"))
+            ) for item in objects(turn.get("items"))
+        )]
+        if len(matches) != 1 or matches[0].get("status") != "completed":
+            return None
+        return "\n\n".join(
+            item["text"] for item in objects(matches[0].get("items"))
+            if item.get("type") == "agentMessage" and item.get("phase") in {None, "final", "final_answer"}
+            and isinstance(item.get("text"), str)
+        ).strip() or None
     finally:
         await client.disconnect()
 
@@ -137,6 +177,8 @@ class CodexAppServerClient:
         self.approval_handler = approval_handler
         self.tools_enabled = tools_enabled
         self._isolated_process_group = isolate_process_group and os.name == "posix"
+        self._owns_process_group = os.name == "posix"
+        self._process_group_id: Optional[int] = None
 
         self.thread_id: Optional[str] = None
         self._proc: Optional[asyncio.subprocess.Process] = None
@@ -150,6 +192,11 @@ class CodexAppServerClient:
         self._current_turn_id: Optional[str] = None
         self._initialized = False
         self._stderr_tail: deque[str] = deque(maxlen=8)
+
+    @property
+    def process_group_id(self) -> Optional[int]:
+        """The group created for this host, retained for recovery fencing."""
+        return self._process_group_id
 
     @property
     def is_alive(self) -> bool:
@@ -351,18 +398,19 @@ class CodexAppServerClient:
         self._stderr_tail.clear()
         try:
             self._proc = await asyncio.create_subprocess_exec(
-                os.path.expanduser(self.cfg.codex_bin or "codex"),
+                resolve_codex_launcher(self.cfg.codex_bin or "codex"),
                 "app-server",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
-                start_new_session=self._isolated_process_group,
+                start_new_session=self._owns_process_group,
             )
         except OSError as exc:
             detail = ("configured executable not found" if isinstance(exc, FileNotFoundError)
                       else "configured executable is not runnable")
             raise CodexStartupError(f"Codex startup failed: {detail}; check CODEX_BIN") from None
+        self._process_group_id = self._proc.pid if self._owns_process_group else None
         self._reader_task = asyncio.create_task(self._reader_loop())
         self._stderr_task = asyncio.create_task(self._stderr_loop())
 

@@ -10,7 +10,7 @@ import pytest
 from inkbox_codex import cli, daemon
 from inkbox_codex.companion import CompanionError, Event, Inbox, inbox_path, inbox_summary
 from inkbox_codex.config import BridgeConfig
-from tests.test_companion import drained, fixture, harness, live
+from tests.test_companion import drained, fixture, harness, live, ReconnectingClient
 
 
 @pytest.fixture(autouse=True)
@@ -20,41 +20,30 @@ def isolated(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize('channel', ['phone', 'imessage', 'mail'])
 @pytest.mark.parametrize('live_first', [False, True])
-def test_uncertain_initialization_blocks_restart_until_retired_then_only_fresh_turn(channel, live_first):
+def test_uncertain_initialization_recovers_restart_without_replaying_old_request(channel, live_first, monkeypatch):
+    from inkbox_codex import companion, sessions
+    monkeypatch.setattr(sessions, 'CodexAppServerClient', ReconnectingClient)
+    lookup = AsyncMock(return_value=None)
+    monkeypatch.setattr(companion, 'recover_saved_answer', lookup)
+
     async def scenario():
         e = fixture(channel)
         r, _, s, sent = harness(e)
         first = live(e) if live_first else e
+        original = s._client
         if live_first:
-            s._client.append_context = AsyncMock(side_effect=RuntimeError('unknown context outcome'))
+            original.append_context = AsyncMock(side_effect=RuntimeError('unknown context outcome'))
         else:
-            s._client.run = AsyncMock(side_effect=RuntimeError('unknown turn outcome'))
+            original.run = AsyncMock(side_effect=RuntimeError('unknown turn outcome'))
         await r.accept(first)
         await drained(r)
-        await r.accept(live(e, sequence=3))
-        await drained(r)
+        r.inbox.accept(Event.parse(live(e, sequence=3)))
         cfg = r.cfg
         assert not sent
         assert inbox_summary(cfg)['blocked_conversations'] == 1
-        assert inbox_summary(cfg)['unfinished_count'] == 2
-        await r.close()
-
-        r, sdk, s, sent = harness(e)
-        r.recover()
-        await drained(r)
-        assert not sent and not s._client.events
         payloads = r.inbox.db.execute('SELECT event_id,payload FROM events').fetchall()
         threads = r.inbox.db.execute('SELECT * FROM threads').fetchall()
         await r.close()
-
-        db = Inbox(inbox_path(cfg))
-        assert db.recover_receipt(first['id'], action='retire', reason='Inspected; skip previous input') == 'done'
-        assert db.db.execute('SELECT event_id,payload FROM events').fetchall() == payloads
-        assert db.db.execute('SELECT * FROM threads').fetchall() == threads
-        assert db.db.execute('SELECT action,previous_state,next_state FROM recovery_actions').fetchone() == (
-            'retire', 'uncertain', 'done')
-        assert db.db.execute('SELECT state FROM activations').fetchone()[0] == 'retired'
-        db.close()
 
         r, sdk, s, sent = harness(e)
         try:
@@ -63,10 +52,21 @@ def test_uncertain_initialization_blocks_restart_until_retired_then_only_fresh_t
             assert len(sent) == 1
             assert [kind for kind, _ in s._client.events] == ['run']
             assert '@agent next' in s._client.events[0][1]
-            assert sdk.loads == 0  # Never replay the retired initialization trigger.
-            assert inbox_summary(cfg)['blocked_conversations'] == 0
-            assert inbox_summary(cfg)['unfinished_count'] == 0
-            assert not await r.accept(first)  # Deduplication still holds.
+            assert 'Do not repeat or finish that earlier request' in s._client.events[0][1]
+            assert sdk.loads == 0
+            assert r.inbox.db.execute('SELECT event_id,payload FROM events').fetchall() == payloads
+            assert r.inbox.db.execute('SELECT * FROM threads').fetchall() == threads
+            assert r.inbox.db.execute('SELECT state FROM activations').fetchone()[0] == 'interrupted'
+            assert r.inbox.db.execute('SELECT action,previous_state,next_state FROM recovery_actions').fetchone() == (
+                'auto_quarantine', 'uncertain', 'quarantined')
+            summary = inbox_summary(cfg)
+            assert summary['blocked_conversations'] == 0
+            assert summary['unfinished_count'] == summary['quarantined_count'] == 1
+            assert not await r.accept(first)
+            await drained(r)
+            assert len(sent) == 1
+            assert lookup.await_count == (0 if live_first else 1)
+            (original.append_context if live_first else original.run).assert_awaited_once()
         finally:
             await r.close()
     asyncio.run(scenario())

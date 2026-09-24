@@ -87,10 +87,12 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
         blocked = summary["blocked_conversations"]
         age = summary["oldest_unfinished_age_s"]
         detail = f"{summary['unfinished_count']} unfinished receipts; {blocked} blocked conversations"
+        if summary.get("quarantined_count"):
+            detail += f"; {summary['quarantined_count']} earlier outcomes unconfirmed (not blocking new inputs)"
         if age is not None:
             detail += f"; oldest {int(age)}s"
         if blocked:
-            detail += "; inspect with inkbox-codex inbox list"
+            detail += "; automatic recovery is active while the gateway runs"
         checks.append(("Companion inbox", not blocked, detail))
 
     codex_home = os.getenv("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")

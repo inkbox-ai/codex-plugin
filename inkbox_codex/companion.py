@@ -9,15 +9,19 @@ import json
 import logging
 import os
 from pathlib import Path
+import signal
 import sqlite3
 import time
 from typing import Any, Callable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 
+from .codex_client import recover_saved_answer
+
 logger = logging.getLogger(__name__)
 MAX_BYTES = 8 * 1024 * 1024
+RETRY_MAX_SECONDS = 60.0
 CHANNELS = {
     "message.received": ("mail", "email", "message", "from_address", "body", "thread_id"),
     "text.received": ("phone", "sms", "text_message", "sender_phone_number", "text", "conversation_id"),
@@ -37,7 +41,7 @@ def inbox_path(cfg) -> Path:
 
 def inbox_summary(cfg) -> dict:
     """Read queue readiness without opening a writer or changing receipts."""
-    summary = {"unfinished_count": 0, "pending_count": 0,
+    summary = {"unfinished_count": 0, "pending_count": 0, "quarantined_count": 0,
                "blocked_conversations": 0, "oldest_unfinished_age_s": None}
     path = inbox_path(cfg)
     if not path.exists():
@@ -55,8 +59,11 @@ def inbox_summary(cfg) -> dict:
         db.close()
     heads = {}
     for scope, state, _, activation in rows:
+        if state == "quarantined":
+            continue
         heads.setdefault(scope, (state, activation))
     summary.update(unfinished_count=len(rows),
+                   quarantined_count=sum(state == "quarantined" for _, state, _, _ in rows),
                    pending_count=sum(state in {"pending", "reply_pending"} for _, state, _, _ in rows),
                    blocked_conversations=sum(
                        state in {"uncertain", "failed"} or
@@ -206,6 +213,13 @@ class Inbox:
                 previous_state TEXT NOT NULL, next_state TEXT NOT NULL,
                 reason TEXT NOT NULL, created_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS host_receipts (
+                event_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, receipt_token TEXT NOT NULL,
+                meta TEXT NOT NULL, source_ids TEXT NOT NULL, trigger TEXT
+            );
+            CREATE TABLE IF NOT EXISTS recovery_notices (
+                scope TEXT PRIMARY KEY, pending INTEGER NOT NULL
+            );
         """)
         if "received_at" not in {row[1] for row in self.db.execute("PRAGMA table_info(events)")}:
             self.db.execute("ALTER TABLE events ADD COLUMN received_at REAL")
@@ -239,12 +253,12 @@ class Inbox:
         return True
 
     def scopes(self) -> list[str]:
-        return [r[0] for r in self.db.execute("SELECT DISTINCT scope FROM events WHERE state!='done'")]
+        return [r[0] for r in self.db.execute("SELECT DISTINCT scope FROM events WHERE state NOT IN ('done','quarantined')")]
 
     def next(self, scope: str) -> Event | None:
-        row = self.db.execute("SELECT payload,state,sequence FROM events WHERE scope=? AND state!='done' ORDER BY sequence LIMIT 1",
+        row = self.db.execute("SELECT payload,state,sequence FROM events WHERE scope=? AND state NOT IN ('done','quarantined') ORDER BY sequence LIMIT 1",
                               (scope,)).fetchone()
-        if not row or row[1] not in {"pending", "reply_pending", "failed"}:
+        if not row or row[1] not in {"pending", "reply_pending", "failed", "uncertain"}:
             return None
         # The signed delivery stream is ordered, not contiguous: a cancelled
         # delivery or a subscription change can leave a permanent numeric gap.
@@ -282,17 +296,17 @@ class Inbox:
             if row is None or row[1] == "done":
                 raise CompanionError("Receipt does not exist or is already complete")
             event, previous = Event.parse(json.loads(row[0])), row[1]
-            head = self.db.execute("SELECT event_id FROM events WHERE scope=? AND state!='done' ORDER BY sequence LIMIT 1",
+            head = self.db.execute("SELECT event_id FROM events WHERE scope=? AND state NOT IN ('done','quarantined') ORDER BY sequence LIMIT 1",
                                    (event.scope,)).fetchone()
-            if head[0] != event_id:
+            if previous != "quarantined" and (head is None or head[0] != event_id):
                 raise CompanionError("Recover the oldest unfinished receipt in this conversation first")
             activation = self.activation(event)
-            ambiguous = previous == "uncertain" or (activation and activation[2] in {"submitting", "uncertain"})
+            ambiguous = previous in {"uncertain", "quarantined"} or (activation and activation[2] in {"submitting", "uncertain"})
             if action == "retry" and ambiguous and not acknowledge_duplicate_risk:
                 raise CompanionError("Retry may duplicate a turn or delivery; pass --acknowledge-duplicate-risk after inspection")
             reply = self.db.execute("SELECT 1 FROM replies WHERE event_id=?", (event_id,)).fetchone()
             next_state = "done" if action == "retire" else "reply_pending" if reply else "pending"
-            if activation and activation[2] in {"submitting", "uncertain"}:
+            if activation and activation[2] in {"submitting", "uncertain", "interrupted"}:
                 if action == "retire":
                     # Continue from the saved thread/anchor without replaying an
                     # ambiguous initialization trigger on the next live input.
@@ -326,6 +340,7 @@ class Receiver:
         self.closing = False
         self.retries: dict[str, asyncio.TimerHandle] = {}
         self.attempts: dict[str, int] = {}
+        self.recovery_hosts: dict[str, tuple[object, int | None]] = {}
 
     def resource(self):
         resource = getattr(self.client, "companion", None)
@@ -356,6 +371,8 @@ class Receiver:
             self.tasks[scope] = asyncio.create_task(self._drain(scope))
 
     def recover(self):
+        if self.closing:
+            return
         for scope in self.inbox.scopes():
             self.schedule(scope)
 
@@ -388,6 +405,9 @@ class Receiver:
                 # A new delivery or restart may recheck a proven preflight
                 # failure, but never an ambiguous submission or send.
                 state = self.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (event.event_id,)).fetchone()[0]
+                if state == "uncertain":
+                    await self.rescue(event)
+                    continue
                 if state == "failed":
                     reply = self.inbox.db.execute("SELECT 1 FROM replies WHERE event_id=?", (event.event_id,)).fetchone()
                     self.inbox.state(event.event_id, "reply_pending" if reply else "pending")
@@ -403,29 +423,125 @@ class Receiver:
                 retrying_reply = False
                 if row[0] in {"submitting", "sending"}:
                     self.inbox.state(event.event_id, "uncertain")
-                elif row[0] == "pending" or (row[0] == "reply_pending" and self.retryable_read(exc)):
+                    self.retries[scope] = asyncio.get_running_loop().call_later(min(2, RETRY_MAX_SECONDS), self.schedule, scope)
+                elif row[0] == "uncertain":
+                    self.retries[scope] = asyncio.get_running_loop().call_later(RETRY_MAX_SECONDS, self.schedule, scope)
+                elif row[0] in {"pending", "reply_pending"}:
                     attempt = self.attempts.get(scope, 0) + 1
                     self.attempts[scope] = attempt
-                    if (self.retryable_read(exc) or attempt <= 5) and not self.closing:
+                    if not self.closing:
+                        # Neither checkpoint has been crossed. Keep retrying
+                        # with bounded backoff even after a prolonged outage.
+                        if attempt > 5 and not self.retryable_read(exc):
+                            self.inbox.state(event.event_id, "failed")
                         old = self.retries.pop(scope, None)
                         if old:
                             old.cancel()
                         self.retries[scope] = asyncio.get_running_loop().call_later(
-                            min(60, 2 ** min(attempt, 6)), self.schedule, scope,
+                            min(RETRY_MAX_SECONDS, 2 ** min(attempt, 6)), self.schedule, scope,
                         )
                         retrying_reply = row[0] == "reply_pending"
-                    elif not self.closing:
-                        self.inbox.state(event.event_id, "failed")
-                elif row[0] == "reply_pending":
-                    self.inbox.state(event.event_id, "failed")
                 if retrying_reply:
                     logger.warning("Companion reply preflight failed (%s); saved answer will retry for receipt %s",
                                    type(exc).__name__, event.event_id)
                 else:
                     logger.error("Companion input paused (%s); receipt %s retained for recovery",
                                  type(exc).__name__, event.event_id)
-                logger.error("Companion recovery: run inkbox-codex inbox list; inspect before retrying or retiring a receipt")
+                if scope in self.retries:
+                    logger.info("Companion recovery will retry automatically; receipt retained")
                 return
+
+    async def _fence_session(self, event):
+        key = event.session_key(self.namespace)
+        session = self.sessions.get(key)
+        host = getattr(session._client, "_proc", None)
+        if host is not None:
+            self.recovery_hosts[key] = (host, getattr(session._client, "process_group_id", None))
+        elif session._last_closed_host is not None:
+            self.recovery_hosts.setdefault(key, session._last_closed_host)
+        captured = self.recovery_hosts.get(key)
+        host, group = captured if captured else (None, None)
+
+        def stop_group():
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        if host is not None and host.returncode is None and group is not None:
+            stop_group()
+        await asyncio.wait_for(session.close(), timeout=10)
+        if host is not None and host.returncode is None:
+            # close() clears the session's client even when cleanup fails.
+            # Retain the process fence across attempts; never assume it died.
+            try:
+                host.kill()
+                await asyncio.wait_for(host.wait(), timeout=1)
+            except (ProcessLookupError, TimeoutError):
+                pass
+        if host is not None and host.returncode is None:
+            raise CompanionError("Previous Codex process has not stopped")
+        if host is not None:
+            async def drain(stream):
+                while await stream.read(8192):
+                    pass
+            streams = [stream for stream in (getattr(host, "stdout", None), getattr(host, "stderr", None))
+                       if stream is not None]
+            if streams:
+                # Inherited pipes must close too; an exited wrapper alone is
+                # not evidence that its app-server descendant has stopped. Do
+                # not signal an old group ID once its host pipes are closed.
+                async def drain_pipes():
+                    await asyncio.gather(*(drain(stream) for stream in streams))
+
+                try:
+                    await asyncio.wait_for(drain_pipes(), timeout=0.05)
+                except TimeoutError:
+                    if group is not None:
+                        stop_group()
+                    await asyncio.wait_for(drain_pipes(), timeout=1)
+        self.recovery_hosts.pop(key, None)
+        session._last_closed_host = None
+        return session
+
+    async def rescue(self, event):
+        """Fence the old host, recover a completed answer, or isolate ambiguity."""
+        session = await self._fence_session(event)
+        journal = self.inbox.db.execute(
+            "SELECT thread_id,receipt_token,meta,source_ids,trigger FROM host_receipts WHERE event_id=?",
+            (event.event_id,),
+        ).fetchone()
+        saved_thread = self.inbox.db.execute("SELECT thread_id FROM threads WHERE session_key=?", (event.session_key(self.namespace),)).fetchone()
+        if saved_thread:
+            session.resume_session_id = saved_thread[0]
+        pending_reply = self.inbox.db.execute("SELECT 1 FROM replies WHERE event_id=?", (event.event_id,)).fetchone()
+        if journal and not pending_reply and json.loads(journal[2]).get("companion_generates_reply") is True:
+            answer = await recover_saved_answer(self.cfg, journal[0], journal[1])
+            if answer is not None:
+                self._settle_submission(event, answer, json.loads(journal[2]),
+                                        source_ids=json.loads(journal[3]),
+                                        trigger=json.loads(journal[4]) if journal[4] else None)
+                with self.inbox.db:
+                    self.inbox.db.execute(
+                        "INSERT INTO recovery_actions(event_id,action,previous_state,next_state,reason,created_at) VALUES(?,?,?,?,?,?)",
+                        (event.event_id, "auto_recover", "uncertain",
+                         self.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (event.event_id,)).fetchone()[0],
+                         "Recovered completed answer from saved host history", time.time()),
+                    )
+                return
+        with self.inbox.db:
+            self.inbox.db.execute("UPDATE events SET state='quarantined' WHERE event_id=?", (event.event_id,))
+            self.inbox.db.execute(
+                "UPDATE activations SET state='interrupted' WHERE scope=? AND activation=? AND state IN ('submitting','uncertain')",
+                (event.scope, event.activation),
+            )
+            self.inbox.db.execute("INSERT INTO recovery_notices VALUES(?,1) ON CONFLICT(scope) DO UPDATE SET pending=1", (event.scope,))
+            self.inbox.db.execute(
+                "INSERT INTO recovery_actions(event_id,action,previous_state,next_state,reason,created_at) VALUES(?,?,?,?,?,?)",
+                (event.event_id, "auto_quarantine", "uncertain", "quarantined",
+                 "Outcome unconfirmed; retained without replay so fresh inputs can proceed", time.time()),
+            )
+        logger.warning("Companion retained unconfirmed receipt %s without replay; fresh inputs can continue", event.event_id)
 
     @staticmethod
     def retryable_read(exc):
@@ -511,6 +627,9 @@ class Receiver:
             "companion_initialization": initialization,
             "companion_sponsor": (self.inbox.activation(event) or (None, sponsor or author or event.author))[1],
             "companion_context_only": context_only,
+            "companion_unconfirmed_previous": bool(self.inbox.db.execute(
+                "SELECT 1 FROM recovery_notices WHERE scope=? AND pending=1", (event.scope,),
+            ).fetchone()),
             "source_message_id": event.source_id,
             "sender_access": event.sender_access,
             "companion_reply_context": reply,
@@ -537,6 +656,7 @@ class Receiver:
             raise CompanionError("Companion reply lost its group conversation")
 
     async def submit(self, event, text, meta, *, trigger=None, source_ids=None):
+        meta = {**meta, "companion_receipt_token": uuid4().hex}
         session_key = event.session_key(self.namespace)
         session = self.sessions.get(session_key)
         self.active_sessions.add(session)
@@ -552,15 +672,26 @@ class Receiver:
                 if thread_id:
                     self.inbox.db.execute("INSERT INTO threads VALUES(?,?) ON CONFLICT(session_key) DO UPDATE SET thread_id=excluded.thread_id",
                                           (session_key, thread_id))
+                    self.inbox.db.execute("INSERT OR REPLACE INTO host_receipts VALUES(?,?,?,?,?,?)", (
+                        event.event_id, thread_id, meta["companion_receipt_token"], json.dumps(meta),
+                        json.dumps(source_ids if source_ids is not None else [event.source_id]),
+                        json.dumps(trigger) if trigger else None,
+                    ))
                 self.inbox.db.execute("UPDATE events SET state='submitting' WHERE event_id=?", (event.event_id,))
                 if trigger:
                     self.inbox.db.execute("INSERT INTO activations VALUES(?,?,?,?,?) ON CONFLICT(scope,activation) DO UPDATE SET state=excluded.state",
                                           (event.scope, event.activation, trigger["id"], trigger["author"], "submitting"))
         reply = await session.submit_companion(text, event.mode, meta, before_submit=before_submit)
+        self._settle_submission(event, reply, meta, trigger=trigger, source_ids=source_ids)
+        await self.deliver_reply(event)
+
+    def _settle_submission(self, event, reply, meta, *, trigger=None, source_ids=None):
         # Initialization and its receipt transition atomically. Live-first needs
         # another input, but a completed live turn must never become pending.
         with self.inbox.db:
             self.inbox.remember_sources(event, source_ids if source_ids is not None else [event.source_id])
+            session_key = event.session_key(self.namespace)
+            session = self.sessions.get(session_key)
             if session._client is None and session.resume_session_id is None:
                 self.inbox.db.execute("DELETE FROM threads WHERE session_key=?", (session_key,))
             if trigger:
@@ -573,8 +704,9 @@ class Receiver:
                 self.inbox.db.execute("INSERT INTO replies VALUES(?,?,?,?)",
                                       (event.event_id, reply, json.dumps(meta), state))
                 state = "reply_pending"
+                if meta.get("companion_unconfirmed_previous"):
+                    self.inbox.db.execute("UPDATE recovery_notices SET pending=0 WHERE scope=?", (event.scope,))
             self.inbox.db.execute("UPDATE events SET state=? WHERE event_id=?", (state, event.event_id))
-        await self.deliver_reply(event)
 
     async def process(self, event):
         # Retry only the saved answer, never the already acknowledged input.
@@ -589,8 +721,13 @@ class Receiver:
             await self.submit(event, await self.live_text(event), self.meta(event))
             return
         saved = self.inbox.activation(event)
-        if saved and saved[2] not in {"initialized", "retired"}:
-            raise CompanionError("Companion initialization has an uncertain host outcome; inspect before retrying")
+        if saved and saved[2] in {"submitting", "uncertain"}:
+            await self._fence_session(event)
+            with self.inbox.db:
+                self.inbox.db.execute("UPDATE activations SET state='interrupted' WHERE scope=? AND activation=?", (event.scope, event.activation))
+                self.inbox.db.execute("INSERT INTO recovery_notices VALUES(?,1) ON CONFLICT(scope) DO UPDATE SET pending=1", (event.scope,))
+        elif saved and saved[2] not in {"initialized", "retired", "interrupted"}:
+            raise CompanionError("Companion initialization has an unsupported state")
         if not saved:
             result, trigger, reply, text = await self.load(event)
             entries = [_dict(entry) for entry in result.entries]
