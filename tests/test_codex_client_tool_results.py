@@ -54,7 +54,7 @@ def test_normal_client_keeps_main_turn_tool_configuration():
         "approvalsReviewer": "user",
         "developerInstructions": "test",
         "sandbox": "workspace-write",
-        "config": {"mcp_servers": {"inkbox": {"command": "inkbox-mcp"}}},
+        "config": {"mcp_servers.inkbox": {"command": "inkbox-mcp"}},
         "serviceName": "inkbox-codex",
     }
 

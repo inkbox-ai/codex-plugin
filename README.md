@@ -176,17 +176,22 @@ Then, from your phone:
 The bridge honors Codex's configured approval policy and relays its requests over your active Inkbox channel:
 
 - Commands, file changes, permission-profile changes, and request-user-input prompts block the agent mid-turn while the bridge texts you a one-line plain-language summary.
-- Tool approvals use the fixed choices below. A different instruction cancels the pending approval turn and becomes fresh work instead of being consumed as an approval answer.
+- MCP tool approvals number the available choices consecutively; reply with the number shown or a word from the table below. A different instruction cancels the pending approval turn and becomes fresh work instead of being consumed as an approval answer.
 - Request-user-input prompts are formatted as numbered options; reply with the number or free text.
 - No reply within `INKBOX_PERMISSION_TIMEOUT_S` (default 10 min) cancels an MCP request; command/file approvals are denied.
 
 | Reply | Decision |
 |---|---|
-| `1` / `YES` | Allow once |
-| `2` / `SESSION` | Allow for this session, when offered by Codex |
-| `3` / `NO` | Deny this request |
-| `4` / `ALWAYS` | Remember approval across sessions, when offered by Codex |
+| `YES` | Allow once |
+| `SESSION` | Allow for this session, when offered by Codex |
+| `NO` | Deny this request |
+| `ALWAYS` | Remember approval across sessions, when offered by Codex |
 | `/stop` / `/cancel` | Cancel the entire task |
+
+For example, a tool offering only allow-once and deny displays **1 — Allow once**
+and **2 — Deny**. If session approval is also available, it displays **1 — Allow
+once**, **2 — Allow for this session**, and **3 — Deny**. Always follow the numbers
+in the current prompt; words such as `NO` keep the same meaning.
 
 Session and permanent approval are distinct: an unavailable scope is never
 silently changed to allow-once. Advertised MCP persistence scopes are forwarded
