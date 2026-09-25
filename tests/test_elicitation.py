@@ -53,7 +53,7 @@ def test_decisions_are_whole_bounded_phrases(text, decision):
 ])
 def test_legacy_and_app_approval_prompts(message):
     assert is_approval({"message": message})
-    assert elicitation_response({"message": message}, "3") == {"action": "decline", "content": None}
+    assert elicitation_response({"message": message}, "2") == {"action": "decline", "content": None}
 
 
 @pytest.mark.parametrize("params", [
@@ -85,9 +85,9 @@ def test_scopes_are_only_advertised_native_capabilities(persist, choices):
     assert approval_choices(params) == frozenset(choices)
     prompt = format_elicitation(params)
     assert "1 — Allow once" in prompt
-    assert "3 — Deny this request" in prompt
+    assert f"{3 if 'session' in choices else 2} — Deny this request" in prompt
     assert ("2 — Allow for this session" in prompt) == ("session" in choices)
-    assert ("4 — Always allow across sessions" in prompt) == ("always" in choices)
+    assert ("Always allow across sessions" in prompt) == ("always" in choices)
     assert "/stop — Cancel the entire task" in prompt
 
 
@@ -98,9 +98,29 @@ def test_native_persistence_metadata_is_returned(reply, persist):
     }
 
 
-@pytest.mark.parametrize(("supported", "reply"), [(None, "2"), (None, "4"), ("session", "always"), ("always", "session")])
+@pytest.mark.parametrize(("supported", "reply"), [(None, "3"), (None, "4"), (None, "session"), ("session", "always"), ("always", "session")])
 def test_unavailable_choice_never_downgrades_to_accept_once(supported, reply):
     assert elicitation_response(approval(supported), reply) is None
+
+
+@pytest.mark.parametrize(("persist", "labels", "decisions"), [
+    (None, ["Allow once (YES)", "Deny this request (NO)"], ["allow", "deny"]),
+    ("session", ["Allow once (YES)", "Allow for this session (SESSION)", "Deny this request (NO)"], ["allow", "session", "deny"]),
+    ("always", ["Allow once (YES)", "Deny this request (NO)", "Always allow across sessions (ALWAYS)"], ["allow", "deny", "always"]),
+    (["always", "session"], ["Allow once (YES)", "Allow for this session (SESSION)", "Deny this request (NO)", "Always allow across sessions (ALWAYS)"], ["allow", "session", "deny", "always"]),
+])
+def test_visible_options_are_consecutive_and_numbers_execute_the_displayed_decision(persist, labels, decisions):
+    params = approval(persist)
+    numbered = [line for line in format_elicitation(params).splitlines() if line[:1].isdigit()]
+    assert numbered == [f"{index} — {label}" for index, label in enumerate(labels, 1)]
+    for index, decision in enumerate(decisions, 1):
+        expected = {"action": "decline" if decision == "deny" else "accept", "content": None}
+        if decision in {"session", "always"}:
+            expected["_meta"] = {"persist": decision}
+        for reply in (str(index), f" {index}! "):
+            assert elicitation_response(params, reply) == expected
+    for reply in ("0", str(len(labels) + 1), "999"):
+        assert elicitation_response(params, reply) is None
 
 
 @pytest.mark.parametrize(("reply", "expected"), [(None, "cancel"), ("Please cancel my request", "cancel"), ("no", "decline"), ("yes", "accept")])

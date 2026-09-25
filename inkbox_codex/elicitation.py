@@ -28,9 +28,13 @@ _REPLIES = {
 }
 
 
+def _normalize_reply(text: str) -> str:
+    return " ".join((text or "").strip().lower().replace("’", "'").replace(",", " ").rstrip(".! ").split())
+
+
 def parse_approval_reply(text: str) -> str | None:
     """Recognize complete decisions, never an affirmative substring in a task."""
-    normalized = " ".join((text or "").strip().lower().replace("’", "'").replace(",", " ").rstrip(".! ").split())
+    normalized = _normalize_reply(text)
     return next((choice for choice, words in _REPLIES.items() if normalized in words), None)
 
 
@@ -66,6 +70,18 @@ def approval_choices(params: dict[str, Any]) -> frozenset[str]:
     persist = _meta(params).get("persist")
     advertised = [persist] if isinstance(persist, str) else persist if isinstance(persist, list) else []
     return frozenset({"allow", "deny"} | {value for value in advertised if isinstance(value, str) and value in {"session", "always"}})
+
+
+def _approval_options(params: dict[str, Any]) -> list[tuple[str, str]]:
+    """Share the displayed option order with numeric reply decoding."""
+    labels = (
+        ("allow", "Allow once (YES)"),
+        ("session", "Allow for this session (SESSION)"),
+        ("deny", "Deny this request (NO)"),
+        ("always", "Always allow across sessions (ALWAYS)"),
+    )
+    choices = approval_choices(params)
+    return [(choice, label) for choice, label in labels if choice in choices]
 
 
 def _line(value: Any, limit: int = 120) -> str:
@@ -155,13 +171,8 @@ def format_elicitation(params: dict[str, Any]) -> str:
     if _url_request(params):
         return f"{message}\n\nOpen this URL and complete the requested step yourself:\n{params.get('url') or '(URL unavailable)'}\nReply DONE after completing it, or /stop to cancel the task."
     if is_approval(params):
-        lines = [message, *_action_details(params), "", "1 — Allow once (YES)"]
-        choices = approval_choices(params)
-        if "session" in choices:
-            lines.append("2 — Allow for this session (SESSION)")
-        lines.append("3 — Deny this request (NO)")
-        if "always" in choices:
-            lines.append("4 — Always allow across sessions (ALWAYS)")
+        lines = [message, *_action_details(params), ""]
+        lines.extend(f"{index} — {label}" for index, (_, label) in enumerate(_approval_options(params), 1))
         lines.append("/stop — Cancel the entire task")
         return "\n".join(lines)
     form = _fields(params)
@@ -217,6 +228,11 @@ def elicitation_response(params: dict[str, Any], reply: str | None) -> dict[str,
     if params.get("mode") not in (None, "form"):
         return None
     if is_approval(params):
+        normalized = _normalize_reply(reply)
+        if normalized.isdecimal():
+            # Numbers refer to this request's visible options, never a hidden
+            # fixed slot for an unavailable persistence scope.
+            decision = {str(index): choice for index, (choice, _) in enumerate(_approval_options(params), 1)}.get(normalized)
         if decision not in approval_choices(params):
             return None
         response = {"action": "decline" if decision == "deny" else "accept", "content": None}

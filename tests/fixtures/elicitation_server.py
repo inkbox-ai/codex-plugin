@@ -36,9 +36,10 @@ def main():
                 params.update(message="Confirm the example selection.", requestedSchema={
                     "type": "object", "properties": {"confirmed": {"type": "boolean"}}, "required": ["confirmed"],
                 })
-            elif case == "persist":
+            elif case in {"persist", "persist-session", "persist-always"}:
+                scopes = ["session", "always"] if case == "persist" else [case.removeprefix("persist-")]
                 params["_meta"] = {"codex_request_type": "approval_request", "codex_approval_kind": "mcp_tool_call",
-                                   "tool_name": "lookup_example", "persist": ["session", "always"]}
+                                   "tool_name": "lookup_example", "persist": scopes}
             send({"id": next_id, "method": "elicitation/create", "params": params})
         elif method == "ping":
             send({"id": request_id, "result": {}})

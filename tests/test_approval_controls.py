@@ -65,6 +65,33 @@ def test_numbered_scopes_reach_host_over_each_channel(channel, answer, persist):
 
 
 @pytest.mark.parametrize("channel", ["sms", "imessage", "email"])
+@pytest.mark.parametrize("scopes,answer,action,persist", [
+    ([], "2", "decline", None),
+    (["always"], "2", "decline", None),
+    (["always"], "3", "accept", "always"),
+])
+def test_renumbered_options_reach_host_over_each_channel(channel, scopes, answer, action, persist):
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.mode = channel
+        request = deepcopy(REQUEST)
+        request["_meta"]["persist"] = scopes
+        task = asyncio.create_task(session._handle_codex_request("mcpServer/elicitation/request", request))
+        try:
+            await wait_until(lambda: sent)
+            assert "2 — Deny this request" in sent[0][1]
+            await session.handle_inbound(answer, channel, {})
+            result = await asyncio.wait_for(task, 2)
+            assert result == {"action": action, "content": None, **({"_meta": {"persist": persist}} if persist else {})}
+            assert session._queue.empty()
+        finally:
+            await session.close()
+            await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("channel", ["sms", "imessage", "email"])
 @pytest.mark.parametrize("text", ["/stop", "Please cancel my request", "What is the weather today?"])
 def test_control_or_new_task_is_not_an_approval_answer(channel, text):
     async def scenario():

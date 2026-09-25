@@ -21,6 +21,13 @@ pytestmark = pytest.mark.skipif(CODEX_BIN is None, reason="contract suite: needs
     ("form", '{"confirmed": true}', "accept", {"confirmed": True}, None),
     ("approval", "yes", "accept", {}, None),
     ("approval", "no", "decline", None, None),
+    ("approval", "2", "decline", None, None),
+    ("persist-session", "2", "accept", {}, "session"),
+    ("persist-session", "3", "decline", None, None),
+    ("persist-always", "2", "decline", None, None),
+    ("persist-always", "3", "accept", {}, "always"),
+    ("persist", "3", "decline", None, None),
+    ("persist", "4", "accept", {}, "always"),
     ("persist", "session", "accept", {}, "session"),
     ("persist", "always", "accept", {}, "always"),
 ])
@@ -71,7 +78,7 @@ def test_text_elicitation_round_trips_real_host(tmp_path, monkeypatch, case, rep
             if case == "form":
                 assert requests[0][1]["requestedSchema"]["properties"]["confirmed"]["type"] == "boolean"
             if persist:
-                assert requests[0][1]["_meta"]["persist"] == ["session", "always"]
+                assert requests[0][1]["_meta"]["persist"] == (["session", "always"] if case == "persist" else [persist])
         finally:
             await client.disconnect()
             await session.close()
