@@ -349,7 +349,9 @@ class CodexAppServerClient:
     def _thread_params(self) -> Dict[str, Any]:
         config: Dict[str, Any] = {}
         if self.tools_enabled and self.mcp_server_config:
-            config["mcp_servers"] = {"inkbox": self.mcp_server_config}
+            # Scope runtime overrides to Inkbox so other servers keep their
+            # launcher-supplied settings, including per-tool approval policies.
+            config["mcp_servers.inkbox"] = self.mcp_server_config
         params = {
             "cwd": self.cfg.project_dir or None,
             "model": self.cfg.codex_model or None,
