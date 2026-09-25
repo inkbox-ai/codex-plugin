@@ -30,7 +30,7 @@ def test_mcp_tool_approval_requires_an_affirmative_answer(server, answer, action
             'message': f'Allow the {server} MCP server to run tool "lookup"?',
         })
         assert response['action'] == action
-        assert response['content'] == ({'text': answer} if action == 'accept' else None)
+        assert response['content'] == None
     asyncio.run(scenario())
 
 
@@ -52,6 +52,7 @@ def test_non_approval_elicitation_keeps_free_text():
         session._escalate = AsyncMock(return_value='no')
         response = await session._handle_codex_request('mcpServer/elicitation/request', {
             'message': 'Enter the two-letter locale code.',
+            'requestedSchema': {'type': 'object', 'properties': {'text': {'type': 'string'}}, 'required': ['text']},
         })
         assert response == {'action': 'accept', 'content': {'text': 'no'}}
     asyncio.run(scenario())
@@ -86,7 +87,7 @@ def test_companion_manual_approval_answers_reach_the_waiting_request(channel, an
             await receiver.accept(set_input(live(event), 'direct', f'@agent {answer}'))
             await drained(receiver)
             assert responses == [{
-                'action': action, 'content': {'text': answer} if action == 'accept' else None,
+                'action': action, 'content': None,
             }]
             assert len(sent) == 1
             assert receiver.inbox.db.execute('SELECT state FROM events').fetchall() == [('done',), ('done',)]
@@ -110,6 +111,7 @@ def test_old_escalation_cleanup_cannot_clear_a_new_interaction():
         await asyncio.wait_for(sending.wait(), 1)
         old = session.pending
         await session.close()
+        assert await asyncio.wait_for(first, 1) is None
         second = asyncio.create_task(session._escalate('poll', 'New request'))
         await asyncio.sleep(0)
         current = session.pending

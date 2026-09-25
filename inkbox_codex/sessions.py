@@ -24,6 +24,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 try:
     from .codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
     from .companion import same_author
+    from .elicitation import elicitation_response, format_elicitation, is_approval
     from .config import (
         BridgeConfig,
         a2a_turn_context_path,
@@ -40,6 +41,7 @@ try:
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
     from companion import same_author
+    from elicitation import elicitation_response, format_elicitation, is_approval
     from config import BridgeConfig, a2a_turn_context_path, hosted_sms_turn_context_path
     from escalation import (
         PendingInteraction,
@@ -121,7 +123,7 @@ def _control_command(text: str) -> Optional[str]:
     token = text.strip().lower()
     if token in RESET_COMMANDS:
         return "reset"
-    if token in STOP_COMMANDS:
+    if token in STOP_COMMANDS or parse_permission_reply(text) == "cancel":
         return "stop"
     if token in RESUME_COMMANDS:
         return "resume"
@@ -144,20 +146,15 @@ def _is_inkbox_mcp_tool_elicitation(params: Dict[str, Any]) -> bool:
         or params.get("server")
         or ""
     ).lower()
-    tool = str(params.get("toolName") or params.get("tool_name") or params.get("tool") or "").lower()
+    metadata = params.get("_meta")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    tool = str(params.get("toolName") or params.get("tool_name") or params.get("tool")
+               or metadata.get("tool_name") or "").lower()
+    if server and server != "inkbox":
+        return False
     if server == "inkbox" and tool.startswith("inkbox_"):
         return True
     return "run tool" in message and ("inkbox mcp server" in message or "inkbox_" in message)
-
-
-def _is_mcp_tool_approval(params: Dict[str, Any]) -> bool:
-    metadata = params.get("_meta")
-    if isinstance(metadata, dict) and metadata.get("codex_approval_kind") == "mcp_tool_call":
-        return True
-    message = " ".join(str(params.get("message") or params.get("prompt") or "").lower().split())
-    return _is_inkbox_mcp_tool_elicitation(params) or bool(
-        re.match(r"allow the .+ mcp server to run tool\b", message)
-    )
 
 
 def _send_error_reason(exc: Exception) -> str:
@@ -302,7 +299,7 @@ def _answer_list(value: Any) -> list[str]:
 
 
 def _codex_decision(decision: Optional[str]) -> str:
-    if decision == "always":
+    if decision == "session":
         return "acceptForSession"
     if decision == "allow":
         return "accept"
@@ -401,6 +398,9 @@ class ContactSession:
         self.mode = "email"  # last inbound modality; selects the reply channel
         self.reply_meta: Dict[str, Any] = {}
         self.pending: Optional[PendingInteraction] = None
+        self._interaction_lock = asyncio.Lock()
+        self._interaction_generation = 0
+        self._approval_waiters = 0
         self.always_allowed: set[str] = set()
 
         self._client: Optional[CodexAppServerClient] = None
@@ -450,21 +450,85 @@ class ContactSession:
             return parts[1] if len(parts) == 2 else ""
         return text
 
-    def companion_answer(self, text: str, meta: Dict[str, Any]) -> bool:
-        """Only a live reply by the prompted sponsor may answer an escalation."""
+    def _companion_interaction_allowed(self, meta: Dict[str, Any]) -> bool:
         mode, route = self._reply_route(self._current_turn)
-        text = self._companion_control_text(text)
         if (not self._companion_wakes(meta)
-                or self.pending is None or self.pending.future.done()
                 or not route.get("companion")
                 or meta.get("companion_initialization")
                 or meta.get("companion_scope_id") != route.get("companion_scope_id")
                 or meta.get("companion_activation_id") != route.get("companion_activation_id")
-                or not same_author(mode, meta.get("sender"), route.get("sender"))
-                or (self.pending.kind == "permission" and parse_permission_reply(text) is None)):
+                or not same_author(mode, meta.get("sender"), route.get("sender"))):
+            return False
+        return True
+
+    def companion_answer(self, text: str, meta: Dict[str, Any]) -> bool:
+        """Only an authorized reply to the displayed question can answer it."""
+        text = self._companion_control_text(text)
+        if (self.pending is None or self.pending.future.done()
+                or not self._companion_interaction_allowed(meta) or _control_command(text)
+                or (self.pending.kind == "permission" and parse_permission_reply(text) is None)
+                or (self.pending.validate_reply and not self.pending.validate_reply(text))):
             return False
         self.pending.future.set_result(text)
         return True
+
+    async def companion_interaction(self, text: str, meta: Dict[str, Any]) -> bool:
+        """Unblock the current turn without submitting work inside its receiver."""
+        if not self._companion_interaction_allowed(meta):
+            return False
+        text = self._companion_control_text(text)
+        command = _control_command(text)
+        if command in {"reset", "resume"}:
+            # Unblock the receiver, then let its normal durable control path
+            # reconcile the saved thread before handling the next receipt.
+            if self._turn_active or self.pending is not None or self._approval_waiters:
+                await self._cancel_pending_turn()
+            return False
+        if command:
+            if not (self._turn_active or self.pending is not None or self._approval_waiters):
+                return False
+            mode, route = self._reply_route(self._current_turn)
+            # Authorization uses the incoming message, but acknowledgments must
+            # retain the active conversation's approved email sponsor anchor.
+            await self.handle_inbound(text, mode, {**route, "raw_text": text})
+            return True
+        if self._approval_waiters and (self.pending is None or self.pending.future.done()):
+            if parse_permission_reply(text) is None:
+                await self._cancel_pending_turn()
+                return False
+            # A second answer cannot authorize a question not yet displayed.
+            return True
+        return await self._answer_pending(text)
+
+    async def _answer_pending(self, text: str) -> bool:
+        pending = self.pending
+        if pending is None or pending.future.done():
+            return False
+        if pending.kind == "permission" and parse_permission_reply(text) is None:
+            # Preserve a fresh instruction as work, not as an approval payload.
+            await self._cancel_pending_turn()
+            return False
+        if pending.validate_reply and not pending.validate_reply(text):
+            await self._reply(
+                "That answer is not one of the supported choices or does not match "
+                "the requested fields. Please use the options shown, or /stop to cancel.",
+                turn=self._current_turn,
+            )
+            return True
+        pending.future.set_result(text)
+        return True
+
+    def _cancel_interactions(self) -> None:
+        self._interaction_generation += 1
+        pending, self.pending = self.pending, None
+        if pending is not None and not pending.future.done():
+            pending.future.set_result(None)
+
+    async def _cancel_pending_turn(self) -> None:
+        self._cancel_interactions()
+        if self._turn_active and self._client is not None:
+            self._interrupting = True
+            await self._interrupt_client()
 
     async def submit_companion(self, text: str, mode: str, meta: Dict[str, Any], *, before_submit) -> Optional[str]:
         """One acknowledged input; historical text never enters command parsers.
@@ -574,11 +638,15 @@ class ContactSession:
             await self._report_health()
             return
 
+        if (not pending_reply and self._approval_waiters
+                and (not is_group or meta.get("sender") == self._reply_route(self._current_turn)[1].get("sender"))):
+            if parse_permission_reply(raw_text) is not None:
+                return  # The previous question is already answered.
+            await self._cancel_pending_turn()
+
         # A reply while an escalation is outstanding answers the escalation —
         # it does not start a new agent turn.
-        if pending_reply:
-            logger.info("[session %s] reply consumed by pending %s", self.chat_id, self.pending.kind)
-            self.pending.future.set_result(raw_text)
+        if pending_reply and await self._answer_pending(raw_text):
             return
 
         # Tag the message with its channel + sender so Codex knows where it
@@ -596,7 +664,7 @@ class ContactSession:
         # delivery-failure recovery) runs to completion and this message just
         # queues behind it.
         running_normal = self._current_turn is not None and self._current_turn.future is None
-        if self._turn_active and self._client is not None and running_normal:
+        if self._turn_active and self._client is not None and running_normal and not self._interrupting:
             logger.info("[session %s] new message interrupts the running turn", self.chat_id)
             self._interrupting = True
             await self._interrupt_client()
@@ -708,13 +776,7 @@ class ContactSession:
         """
         # Unblock a parked permission/poll so its turn can unwind (None reads
         # as "no answer" — the same as a timeout).
-        if self.pending is not None and not self.pending.future.done():
-            self.pending.future.set_result(None)
-            self.pending = None
-        # Interrupt a turn that's actively running, like pressing Esc.
-        if self._turn_active and self._client is not None:
-            self._interrupting = True
-            await self._interrupt_client()
+        await self._cancel_pending_turn()
         # Discard messages queued but not yet started. Settle any capture-turn
         # futures (consult / post-call / failure recovery) so their awaiters
         # don't hang waiting on work we just dropped.
@@ -723,6 +785,8 @@ class ContactSession:
                 turn = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            if turn.completion is not None and not turn.completion.done():
+                turn.completion.set_result(None)
             if turn.future is not None and not turn.future.done():
                 if turn.capture_tools:
                     turn.future.set_result(CodexTurnResult(
@@ -913,6 +977,7 @@ class ContactSession:
                 return
             raise
         finally:
+            self._cancel_interactions()
             if a2a_context_path is not None:
                 try:
                     persisted = json.loads(a2a_context_path.read_text())
@@ -1193,20 +1258,18 @@ class ContactSession:
             }
 
         if method == "mcpServer/elicitation/request":
-            message = str(params.get("message") or params.get("prompt") or "Codex needs your input.")
-            if self.cfg.auto_approve_inkbox_tools and _is_inkbox_mcp_tool_elicitation(params):
-                logger.info("[session %s] Auto-approved Inkbox MCP tool elicitation: %s", self.chat_id, message)
-                return {"action": "accept", "content": {"text": "yes"}}
-            reply = await self._escalate("poll", message)
-            if not reply or not reply.strip():
-                return {"action": "cancel", "content": None}
-            if _is_mcp_tool_approval(params):
-                decision = parse_permission_reply(reply)
-                if decision == "deny":
-                    return {"action": "decline", "content": None}
-                if decision not in {"allow", "always"}:
-                    return {"action": "cancel", "content": None}
-            return {"action": "accept", "content": {"text": reply or ""}}
+            if self._interrupting:
+                return elicitation_response(params, None)
+            approval = is_approval(params)
+            if (approval and self.cfg.auto_approve_inkbox_tools
+                    and _is_inkbox_mcp_tool_elicitation(params)):
+                logger.info("[session %s] Auto-approved Inkbox tool request", self.chat_id)
+                return elicitation_response(params, "1")
+            reply = await self._escalate(
+                "permission" if approval else "poll", format_elicitation(params),
+                validate_reply=lambda text: elicitation_response(params, text) is not None,
+            )
+            return elicitation_response(params, reply) or {"action": "cancel", "content": None}
 
         if method in {
             "item/commandExecution/requestApproval",
@@ -1219,10 +1282,11 @@ class ContactSession:
                 "permission",
                 format_codex_approval_request(method, params),
                 tool_name=method,
+                validate_reply=lambda text: parse_permission_reply(text) in {"allow", "session", "deny"},
             )
             decision = parse_permission_reply(reply or "")
             if method == "item/permissions/requestApproval":
-                if decision == "always":
+                if decision == "session":
                     return {"permissions": params.get("permissions") or {}, "scope": "session"}
                 if decision == "allow":
                     return {"permissions": params.get("permissions") or {}, "scope": "turn"}
@@ -1239,6 +1303,7 @@ class ContactSession:
         prompt_text: str,
         questions: Optional[list] = None,
         tool_name: str = "",
+        validate_reply: Optional[Callable[[str], bool]] = None,
     ) -> Optional[str]:
         """Send an escalation text and wait for the next inbound reply.
 
@@ -1251,6 +1316,19 @@ class ContactSession:
         Returns:
             Optional[str]: The human's reply text, or None on timeout.
         """
+        generation = self._interaction_generation
+        if kind == "permission":
+            self._approval_waiters += 1
+        try:
+            async with self._interaction_lock:
+                if generation != self._interaction_generation or self._interrupting:
+                    return None
+                return await self._wait_for_interaction(kind, prompt_text, questions, tool_name, validate_reply)
+        finally:
+            if kind == "permission":
+                self._approval_waiters -= 1
+
+    async def _wait_for_interaction(self, kind, prompt_text, questions, tool_name, validate_reply):
         loop = asyncio.get_running_loop()
         pending = PendingInteraction(
             kind=kind,
@@ -1258,6 +1336,7 @@ class ContactSession:
             future=loop.create_future(),
             questions=list(questions or []),
             tool_name=tool_name,
+            validate_reply=validate_reply,
         )
         self.pending = pending
         reply_mode, reply_meta = self._reply_route(self._current_turn)
@@ -1267,14 +1346,21 @@ class ContactSession:
                 if reply_mode == "email"
                 else "\nInclude @agent before your answer (for example, @agent allow)."
             )
+        sending = asyncio.create_task(self._reply(prompt_text, turn=self._current_turn))
         try:
-            await self._reply(prompt_text, turn=self._current_turn)
+            done, _ = await asyncio.wait({sending, pending.future}, return_when=asyncio.FIRST_COMPLETED)
+            if pending.future in done and (pending.future.cancelled() or pending.future.result() is None):
+                return None
+            await sending
             return await asyncio.wait_for(
                 pending.future, timeout=self.cfg.permission_timeout_s
             )
         except asyncio.TimeoutError:
             return None
         finally:
+            if not sending.done():
+                sending.cancel()
+            await asyncio.gather(sending, return_exceptions=True)
             if not pending.future.done():
                 pending.future.cancel()
             if self.pending is pending:
@@ -1289,9 +1375,7 @@ class ContactSession:
         await self.send_fn(self.chat_id, text, *self._reply_route(turn))
 
     async def close(self) -> None:
-        pending, self.pending = self.pending, None
-        if pending is not None and not pending.future.done():
-            pending.future.set_result(None)
+        self._cancel_interactions()
         clients = (self._client, self._connecting_client)
         self._client = self._connecting_client = None
         for client in clients:
