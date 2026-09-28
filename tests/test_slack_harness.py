@@ -65,6 +65,39 @@ def test_harness_only_reconciles_slack(monkeypatch, tmp_path):
     assert not gateway._inkbox.mock_calls
 
 
+def test_receiver_can_start_before_workspace_installation(tmp_path, monkeypatch):
+    import inkbox
+
+    credentials = tmp_path / "credentials.env"
+    credentials.write_text("SELECTED_KEY=test_selected\nINKBOX_SIGNING_KEY=whsec_test\n")
+    client = Mock()
+    client.whoami.return_value = NS(scope=f"agent_identity:{IDENTITY}")
+    client.get_identity.return_value = NS(id=IDENTITY)
+    client.slack.list_connections.return_value = NS(connections=[])
+    monkeypatch.setattr(inkbox, "Inkbox", Mock(return_value=client))
+    calls = []
+
+    class Receiver:
+        def __init__(self, cfg):
+            assert cfg.slack_enabled and cfg.port == 8777
+
+        async def run(self):
+            calls.append("run")
+
+        async def _cleanup(self):
+            calls.append("cleanup")
+
+    monkeypatch.setattr(slack_harness, "SlackHarness", Receiver)
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    monkeypatch.setenv("INKBOX_SLACK_ENABLED", "0")
+    assert slack_harness.main([
+        "--credentials-file", str(credentials), "--api-key-env", "SELECTED_KEY",
+        "--identity", "agent", "--base-url", "https://api.example",
+        "--state-dir", str(tmp_path / "state"), "--run",
+    ]) == 0
+    assert calls == ["run", "cleanup"]
+
+
 def test_signed_http_event_runs_session_and_posts_one_threaded_reply(tmp_path, monkeypatch):
     from aiohttp import ClientSession, web
     from inkbox_codex.webhook_providers import inkbox as verifier

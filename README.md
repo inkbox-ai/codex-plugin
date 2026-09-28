@@ -210,7 +210,8 @@ before replying `DONE`.
 Set `INKBOX_SLACK_ENABLED=true` to add Slack to the gateway. This requires an
 Inkbox SDK exposing `client.slack` and an API with Slack support; the existing
 SDK minimum remains usable when Slack is off. Connect a workspace to the same
-Inkbox identity before starting. No separate Slack token is needed.
+Inkbox identity to exchange messages; the receiver can start before installation.
+No separate Slack token is needed.
 
 - DMs, group DMs, and mentions wake Codex. Channel replies start a thread;
   follow-ups in an already-engaged thread continue its conversation without

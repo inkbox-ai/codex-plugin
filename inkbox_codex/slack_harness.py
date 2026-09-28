@@ -99,8 +99,6 @@ def main(argv=None) -> int:
         }, indent=2))
         if not args.run:
             return 0
-        if not any(c.status == "connected" for c in connections.connections):
-            raise ValueError("Connect a Slack workspace to this identity before starting the harness")
         signing_values = read_env_file(args.signing_env_file) if args.signing_env_file else values
         signing_key = signing_values.get("INKBOX_SIGNING_KEY", "")
         if not signing_key:
