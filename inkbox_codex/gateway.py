@@ -4174,7 +4174,7 @@ class InkboxGateway:
         """
         if mode == "slack":
             # A failed request may still have posted. Never generate a resend.
-            logger.error("[bridge] Slack reply unconfirmed for %s: %s", chat_id, reason)
+            logger.error("[bridge] Slack reply failed or unconfirmed; no automatic retry")
             return None
         meta = meta or {}
         conversation_id = str(meta.get("conversation_id") or "")
