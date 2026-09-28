@@ -586,7 +586,7 @@ class ContactSession:
         meta = dict(meta or {})
         raw_text = str(meta.get("raw_text", text))
         command = _control_command(raw_text)
-        is_group = mode in {"sms", "imessage"} and meta.get("conversation_kind") == "group"
+        is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
         pending_reply = self.pending is not None and not self.pending.future.done()
         if is_group and pending_reply:
             pending_reply = (
@@ -595,7 +595,12 @@ class ContactSession:
                 and (self.pending.kind != "permission" or parse_permission_reply(raw_text) is not None)
             )
         context_only = (
+            mode == "slack" and is_group
+            and self.pending is not None and not self.pending.future.done()
+            and meta.get("sender") != self._reply_route(self._current_turn)[1].get("sender")
+        ) or (
             is_group
+            and mode != "slack"
             and self.cfg.group_reply_mode == "mention"
             and not command
             and not pending_reply
@@ -1179,6 +1184,8 @@ class ContactSession:
             identity_handle=self.identity_info.get("handle", ""),
             email_address=self.identity_info.get("email", ""),
             phone_number=self.identity_info.get("phone", ""),
+            channels=("email, SMS, iMessage, Slack, and voice calls" if self.cfg.slack_enabled
+                      else "email, SMS, iMessage, and voice calls"),
         )
         client = CodexAppServerClient(
             self.cfg,
@@ -1439,6 +1446,10 @@ class SessionManager:
         """Forget a contact's persisted Codex session id (for /clear, /new)."""
         if self._session_ids.pop(chat_id, None) is not None:
             self._persist()
+
+    def has_session(self, chat_id: str) -> bool:
+        """Whether this conversation has already engaged the agent."""
+        return chat_id in self.sessions or chat_id in self._session_ids
 
     def get(self, chat_id: str) -> ContactSession:
         """Fetch or lazily create the session for one remote party.

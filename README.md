@@ -205,6 +205,68 @@ return typed answers; unsupported forms require using Codex directly or cancelin
 the interaction. URL-based requests require completing the displayed URL step
 before replying `DONE`.
 
+## Slack preview
+
+Set `INKBOX_SLACK_ENABLED=true` to add Slack to the gateway. This requires an
+Inkbox SDK exposing `client.slack` and an API with Slack support; the existing
+SDK minimum remains usable when Slack is off. Connect a workspace to the same
+Inkbox identity before starting. No separate Slack token is needed.
+
+- DMs, group DMs, and mentions wake Codex. Channel replies start a thread;
+  follow-ups in an already-engaged thread continue its conversation without
+  another mention. Unrelated channel messages and bot messages do not wake it.
+- Each workspace/conversation/thread gets a separate, resumable Codex session.
+  Slack users are not automatically matched to email or phone contacts.
+- Replies and approval prompts stay on the originating Slack route. Only the
+  requesting sender can answer a pending group-thread approval.
+- Six tools list workspaces, list conversations, read messages/threads, search
+  retained text, send explicitly requested messages, and inspect send outcomes.
+  Ordinary final replies are sent automatically; do not send them again by tool.
+- Unconfirmed sends are logged with their action ID when available, never
+  automatically resent. Reuse the exact idempotency key when retrying an explicit
+  send. Webhook duplicate suppression follows the gateway's existing bounded,
+  in-memory behavior.
+- Attachments are exposed as metadata in this first version. File transfer,
+  reactions, and processing indicators are not included.
+
+`INKBOX_ALLOWED_USERS` accepts Slack user IDs or workspace-qualified `T_ID:U_ID`
+entries. An empty list admits all human senders whose events reach the identity.
+Slack subscriptions are additive: starting this gateway does not remove another
+Slack receiver. Stop/remove any previous Slack receiver if it should no longer reply.
+
+### Isolated Slack harness
+
+The harness uses the same gateway, sessions, signing verification, tools, and
+reply path. It registers **only Slack** and does not change email, phone,
+iMessage, or A2A subscriptions. Credentials are read into the process from the
+selected file, never copied into its state directory. Use a separate directory
+and port from your regular gateway. Run only one gateway on an identity’s tunnel
+at a time, or pass `--public-url` for a separately reachable receiver.
+
+After installing this checkout and a Slack-capable SDK, run a read-only preflight:
+
+```bash
+python -m inkbox_codex.slack_harness \
+  --credentials-file ~/.env --api-key-env INKBOX_API_KEY \
+  --identity "$INKBOX_IDENTITY" --base-url "$INKBOX_BASE_URL" \
+  --state-dir ~/.inkbox-codex-slack --project-dir "$PWD" \
+  --signing-env-file /path/to/identity.env
+```
+
+Add `--run` to connect the identity’s existing tunnel and register the signed Slack receiver. The signing
+file must contain the identity's existing `INKBOX_SIGNING_KEY`; the harness never
+creates or rotates keys. `--allow-user T_ID:U_ID` can be repeated. Ctrl+C stops
+the local receiver; its subscription remains available for the next run.
+
+For manual acceptance: DM the agent, mention it in a channel, continue in that
+thread without a mention, ask for recent thread history or retained-text search,
+then exercise an approval and `/status`. Replies should stay in the right thread;
+unrelated channels and bot messages should remain quiet. The preflight does not
+send messages. Live delivery can only be verified after connecting the workspace
+and starting the harness.
+
+Offline regression harness: `python -m pytest -q tests/test_slack.py tests/test_slack_harness.py`.
+
 ## Sessions
 
 Direct-message sessions are keyed by Inkbox contact, so one person = one conversation across channels. Group SMS messages share a session keyed by the group conversation, separate from direct messages and other groups, while retaining each sender's contact details. Codex session ids are persisted in `~/.inkbox-codex/sessions.json` and resumed across bridge restarts — your conversation picks up where it left off. Replies go out on the channel you last used. If a voice call ends before Codex finishes a voice reply, that late voice reply is dropped instead of silently switching to SMS or email.

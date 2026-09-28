@@ -1157,6 +1157,8 @@ class InkboxGateway:
 
     def _patch_identity_objects(self) -> None:
         """Point the identity's mailbox/phone/iMessage events at this server."""
+        if self.cfg.slack_enabled and not self.cfg.skip_webhook_reconcile:
+            self._reconcile_slack()
         if self.cfg.skip_webhook_reconcile:
             logger.info(
                 "[bridge] leaving webhook subscriptions alone; expecting them "
@@ -1756,7 +1758,7 @@ class InkboxGateway:
             bool: True for a recognised Inkbox event shape.
         """
         if event_type and event_type.startswith(
-            ("message.", "text.", "imessage.", "a2a.", "call.")
+            ("message.", "text.", "imessage.", "a2a.", "call.", "slack.")
         ):
             return True
         explicit_call_id = envelope.get("call_id") or envelope.get("callId")
@@ -1888,6 +1890,8 @@ class InkboxGateway:
                 if len(self._call_meta_by_id) > 100:
                     self._call_meta_by_id.pop(next(iter(self._call_meta_by_id)), None)
             return web.json_response({"ok": True})
+        if event_type == "slack.message_received":
+            return await self._on_slack_received(envelope)
         if event_type == "message.received":
             return await self._on_mail_received(envelope)
         if event_type == "text.received":
@@ -3728,6 +3732,40 @@ class InkboxGateway:
         ])
         return f"{marker}\n{policy}"
 
+    def _reconcile_slack(self) -> None:
+        from .slack import reconcile_subscription
+
+        reconcile_subscription(
+            self._inkbox, self._identity.id,
+            f"{self._public_url}{DEFAULT_WEBHOOK_PATH}?channel=slack",
+        )
+
+    async def _on_slack_received(self, envelope: Dict[str, Any]) -> "web.Response":
+        from .slack import inbound_message
+
+        if not self.cfg.slack_enabled:
+            return web.json_response({"ok": True, "ignored": "slack-disabled"})
+        if self.sessions is None or self._identity is None:
+            raise RuntimeError("Slack sessions are not ready")
+        incoming = inbound_message(envelope, str(self._identity.id))
+        if incoming is None:
+            return web.json_response({"ok": True, "ignored": "slack-message"})
+        chat_id, body, meta = incoming
+        if not self._sender_allowed(meta["sender"], meta["actor_id"]):
+            return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
+        if not meta["slack_addressed"] and not self.sessions.has_session(chat_id):
+            return web.json_response({"ok": True, "ignored": "unwatched-thread"})
+        event_key = f"slack:{envelope['id']}"
+        if self._dedup_begin(event_key):
+            return web.json_response({"ok": True, "deduped": True})
+        try:
+            await self.sessions.get(chat_id).handle_inbound(body, "slack", meta)
+        except BaseException:
+            self._dedup_rollback(event_key)
+            raise
+        self._dedup_commit(event_key)
+        return web.json_response({"ok": True})
+
     async def _on_text_received(self, envelope: Dict[str, Any]) -> "web.Response":
         data = envelope.get("data") or {}
         message = data.get("text_message") or {}
@@ -4134,6 +4172,10 @@ class InkboxGateway:
         Returns:
             Optional[str]: The recovery prompt, or None once the cap is hit.
         """
+        if mode == "slack":
+            # A failed request may still have posted. Never generate a resend.
+            logger.error("[bridge] Slack reply unconfirmed for %s: %s", chat_id, reason)
+            return None
         meta = meta or {}
         conversation_id = str(meta.get("conversation_id") or "")
         target = str(meta.get("to") or meta.get("sender") or "")
@@ -4810,6 +4852,11 @@ class InkboxGateway:
             )
             return
 
+        if mode == "slack":
+            from .slack import send_reply
+
+            await asyncio.to_thread(send_reply, self._inkbox, meta, content)
+            return
         if mode == "sms":
             text = strip_markdown(content)
             if len(text) > SMS_MAX_LENGTH:
