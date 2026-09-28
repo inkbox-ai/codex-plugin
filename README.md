@@ -213,9 +213,15 @@ SDK minimum remains usable when Slack is off. Connect a workspace to the same
 Inkbox identity to exchange messages; the receiver can start before installation.
 No separate Slack token is needed.
 
-- DMs, group DMs, and mentions wake Codex. Channel replies start a thread;
+- By default, DMs, group DMs, and mentions wake Codex. Channel replies start a thread;
   follow-ups in an already-engaged thread continue its conversation without
   another mention. Unrelated channel messages and bot messages do not wake it.
+- With `INKBOX_GROUP_REPLY_MODE=mention`, Slack channels, group DMs, and their
+  threads require a native @mention of this agent on each new message to generate
+  a reply, even after the agent has joined the thread. Unmentioned follow-ups are
+  context only: no reply, tool execution, or interruption of an active turn.
+  Direct DMs are unchanged. Bridge commands and the requesting sender's answers
+  to pending approval/question prompts still work without a mention.
 - Each workspace/conversation/thread gets a separate, resumable Codex session.
   Slack users are not automatically matched to email or phone contacts.
 - Replies and approval prompts stay on the originating Slack route. Only the
@@ -258,6 +264,14 @@ Add `--run` to connect the identity’s existing tunnel and register the signed 
 file must contain the identity's existing `INKBOX_SIGNING_KEY`; the harness never
 creates or rotates keys. `--allow-user T_ID:U_ID` can be repeated. Ctrl+C stops
 the local receiver; its subscription remains available for the next run.
+`--group-reply-mode mention` enables mention-only group/thread replies in the
+harness; it otherwise follows `INKBOX_GROUP_REPLY_MODE`, defaulting to `auto`.
+The webhook still includes thread messages so quiet context and approval answers
+can reach the session.
+
+In mention mode, test a native @mention, an unmentioned follow-up in the same
+thread, and another @mention: expect reply, silence, reply, with the quiet message
+available as context for the last reply.
 
 For manual acceptance: DM the agent, mention it in a channel, continue in that
 thread without a mention, ask for recent thread history or retained-text search,
@@ -272,7 +286,7 @@ Offline regression harness: `python -m pytest -q tests/test_slack.py tests/test_
 
 Direct-message sessions are keyed by Inkbox contact, so one person = one conversation across channels. Group SMS messages share a session keyed by the group conversation, separate from direct messages and other groups, while retaining each sender's contact details. Codex session ids are persisted in `~/.inkbox-codex/sessions.json` and resumed across bridge restarts — your conversation picks up where it left off. Replies go out on the channel you last used. If a voice call ends before Codex finishes a voice reply, that late voice reply is dropped instead of silently switching to SMS or email.
 
-**Group replies.** The setup wizard offers **Automatic** (default) or **Mention required** for group SMS and iMessage, saved as `INKBOX_GROUP_REPLY_MODE=auto|mention`. Automatic keeps the existing behavior: the agent decides whether to answer. Mention mode starts a reply only when the new message itself includes `@agent` or `@<agent-handle>` as a whole mention, case-insensitively; older messages, links, and email addresses do not count. Other messages and group reactions are added to Codex's context without generating a reply or a typing indicator. While a turn is running, background messages wait until it finishes before being appended. Appended context persists with the Codex thread; messages still waiting in the bridge's queue are not persisted across a restart. Direct messages are unchanged. Commands such as `/stop`, and answers to the agent's pending questions from the sender it asked, do not require a mention.
+**Group replies.** The setup wizard offers **Automatic** (default) or **Mention required** for group SMS, iMessage, and Slack, saved as `INKBOX_GROUP_REPLY_MODE=auto|mention`. Automatic keeps the existing behavior: the agent decides whether to answer. For SMS/iMessage, mention mode starts a reply only when the new message itself includes `@agent` or `@<agent-handle>` as a whole mention, case-insensitively; older messages, links, and email addresses do not count. Slack requires a native @mention of the agent, including on follow-ups in an engaged thread. Other messages and group reactions are added to Codex's context without generating a reply or a typing indicator. While a turn is running, background messages wait until it finishes before being appended. Appended context persists with the Codex thread; messages still waiting in the bridge's queue are not persisted across a restart. Direct messages are unchanged. Commands such as `/stop`, and answers to the agent's pending questions from the sender it asked, do not require a mention.
 
 ### Companion conversations (preview)
 
@@ -570,7 +584,7 @@ with both deterministic and real-model gateway runs, without SMS reset traffic.
 | `INKBOX_ALLOW_ALL_USERS` | no | `false` | Allow all senders admitted by Inkbox contact rules. |
 | `INKBOX_BRIDGE_PORT` | no | `8767` | Local webhook server port. |
 | `INKBOX_PERMISSION_TIMEOUT_S` | no | `600` | Seconds to wait for a permission/poll reply. |
-| `INKBOX_GROUP_REPLY_MODE` | no | `auto` | Group SMS/iMessage and Companion email replies: `auto` lets the agent decide; `mention` requires `@agent` or `@<agent-handle>` in the new message. Other messages become context without starting a turn. Also configurable in setup. |
+| `INKBOX_GROUP_REPLY_MODE` | no | `auto` | Group SMS/iMessage, Slack, and Companion email replies: `auto` lets the agent decide; `mention` requires a native Slack @mention, SMS/iMessage `@agent` or `@<agent-handle>`, or Companion email addressed To the agent. Other messages become context without starting a turn. Also configurable in setup. |
 | `INKBOX_COMPANION_RESPONSE_MODE` | no | `safe` | Companion SMS/MMS, iMessage, and email: `safe` wakes only for direct access; `relaxed` permits any delivered sender. Both honor Auto/Mention. Sponsored and unknown access stays context-only in Safe mode. Also configurable in setup. |
 | `INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS` | no | `false` | Auto-accept Codex MCP prompts for Inkbox tools only. The setup wizard writes `true` when you trust the agent to send through Inkbox without per-call approval. |
 | `INKBOX_A2A_PROGRESS_INTERVAL_SECONDS` | no | `180` | Seconds between progress updates for active inbound A2A tasks. Set to `0` to disable periodic updates. |

@@ -78,6 +78,7 @@ def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] |
         "conversation_kind": "direct" if direct else "group",
         "raw_text": raw,
         "source_event_id": envelope["id"],
+        "slack_mentioned": "mention" in kinds,
         "slack_addressed": bool(set(kinds) & {"dm", "group_dm", "mention"}),
     }
     return chat_id, body, meta

@@ -72,10 +72,17 @@ def main(argv=None) -> int:
     parser.add_argument("--project-dir", type=Path, default=Path.cwd())
     parser.add_argument("--port", type=int, default=8777)
     parser.add_argument("--public-url", default="")
+    parser.add_argument(
+        "--group-reply-mode", choices=("auto", "mention"),
+        default=os.getenv("INKBOX_GROUP_REPLY_MODE", "auto").strip().lower(),
+        help="Group/channel replies; defaults to INKBOX_GROUP_REPLY_MODE or auto",
+    )
     parser.add_argument("--allow-user", action="append", default=[], help="Workspace-qualified T_ID:U_ID")
     parser.add_argument("--run", action="store_true", help="Start the receiver and register its Slack subscription")
     args = parser.parse_args(argv)
     try:
+        if args.group_reply_mode not in {"auto", "mention"}:
+            raise ValueError("INKBOX_GROUP_REPLY_MODE must be auto or mention")
         values = read_env_file(args.credentials_file)
         api_key = values.get(args.api_key_env)
         if not api_key:
@@ -94,6 +101,7 @@ def main(argv=None) -> int:
         identity, connections = preflight(client, args.identity)
         print(json.dumps({
             **profile, "identity_verified": True,
+            "group_reply_mode": args.group_reply_mode,
             "connections": [{"id": str(c.id), "workspace": c.workspace_name, "status": c.status}
                             for c in connections.connections],
         }, indent=2))
@@ -116,6 +124,7 @@ def main(argv=None) -> int:
             base_url=profile["base_url"], project_dir=str(args.project_dir.resolve()),
             slack_enabled=True, port=args.port, host="127.0.0.1", public_url=args.public_url,
             tunnel_name=args.identity, allowed_users=args.allow_user,
+            group_reply_mode=args.group_reply_mode,
         )
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 

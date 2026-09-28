@@ -65,7 +65,12 @@ def test_harness_only_reconciles_slack(monkeypatch, tmp_path):
     assert not gateway._inkbox.mock_calls
 
 
-def test_receiver_can_start_before_workspace_installation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("env_mode,flags,expected", [
+    ("auto", [], "auto"), ("mention", [], "mention"),
+    ("auto", ["--group-reply-mode", "mention"], "mention"),
+    ("mention", ["--group-reply-mode", "auto"], "auto"),
+])
+def test_receiver_can_start_before_workspace_installation(tmp_path, monkeypatch, env_mode, flags, expected):
     import inkbox
 
     credentials = tmp_path / "credentials.env"
@@ -80,6 +85,7 @@ def test_receiver_can_start_before_workspace_installation(tmp_path, monkeypatch)
     class Receiver:
         def __init__(self, cfg):
             assert cfg.slack_enabled and cfg.port == 8777
+            assert cfg.group_reply_mode == expected
 
         async def run(self):
             calls.append("run")
@@ -90,10 +96,11 @@ def test_receiver_can_start_before_workspace_installation(tmp_path, monkeypatch)
     monkeypatch.setattr(slack_harness, "SlackHarness", Receiver)
     monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
     monkeypatch.setenv("INKBOX_SLACK_ENABLED", "0")
+    monkeypatch.setenv("INKBOX_GROUP_REPLY_MODE", env_mode)
     assert slack_harness.main([
         "--credentials-file", str(credentials), "--api-key-env", "SELECTED_KEY",
         "--identity", "agent", "--base-url", "https://api.example",
-        "--state-dir", str(tmp_path / "state"), "--run",
+        "--state-dir", str(tmp_path / "state"), "--run", *flags,
     ]) == 0
     assert calls == ["run", "cleanup"]
 

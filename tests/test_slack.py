@@ -213,12 +213,15 @@ def test_tools_scope_reads_and_writes_to_configured_identity(monkeypatch):
     assert client.slack.send_message.call_count == 1
 
 
-def test_group_approval_cannot_be_answered_by_another_slack_user(monkeypatch):
+@pytest.mark.parametrize("mode", ["auto", "mention"])
+def test_group_approval_cannot_be_answered_by_another_slack_user(mode):
     async def scenario():
         from inkbox_codex.escalation import PendingInteraction
 
         session = make_session([])
+        session.cfg.group_reply_mode = mode
         meta = inbound_message(event(), IDENTITY)[2]
+        meta["slack_mentioned"] = False
         session._current_turn = _Turn(text="work", reply_mode="slack", reply_meta=meta)
         future = asyncio.get_running_loop().create_future()
         session.pending = PendingInteraction(kind="permission", future=future, prompt_text="Allow?")
@@ -231,6 +234,89 @@ def test_group_approval_cannot_be_answered_by_another_slack_user(monkeypatch):
         assert future.done()
         session._worker.cancel()
         await asyncio.gather(session._worker, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kinds", [["channel", "thread"], ["group_dm", "thread"]])
+def test_slack_mention_mode_keeps_unmentioned_followups_as_context(kinds):
+    from tests.test_group_reply_mode import Client
+
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.cfg.group_reply_mode = "mention"
+        client = session._client = Client()
+        for index, mentioned in enumerate((False, True, False, True, False)):
+            payload = event(
+                message_ts=f"1234567890.00000{index + 1}", thread_ts="1234567890.000001",
+                message_kinds=kinds + (["mention"] if mentioned else []),
+                # Typed names and other users' mentions are not native agent mentions.
+                event={"text": "<@U_AGENT> help" if mentioned else "@agent <@U_OTHER> chatter"},
+            )
+            _, body, meta = inbound_message(payload, IDENTITY)
+            await session.handle_inbound(body, "slack", meta)
+            await session._worker
+        assert [kind for kind, _ in client.events] == ["context", "run", "context", "run", "context"]
+        assert len(sent) == 2
+        assert client.interrupts == 0
+        assert all(reply[2] == "slack" and reply[3]["thread_ts"] == "1234567890.000001" for reply in sent)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode,kinds", [
+    ("auto", ["channel", "thread"]), ("auto", ["group_dm"]),
+    ("mention", ["dm"]), ("mention", ["dm", "thread"]),
+])
+def test_slack_default_and_direct_dm_replies_are_unchanged(mode, kinds):
+    from tests.test_group_reply_mode import Client
+
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.cfg.group_reply_mode = mode
+        client = session._client = Client()
+        _, body, meta = inbound_message(event(message_kinds=kinds, event={"text": "Hello"}), IDENTITY)
+        await session.handle_inbound(body, "slack", meta)
+        await session._worker
+        assert [kind for kind, _ in client.events] == ["run"]
+        assert len(sent) == 1
+
+    asyncio.run(scenario())
+
+
+def test_quiet_slack_followup_does_not_interrupt_or_change_active_reply():
+    from tests.test_group_reply_mode import Client
+
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.cfg.group_reply_mode = "mention"
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        class SlowClient(Client):
+            async def run(self, prompt):
+                self.events.append(("run", prompt))
+                started.set()
+                await finish.wait()
+                return "Answer"
+
+        client = session._client = SlowClient()
+        _, body, meta = inbound_message(event(), IDENTITY)
+        await session.handle_inbound(body, "slack", meta)
+        await started.wait()
+        _, quiet, quiet_meta = inbound_message(event(
+            actor_id="U_BOB", message_ts="1234567890.000002", thread_ts="1234567890.000001",
+            message_kinds=["channel", "thread"], event={"text": "Thanks"},
+        ), IDENTITY)
+        await session.handle_inbound(quiet, "slack", quiet_meta)
+        assert client.interrupts == 0
+        assert session.reply_meta["sender"] == meta["sender"]
+        finish.set()
+        await session._worker
+        assert [kind for kind, _ in client.events] == ["run", "context"]
+        assert len(sent) == 1 and sent[0][3]["sender"] == meta["sender"]
 
     asyncio.run(scenario())
 

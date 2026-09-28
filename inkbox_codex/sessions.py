@@ -594,17 +594,20 @@ class ContactSession:
                 and meta.get("sender") == self._reply_route(self._current_turn)[1].get("sender")
                 and (self.pending.kind != "permission" or parse_permission_reply(raw_text) is not None)
             )
+        mentioned = (
+            meta.get("slack_mentioned") is True if mode == "slack"
+            else mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity)
+        )
         context_only = (
             mode == "slack" and is_group
             and self.pending is not None and not self.pending.future.done()
             and meta.get("sender") != self._reply_route(self._current_turn)[1].get("sender")
         ) or (
             is_group
-            and mode != "slack"
             and self.cfg.group_reply_mode == "mention"
             and not command
             and not pending_reply
-            and not mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity)
+            and not mentioned
         )
         if context_only:
             await self._queue.put(_Turn(

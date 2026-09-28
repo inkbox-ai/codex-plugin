@@ -162,7 +162,8 @@ def test_failed_context_append_is_retried_before_the_next_model_turn(caplog):
     asyncio.run(scenario())
 
 
-def test_group_commands_use_raw_text_without_requiring_mention(monkeypatch):
+@pytest.mark.parametrize("channel", ["sms", "slack"])
+def test_group_commands_use_raw_text_without_requiring_mention(monkeypatch, channel):
     async def scenario():
         session = make_session([])
         session.cfg.group_reply_mode = "mention"
@@ -172,7 +173,7 @@ def test_group_commands_use_raw_text_without_requiring_mention(monkeypatch):
             called.append("stop")
 
         monkeypatch.setattr(session, "_stop_turn", stop)
-        await session.handle_inbound("[inkbox:group_sms]\nPolicy\n/stop", "sms", meta("/stop"))
+        await session.handle_inbound("[inkbox:group]\nPolicy\n/stop", channel, meta("/stop"))
         assert called == ["stop"]
         assert session._worker is None
     asyncio.run(scenario())
