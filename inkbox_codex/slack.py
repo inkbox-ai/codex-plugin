@@ -8,6 +8,18 @@ import re
 from typing import Any
 
 
+SLACK_INCOMING_EVENTS = (
+    "slack.dm_received",
+    "slack.group_dm_received",
+    "slack.channel_message_received",
+    "slack.mention_received",
+    "slack.thread_reply_received",
+)
+SLACK_ATTENTION_EVENTS = tuple(
+    event for event in SLACK_INCOMING_EVENTS if event != "slack.channel_message_received"
+)
+
+
 def slack_resource(client: Any) -> Any:
     resource = getattr(client, "slack", None)
     if resource is None:
@@ -18,19 +30,15 @@ def slack_resource(client: Any) -> Any:
 def reconcile_subscription(client: Any, identity_id: Any, url: str) -> None:
     slack_resource(client)
     subscriptions = client.webhooks.subscriptions
-    events = ["slack.message_received"]
-    selectors = {"message_kinds": ["dm", "group_dm", "mention", "thread"]}
+    events = list(SLACK_ATTENTION_EVENTS)
     for sub in subscriptions.list(agent_identity_id=identity_id):
         if sub.url == url and set(sub.event_types) == set(events):
             if sub.status != "active":
                 raise RuntimeError("The Slack subscription is paused; resume it before starting")
-            if sub.slack_filter != selectors:
-                subscriptions.update(sub.id, slack_filter=selectors)
             return
     # A test receiver must not replace another receiver or another channel.
     subscriptions.create(
         agent_identity_id=identity_id, url=url, event_types=events,
-        slack_filter=selectors,
     )
 
 

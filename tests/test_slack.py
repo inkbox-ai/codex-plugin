@@ -12,7 +12,10 @@ from inkbox_codex.config import BridgeConfig
 from inkbox_codex.gateway import InkboxGateway
 from inkbox_codex.prompts import frame_inbound
 from inkbox_codex.sessions import SessionManager, _Turn
-from inkbox_codex.slack import inbound_message, reconcile_subscription, run_tool, send_reply
+from inkbox_codex.slack import (
+    SLACK_ATTENTION_EVENTS, SLACK_INCOMING_EVENTS, inbound_message,
+    reconcile_subscription, run_tool, send_reply,
+)
 from inkbox_codex.tools import build_inkbox_mcp_server_config, call_inkbox_tool, mcp_tool_list
 from tests.test_sessions import make_session
 
@@ -22,7 +25,7 @@ CONNECTION = "00000000-0000-4000-8000-000000000002"
 
 
 def event(**overrides):
-    result = {"id": "evt_1", "event_type": "slack.message_received", "data": {
+    result = {"id": "evt_1", "event_type": "slack.mention_received", "data": {
         "identity_id": IDENTITY, "connection_id": CONNECTION, "workspace_id": "T_TEST",
         "conversation_id": "C_TEST", "message_ts": "1234567890.000001", "actor_id": "U_ALICE",
         "thread_ts": None, "message_kinds": ["channel", "mention"],
@@ -168,19 +171,24 @@ def test_unconfirmed_send_is_not_automatically_retried(gw, status):
 
 def test_subscription_reconciliation_does_not_remove_other_receivers():
     client = Mock()
-    unrelated = NS(id="other", url="https://other.example/webhook", event_types=["slack.message_received"])
+    unrelated = NS(id="other", url="https://other.example/webhook", event_types=["slack.mention_received"])
     client.webhooks.subscriptions.list.return_value = [unrelated]
     reconcile_subscription(client, IDENTITY, "https://agent.example/webhook?channel=slack")
     created = client.webhooks.subscriptions.create.call_args.kwargs
-    assert created["slack_filter"]["message_kinds"] == ["dm", "group_dm", "mention", "thread"]
+    assert created == {
+        "agent_identity_id": IDENTITY,
+        "url": "https://agent.example/webhook?channel=slack",
+        "event_types": ["slack.dm_received", "slack.group_dm_received",
+                        "slack.mention_received", "slack.thread_reply_received"],
+    }
+    assert set(created["event_types"]) == set(SLACK_ATTENTION_EVENTS)
+    assert "slack.channel_message_received" not in created["event_types"]
     client.webhooks.subscriptions.delete.assert_not_called()
     existing = NS(id="ours", status="active", **created)
     client.webhooks.subscriptions.list.return_value = [unrelated, existing]
     reconcile_subscription(client, IDENTITY, existing.url)
     assert client.webhooks.subscriptions.create.call_count == 1
-    existing.slack_filter = None
-    reconcile_subscription(client, IDENTITY, existing.url)
-    client.webhooks.subscriptions.update.assert_called_once()
+    client.webhooks.subscriptions.update.assert_not_called()
 
 
 def test_slack_tools_opt_in_and_child_process_config(monkeypatch):
@@ -381,3 +389,49 @@ def test_tools_and_replies_match_real_slack_sdk_wire(monkeypatch):
         assert json.loads(requests[-1].content)["thread_ts"] == "1234567890.000001"
     finally:
         client.close()
+
+
+@pytest.mark.parametrize("event_type", SLACK_INCOMING_EVENTS)
+def test_event_router_recognizes_all_five_message_events(gw, event_type):
+    from unittest.mock import AsyncMock
+
+    gw._on_slack_received = AsyncMock()
+    envelope = event()
+    envelope["event_type"] = event_type
+    asyncio.run(gw._route_inkbox_event(event_type, envelope))
+    gw._on_slack_received.assert_awaited_once_with(envelope)
+
+
+def test_new_event_router_preserves_attention_and_overlap_dedup(gw):
+    async def scenario():
+        plain = event(message_kinds=["channel"], event={"text": "Unrelated chatter"})
+        plain["event_type"] = "slack.channel_message_received"
+        await gw._route_inkbox_event(plain["event_type"], plain)
+        assert not gw.sessions.turns
+        mention = event()
+        mention["event_type"] = "slack.mention_received"
+        await gw._route_inkbox_event(mention["event_type"], mention)
+        duplicate = copy.deepcopy(mention)
+        duplicate["event_type"] = "slack.thread_reply_received"
+        await gw._route_inkbox_event(duplicate["event_type"], duplicate)
+        followup = event(message_ts="1234567890.000002", thread_ts="1234567890.000001",
+                         message_kinds=["channel", "thread"], event={"text": "Follow-up"})
+        followup.update(id="evt_2", event_type="slack.thread_reply_received")
+        await gw._route_inkbox_event(followup["event_type"], followup)
+        assert len(gw.sessions.turns) == 2
+        assert gw.sessions.turns[0][0] == gw.sessions.turns[1][0]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("event_type,kinds,conversation", [
+    ("slack.dm_received", ["dm"], "D_TEST"),
+    ("slack.group_dm_received", ["group_dm"], "G_TEST"),
+])
+def test_new_direct_event_router_wakes_with_reply_coordinates(gw, event_type, kinds, conversation):
+    envelope = event(conversation_id=conversation, message_kinds=kinds,
+                     event={"text": "Hello"})
+    envelope["event_type"] = event_type
+    asyncio.run(gw._route_inkbox_event(event_type, envelope))
+    assert len(gw.sessions.turns) == 1
+    assert gw.sessions.turns[0][3]["conversation_id"] == conversation

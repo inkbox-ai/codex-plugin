@@ -1890,7 +1890,9 @@ class InkboxGateway:
                 if len(self._call_meta_by_id) > 100:
                     self._call_meta_by_id.pop(next(iter(self._call_meta_by_id)), None)
             return web.json_response({"ok": True})
-        if event_type == "slack.message_received":
+        from .slack import SLACK_INCOMING_EVENTS
+
+        if event_type in SLACK_INCOMING_EVENTS:
             return await self._on_slack_received(envelope)
         if event_type == "message.received":
             return await self._on_mail_received(envelope)

@@ -211,7 +211,12 @@ Set `INKBOX_SLACK_ENABLED=true` to add Slack to the gateway. This requires an
 Inkbox SDK exposing `client.slack` and an API with Slack support; the existing
 SDK minimum remains usable when Slack is off. Connect a workspace to the same
 Inkbox identity to exchange messages; the receiver can start before installation.
-No separate Slack token is needed.
+No separate Slack token is needed. Slack subscriptions use
+`slack.dm_received`, `slack.group_dm_received`, `slack.mention_received`, and
+`slack.thread_reply_received` with no Slack-specific filter. The gateway also
+recognizes `slack.channel_message_received`, while its local attention rules keep
+unrelated channel chatter from waking Codex. Update the API and receiver together
+when upgrading from the older incoming-message preview event.
 
 - By default, DMs, group DMs, and mentions wake Codex. Channel replies start a thread;
   follow-ups in an already-engaged thread continue its conversation without
