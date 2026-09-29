@@ -90,6 +90,20 @@ def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] |
         "slack_mentioned": "mention" in kinds,
         "slack_addressed": bool(set(kinds) & {"dm", "group_dm", "mention"}),
     }
+    # Sender context never changes workspace/thread isolation or approval ownership.
+    sender_context = {}
+    if isinstance(data.get("contact_id"), str):
+        sender_context["contact_id"] = data["contact_id"]
+    actor = data.get("actor_profile")
+    if isinstance(actor, dict) and actor.get("id") == data["actor_id"]:
+        profile = actor.get("profile")
+        profile = profile if isinstance(profile, dict) else {}
+        sender_context.update({
+            key: profile[key] for key in ("display_name", "real_name", "email", "phone", "title")
+            if isinstance(profile.get(key), str) and profile[key]
+        })
+    if sender_context:
+        meta["slack_sender_context"] = sender_context
     return chat_id, body, meta
 
 

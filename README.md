@@ -211,6 +211,21 @@ Set `INKBOX_SLACK_ENABLED=true` to add Slack to the gateway. This requires an
 Inkbox SDK exposing `client.slack` and an API with Slack support; the existing
 SDK minimum remains usable when Slack is off. Connect a workspace to the same
 Inkbox identity to exchange messages; the receiver can start before installation.
+Run `inkbox-codex setup` to opt in interactively. The wizard offers **Connect Slack
+now?**, waits for app preparation, prints a one-time invitation link to open or
+share with a workspace admin, and polls until the workspace is connected. This
+flow requires an SDK exposing `client.slack.start_setup`. Enabling Slack on the
+identity and creating invitations require an admin-scoped key from the same
+organization; setup reuses one provided during that run or prompts for a temporary
+key, never saving it. The bridge continues using its agent-scoped key. A newly
+self-signed-up identity must be claimed before using Slack.
+
+Existing connections are shown on reruns. You can skip connecting, press Ctrl+C
+during either wait, or rerun after the five-minute wait expires. Rerunning setup
+and declining full reconfiguration still offers Slack onboarding. Declining Slack
+turns it off only in this bridge; it does not disconnect the workspace or disable
+Slack for other clients. On startup, the gateway registers the subscriptions below.
+
 No separate Slack token is needed. Slack subscriptions use
 `slack.dm_received`, `slack.group_dm_received`, `slack.mention_received`, and
 `slack.thread_reply_received` with no Slack-specific filter. The gateway also
@@ -231,7 +246,9 @@ Replies remain deduplicated by the stable event ID, not the selected category.
   Direct DMs are unchanged. Bridge commands and the requesting sender's answers
   to pending approval/question prompts still work without a mention.
 - Each workspace/conversation/thread gets a separate, resumable Codex session.
-  Slack users are not automatically matched to email or phone contacts.
+  When supplied by Inkbox, the sender's linked contact ID and Slack profile fields
+  are included as context. Email and phone may be absent. The bridge does not
+  match contacts itself, merge conversations, or grant permissions from profiles.
 - Replies and approval prompts stay on the originating Slack route. Only the
   requesting sender can answer a pending group-thread approval.
 - Six tools list workspaces, list conversations, read messages/threads, search

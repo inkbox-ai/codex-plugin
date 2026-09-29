@@ -127,11 +127,12 @@ def test_existing_setup_can_change_group_reply_mode_without_reconfiguring(monkey
     monkeypatch.setattr(setup_wizard, "_env", lambda name: "configured")
     monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **kw: False)
     calls = []
+    monkeypatch.setattr(setup_wizard, "_configure_slack", lambda *a: calls.append("slack"))
     monkeypatch.setattr(setup_wizard, "_configure_group_reply_mode", lambda: calls.append("group"))
     monkeypatch.setattr(setup_wizard, "_configure_companion_response_mode", lambda: calls.append("companion"))
     monkeypatch.setattr(setup_wizard, "_configure_inkbox_tool_approvals", lambda: calls.append("approvals"))
     setup_wizard.interactive_setup()
-    assert calls == ["group", "companion", "approvals"]
+    assert calls == ["slack", "group", "companion", "approvals"]
 
 
 def test_env_reads_quoted_value_from_file(tmp_path, monkeypatch):
@@ -1084,6 +1085,7 @@ def test_wizard_walks_imessage_before_dedicated_number(monkeypatch):
         "_offer_dedicated_number",
         lambda _c, ident: calls.append("dedicated_number") or (ident, False),
     )
+    monkeypatch.setattr(setup_wizard, "_configure_slack", lambda *a: calls.append("slack"))
     monkeypatch.setattr(
         setup_wizard,
         "_print_agent_summary",
@@ -1126,6 +1128,7 @@ def test_wizard_walks_imessage_before_dedicated_number(monkeypatch):
 
     assert calls == [
         "imessage",
+        "slack",
         "dedicated_number",
         "summary",
         ("voice_stack", True),  # iMessage result threaded into the voice-stack gate
