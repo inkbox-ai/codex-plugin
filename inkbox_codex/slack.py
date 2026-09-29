@@ -55,6 +55,7 @@ def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] |
     # Only human messages wake the agent; bot echoes must not form reply loops.
     if event.get("bot_id") or event.get("app_id") or event.get("subtype") == "bot_message":
         return None
+    # The selected event type may represent only one of a message's categories.
     kinds = data.get("message_kinds") or []
     if not isinstance(kinds, list):
         return None

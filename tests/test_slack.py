@@ -191,6 +191,43 @@ def test_subscription_reconciliation_does_not_remove_other_receivers():
     client.webhooks.subscriptions.update.assert_not_called()
 
 
+def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection():
+    pytest.importorskip("inkbox.slack", reason="requires the Slack-capable SDK preview")
+    import httpx
+    from inkbox import Inkbox
+
+    requests, rows = [], []
+    url = "https://agent.example/webhook?channel=slack"
+
+    def handle(request):
+        requests.append(request)
+        assert request.url.path == "/api/v1/webhooks/subscriptions"
+        if request.method == "GET":
+            assert request.url.params["agent_identity_id"] == IDENTITY
+            return httpx.Response(200, json={"subscriptions": rows})
+        assert request.method == "POST"
+        assert json.loads(request.content) == {
+            "agent_identity_id": IDENTITY, "url": url,
+            "event_types": list(SLACK_ATTENTION_EVENTS),
+        }
+        rows.append({
+            "id": "00000000-0000-4000-8000-000000000003", "organization_id": "org_test",
+            "agent_identity_id": IDENTITY, "url": url, "status": "active",
+            "event_types": list(reversed(SLACK_ATTENTION_EVENTS)),
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+        })
+        return httpx.Response(201, json=rows[0])
+
+    with Inkbox(api_key="synthetic-test-key", base_url="https://api.example") as client:
+        client._api_http._client.close()
+        client._api_http._client = httpx.Client(
+            base_url="https://api.example/api/v1", transport=httpx.MockTransport(handle),
+        )
+        reconcile_subscription(client, IDENTITY, url)
+        reconcile_subscription(client, IDENTITY, url)
+    assert [request.method for request in requests] == ["GET", "POST", "GET"]
+
+
 def test_slack_tools_opt_in_and_child_process_config(monkeypatch):
     monkeypatch.delenv("INKBOX_SLACK_ENABLED", raising=False)
     assert not any(t["name"].startswith("inkbox_slack_") for t in mcp_tool_list())
@@ -435,3 +472,48 @@ def test_new_direct_event_router_wakes_with_reply_coordinates(gw, event_type, ki
     asyncio.run(gw._route_inkbox_event(event_type, envelope))
     assert len(gw.sessions.turns) == 1
     assert gw.sessions.turns[0][3]["conversation_id"] == conversation
+
+
+@pytest.mark.parametrize("selected_event", ["slack.mention_received", "slack.thread_reply_received"])
+def test_selected_category_does_not_override_message_kinds(selected_event):
+    payload = event(
+        conversation_id="D_TEST", thread_ts="1234567880.000001",
+        message_kinds=["dm", "mention", "thread"],
+    )
+    payload["event_type"] = selected_event
+    _, _, meta = inbound_message(payload, IDENTITY)
+    assert meta["conversation_kind"] == "direct"
+    assert meta["slack_mentioned"] is True
+    assert meta["thread_ts"] == "1234567880.000001"
+
+
+def test_current_events_preserve_mention_only_thread_context(gw):
+    from tests.test_group_reply_mode import Client
+
+    async def scenario():
+        sent = []
+        async def send(*args):
+            sent.append(args)
+
+        gw.cfg.group_reply_mode = "mention"
+        gw.sessions = SessionManager(gw.cfg, send, {}, {"handle": "agent"})
+        session = gw.sessions.get(inbound_message(event(), IDENTITY)[0])
+        client = session._client = Client()
+        for index, (selected, mentioned) in enumerate([
+            ("slack.mention_received", True), ("slack.thread_reply_received", False),
+            ("slack.thread_reply_received", True),
+        ]):
+            payload = event(
+                message_ts=f"1234567890.00000{index + 2}", thread_ts="1234567890.000001",
+                message_kinds=["channel", "thread"] + (["mention"] if mentioned else []),
+                event={"text": "<@U_AGENT> help" if mentioned else "Quiet follow-up"},
+            )
+            payload.update(id=f"evt_{index}", event_type=selected)
+            await gw._route_inkbox_event(selected, payload)
+            await session._worker
+            await gw._route_inkbox_event(selected, copy.deepcopy(payload))
+        assert [kind for kind, _ in client.events] == ["run", "context", "run"]
+        assert len(sent) == 2
+        assert client.interrupts == 0
+
+    asyncio.run(scenario())

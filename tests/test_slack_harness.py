@@ -105,7 +105,13 @@ def test_receiver_can_start_before_workspace_installation(tmp_path, monkeypatch,
     assert calls == ["run", "cleanup"]
 
 
-def test_signed_http_event_runs_session_and_posts_one_threaded_reply(tmp_path, monkeypatch):
+@pytest.mark.parametrize("event_type,kinds,conversation,thread", [
+    ("slack.dm_received", ["dm"], "D_TEST", None),
+    ("slack.group_dm_received", ["group_dm"], "G_TEST", None),
+    ("slack.mention_received", ["channel", "mention"], "C_TEST", None),
+    ("slack.thread_reply_received", ["channel", "thread"], "C_TEST", "1234567890.000001"),
+])
+def test_signed_http_event_runs_session_and_posts_one_reply(tmp_path, monkeypatch, event_type, kinds, conversation, thread):
     from aiohttp import ClientSession, web
     from inkbox_codex.webhook_providers import inkbox as verifier
     from inkbox import verify_webhook
@@ -120,7 +126,10 @@ def test_signed_http_event_runs_session_and_posts_one_threaded_reply(tmp_path, m
         client = gateway._inkbox = Mock()
         client.slack.send_message.return_value = NS(id="action-1", status="sent")
         gateway.sessions = SessionManager(cfg, gateway.send_to_contact, {}, {"handle": "agent"})
-        session = gateway.sessions.get(inbound_message(event(), IDENTITY)[0])
+        payload = event(conversation_id=conversation, message_kinds=kinds, thread_ts=thread)
+        payload["event_type"] = event_type
+        # An unmentioned thread reply belongs to a conversation already engaged.
+        session = gateway.sessions.get(inbound_message(payload, IDENTITY)[0])
         prompts = []
 
         class Codex:
@@ -141,7 +150,7 @@ def test_signed_http_event_runs_session_and_posts_one_threaded_reply(tmp_path, m
         try:
             async with ClientSession() as http:
                 url = f"http://127.0.0.1:{port}/webhook"
-                body = json.dumps(event()).encode()
+                body = json.dumps(payload).encode()
                 headers = _sign(body, "whsec_test", timestamp=str(int(time.time())))
                 async with http.post(url, data=body, headers={**headers, "X-Inkbox-Signature": "bad"}) as response:
                     assert response.status == 401
@@ -154,8 +163,8 @@ def test_signed_http_event_runs_session_and_posts_one_threaded_reply(tmp_path, m
                 call = client.slack.send_message.call_args
                 assert client.slack.send_message.call_count == 1
                 assert call.args == (CONNECTION,)
-                assert call.kwargs["conversation_id"] == "C_TEST"
-                assert call.kwargs["thread_ts"] == "1234567890.000001"
+                assert call.kwargs["conversation_id"] == conversation
+                assert call.kwargs["thread_ts"] == (None if kinds == ["dm"] else "1234567890.000001")
                 assert call.kwargs["text"] == "*Hello from Codex*"
                 unrelated = json.dumps({"event_type": "text.received", "companion": {"test": True}}).encode()
                 async with http.post(url, data=unrelated) as response:

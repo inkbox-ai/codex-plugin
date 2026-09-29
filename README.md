@@ -217,6 +217,9 @@ No separate Slack token is needed. Slack subscriptions use
 recognizes `slack.channel_message_received`, while its local attention rules keep
 unrelated channel chatter from waking Codex. Update the API and receiver together
 when upgrading from the older incoming-message preview event.
+Incoming messages can match several categories; the payload's `message_kinds`
+retains the full classification even when only one event type is selected.
+Replies remain deduplicated by the stable event ID, not the selected category.
 
 - By default, DMs, group DMs, and mentions wake Codex. Channel replies start a thread;
   follow-ups in an already-engaged thread continue its conversation without
