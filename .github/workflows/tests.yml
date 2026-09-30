@@ -49,7 +49,7 @@ jobs:
       - name: Install bridge and pinned Slack SDK preview
         run: >-
           pip install -e . pytest httpx
-          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@93accd5f3c78b64c7449c432db4da92ea359c89a#subdirectory=sdk/python"
+          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@03ef712f854789e2acc17fb7e48a831b6e32b47f#subdirectory=sdk/python"
       - name: Require provisioning-workspace and identity-subscription support
         run: |
           python - <<'PY'

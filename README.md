@@ -216,10 +216,10 @@ now?**, selects a saved provisioning workspace, waits for app preparation, print
 an installation link to open in your browser, and polls until that workspace is
 connected. Keep the link private and complete authorization in the same browser.
 This flow requires an SDK exposing `client.slack.list_provisioning_workspaces`
-and identity-wide webhook subscriptions. Preparing and installing the app require
-an admin-scoped key from the same organization; setup reuses one provided during
-that run or prompts for a temporary key, never saving it. The bridge continues
-using its agent-scoped key. A newly self-signed-up identity must be claimed first.
+and identity-wide webhook subscriptions. Setup uses the bridge's existing claimed
+agent key for workspace credentials, app preparation, and installation; no extra
+admin key is needed. A newly self-signed-up identity must be claimed first. An
+organization admin key is also supported when already configured for the bridge.
 
 If you need to add a provisioning workspace or renew its credentials, the wizard
 prompts for a masked Slack app-configuration access/refresh token pair from

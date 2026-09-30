@@ -21,7 +21,6 @@ import shutil
 import subprocess
 import sys
 import time
-from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -1263,8 +1262,7 @@ def _configure_slack(api_key: str, base_url: str, handle: str, Inkbox: Any) -> b
         return False
 
     try:
-        with ExitStack() as stack:
-            client = stack.enter_context(Inkbox(**inkbox_client_kwargs(api_key, base_url)))
+        with Inkbox(**inkbox_client_kwargs(api_key, base_url)) as client:
             info = client.whoami()
             identity = client.get_identity(handle)
             subtype = _enum_value(getattr(info, "auth_subtype", ""))
@@ -1282,29 +1280,6 @@ def _configure_slack(api_key: str, base_url: str, handle: str, Inkbox: Any) -> b
                 print_warning("  Slack setup requires an Inkbox SDK with provisioning-workspace support.")
                 print_info(f"  Upgrade the SDK and rerun setup: {_install_command_text()}")
                 return enabled
-
-            admin = client if is_admin else _TRANSIENT_ADMIN_CLIENT
-
-            def management_client() -> Any | None:
-                nonlocal admin
-                if admin is None:
-                    print_info("  Preparing and installing a Slack app require an admin-scoped key.")
-                    print_info("  It is used only for this setup run and is never saved.")
-                    key = prompt("  Admin-scoped Inkbox API key (leave blank to skip)", password=True).strip()
-                    if not key:
-                        print_info("  Skipped. Connect Slack in the Inkbox console or rerun setup later.")
-                        return None
-                    admin = stack.enter_context(Inkbox(**inkbox_client_kwargs(key, base_url)))
-                admin_info = admin.whoami()
-                if (
-                    _enum_value(getattr(admin_info, "auth_subtype", "")) != "api_key.admin_scoped"
-                    or not getattr(info, "organization_id", None)
-                    or admin_info.organization_id != info.organization_id
-                    or str(admin.get_identity(handle).id) != str(identity.id)
-                ):
-                    print_error("  Use an admin-scoped key from this agent's organization and environment.")
-                    return None
-                return admin
 
             _save("INKBOX_SLACK_ENABLED", "true")
             enabled = True
@@ -1325,16 +1300,12 @@ def _configure_slack(api_key: str, base_url: str, handle: str, Inkbox: Any) -> b
             if getattr(setup, "error_code", None) == "outcome_unknown":
                 print_warning("  Slack app creation could not be confirmed. Contact support before trying again.")
                 return True
-            admin = management_client()
-            if admin is None:
-                return True
-            setup_resource = admin.slack
             if setup.status not in {"ready", "pending"}:
-                workspace = _select_slack_workspace(setup_resource, snapshot)
+                workspace = _select_slack_workspace(resource, snapshot)
                 if workspace is None:
                     print_info("  Workspace setup skipped. Rerun `inkbox-codex setup` to continue.")
                     return True
-                setup_resource.start_setup(identity.id, workspace.id)
+                resource.start_setup(identity.id, workspace.id)
             print_info("  Preparing Slack… (Ctrl+C skips; other setup steps will continue.)")
             deadline = time.monotonic() + 300.0
             while True:
@@ -1346,7 +1317,7 @@ def _configure_slack(api_key: str, base_url: str, handle: str, Inkbox: Any) -> b
                     print_warning("  The app's workspace could not be confirmed. Check Slack in the Inkbox console.")
                     return True
                 try:
-                    installation = setup_resource.start_installation(identity.id, workspace_id=workspace.workspace_id)
+                    installation = resource.start_installation(identity.id, workspace_id=workspace.workspace_id)
                     break
                 except Exception as exc:
                     detail = getattr(exc, "detail", None)
