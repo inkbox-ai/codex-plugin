@@ -36,6 +36,34 @@ jobs:
       - name: Run unit tests
         run: pytest -q
 
+  # Slack is optional until its SDK is released. Exercise its real request and
+  # response contracts as well as the released SDK floor in the unit jobs above.
+  slack-sdk:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install bridge and pinned Slack SDK preview
+        run: >-
+          pip install -e . pytest httpx
+          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@93accd5f3c78b64c7449c432db4da92ea359c89a#subdirectory=sdk/python"
+      - name: Require provisioning-workspace and identity-subscription support
+        run: |
+          python - <<'PY'
+          import inspect
+          from inkbox.slack import SlackResource
+          from inkbox.webhook_subscriptions import WebhookSubscriptionsResource
+          assert callable(SlackResource.list_provisioning_workspaces)
+          assert "scope" in inspect.signature(WebhookSubscriptionsResource.list).parameters
+          PY
+      - name: Slack onboarding, routing, signed receiver, and SDK contracts
+        run: >-
+          pytest -q tests/test_setup_slack.py tests/test_setup_wizard.py
+          tests/test_prompts.py tests/test_slack.py tests/test_slack_harness.py
+
   # Contract suite against the REAL Codex host at its freshest main cut. This is
   # the lane that catches upstream drift in the app-server protocol (a renamed
   # method, a moved result field, a dropped notification) before it reaches a

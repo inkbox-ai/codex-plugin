@@ -195,11 +195,39 @@ def test_unconfirmed_send_is_not_automatically_retried(gw, status):
     assert gw._note_sync_send_failure("session", "slack", meta, "hello", status) is None
 
 
+@pytest.mark.parametrize("via_tool", [False, True])
+@pytest.mark.parametrize("text,valid", [("x" * 12000, True), ("x" * 12001, False), ("hello\x00world", False)])
+def test_send_respects_api_text_boundary(via_tool, text, valid):
+    client = Mock()
+    client.get_identity.return_value = NS(id=IDENTITY)
+    client.slack.list_connections.return_value = NS(connections=[NS(id=CONNECTION)])
+    client.slack.send_message.return_value = NS(status="sent")
+
+    def send():
+        if via_tool:
+            return run_tool(client, "agent", "inkbox_slack_send_message", {
+                "connection_id": CONNECTION, "conversation_id": "CTEST", "text": text,
+                "idempotency_key": "boundary-test",
+            })
+        return send_reply(client, inbound_message(event(), IDENTITY)[2], text)
+
+    if valid:
+        send()
+        assert client.slack.send_message.call_count == 1
+        assert client.slack.send_message.call_args.kwargs["text"] == text
+    else:
+        with pytest.raises(ValueError):
+            send()
+        client.slack.send_message.assert_not_called()
+
+
 def test_subscription_reconciliation_does_not_remove_other_receivers():
     client = Mock()
     unrelated = NS(id="other", url="https://other.example/webhook", event_types=["slack.mention_received"])
     client.webhooks.subscriptions.list.return_value = [unrelated]
     reconcile_subscription(client, IDENTITY, "https://agent.example/webhook?channel=slack")
+    client.webhooks.subscriptions.list.assert_called_once_with(
+        agent_identity_id=IDENTITY, scope="identity", url="https://agent.example/webhook?channel=slack")
     created = client.webhooks.subscriptions.create.call_args.kwargs
     assert created == {
         "agent_identity_id": IDENTITY,
@@ -217,31 +245,41 @@ def test_subscription_reconciliation_does_not_remove_other_receivers():
     client.webhooks.subscriptions.update.assert_not_called()
 
 
-def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection():
-    pytest.importorskip("inkbox.slack", reason="requires the Slack-capable SDK preview")
+@pytest.mark.parametrize("mixed", [False, True])
+def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection(mixed):
+    slack = pytest.importorskip("inkbox.slack", reason="requires the Slack-capable SDK preview")
+    if not hasattr(slack.SlackResource, "list_provisioning_workspaces"):
+        pytest.skip("installed SDK predates identity-wide subscriptions")
     import httpx
     from inkbox import Inkbox
 
     requests, rows = [], []
     url = "https://agent.example/webhook?channel=slack"
+    row = {
+        "id": "00000000-0000-4000-8000-000000000003", "organization_id": "org_test",
+        "agent_identity_id": IDENTITY, "url": url, "status": "active",
+        "event_types": list(reversed(SLACK_ATTENTION_EVENTS)),
+        "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+    }
+    if mixed:
+        rows.append({**row, "event_types": [*row["event_types"], "email.received"]})
 
     def handle(request):
         requests.append(request)
+        if request.url.path == "/api/v1/webhooks/catalog":
+            return httpx.Response(200, json={"supports_identity_subscriptions": True})
         assert request.url.path == "/api/v1/webhooks/subscriptions"
         if request.method == "GET":
             assert request.url.params["agent_identity_id"] == IDENTITY
+            assert request.url.params["scope"] == "identity"
+            assert request.url.params["url"] == url
             return httpx.Response(200, json={"subscriptions": rows})
         assert request.method == "POST"
         assert json.loads(request.content) == {
             "agent_identity_id": IDENTITY, "url": url,
             "event_types": list(SLACK_ATTENTION_EVENTS),
         }
-        rows.append({
-            "id": "00000000-0000-4000-8000-000000000003", "organization_id": "org_test",
-            "agent_identity_id": IDENTITY, "url": url, "status": "active",
-            "event_types": list(reversed(SLACK_ATTENTION_EVENTS)),
-            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
-        })
+        rows.append(row)
         return httpx.Response(201, json=rows[0])
 
     with Inkbox(api_key="synthetic-test-key", base_url="https://api.example") as client:
@@ -251,7 +289,38 @@ def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection():
         )
         reconcile_subscription(client, IDENTITY, url)
         reconcile_subscription(client, IDENTITY, url)
-    assert [request.method for request in requests] == ["GET", "POST", "GET"]
+    assert [request.method for request in requests] == (
+        ["GET", "GET", "GET", "GET"] if mixed else ["GET", "GET", "POST", "GET", "GET"])
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_subscription_coverage_reuses_mixed_and_split_event_sets(split):
+    client = Mock()
+    url = "https://agent.example/webhook?channel=slack"
+    first, *remaining = SLACK_ATTENTION_EVENTS
+    rows = [NS(url=url, status="active", event_types=["email.received", first])]
+    if split:
+        rows.append(NS(url=url, status="active", event_types=remaining))
+    client.webhooks.subscriptions.list.return_value = rows
+    reconcile_subscription(client, IDENTITY, url)
+    if split:
+        client.webhooks.subscriptions.create.assert_not_called()
+    else:
+        client.webhooks.subscriptions.create.assert_called_once_with(
+            agent_identity_id=IDENTITY, url=url, event_types=remaining)
+    client.webhooks.subscriptions.delete.assert_not_called()
+    client.webhooks.subscriptions.update.assert_not_called()
+
+
+def test_paused_subscription_is_not_bypassed_by_new_registration():
+    client = Mock()
+    url = "https://agent.example/webhook?channel=slack"
+    client.webhooks.subscriptions.list.return_value = [
+        NS(url=url, status="paused", event_types=["email.received", "slack.dm_received"])]
+    with pytest.raises(RuntimeError, match="paused"):
+        reconcile_subscription(client, IDENTITY, url)
+    client.webhooks.subscriptions.create.assert_not_called()
+    client.webhooks.subscriptions.update.assert_not_called()
 
 
 def test_slack_tools_opt_in_and_child_process_config(monkeypatch):
@@ -399,13 +468,13 @@ def test_tools_and_replies_match_real_slack_sdk_wire(monkeypatch):
 
     requests = []
     connection = {
-        "id": CONNECTION, "identity_id": IDENTITY, "workspace_id": "T_TEST",
-        "workspace_name": "Example", "bot_user_id": "U_AGENT", "status": "connected",
+        "id": CONNECTION, "identity_id": IDENTITY, "workspace_id": "TTEST",
+        "workspace_name": "Example", "bot_user_id": "UAGENT", "status": "connected",
         "scopes": [], "created_at": "2026-01-01T00:00:00Z",
     }
     action = {
         "id": "00000000-0000-4000-8000-000000000003", "connection_id": CONNECTION,
-        "status": "sent", "conversation_id": "C_TEST", "message_ts": "1234567890.000003",
+        "status": "sent", "conversation_id": "CTEST", "message_ts": "1234567890.000003",
         "thread_ts": "1234567890.000001",
     }
 
@@ -415,7 +484,7 @@ def test_tools_and_replies_match_real_slack_sdk_wire(monkeypatch):
         if path.endswith("/connections"):
             payload = {"connections": [connection], "installation_available": False}
         elif path.endswith("/conversations"):
-            payload = {"conversations": [{"id": "C_TEST"}], "next_cursor": "page-2"}
+            payload = {"conversations": [{"id": "CTEST"}], "next_cursor": "page-2"}
         elif request.method == "POST" or "/actions/" in path:
             payload = action
         else:
@@ -432,10 +501,10 @@ def test_tools_and_replies_match_real_slack_sdk_wire(monkeypatch):
         for name, args in [
             ("list_connections", {}),
             ("list_conversations", {"connection_id": CONNECTION}),
-            ("list_messages", {"connection_id": CONNECTION, "conversation_id": "C_TEST",
+            ("list_messages", {"connection_id": CONNECTION, "conversation_id": "CTEST",
                                "thread_ts": "1234567890.000001", "cursor": "page-1"}),
             ("search", {"q": "release"}),
-            ("send_message", {"connection_id": CONNECTION, "conversation_id": "C_TEST",
+            ("send_message", {"connection_id": CONNECTION, "conversation_id": "CTEST",
                               "text": "Hello", "idempotency_key": "test-1"}),
             ("get_action", {"connection_id": CONNECTION, "action_id": action["id"]}),
         ]:
@@ -447,8 +516,8 @@ def test_tools_and_replies_match_real_slack_sdk_wire(monkeypatch):
         assert history.url.params["cursor"] == "page-1"
         send = next(r for r in requests if r.method == "POST")
         assert send.headers["Idempotency-Key"] == "test-1"
-        assert json.loads(send.content) == {"conversation_id": "C_TEST", "text": "Hello"}
-        send_reply(client, inbound_message(event(), IDENTITY)[2], "Reply")
+        assert json.loads(send.content) == {"conversation_id": "CTEST", "text": "Hello"}
+        send_reply(client, inbound_message(event(conversation_id="CTEST"), IDENTITY)[2], "Reply")
         assert json.loads(requests[-1].content)["thread_ts"] == "1234567890.000001"
     finally:
         client.close()

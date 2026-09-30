@@ -18,6 +18,7 @@ SLACK_INCOMING_EVENTS = (
 SLACK_ATTENTION_EVENTS = tuple(
     event for event in SLACK_INCOMING_EVENTS if event != "slack.channel_message_received"
 )
+SLACK_MAX_TEXT_LENGTH = 12000
 
 
 def slack_resource(client: Any) -> Any:
@@ -31,14 +32,19 @@ def reconcile_subscription(client: Any, identity_id: Any, url: str) -> None:
     slack_resource(client)
     subscriptions = client.webhooks.subscriptions
     events = list(SLACK_ATTENTION_EVENTS)
-    for sub in subscriptions.list(agent_identity_id=identity_id):
-        if sub.url == url and set(sub.event_types) == set(events):
+    covered = set()
+    for sub in subscriptions.list(agent_identity_id=identity_id, scope="identity", url=url):
+        overlap = set(sub.event_types) & set(events)
+        if sub.url == url and overlap:
             if sub.status != "active":
                 raise RuntimeError("The Slack subscription is paused; resume it before starting")
-            return
+            covered.update(overlap)
+    missing = [event for event in events if event not in covered]
+    if not missing:
+        return
     # A test receiver must not replace another receiver or another channel.
     subscriptions.create(
-        agent_identity_id=identity_id, url=url, event_types=events,
+        agent_identity_id=identity_id, url=url, event_types=missing,
     )
 
 
@@ -108,6 +114,8 @@ def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] |
 
 
 def send_reply(client: Any, meta: dict, text: str) -> Any:
+    if not text or len(text) > SLACK_MAX_TEXT_LENGTH or "\x00" in text:
+        raise ValueError("Slack text must be 1–12000 characters without NUL characters")
     coordinates = [meta["connection_id"], meta["conversation_id"], meta.get("thread_ts")]
     key = hashlib.sha256(json.dumps(
         [meta["source_event_id"], coordinates, text], separators=(",", ":")
@@ -148,7 +156,7 @@ SLACK_TOOLS = [
     _tool("send_message", "Send a Slack message only when explicitly requested. Ordinary replies "
           "are automatic. Reuse idempotency_key for retries of the exact same message. "
           "For sending/unknown outcomes inspect get_action; never blindly resend.",
-          {**_CONVERSATION, "text": {"type": "string", "minLength": 1, "maxLength": 40000},
+          {**_CONVERSATION, "text": {"type": "string", "minLength": 1, "maxLength": SLACK_MAX_TEXT_LENGTH},
            "thread_ts": _STRING, "idempotency_key": {
                "type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"}},
           ["connection_id", "conversation_id", "text", "idempotency_key"]),
@@ -170,6 +178,8 @@ def run_tool(client: Any, identity_handle: str, name: str, args: dict) -> Any:
                 raise ValueError("limit must be an integer from 1 to 100")
         elif not isinstance(value, str) or not value.strip():
             raise ValueError(f"{key} must be a nonempty string")
+        elif "\x00" in value:
+            raise ValueError(f"{key} must not contain NUL characters")
     resource = slack_resource(client)
     identity = client.get_identity(identity_handle)
     if name == "inkbox_slack_list_connections":
@@ -185,6 +195,6 @@ def run_tool(client: Any, identity_handle: str, name: str, args: dict) -> Any:
     if name == "inkbox_slack_send_message":
         if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", args["idempotency_key"]):
             raise ValueError("Invalid Slack idempotency_key")
-        if len(args["text"]) > 40000:
-            raise ValueError("Slack text must not exceed 40000 characters")
+        if len(args["text"]) > SLACK_MAX_TEXT_LENGTH:
+            raise ValueError("Slack text must not exceed 12000 characters")
     return getattr(resource, name.removeprefix("inkbox_slack_"))(**args)

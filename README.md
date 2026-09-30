@@ -212,13 +212,23 @@ Inkbox SDK exposing `client.slack` and an API with Slack support; the existing
 SDK minimum remains usable when Slack is off. Connect a workspace to the same
 Inkbox identity to exchange messages; the receiver can start before installation.
 Run `inkbox-codex setup` to opt in interactively. The wizard offers **Connect Slack
-now?**, waits for app preparation, prints a one-time invitation link to open or
-share with a workspace admin, and polls until the workspace is connected. This
-flow requires an SDK exposing `client.slack.start_setup`. Enabling Slack on the
-identity and creating invitations require an admin-scoped key from the same
-organization; setup reuses one provided during that run or prompts for a temporary
-key, never saving it. The bridge continues using its agent-scoped key. A newly
-self-signed-up identity must be claimed before using Slack.
+now?**, selects a saved provisioning workspace, waits for app preparation, prints
+an installation link to open in your browser, and polls until that workspace is
+connected. Keep the link private and complete authorization in the same browser.
+This flow requires an SDK exposing `client.slack.list_provisioning_workspaces`
+and identity-wide webhook subscriptions. Preparing and installing the app require
+an admin-scoped key from the same organization; setup reuses one provided during
+that run or prompts for a temporary key, never saving it. The bridge continues
+using its agent-scoped key. A newly self-signed-up identity must be claimed first.
+
+If you need to add a provisioning workspace or renew its credentials, the wizard
+prompts for a masked Slack app-configuration access/refresh token pair from
+[Your App Configuration Tokens](https://api.slack.com/apps). Inkbox verifies and
+stores the pair for your organization; the bridge does not save it locally.
+These are not bot tokens. Each identity's app is permanently bound to one
+workspace. Existing connections need no new installation; manage permission
+refreshes in the Inkbox console. After installation, add the bot to the channels
+where you want to use it.
 
 Existing connections are shown on reruns. You can skip connecting, press Ctrl+C
 during either wait, or rerun after the five-minute wait expires. Rerunning setup
@@ -226,7 +236,7 @@ and declining full reconfiguration still offers Slack onboarding. Declining Slac
 turns it off only in this bridge; it does not disconnect the workspace or disable
 Slack for other clients. On startup, the gateway registers the subscriptions below.
 
-No separate Slack token is needed. Slack subscriptions use
+No separate Slack bot token is needed at runtime. Slack subscriptions use
 `slack.dm_received`, `slack.group_dm_received`, `slack.mention_received`, and
 `slack.thread_reply_received` with no Slack-specific filter. The gateway also
 recognizes `slack.channel_message_received`, while its local attention rules keep
@@ -251,6 +261,8 @@ Replies remain deduplicated by the stable event ID, not the selected category.
   match contacts itself, merge conversations, or grant permissions from profiles.
 - Replies and approval prompts stay on the originating Slack route. Only the
   requesting sender can answer a pending group-thread approval.
+- Messages are limited to 12,000 characters per send. The bridge rejects longer
+  replies before sending; it does not split or automatically retry them.
 - Six tools list workspaces, list conversations, read messages/threads, search
   retained text, send explicitly requested messages, and inspect send outcomes.
   Ordinary final replies are sent automatically; do not send them again by tool.
@@ -264,7 +276,10 @@ Replies remain deduplicated by the stable event ID, not the selected category.
 `INKBOX_ALLOWED_USERS` accepts Slack user IDs or workspace-qualified `T_ID:U_ID`
 entries. An empty list admits all human senders whose events reach the identity.
 Slack subscriptions are additive: starting this gateway does not remove another
-Slack receiver. Stop/remove any previous Slack receiver if it should no longer reply.
+Slack receiver. Existing active subscriptions at this receiver's URL, including
+mixed-event subscriptions, are reused; only missing events are registered.
+Paused overlapping subscriptions require attention in the console before startup.
+Stop/remove any previous Slack receiver if it should no longer reply.
 
 ### Isolated Slack harness
 
