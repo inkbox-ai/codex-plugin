@@ -28,7 +28,9 @@ def connection(id="connection-1", status="connected", workspace_id="TEXAMPLE"):
 @pytest.fixture
 def setup(monkeypatch, tmp_path):
     monkeypatch.setenv("INKBOX_CODEX_ENV_FILE", str(tmp_path / ".env"))
-    monkeypatch.delenv("INKBOX_SLACK_ENABLED", raising=False)
+    # _save updates os.environ directly; register even an initially absent key
+    # so teardown restores it instead of enabling Slack for subsequent tests.
+    monkeypatch.setenv("INKBOX_SLACK_ENABLED", "false")
     monkeypatch.setattr(wizard, "_TRANSIENT_ADMIN_CLIENT", None)
     # No remote slack_enabled field: opting in is a bridge-local setting.
     identity = NS(id="identity-1", agent_handle="agent", update=Mock())

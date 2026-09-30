@@ -63,6 +63,7 @@ jobs:
         run: >-
           pytest -q tests/test_setup_slack.py tests/test_setup_wizard.py
           tests/test_prompts.py tests/test_slack.py tests/test_slack_harness.py
+          tests/test_tools.py::test_coding_agent_tool_tier_is_registered
 
   # Contract suite against the REAL Codex host at its freshest main cut. This is
   # the lane that catches upstream drift in the app-server protocol (a renamed
