@@ -239,20 +239,23 @@ and declining full reconfiguration still offers Slack onboarding. Declining Slac
 turns it off only in this bridge; it does not disconnect the workspace or disable
 Slack for other clients. On startup, the gateway registers the subscriptions below.
 
-**Work indicators.** An accepted Slack request adds 👀 to your incoming message,
-including replies deep inside a thread. It stays while work for that message is
-queued or running. Completion removes it; a failed turn or failed reply delivery
-replaces it with ❌ on that same message. Each message has its own status;
-retrying work on that message clears its previous failure.
-Mention-mode context, local commands, and approval answers do not create another
-indicator. Stopping work clears the busy indicator without marking a failure.
-After an unexpected gateway exit, restart cleanup marks unfinished work failed.
-Reactions require `reactions:write` and SDK reaction support; failures are logged
-without blocking the conversation or blindly retrying an uncertain operation.
+**Work indicators.** Accepted requests in Slack threads use the native agent
+loading indicator, without adding reaction bubbles. It stays while work is queued
+or running, switches to awaiting-input during questions or approvals, and returns
+to ready after completion, failure, or cancellation. Overlapping requests in the
+same thread share one indicator. Mention-mode context does not start it.
+Slack's native Stop button cancels work in the matching engaged thread, subject to
+the same allowed-sender policy. Ordinary unthreaded DMs keep replying in the main
+DM without opening a thread just to display status.
+Native status needs `chat:write`, SDK processing-status support, and workspace
+feature availability. Unsupported or uncertain updates are logged without
+blocking replies or falling back to reactions. Restart cleanup clears unfinished
+native status and removes pending indicators from the previous reaction version.
 
 No separate Slack bot token is needed at runtime. Slack subscriptions use
-`slack.dm_received`, `slack.group_dm_received`, `slack.mention_received`, and
-`slack.thread_reply_received` with no Slack-specific filter. The gateway also
+`slack.dm_received`, `slack.group_dm_received`, `slack.mention_received`,
+`slack.thread_reply_received`, and `slack.session_stopped` with no Slack-specific
+filter. The gateway also
 recognizes `slack.channel_message_received`, while its local attention rules keep
 unrelated channel chatter from waking Codex. Update the API and receiver together
 when upgrading from the older incoming-message preview event.
@@ -284,8 +287,8 @@ Replies remain deduplicated by the stable event ID, not the selected category.
   automatically resent. Reuse the exact idempotency key when retrying an explicit
   send. Webhook duplicate suppression follows the gateway's existing bounded,
   in-memory behavior.
-- Attachments are exposed as metadata in this first version. File transfer,
-  arbitrary reaction tools, and native processing-status updates are not included.
+- Attachments are exposed as metadata in this first version. File transfer and
+  arbitrary reaction tools are not included.
 
 `INKBOX_ALLOWED_USERS` accepts Slack user IDs or workspace-qualified `T_ID:U_ID`
 entries. An empty list admits all human senders whose events reach the identity.
@@ -458,7 +461,7 @@ uses POSIX file locking (Linux/macOS).
 
 Run `inkbox-codex setup` to change the choice without reconfiguring your identity, or edit `.env`, then restart the bridge to apply it. For background mode, use `inkbox-codex restart`; for a systemd installation, use `systemctl --user restart inkbox-codex.service`. Mention mode requires a Codex version supporting `thread/inject_items`.
 
-**Typing indicator.** While Codex works on a turn, the bridge keeps a typing indicator alive on your iMessage thread (refreshed every few seconds, since it expires) so you can see it's busy. SMS, email, and voice have no typing indicator, so this is iMessage-only.
+**Typing indicator.** While Codex works on a turn, the bridge keeps a typing indicator alive on your iMessage thread (refreshed every few seconds, since it expires) so you can see it's busy. SMS, email, and voice have no typing indicator. Slack threads use the native agent status described above.
 
 **Delivery failures.** Outbound messages can silently fail — a carrier filters an SMS, an iMessage is declined, an email bounces. Inkbox reports these asynchronously (`text.delivery_failed`, `imessage.delivery_failed`, `message.bounced`/`message.failed`). The bridge catches them and wakes the affected contact's session to tell Codex *which* message didn't land and *why*, so it can retry or reach you another way (a different channel, or a call) using its Inkbox tools. The notice runs as a side-effect turn — Codex acts via tools rather than replying on the channel that just failed — and repeat webhooks for the same message are de-duplicated so it can't loop. `text.delivery_unconfirmed` is different: it only means the carrier couldn't *confirm* delivery (the message usually landed), so it's logged for debugging without waking Codex — waking there would resend a message that was likely delivered.
 

@@ -1901,9 +1901,9 @@ class InkboxGateway:
                 if len(self._call_meta_by_id) > 100:
                     self._call_meta_by_id.pop(next(iter(self._call_meta_by_id)), None)
             return web.json_response({"ok": True})
-        from .slack import SLACK_INCOMING_EVENTS
+        from .slack import SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT
 
-        if event_type in SLACK_INCOMING_EVENTS:
+        if event_type in (*SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT):
             return await self._on_slack_received(envelope)
         if event_type == "message.received":
             return await self._on_mail_received(envelope)
@@ -3754,13 +3754,14 @@ class InkboxGateway:
         )
 
     async def _on_slack_received(self, envelope: Dict[str, Any]) -> "web.Response":
-        from .slack import inbound_message
+        from .slack import SLACK_STOP_EVENT, inbound_message, inbound_stop
 
         if not self.cfg.slack_enabled:
             return web.json_response({"ok": True, "ignored": "slack-disabled"})
         if self.sessions is None or self._identity is None:
             raise RuntimeError("Slack sessions are not ready")
-        incoming = inbound_message(envelope, str(self._identity.id))
+        parse = inbound_stop if envelope.get("event_type") == SLACK_STOP_EVENT else inbound_message
+        incoming = parse(envelope, str(self._identity.id))
         if incoming is None:
             return web.json_response({"ok": True, "ignored": "slack-message"})
         chat_id, body, meta = incoming

@@ -13,7 +13,7 @@ from inkbox_codex.gateway import InkboxGateway
 from inkbox_codex.prompts import frame_inbound
 from inkbox_codex.sessions import SessionManager, _Turn
 from inkbox_codex.slack import (
-    SLACK_ATTENTION_EVENTS, SLACK_INCOMING_EVENTS, inbound_message,
+    SLACK_SUBSCRIPTION_EVENTS, SLACK_INCOMING_EVENTS, inbound_message,
     reconcile_subscription, run_tool, send_reply,
 )
 from inkbox_codex.tools import build_inkbox_mcp_server_config, call_inkbox_tool, mcp_tool_list
@@ -233,9 +233,9 @@ def test_subscription_reconciliation_does_not_remove_other_receivers():
         "agent_identity_id": IDENTITY,
         "url": "https://agent.example/webhook?channel=slack",
         "event_types": ["slack.dm_received", "slack.group_dm_received",
-                        "slack.mention_received", "slack.thread_reply_received"],
+                        "slack.mention_received", "slack.thread_reply_received", "slack.session_stopped"],
     }
-    assert set(created["event_types"]) == set(SLACK_ATTENTION_EVENTS)
+    assert set(created["event_types"]) == set(SLACK_SUBSCRIPTION_EVENTS)
     assert "slack.channel_message_received" not in created["event_types"]
     client.webhooks.subscriptions.delete.assert_not_called()
     existing = NS(id="ours", status="active", **created)
@@ -258,7 +258,7 @@ def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection(mixed)
     row = {
         "id": "00000000-0000-4000-8000-000000000003", "organization_id": "org_test",
         "agent_identity_id": IDENTITY, "url": url, "status": "active",
-        "event_types": list(reversed(SLACK_ATTENTION_EVENTS)),
+        "event_types": list(reversed(SLACK_SUBSCRIPTION_EVENTS)),
         "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
     }
     if mixed:
@@ -277,7 +277,7 @@ def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection(mixed)
         assert request.method == "POST"
         assert json.loads(request.content) == {
             "agent_identity_id": IDENTITY, "url": url,
-            "event_types": list(SLACK_ATTENTION_EVENTS),
+            "event_types": list(SLACK_SUBSCRIPTION_EVENTS),
         }
         rows.append(row)
         return httpx.Response(201, json=rows[0])
@@ -297,7 +297,7 @@ def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection(mixed)
 def test_subscription_coverage_reuses_mixed_and_split_event_sets(split):
     client = Mock()
     url = "https://agent.example/webhook?channel=slack"
-    first, *remaining = SLACK_ATTENTION_EVENTS
+    first, *remaining = SLACK_SUBSCRIPTION_EVENTS
     rows = [NS(url=url, status="active", event_types=["email.received", first])]
     if split:
         rows.append(NS(url=url, status="active", event_types=remaining))
@@ -612,3 +612,81 @@ def test_current_events_preserve_mention_only_thread_context(gw):
         assert client.interrupts == 0
 
     asyncio.run(scenario())
+
+
+def stop_event(**overrides):
+    payload = event(message_ts=None, thread_ts="1234567890.000001", message_kinds=[],
+                    event={"type": "agent_session_stopped", "streaming_message_ts": []}, **overrides)
+    payload["id"] = "stop-event"
+    payload["event_type"] = "slack.session_stopped"
+    return payload
+
+
+def test_native_stop_routes_to_existing_thread_and_deduplicates(gw):
+    async def scenario():
+        await gw._on_slack_received(event())
+        stop = stop_event()
+        await gw._route_inkbox_event(stop["event_type"], stop)
+        await gw._route_inkbox_event(stop["event_type"], stop)
+        assert len(gw.sessions.turns) == 2
+        original, control = gw.sessions.turns
+        assert original[0] == control[0]
+        assert control[1] == "/stop" and control[3]["slack_native_stop"]
+        assert control[3]["thread_ts"] == "1234567890.000001"
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("bad", ["identity", "sender", "unknown-thread", "missing-thread", "malformed"])
+def test_native_stop_respects_identity_sender_and_thread_boundaries(gw, bad):
+    async def scenario():
+        await gw._on_slack_received(event())
+        payload = stop_event()
+        if bad == "identity":
+            payload["data"]["identity_id"] = "another-identity"
+        elif bad == "sender":
+            gw.cfg.allowed_users = ["T_TEST:U_ALICE"]
+            payload["data"]["actor_id"] = "U_OTHER"
+        elif bad == "unknown-thread":
+            payload["data"]["thread_ts"] = "1234567890.000004"
+        elif bad == "missing-thread":
+            payload["data"]["thread_ts"] = None
+        else:
+            payload["data"]["event"] = {"type": "message", "text": "/stop"}
+        await gw._route_inkbox_event(payload["event_type"], payload)
+        assert len(gw.sessions.turns) == 1
+    asyncio.run(scenario())
+
+
+def test_signed_stop_webhook_requires_valid_signature(gw, monkeypatch):
+    import time
+    from unittest.mock import AsyncMock
+    from inkbox import verify_webhook
+    from inkbox_codex.webhook_providers import inkbox as verifier
+    from tests.test_webhook_providers import _sign
+    monkeypatch.setattr(verifier, "verify_webhook", verify_webhook)
+    gw.cfg.signing_key = "whsec_test"
+    async def scenario():
+        await gw._on_slack_received(event())
+        body = json.dumps(stop_event()).encode()
+        headers = _sign(body, "whsec_test", timestamp=str(int(time.time())))
+        request = NS(headers={**headers, "X-Inkbox-Signature": "bad"},
+                     url="https://agent.example/webhook", read=AsyncMock(return_value=body))
+        assert (await gw._handle_webhook(request)).status == 401
+        assert len(gw.sessions.turns) == 1
+        request.headers = headers
+        assert (await gw._handle_webhook(request)).status == 200
+        assert len(gw.sessions.turns) == 2
+    asyncio.run(scenario())
+
+
+def test_existing_message_subscription_adds_only_native_stop(gw):
+    client = Mock()
+    url = "https://agent.example/webhook"
+    client.webhooks.subscriptions.list.return_value = [NS(
+        url=url, status="active", event_types=[event for event in SLACK_SUBSCRIPTION_EVENTS
+                                                if event != "slack.session_stopped"],
+    )]
+    reconcile_subscription(client, IDENTITY, url)
+    client.webhooks.subscriptions.create.assert_called_once_with(
+        agent_identity_id=IDENTITY, url=url, event_types=["slack.session_stopped"],
+    )

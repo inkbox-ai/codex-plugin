@@ -57,7 +57,7 @@ jobs:
           from inkbox.slack import SlackResource
           from inkbox.webhook_subscriptions import WebhookSubscriptionsResource
           assert callable(SlackResource.list_provisioning_workspaces)
-          assert callable(SlackResource.add_reaction)
+          assert callable(SlackResource.set_processing_status)
           assert callable(SlackResource.remove_reaction)
           assert "scope" in inspect.signature(WebhookSubscriptionsResource.list).parameters
           PY

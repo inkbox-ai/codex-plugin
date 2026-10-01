@@ -1,4 +1,4 @@
-"""Best-effort, ordered Slack turn reactions with restart cleanup."""
+"""Best-effort, ordered native Slack status with restart cleanup."""
 
 from __future__ import annotations
 
@@ -16,13 +16,11 @@ class SlackActivity:
     def __init__(self, resource, state_path: Path):
         self.resource = resource
         self.state_path = state_path
-        self._active: dict[str, set[str]] = {}
-        self._failed: set[str] = set()
+        self._active: dict[str, dict[str, str]] = {}
         self._records: dict[str, dict] = {}
         self._tails: dict[str, asyncio.Task] = {}
         self._closing = False
-        self._supported = all(callable(getattr(resource, name, None))
-                              for name in ("add_reaction", "remove_reaction"))
+        self._supported = callable(getattr(resource, "set_processing_status", None))
 
     def _persist(self) -> None:
         try:
@@ -36,8 +34,7 @@ class SlackActivity:
 
     async def recover(self) -> None:
         if not self._supported:
-            logger.warning("Slack activity reactions need an SDK with reaction support")
-            return
+            logger.warning("Slack native status needs an SDK with processing-status support")
         try:
             records = json.loads(self.state_path.read_text())
         except FileNotFoundError:
@@ -51,11 +48,18 @@ class SlackActivity:
         for key, record in records.items():
             if (not isinstance(record, dict)
                     or not all(isinstance(record.get(field), str) and record[field]
-                               for field in ("connection_id", "conversation_id", "message_ts", "token"))
-                    or record.get("state") not in {"active", "completed", "failed", "cancelled"}):
+                               for field in ("connection_id", "conversation_id", "token"))):
                 continue
-            if record["state"] == "active":
-                record = {**record, "state": "failed"}
+            if isinstance(record.get("thread_ts"), str) and record["thread_ts"]:
+                if record.get("state") not in {"processing", "suspended", "active"}:
+                    continue
+                if record["state"] != "active":
+                    record = {**record, "state": "active", "token": uuid4().hex}
+            elif isinstance(record.get("message_ts"), str) and record["message_ts"]:
+                # Retire indicators left by the previous reaction-based implementation.
+                record = {**record, "state": "completed"}
+            else:
+                continue
             valid[key] = record
         self._records.update(valid)
         for key, record in valid.items():
@@ -64,34 +68,36 @@ class SlackActivity:
     async def notify(self, _chat_id: str, mode: str, meta: dict, state: str) -> None:
         if mode != "slack" or self._closing or not self._supported:
             return
-        anchor = meta.get("message_ts")
-        fields = [meta.get("connection_id"), meta.get("conversation_id"), anchor]
+        # A status on an unthreaded DM would open a thread we do not reply into.
+        fields = [meta.get("connection_id"), meta.get("conversation_id"), meta.get("thread_ts")]
         event_id = meta.get("source_event_id")
         if not all(isinstance(value, str) and value for value in [*fields, event_id]):
             return
         key = hashlib.sha256(json.dumps(fields).encode()).hexdigest()
-        active = self._active.get(key, set())
+        active = self._active.get(key, {})
         if state == "accepted":
             if event_id in active:
                 return
-            active.add(event_id)
-            self._active[key] = active
-            if len(active) > 1:
-                return
-            self._failed.discard(key)
-            desired = "active"
-        else:
+            active[event_id] = "processing"
+        elif state in {"waiting", "resumed"}:
             if event_id not in active:
                 return
-            active.remove(event_id)
-            if state == "failed":
-                self._failed.add(key)
-            if active:
+            active[event_id] = "suspended" if state == "waiting" else "processing"
+        elif state in {"completed", "failed", "cancelled"}:
+            if event_id not in active:
                 return
+            active.pop(event_id)
+        else:
+            return
+        if active:
+            self._active[key] = active
+            desired = "suspended" if "suspended" in active.values() else "processing"
+        else:
             self._active.pop(key, None)
-            desired = "failed" if key in self._failed else state
-            self._failed.discard(key)
-        self._schedule(key, dict(zip(("connection_id", "conversation_id", "message_ts"), fields),
+            desired = "active"
+        if self._records.get(key, {}).get("state") == desired:
+            return
+        self._schedule(key, dict(zip(("connection_id", "conversation_id", "thread_ts"), fields),
                                  state=desired, token=uuid4().hex))
 
     def _schedule(self, key: str, record: dict) -> None:
@@ -111,27 +117,34 @@ class SlackActivity:
         if previous is not None:
             await previous
         state = record["state"]
-        changes = [("remove", "x"), ("add", "eyes")] if state == "active" else [
-            ("remove", "eyes"), ("add" if state == "failed" else "remove", "x"),
+        native = "thread_ts" in record
+        changes = [("set_processing_status", record["thread_ts"], state)] if native else [
+            ("remove_reaction", record["message_ts"], "eyes"),
+            ("remove_reaction", record["message_ts"], "x"),
         ]
         succeeded = True
-        for verb, name in changes:
+        for method, timestamp, value in changes:
             operation_key = hashlib.sha256(
-                f"{key}:{record['token']}:{state}:{verb}:{name}".encode()
+                f"{key}:{record['token']}:{state}:{method}:{value}".encode()
             ).hexdigest()
             try:
                 operation = await asyncio.to_thread(
-                    getattr(self.resource, f"{verb}_reaction"),
-                    record["connection_id"], record["conversation_id"], record["message_ts"], name,
+                    getattr(self.resource, method),
+                    record["connection_id"], record["conversation_id"], timestamp, value,
                     idempotency_key=f"codex:activity:{operation_key}",
                 )
                 if operation.status != "succeeded":
                     succeeded = False
-                    logger.warning("Slack activity reaction was not confirmed; the agent turn is unaffected")
+                    code = getattr(operation, "error_code", None)
+                    reason = code if code in {"feature_disabled", "missing_scope", "not_allowed_token_type",
+                                              "channel_not_found", "thread_ts_required"} else "unconfirmed"
+                    logger.warning("Slack native status/cleanup not confirmed (%s); the agent turn is unaffected", reason)
+                elif native:
+                    logger.info("Slack native status confirmed: %s", state)
             except Exception:
                 succeeded = False
-                logger.warning("Slack activity reaction failed; check connection permissions and API availability")
-        if succeeded and state != "active" and self._records.get(key) is record:
+                logger.warning("Slack native status/cleanup failed; check connection permissions and API availability")
+        if succeeded and state in {"active", "completed"} and self._records.get(key) is record:
             self._records.pop(key, None)
             self._persist()
 
@@ -144,7 +157,7 @@ class SlackActivity:
         for key in self._active:
             record = self._records.get(key)
             if record is not None:
-                self._schedule(key, {**record, "state": "cancelled", "token": uuid4().hex})
+                self._schedule(key, {**record, "state": "active", "token": uuid4().hex})
         self._active.clear()
         try:
             await asyncio.wait_for(self.flush(), timeout=5)

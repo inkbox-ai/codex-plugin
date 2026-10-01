@@ -18,6 +18,8 @@ SLACK_INCOMING_EVENTS = (
 SLACK_ATTENTION_EVENTS = tuple(
     event for event in SLACK_INCOMING_EVENTS if event != "slack.channel_message_received"
 )
+SLACK_STOP_EVENT = "slack.session_stopped"
+SLACK_SUBSCRIPTION_EVENTS = (*SLACK_ATTENTION_EVENTS, SLACK_STOP_EVENT)
 SLACK_MAX_TEXT_LENGTH = 12000
 
 
@@ -31,7 +33,7 @@ def slack_resource(client: Any) -> Any:
 def reconcile_subscription(client: Any, identity_id: Any, url: str) -> None:
     slack_resource(client)
     subscriptions = client.webhooks.subscriptions
-    events = list(SLACK_ATTENTION_EVENTS)
+    events = list(SLACK_SUBSCRIPTION_EVENTS)
     covered = set()
     for sub in subscriptions.list(agent_identity_id=identity_id, scope="identity", url=url):
         overlap = set(sub.event_types) & set(events)
@@ -111,6 +113,25 @@ def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] |
     if sender_context:
         meta["slack_sender_context"] = sender_context
     return chat_id, body, meta
+
+
+def inbound_stop(envelope: dict, identity_id: str) -> tuple[str, str, dict] | None:
+    data = envelope.get("data")
+    if not isinstance(data, dict) or envelope.get("event_type") != SLACK_STOP_EVENT:
+        return None
+    event = data.get("event")
+    if not isinstance(event, dict) or event.get("type") != "agent_session_stopped":
+        return None
+    thread = data.get("thread_ts")
+    if not isinstance(thread, str) or not thread:
+        return None
+    incoming = inbound_message({**envelope, "data": {
+        **data, "message_ts": thread, "message_kinds": ["thread"],
+        "event": {"type": "message", "text": "/stop"},
+    }}, identity_id)
+    if incoming is not None:
+        incoming[2]["slack_native_stop"] = True
+    return incoming
 
 
 def send_reply(client: Any, meta: dict, text: str) -> Any:

@@ -591,6 +591,10 @@ class ContactSession:
         meta = dict(meta or {})
         raw_text = str(meta.get("raw_text", text))
         command = _control_command(raw_text)
+        if mode == "slack" and meta.get("slack_native_stop") and command == "stop":
+            self.mode, self.reply_meta = mode, meta
+            await self._stop_turn()
+            return
         is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
         pending_reply = self.pending is not None and not self.pending.future.done()
         if is_group and pending_reply:
@@ -694,7 +698,7 @@ class ContactSession:
             turn.activity_started = True
         elif not turn.activity_started:
             return
-        else:
+        elif state in {"completed", "failed", "cancelled"}:
             turn.activity_started = False
         try:
             await self.turn_activity_fn(self.chat_id, "slack", turn.reply_meta or {}, state)
@@ -1385,7 +1389,10 @@ class ContactSession:
                 else "\nInclude @agent before your answer (for example, @agent allow)."
             )
         sending = asyncio.create_task(self._reply(prompt_text, turn=self._current_turn))
+        turn = self._current_turn
         try:
+            if turn is not None:
+                await self._notify_turn_activity(turn, "waiting")
             done, _ = await asyncio.wait({sending, pending.future}, return_when=asyncio.FIRST_COMPLETED)
             if pending.future in done and (pending.future.cancelled() or pending.future.result() is None):
                 return None
@@ -1403,6 +1410,8 @@ class ContactSession:
                 pending.future.cancel()
             if self.pending is pending:
                 self.pending = None
+            if turn is not None and not self._interrupting:
+                await self._notify_turn_activity(turn, "resumed")
 
     def _reply_route(self, turn: Optional[_Turn] = None) -> tuple[str, Dict[str, Any]]:
         if turn is not None and turn.reply_mode is not None and turn.reply_meta is not None:
