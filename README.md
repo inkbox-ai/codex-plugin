@@ -239,16 +239,18 @@ and declining full reconfiguration still offers Slack onboarding. Declining Slac
 turns it off only in this bridge; it does not disconnect the workspace or disable
 Slack for other clients. On startup, the gateway registers the subscriptions below.
 
-**Work indicators.** Accepted Slack requests use the native agent
+**Work indicators.** Accepted threaded Slack requests use the native agent
 loading indicator, without adding reaction bubbles. It stays while work is queued
 or running, switches to awaiting-input during questions or approvals, and returns
 to ready after completion, failure, or cancellation. Overlapping requests in the
 same thread share one indicator. Mention-mode context does not start it.
 Slack's native Stop button cancels work in the matching engaged thread, subject to
-the same allowed-sender policy. A new main-DM message starts a thread beneath that
-message; the indicator and answer use that same thread. Continue there for
-follow-ups, approval answers, and commands. A new main-DM message starts a separate
-conversation; existing threaded conversations keep their saved context.
+the same allowed-sender policy. Ordinary main-DM messages receive replies in the
+main DM and share conversation context, without a native status indicator.
+An explicit native @mention starts a thread beneath that message; messages already
+inside a thread stay there. Threaded replies and their indicators use the same
+thread. Continue there for follow-ups, approval answers, and commands; each thread
+keeps its own saved context.
 Native status needs an app declared as a Slack Agent (including `assistant:write`),
 `chat:write`, SDK processing-status support, and workspace feature availability.
 Existing installations may need an app-configuration update and reauthorization.

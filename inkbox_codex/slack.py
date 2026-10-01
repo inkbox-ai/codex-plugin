@@ -71,11 +71,11 @@ def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] |
     if thread_ts is not None and not isinstance(thread_ts, str):
         return None
     direct = "dm" in kinds
-    # Native status opens a DM thread, so replies and follow-ups must share it.
-    root = thread_ts or data["message_ts"]
+    # Keep ordinary DMs in the main conversation; native mentions can start a thread.
+    root = thread_ts or (None if direct and "mention" not in kinds else data["message_ts"])
     # Timestamps are opaque strings: converting them to floats loses precision.
     chat_id = "slack:" + ":".join(
-        [identity_id, data["connection_id"], data["conversation_id"], root]
+        [identity_id, data["connection_id"], data["conversation_id"], root or "dm"]
     )
     raw = event.get("text") or ""
     if not isinstance(raw, str):

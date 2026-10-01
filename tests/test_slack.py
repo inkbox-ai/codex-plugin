@@ -115,22 +115,47 @@ def test_retry_after_session_admission_failure(gw):
     assert len(gw.sessions.turns) == 1
 
 
-def test_dm_request_and_followup_share_thread_but_new_requests_are_isolated():
+def test_ordinary_dms_share_context_but_explicit_threads_are_isolated():
     top = inbound_message(event(conversation_id="D_TEST", message_kinds=["dm"]), IDENTITY)
     threaded = inbound_message(event(conversation_id="D_TEST", message_kinds=["dm", "thread"],
                                      thread_ts="1234567890.000001"), IDENTITY)
-    assert top[0] == threaded[0]
-    assert top[2]["thread_ts"] == "1234567890.000001"
+    assert top[0] != threaded[0]
+    assert top[2]["thread_ts"] is None
     assert threaded[2]["thread_ts"] == "1234567890.000001"
     assert top[2]["conversation_kind"] == threaded[2]["conversation_kind"] == "direct"
     new_request = inbound_message(event(conversation_id="D_TEST", message_kinds=["dm"],
                                         message_ts="1234567890.000002"), IDENTITY)
-    assert new_request[0] != top[0]
-    assert new_request[2]["thread_ts"] == "1234567890.000002"
+    assert new_request[0] == top[0]
+    assert new_request[2]["thread_ts"] is None
+    thread_followup = inbound_message(event(
+        conversation_id="D_TEST", message_kinds=["dm", "thread"],
+        thread_ts="1234567890.000001", message_ts="1234567890.000003",
+    ), IDENTITY)
+    assert thread_followup[0] == threaded[0]
     other_dm = inbound_message(event(conversation_id="D_OTHER", message_kinds=["dm"]), IDENTITY)
     assert other_dm[0] != top[0]
     other_workspace = inbound_message(event(connection_id="another-connection"), IDENTITY)
     assert other_workspace[0] != inbound_message(event(), IDENTITY)[0]
+
+
+def test_native_dm_mention_starts_thread_and_followups_keep_its_context():
+    mentioned = inbound_message(event(
+        conversation_id="D_TEST", message_kinds=["dm", "mention"],
+    ), IDENTITY)
+    followup = inbound_message(event(
+        conversation_id="D_TEST", message_kinds=["dm", "thread"],
+        thread_ts="1234567890.000001", message_ts="1234567890.000002",
+    ), IDENTITY)
+    ordinary = inbound_message(event(
+        conversation_id="D_TEST", message_kinds=["dm"], message_ts="1234567890.000003",
+    ), IDENTITY)
+    assert mentioned[2]["thread_ts"] == "1234567890.000001"
+    assert mentioned[0] == followup[0] != ordinary[0]
+    another_mention = inbound_message(event(
+        conversation_id="D_TEST", message_kinds=["dm", "mention"],
+        message_ts="1234567890.000004",
+    ), IDENTITY)
+    assert another_mention[0] != mentioned[0]
 
 
 def test_files_are_metadata_not_claimed_downloads():
@@ -176,16 +201,23 @@ def test_watched_sessions_survive_manager_restart(tmp_path, monkeypatch):
     assert restarted.has_session(key)
 
 
-def test_replies_preserve_formatting_thread_and_idempotency(gw):
+@pytest.mark.parametrize("overrides,reply_thread", [
+    ({}, "1234567890.000001"),
+    ({"conversation_id": "D_TEST", "message_kinds": ["dm"]}, None),
+    ({"conversation_id": "D_TEST", "message_kinds": ["dm", "mention"]}, "1234567890.000001"),
+    ({"conversation_id": "D_TEST", "message_kinds": ["dm", "thread"],
+      "thread_ts": "1234567880.000001"}, "1234567880.000001"),
+])
+def test_replies_preserve_formatting_thread_and_idempotency(gw, overrides, reply_thread):
     client = Mock()
     client.slack.send_message.return_value = NS(id="action-1", status="sent")
     gw._inkbox = client
-    _, _, meta = inbound_message(event(), IDENTITY)
+    _, _, meta = inbound_message(event(**overrides), IDENTITY)
     asyncio.run(gw.send_to_contact("session", "*hello*\n```code```", "slack", meta))
     first = client.slack.send_message.call_args
     send_reply(client, meta, "*hello*\n```code```")
     assert client.slack.send_message.call_args == first
-    assert first.kwargs["thread_ts"] == "1234567890.000001"
+    assert first.kwargs["thread_ts"] == reply_thread
     assert first.kwargs["text"] == "*hello*\n```code```"
     send_reply(client, {**meta, "source_event_id": "evt_2"}, "*hello*\n```code```")
     assert client.slack.send_message.call_args.kwargs["idempotency_key"] != first.kwargs["idempotency_key"]

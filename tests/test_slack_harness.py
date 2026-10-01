@@ -105,13 +105,15 @@ def test_receiver_can_start_before_workspace_installation(tmp_path, monkeypatch,
     assert calls == ["run", "cleanup"]
 
 
-@pytest.mark.parametrize("event_type,kinds,conversation,thread", [
-    ("slack.dm_received", ["dm"], "D_TEST", None),
-    ("slack.group_dm_received", ["group_dm"], "G_TEST", None),
-    ("slack.mention_received", ["channel", "mention"], "C_TEST", None),
-    ("slack.thread_reply_received", ["channel", "thread"], "C_TEST", "1234567890.000001"),
+@pytest.mark.parametrize("event_type,kinds,conversation,thread,reply_thread", [
+    ("slack.dm_received", ["dm"], "D_TEST", None, None),
+    ("slack.dm_received", ["dm", "mention"], "D_TEST", None, "1234567890.000001"),
+    ("slack.thread_reply_received", ["dm", "thread"], "D_TEST", "1234567880.000001", "1234567880.000001"),
+    ("slack.group_dm_received", ["group_dm"], "G_TEST", None, "1234567890.000001"),
+    ("slack.mention_received", ["channel", "mention"], "C_TEST", None, "1234567890.000001"),
+    ("slack.thread_reply_received", ["channel", "thread"], "C_TEST", "1234567890.000001", "1234567890.000001"),
 ])
-def test_signed_http_event_runs_session_and_posts_one_reply(tmp_path, monkeypatch, event_type, kinds, conversation, thread):
+def test_signed_http_event_runs_session_and_posts_one_reply(tmp_path, monkeypatch, event_type, kinds, conversation, thread, reply_thread):
     from aiohttp import ClientSession, web
     from inkbox_codex.webhook_providers import inkbox as verifier
     from inkbox import verify_webhook
@@ -169,13 +171,13 @@ def test_signed_http_event_runs_session_and_posts_one_reply(tmp_path, monkeypatc
                 assert client.slack.send_message.call_count == 1
                 assert call.args == (CONNECTION,)
                 assert call.kwargs["conversation_id"] == conversation
-                assert call.kwargs["thread_ts"] == "1234567890.000001"
+                assert call.kwargs["thread_ts"] == reply_thread
                 assert call.kwargs["text"] == "*Hello from Codex*"
                 status_calls = client.slack.set_processing_status.call_args_list
-                assert [call.args for call in status_calls] == [
-                    (CONNECTION, conversation, "1234567890.000001", "processing"),
-                    (CONNECTION, conversation, "1234567890.000001", "active"),
-                ]
+                assert [call.args for call in status_calls] == ([
+                    (CONNECTION, conversation, reply_thread, "processing"),
+                    (CONNECTION, conversation, reply_thread, "active"),
+                ] if reply_thread else [])
                 unrelated = json.dumps({"event_type": "text.received", "companion": {"test": True}}).encode()
                 async with http.post(url, data=unrelated) as response:
                     assert (await response.json())["ignored"] == "non-slack"
