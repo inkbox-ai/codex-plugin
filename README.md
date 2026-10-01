@@ -239,10 +239,11 @@ and declining full reconfiguration still offers Slack onboarding. Declining Slac
 turns it off only in this bridge; it does not disconnect the workspace or disable
 Slack for other clients. On startup, the gateway registers the subscriptions below.
 
-**Work indicators.** An accepted Slack request adds 👀 to the thread's root
-message (or the triggering message in an unthreaded DM). It stays while requests
-for that anchor are queued or running. Completion removes it; a failed turn or
-failed reply delivery replaces it with ❌. New work clears a previous failure.
+**Work indicators.** An accepted Slack request adds 👀 to your incoming message,
+including replies deep inside a thread. It stays while work for that message is
+queued or running. Completion removes it; a failed turn or failed reply delivery
+replaces it with ❌ on that same message. Each message has its own status;
+retrying work on that message clears its previous failure.
 Mention-mode context, local commands, and approval answers do not create another
 indicator. Stopping work clears the busy indicator without marking a failure.
 After an unexpected gateway exit, restart cleanup marks unfinished work failed.

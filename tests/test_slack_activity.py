@@ -29,25 +29,25 @@ def changes(sdk):
 
 @pytest.mark.parametrize("outcome,terminal", [("completed", "remove_reaction"),
                                               ("failed", "add_reaction"), ("cancelled", "remove_reaction")])
-def test_activity_lifecycle_targets_anchor_and_cleans_up(tmp_path, outcome, terminal):
+def test_activity_lifecycle_targets_incoming_message_not_thread_root(tmp_path, outcome, terminal):
     async def scenario():
         sdk = resource()
         tracker = SlackActivity(sdk, tmp_path / "activity.json")
         await tracker.notify("chat", "slack", route(), "accepted")
         await tracker.flush()
-        assert changes(sdk) == [("remove_reaction", "1234567890.000001", "x"),
-                                ("add_reaction", "1234567890.000001", "eyes")]
+        assert changes(sdk) == [("remove_reaction", "1234567890.000002", "x"),
+                                ("add_reaction", "1234567890.000002", "eyes")]
         await tracker.notify("chat", "slack", route(), outcome)
         await tracker.flush()
-        assert changes(sdk)[-2:] == [("remove_reaction", "1234567890.000001", "eyes"),
-                                    (terminal, "1234567890.000001", "x")]
+        assert changes(sdk)[-2:] == [("remove_reaction", "1234567890.000002", "eyes"),
+                                    (terminal, "1234567890.000002", "x")]
         assert json.loads(tracker.state_path.read_text()) == {}
         keys = [call.kwargs["idempotency_key"] for call in sdk.mock_calls]
         assert len(set(keys)) == 4 and all(len(key) <= 128 for key in keys)
     asyncio.run(scenario())
 
 
-def test_overlapping_turns_and_duplicate_admission_do_not_clear_busy_anchor(tmp_path):
+def test_overlapping_turns_and_duplicate_admission_do_not_clear_busy_message(tmp_path):
     async def scenario():
         sdk = resource()
         tracker = SlackActivity(sdk, tmp_path / "activity.json")
@@ -59,7 +59,35 @@ def test_overlapping_turns_and_duplicate_admission_do_not_clear_busy_anchor(tmp_
         assert len(sdk.mock_calls) == 2
         await tracker.notify("chat", "slack", route("event-2"), "completed")
         await tracker.flush()
-        assert changes(sdk)[-1] == ("remove_reaction", "1234567890.000001", "x")
+        assert changes(sdk)[-1] == ("remove_reaction", "1234567890.000002", "x")
+    asyncio.run(scenario())
+
+
+def test_messages_in_same_thread_have_independent_work_and_failure_indicators(tmp_path):
+    async def scenario():
+        sdk = resource()
+        tracker = SlackActivity(sdk, tmp_path / "activity.json")
+        first = route()
+        second = route("event-2", "1234567890.000003")
+        await tracker.notify("chat", "slack", first, "accepted")
+        await tracker.notify("chat", "slack", second, "accepted")
+        await tracker.flush()
+        assert {call.args[2] for call in sdk.add_reaction.call_args_list} == {
+            first["message_ts"], second["message_ts"],
+        }
+        sdk.reset_mock()
+        await tracker.notify("chat", "slack", first, "failed")
+        await tracker.flush()
+        assert changes(sdk) == [("remove_reaction", first["message_ts"], "eyes"),
+                                ("add_reaction", first["message_ts"], "x")]
+        records = json.loads(tracker.state_path.read_text())
+        assert [record["message_ts"] for record in records.values()] == [second["message_ts"]]
+        sdk.reset_mock()
+        await tracker.notify("chat", "slack", second, "completed")
+        await tracker.flush()
+        assert changes(sdk) == [("remove_reaction", second["message_ts"], "eyes"),
+                                ("remove_reaction", second["message_ts"], "x")]
+        assert json.loads(tracker.state_path.read_text()) == {}
     asyncio.run(scenario())
 
 
@@ -73,12 +101,12 @@ def test_process_restart_marks_unfinished_work_failed_and_new_work_clears_failur
         restarted = SlackActivity(sdk, path)
         await restarted.recover()
         await restarted.flush()
-        assert changes(sdk)[-2:] == [("remove_reaction", "1234567890.000001", "eyes"),
-                                    ("add_reaction", "1234567890.000001", "x")]
+        assert changes(sdk)[-2:] == [("remove_reaction", "1234567890.000002", "eyes"),
+                                    ("add_reaction", "1234567890.000002", "x")]
         await restarted.notify("chat", "slack", route("event-2"), "accepted")
         await restarted.flush()
-        assert changes(sdk)[-2:] == [("remove_reaction", "1234567890.000001", "x"),
-                                    ("add_reaction", "1234567890.000001", "eyes")]
+        assert changes(sdk)[-2:] == [("remove_reaction", "1234567890.000002", "x"),
+                                    ("add_reaction", "1234567890.000002", "eyes")]
         await restarted.close()
         assert json.loads(path.read_text()) == {}
     asyncio.run(scenario())
@@ -229,13 +257,13 @@ def test_reaction_lifecycle_through_actual_sdk_http_transport(tmp_path, monkeypa
     def handle(request):
         assert request.headers["X-API-Key"] == "test-key"
         assert request.headers["Idempotency-Key"].startswith("codex:activity:")
-        prefix = f"/api/v1/slack/connections/{route()['connection_id']}/conversations/C123/messages/1234567890.000001/reactions"
+        prefix = f"/api/v1/slack/connections/{route()['connection_id']}/conversations/C123/messages/1234567890.000002/reactions"
         requests.append((request.method, request.url.path, json.loads(request.content) if request.content else None))
         assert request.url.path in (prefix, prefix + "/eyes", prefix + "/x")
         return httpx.Response(200, json={
             "id": "00000000-0000-4000-8000-000000000002", "connection_id": route()["connection_id"],
             "operation": "reaction_add" if request.method == "POST" else "reaction_remove",
-            "status": "succeeded", "conversation_id": "C123", "message_ts": "1234567890.000001",
+            "status": "succeeded", "conversation_id": "C123", "message_ts": "1234567890.000002",
         })
     monkeypatch.setattr(httpx, "HTTPTransport", lambda **kwargs: httpx.MockTransport(handle))
     async def scenario():

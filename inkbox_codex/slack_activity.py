@@ -64,7 +64,7 @@ class SlackActivity:
     async def notify(self, _chat_id: str, mode: str, meta: dict, state: str) -> None:
         if mode != "slack" or self._closing or not self._supported:
             return
-        anchor = meta.get("thread_ts") or meta.get("message_ts")
+        anchor = meta.get("message_ts")
         fields = [meta.get("connection_id"), meta.get("conversation_id"), anchor]
         event_id = meta.get("source_event_id")
         if not all(isinstance(value, str) and value for value in [*fields, event_id]):
