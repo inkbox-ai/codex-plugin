@@ -225,6 +225,9 @@ If you need to add a provisioning workspace or renew its credentials, the wizard
 prompts for a masked Slack app-configuration access/refresh token pair from
 [Your App Configuration Tokens](https://api.slack.com/apps). Inkbox verifies and
 stores the pair for your organization; the bridge does not save it locally.
+If the pair is rejected, setup explains the credential issue and offers another
+attempt without leaving the wizard. Other errors identify the failed step and
+HTTP status when available; they do not silently retry app creation or expose tokens.
 These are not bot tokens. Each identity's app is permanently bound to one
 workspace. Existing connections need no new installation; manage permission
 refreshes in the Inkbox console. After installation, add the bot to the channels

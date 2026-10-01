@@ -278,13 +278,106 @@ def test_unknown_creation_outcome_never_retries_or_requests_credentials(setup, m
 
 
 @pytest.mark.parametrize("status,available", [("needs_credentials", False), ("ready", False)])
-def test_preparation_stops_when_credentials_or_installation_unavailable(setup, status, available, capsys):
+def test_preparation_stops_when_credentials_or_installation_unavailable(setup, monkeypatch, status, available, capsys):
     setup.resource.list_connections.side_effect = [snapshot("pending"), snapshot(status, available=available)]
+    answers = iter([True, True, False])
+    monkeypatch.setattr(wizard, "prompt_yes_no", lambda *a: next(answers))
     assert setup.run() is True
     setup.resource.start_setup.assert_not_called()
     setup.resource.start_installation.assert_not_called()
     assert setup.now[0] == 0
-    assert "Slack connected" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Slack connected" not in out and "Could not finish Slack setup" not in out
+
+
+@pytest.mark.parametrize("status,detail", [
+    (422, "do-not-print-response-or-tokens"),
+    (409, {"code": "credentials_required", "message": "do-not-print-response-or-tokens"}),
+    (409, "Generate a separate app-configuration token pair for this organization."),
+    (409, "Use app-configuration tokens from the Slack user who created these apps."),
+])
+def test_rejected_credentials_offer_another_pair_and_finish_setup(setup, monkeypatch, capsys, status, detail):
+    setup.resource.list_provisioning_workspaces.return_value = []
+    setup.resource.list_connections.side_effect = [
+        snapshot("needs_credentials", bound=False), snapshot(), snapshot(connections=[connection()]),
+    ]
+    error = RuntimeError("do-not-print-response-or-tokens")
+    error.status_code, error.detail = status, detail
+    setup.resource.save_provisioning_workspace.side_effect = [error, workspace()]
+    credentials = iter(["access-first", "refresh-first", "access-second", "refresh-second"])
+    monkeypatch.setattr(wizard, "prompt", lambda *a, **kw: next(credentials))
+    questions = []
+    monkeypatch.setattr(wizard, "prompt_yes_no", lambda question, default: questions.append(question) or True)
+
+    assert setup.run() is True
+    assert setup.resource.save_provisioning_workspace.call_count == 2
+    assert setup.resource.save_provisioning_workspace.call_args.kwargs == {
+        "access_token": "access-second", "refresh_token": "refresh-second",
+    }
+    assert any("another app-configuration token pair" in q for q in questions)
+    setup.resource.start_setup.assert_called_once_with("identity-1", "saved-workspace-1")
+    out = capsys.readouterr().out
+    assert "No saved Slack workspaces" in out
+    assert "Slack connected" in out
+    assert all(secret not in out for secret in (
+        "do-not-print-response-or-tokens", "access-first", "refresh-first", "access-second", "refresh-second",
+    ))
+    assert setup.env.read_text() == "INKBOX_SLACK_ENABLED=true\n"
+
+
+def test_declining_credential_retry_does_not_create_app(setup, monkeypatch, capsys):
+    setup.resource.list_provisioning_workspaces.return_value = []
+    setup.resource.list_connections.return_value = snapshot("needs_credentials", bound=False)
+    error = RuntimeError("secret-response")
+    error.status_code = 422
+    setup.resource.save_provisioning_workspace.side_effect = error
+    tokens = iter(["access", "refresh"])
+    answers = iter([True, True, False])
+    monkeypatch.setattr(wizard, "prompt", lambda *a, **kw: next(tokens))
+    monkeypatch.setattr(wizard, "prompt_yes_no", lambda *a: next(answers))
+
+    assert setup.run() is True
+    setup.resource.save_provisioning_workspace.assert_called_once()
+    setup.resource.start_setup.assert_not_called()
+    setup.resource.start_installation.assert_not_called()
+    out = capsys.readouterr().out
+    assert "Slack rejected" in out and "secret-response" not in out
+
+
+@pytest.mark.parametrize("status", [401, 403, 409, 503, None])
+def test_noncredential_failure_reports_the_step_without_replaying_save(setup, monkeypatch, capsys, status):
+    setup.resource.list_provisioning_workspaces.return_value = []
+    setup.resource.list_connections.return_value = snapshot("needs_credentials", bound=False)
+    error = RuntimeError("secret-response")
+    error.status_code = status
+    error.detail = {"code": "unexpected", "input": "secret-response"}
+    setup.resource.save_provisioning_workspace.side_effect = error
+    tokens = iter(["access", "refresh"])
+    monkeypatch.setattr(wizard, "prompt", lambda *a, **kw: next(tokens))
+
+    assert setup.run() is True
+    setup.resource.save_provisioning_workspace.assert_called_once()
+    setup.resource.start_setup.assert_not_called()
+    out = capsys.readouterr().out
+    assert "saving workspace credentials" in out and "secret-response" not in out
+    if status:
+        assert f"HTTP {status}" in out
+
+
+def test_preparation_can_renew_credentials_and_resume_without_leaving_wizard(setup, monkeypatch, capsys):
+    setup.resource.list_connections.side_effect = [
+        snapshot("pending"), snapshot("needs_credentials"), snapshot(), snapshot(connections=[connection()]),
+    ]
+    tokens = iter(["renewed-access", "renewed-refresh"])
+    monkeypatch.setattr(wizard, "prompt", lambda *a, **kw: next(tokens))
+    monkeypatch.setattr(wizard, "prompt_yes_no", lambda *a: True)
+
+    assert setup.run() is True
+    setup.resource.save_provisioning_workspace.assert_called_once_with(
+        access_token="renewed-access", refresh_token="renewed-refresh")
+    setup.resource.start_setup.assert_called_once_with("identity-1", "saved-workspace-1")
+    setup.resource.start_installation.assert_called_once()
+    assert "Slack connected" in capsys.readouterr().out
 
 
 def test_new_workspace_uses_masked_pair_without_local_persistence(setup, monkeypatch, capsys):
@@ -330,6 +423,8 @@ def test_bound_workspace_credential_renewal_cannot_move_app(setup, monkeypatch, 
         id="saved-workspace-1" if matching else "saved-workspace-other")
     answers = iter(["xoxe.xoxp-synthetic-access", "xoxe-synthetic-refresh"])
     monkeypatch.setattr(wizard, "prompt", lambda *a, **kw: next(answers))
+    retries = iter([True, True, False])
+    monkeypatch.setattr(wizard, "prompt_yes_no", lambda *a: next(retries))
     monkeypatch.setattr(wizard, "prompt_choice", lambda *a: pytest.fail("bound app cannot choose workspace"))
     assert setup.run() is True
     setup.resource.list_provisioning_workspaces.assert_not_called()
@@ -362,9 +457,9 @@ def test_app_without_binding_is_not_recreated(setup, capsys):
     assert "no available workspace binding" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("new_workspace", [False, True])
+@pytest.mark.parametrize("new_workspace,reject_first", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("claimed", [False, True])
-def test_onboarding_through_slack_sdk_wire_contract(setup, monkeypatch, capsys, new_workspace, claimed):
+def test_onboarding_through_slack_sdk_wire_contract(setup, monkeypatch, capsys, new_workspace, reject_first, claimed):
     """Run actual SDK parsers/builders; removed identity mutations and invitations fail."""
     import json
 
@@ -383,10 +478,12 @@ def test_onboarding_through_slack_sdk_wire_contract(setup, monkeypatch, capsys, 
         "user_id": "UADMIN", "status": "ready", "token_expires_at": "2030-01-01T12:00:00Z",
         "created_at": "2030-01-01T00:00:00Z", "updated_at": "2030-01-01T00:00:00Z",
     }
-    state = {"started": False, "polls": 0, "installed": False}
+    state = {"started": False, "polls": 0, "installed": False, "saves": 0}
     requests = []
-    answers = iter(["xoxe.xoxp-synthetic-access", "xoxe-synthetic-refresh"])
+    answers = iter((["invalid-access", "invalid-refresh"] if reject_first else [])
+                   + ["xoxe.xoxp-synthetic-access", "xoxe-synthetic-refresh"])
     monkeypatch.setattr(wizard, "prompt", lambda *a, **kw: next(answers))
+    monkeypatch.setattr(wizard, "prompt_yes_no", lambda *a: True)
 
     def handle(request):
         assert request.headers["X-API-Key"] == "runtime-key"
@@ -409,6 +506,10 @@ def test_onboarding_through_slack_sdk_wire_contract(setup, monkeypatch, capsys, 
             if request.method == "GET":
                 return httpx.Response(200, json={"workspaces": [] if new_workspace else [saved]})
             assert request.method == "POST" and new_workspace
+            state["saves"] += 1
+            if reject_first and state["saves"] == 1:
+                assert body == {"access_token": "invalid-access", "refresh_token": "invalid-refresh"}
+                return httpx.Response(422, json={"detail": [{"msg": "Invalid token", "input": "invalid-access"}]})
             assert body == {"access_token": "xoxe.xoxp-synthetic-access", "refresh_token": "xoxe-synthetic-refresh"}
             return httpx.Response(200, json=saved)
         if path == "/api/v1/slack/applications/setup":
@@ -444,8 +545,10 @@ def test_onboarding_through_slack_sdk_wire_contract(setup, monkeypatch, capsys, 
     monkeypatch.setattr(httpx, "HTTPTransport", lambda **kw: httpx.MockTransport(handle))
     assert wizard._configure_slack("runtime-key", "https://example.com", "agent", Inkbox) is True
     assert state["started"] and state["installed"]
+    assert state["saves"] == (2 if reject_first else 1 if new_workspace else 0)
     assert setup.env.read_text() == "INKBOX_SLACK_ENABLED=true\n"
     assert sum(path.endswith("/installations") for _, path in requests) == 1
     out = capsys.readouterr().out
     assert "Slack connected: Example workspace" in out
-    assert all(secret not in out for secret in ["runtime-key", "xoxe.xoxp-synthetic-access", "xoxe-synthetic-refresh"])
+    assert all(secret not in out for secret in ["runtime-key", "xoxe.xoxp-synthetic-access", "xoxe-synthetic-refresh",
+                                               "invalid-access", "invalid-refresh"])

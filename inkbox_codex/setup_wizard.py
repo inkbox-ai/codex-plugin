@@ -1171,6 +1171,30 @@ def _configure_phone_call_voice_stack(
 # ----------------------------------------------------------------------
 
 
+def _slack_credential_error(exc: Exception) -> str | None:
+    """Translate credential rejections without printing response bodies."""
+    status = _error_status(exc)
+    detail = getattr(exc, "detail", None)
+    if status == 422:
+        return "Slack rejected the app-configuration token pair. Check the token types, expiry, and that both belong together."
+    if status == 409:
+        if isinstance(detail, dict) and detail.get("code") == "credentials_required":
+            return "Slack needs a new app-configuration access and refresh token pair."
+        if detail == "Generate a separate app-configuration token pair for this organization.":
+            return "Generate a separate app-configuration token pair for this Inkbox organization."
+        if detail == "Use app-configuration tokens from the Slack user who created these apps.":
+            return "Use app-configuration tokens from the Slack user who created this workspace's apps."
+    return None
+
+
+def _print_slack_setup_error(stage: str, exc: Exception) -> None:
+    """Identify the failed step without exposing tokens or installation URLs."""
+    status = _error_status(exc)
+    suffix = f" (HTTP {status})" if isinstance(status, int) and 100 <= status <= 599 else ""
+    print_warning(f"  Could not finish Slack setup while {stage}{suffix}.")
+    print_info("  The Slack connection was not confirmed. Rerun `inkbox-codex setup` to continue.")
+
+
 def _wait_for_slack(
     resource: Any, identity_id: Any, *, deadline: float,
     workspace_id: str | None = None,
@@ -1192,8 +1216,8 @@ def _wait_for_slack(
                 print_warning("  Slack installation is currently unavailable. Check the identity in the Inkbox console.")
                 return None
             if status == "needs_credentials":
-                print_warning("  Slack workspace credentials need updating. Rerun setup to replace the token pair.")
-                return None
+                print_warning("  Slack workspace credentials need updating.")
+                return snapshot
             if status in {"failed", "unavailable"}:
                 print_warning("  Slack app preparation needs attention. Check Slack in the Inkbox console.")
                 return None
@@ -1205,7 +1229,7 @@ def _wait_for_slack(
     return None
 
 
-def _select_slack_workspace(resource: Any, snapshot: Any) -> Any | None:
+def _select_slack_workspace(resource: Any, snapshot: Any, *, renew_credentials: bool = False) -> Any | None:
     """Reuse the app's workspace or save a masked, write-only configuration pair."""
     bound = getattr(snapshot, "provisioning_workspace", None)
     bound_id = getattr(bound, "id", None) or getattr(snapshot.setup, "provisioning_workspace_id", None)
@@ -1228,27 +1252,40 @@ def _select_slack_workspace(resource: Any, snapshot: Any) -> Any | None:
             ] + ["Add a workspace"]
             choice = prompt_choice("  Choose the workspace for this agent's Slack app:", choices, 0)
             workspace = workspaces[choice] if choice < len(workspaces) else None
-    if workspace is not None and workspace.status == "ready":
+        else:
+            print_info("  No saved Slack workspaces were found for this Inkbox organization.")
+    if workspace is not None and workspace.status == "ready" and not renew_credentials:
         return workspace
     if workspace is not None:
         print_info(f"  Update app-configuration credentials for {workspace.workspace_name} ({workspace.workspace_id}).")
     print_info("  Open https://api.slack.com/apps and choose your workspace under Your App Configuration Tokens.")
     print_info("  Generate an access token and refresh token. These are not bot tokens.")
     print_info("  Inkbox saves the pair for your organization; this bridge never saves either token locally.")
-    access = prompt("  Slack app-configuration access token (leave blank to skip)", password=True).strip()
-    if not access:
-        return None
-    refresh = prompt("  Slack app-configuration refresh token (leave blank to skip)", password=True).strip()
-    if not refresh:
-        return None
-    saved = resource.save_provisioning_workspace(access_token=access, refresh_token=refresh)
-    if bound_id is not None and str(saved.id) != str(bound_id):
-        print_warning("  These tokens belong to a different workspace. This app cannot move; use its original workspace's tokens.")
-        return None
-    if saved.status != "ready":
-        print_warning("  Workspace credentials still need attention. Rerun setup with a new token pair.")
-        return None
-    return saved
+    while True:
+        access = prompt("  Slack app-configuration access token (leave blank to skip)", password=True).strip()
+        if not access:
+            return None
+        refresh = prompt("  Slack app-configuration refresh token (leave blank to skip)", password=True).strip()
+        if not refresh:
+            return None
+        try:
+            saved = resource.save_provisioning_workspace(access_token=access, refresh_token=refresh)
+        except Exception as exc:
+            problem = _slack_credential_error(exc)
+            if problem is None:
+                _print_slack_setup_error("saving workspace credentials", exc)
+                return None
+        else:
+            if bound_id is not None and str(saved.id) != str(bound_id):
+                problem = "These tokens belong to a different workspace. This app cannot move; use its original workspace's tokens."
+            elif saved.status != "ready":
+                problem = "Workspace credentials still need attention. Generate a new app-configuration token pair."
+            else:
+                print_success(f"  Saved Slack workspace credentials: {saved.workspace_name}")
+                return saved
+        print_warning(f"  {problem}")
+        if not prompt_yes_no("  Enter another app-configuration token pair?", True):
+            return None
 
 
 def _configure_slack(api_key: str, base_url: str, handle: str, Inkbox: Any) -> bool:
@@ -1261,9 +1298,11 @@ def _configure_slack(api_key: str, base_url: str, handle: str, Inkbox: Any) -> b
         print_info("  Slack is off in this bridge. Existing workspace connections are unchanged.")
         return False
 
+    stage = "checking the Inkbox API key"
     try:
         with Inkbox(**inkbox_client_kwargs(api_key, base_url)) as client:
             info = client.whoami()
+            stage = "loading the agent identity"
             identity = client.get_identity(handle)
             subtype = _enum_value(getattr(info, "auth_subtype", ""))
             is_admin = subtype == "api_key.admin_scoped"
@@ -1284,6 +1323,7 @@ def _configure_slack(api_key: str, base_url: str, handle: str, Inkbox: Any) -> b
             _save("INKBOX_SLACK_ENABLED", "true")
             enabled = True
 
+            stage = "checking existing Slack connections"
             snapshot = resource.list_connections(identity.id)
             connected = [c for c in snapshot.connections if c.status == "connected"]
             if connected:
@@ -1301,22 +1341,37 @@ def _configure_slack(api_key: str, base_url: str, handle: str, Inkbox: Any) -> b
                 print_warning("  Slack app creation could not be confirmed. Contact support before trying again.")
                 return True
             if setup.status not in {"ready", "pending"}:
+                stage = "loading saved Slack workspaces"
                 workspace = _select_slack_workspace(resource, snapshot)
                 if workspace is None:
                     print_info("  Workspace setup skipped. Rerun `inkbox-codex setup` to continue.")
                     return True
+                stage = "requesting Slack app preparation"
                 resource.start_setup(identity.id, workspace.id)
             print_info("  Preparing Slack… (Ctrl+C skips; other setup steps will continue.)")
             deadline = time.monotonic() + 300.0
             while True:
+                stage = "waiting for Slack app preparation"
                 ready = _wait_for_slack(resource, identity.id, deadline=deadline)
                 if ready is None:
                     return True
+                if ready.setup.status == "needs_credentials":
+                    if not prompt_yes_no("  Update the workspace credentials and retry Slack setup?", True):
+                        return True
+                    stage = "loading saved Slack workspaces"
+                    workspace = _select_slack_workspace(resource, ready, renew_credentials=True)
+                    if workspace is None:
+                        return True
+                    stage = "requesting Slack app preparation"
+                    resource.start_setup(identity.id, workspace.id)
+                    deadline = time.monotonic() + 300.0
+                    continue
                 workspace = getattr(ready, "provisioning_workspace", None)
                 if workspace is None:
                     print_warning("  The app's workspace could not be confirmed. Check Slack in the Inkbox console.")
                     return True
                 try:
+                    stage = "creating the Slack installation link"
                     installation = resource.start_installation(identity.id, workspace_id=workspace.workspace_id)
                     break
                 except Exception as exc:
@@ -1336,15 +1391,15 @@ def _configure_slack(api_key: str, base_url: str, handle: str, Inkbox: Any) -> b
             print_info(f"  {installation.authorization_url}")
             print_info(f"  Expires: {installation.expires_at}. Keep the link private and finish in the same browser.")
             print_info("  Waiting for a successful connection… (Ctrl+C skips.)")
+            stage = "waiting for Slack installation"
             _wait_for_slack(
                 resource, identity.id, deadline=time.monotonic() + 300.0,
                 workspace_id=workspace.workspace_id,
             )
     except KeyboardInterrupt:
         print_info("\n  Slack waiting skipped. Rerun `inkbox-codex setup` to continue.")
-    except Exception:
-        # Setup errors can contain credentials or installation links.
-        print_warning("  Could not finish Slack setup. Check Slack in the Inkbox console and rerun setup.")
+    except Exception as exc:
+        _print_slack_setup_error(stage, exc)
     return enabled
 
 
