@@ -142,6 +142,16 @@ class SlackActivity:
                         "thread_ts_required", "thread_not_found", "invalid_response",
                         "method_not_supported_for_channel_type", "upstream_rejected",
                         "provider_error", "not_in_channel", "no_permission", "outcome_unknown",
+                        "invalid_arguments", "invalid_parameters", "invalid_status", "invalid_app",
+                        "invalid_channel", "missing_argument", "restricted_action", "access_denied",
+                        "accesslimited", "app_access_restricted", "team_access_not_granted",
+                        "enterprise_is_restricted", "is_archived", "messages_tab_disabled",
+                        "restricted_action_read_only_channel", "restricted_action_thread_only_channel",
+                        "restricted_action_non_threadable_channel", "rate_limited", "upstream_error",
+                        "account_inactive", "not_authed", "not_authorized", "not_in_team",
+                        "org_login_required", "team_not_found", "token_expired", "token_revoked",
+                        "internal_error", "fatal_error", "service_unavailable", "request_timeout",
+                        "transport_timeout", "connection_failed", "transport_error", "upstream_unavailable",
                     } else "unconfirmed"
                     outcome = operation.status if operation.status in {"failed", "unknown", "in_progress"} else "invalid"
                     logger.warning("Slack native status/cleanup not confirmed (status=%s, reason=%s); "
