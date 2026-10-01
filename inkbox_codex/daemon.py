@@ -323,6 +323,9 @@ def install_autostart(env_file: str) -> bool:
     exe = _launcher_path()
     system = platform.system()
     if system == "Linux":
+        if shutil.which("systemctl") is None:
+            print("  systemctl is unavailable; boot autostart cannot be installed here.")
+            return False
         return _install_systemd_user(exe, env_file)
     if system == "Darwin":
         return _install_launchd(exe, env_file)

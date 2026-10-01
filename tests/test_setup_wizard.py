@@ -1247,6 +1247,25 @@ def test_autostart_fallback_also_restarts_a_live_bridge(monkeypatch):
     assert calls == ["install_autostart", "restart"]
 
 
+def test_autostart_without_systemctl_uses_background_fallback(tmp_path, monkeypatch, capsys):
+    from inkbox_codex import daemon
+
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(daemon.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(daemon.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("INKBOX_CODEX_ENV_FILE", str(tmp_path / ".env"))
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: True)
+    monkeypatch.setattr(daemon, "running_pid", lambda: None)
+    calls = []
+    monkeypatch.setattr(daemon, "start", lambda: calls.append("start") or 0)
+    monkeypatch.setattr(setup_wizard, "_confirm_bridge_running", lambda *_a, **_k: True)
+
+    assert setup_wizard._configure_autostart() is True
+    assert calls == ["start"]
+    assert not (tmp_path / ".config" / "systemd").exists()
+    assert "starting in the background" in capsys.readouterr().out
+
+
 def test_declining_both_offers_starts_nothing(monkeypatch, capsys):
     calls = []
     _patch_daemon(monkeypatch, pid=None, calls=calls)

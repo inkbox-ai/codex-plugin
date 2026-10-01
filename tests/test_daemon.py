@@ -70,12 +70,32 @@ def test_launcher_path_is_a_string():
     assert isinstance(daemon._launcher_path(), str)
 
 
+def test_install_autostart_without_systemctl_leaves_config_and_gateway_untouched(tmp_path, monkeypatch):
+    monkeypatch.setattr(daemon.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(daemon.shutil, "which", lambda _name: None)
+    env_file = tmp_path / ".env"
+    env_file.write_text("INKBOX_IDENTITY=test-agent\n")
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("No service command or gateway stop should run")
+
+    monkeypatch.setattr(daemon.subprocess, "run", unexpected)
+    monkeypatch.setattr(daemon, "stop", unexpected)
+    monkeypatch.setattr(daemon, "_read_pid", lambda: 123)
+
+    assert daemon.install_autostart(str(env_file)) is False
+    assert not (tmp_path / ".config" / "systemd").exists()
+    assert env_file.read_text() == "INKBOX_IDENTITY=test-agent\n"
+
+
 def test_install_autostart_writes_and_enables_systemd_unit(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(daemon.Path, "home", classmethod(lambda cls: home))
     monkeypatch.setattr(daemon.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(daemon.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(daemon, "_read_pid", lambda: None)  # nothing to stop
 
     calls = []
@@ -108,6 +128,7 @@ def test_install_autostart_reports_failure_when_enable_fails(tmp_path, monkeypat
     home.mkdir()
     monkeypatch.setattr(daemon.Path, "home", classmethod(lambda cls: home))
     monkeypatch.setattr(daemon.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(daemon.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(daemon, "_read_pid", lambda: None)
 
     class _Fail:
