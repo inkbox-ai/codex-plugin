@@ -509,9 +509,11 @@ sending an unthreaded reply. The existing SDK minimum is unchanged when disabled
   A final answer exactly matching an observed targeted tool send is suppressed too.
 - **No audience changes:** targeted tools must use a visible source in the same
   conversation; in a running chat they must also belong to that active input.
-  Opaque native thread IDs are not message IDs or new Codex sessions. Native
-  thread-read tools return one bounded chronological page and do not broaden
-  Companion activation history.
+  Opaque native thread IDs are not message IDs or new Codex sessions. Replies use
+  the API's message IDs; missing parent/root IDs remain unknown, never inferred
+  from a thread ID. A visible ancestor root can identify a reply even when its
+  immediate parent is unavailable. Native thread-read tools return one bounded
+  chronological page and do not broaden Companion activation history.
 - **Fallback and failures:** `plain_reply_fallback=true` delegates an eligible
   same-conversation fallback to the API. A timeout or arbitrary send failure never
   triggers a client-side unthreaded resend. Accepted sends are queued, not proof of

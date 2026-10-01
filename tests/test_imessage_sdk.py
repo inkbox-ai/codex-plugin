@@ -14,6 +14,7 @@ from inkbox.agent_identity import AgentIdentity
 
 from inkbox_codex.config import BridgeConfig, imessage_threading_capability
 from inkbox_codex.gateway import InkboxGateway
+from inkbox_codex.imessage import IMessageState, auto_reply_kwargs, source_metadata
 from inkbox_codex.tools import call_inkbox_tool
 
 
@@ -27,6 +28,8 @@ CONVERSATION_ID = str(UUID(int=2))
 SOURCE_ID = str(UUID(int=3))
 OUTBOUND_ID = str(UUID(int=4))
 THREAD_ID = str(UUID(int=5))
+ROOT_ID = str(UUID(int=6))
+PARENT_ID = str(UUID(int=7))
 TIMESTAMP = "2026-01-01T00:00:00+00:00"
 
 
@@ -155,6 +158,47 @@ def test_real_sdk_thread_pages_keep_cursor_identity_and_null_metadata(sdk, name,
     assert payload["messages"][0]["id"] == SOURCE_ID
     assert payload["messages"][0]["reply_to_message_id"] is None
     assert payload["next_cursor"] == "next:opaque+/="
+
+
+@pytest.mark.parametrize("ancestry,expected_target", [
+    ({"reply_to_message_id": None, "thread_id": None, "thread_root_message_id": None}, None),
+    ({"reply_to_message_id": None, "thread_id": THREAD_ID, "thread_root_message_id": None}, None),
+    ({"reply_to_message_id": None, "thread_id": THREAD_ID, "thread_root_message_id": SOURCE_ID}, None),
+    ({"reply_to_message_id": None, "thread_id": THREAD_ID, "thread_root_message_id": ROOT_ID}, SOURCE_ID),
+    ({"reply_to_message_id": PARENT_ID, "thread_id": None, "thread_root_message_id": None}, SOURCE_ID),
+    ({"reply_to_message_id": PARENT_ID, "thread_id": THREAD_ID, "thread_root_message_id": ROOT_ID}, SOURCE_ID),
+])
+def test_real_sdk_ancestry_controls_reply_route_without_inventing_references(sdk, ancestry, expected_target):
+    sdk.source.update(ancestry)
+    identity = sdk.client.get_identity("agent")
+    received = identity.get_imessage(SOURCE_ID)
+    meta = {"conversation_id": CONVERSATION_ID, **source_metadata(received, "received-event")}
+
+    assert {key: meta[key] for key in ancestry} == ancestry
+    assert meta["imessage_reply_target"] == expected_target
+    assert auto_reply_kwargs(meta) == (
+        {"reply_to_message_id": SOURCE_ID, "plain_reply_fallback": True} if expected_target else {}
+    )
+
+    # Saved inputs must preserve the API projection, including unresolved ancestry.
+    store = IMessageState(BridgeConfig(identity="agent", base_url="https://example.com"))
+    assert store.admit("contact", received.content, meta)
+    restored = store.replay_pending()[0]["meta"]
+    assert {key: restored["imessage_sources"][0][key] for key in ancestry} == ancestry
+    assert auto_reply_kwargs(restored) == auto_reply_kwargs(meta)
+    assert not posts(sdk)
+
+
+def test_real_sdk_absent_ancestry_stays_unknown(sdk):
+    for field in ("reply_to_message_id", "thread_id", "thread_root_message_id"):
+        sdk.source.pop(field)
+    received = sdk.client.get_identity("agent").get_imessage(SOURCE_ID)
+    meta = source_metadata(received, "received-event")
+    assert meta["message_id"] == SOURCE_ID
+    assert meta["reply_to_message_id"] is None
+    assert meta["thread_id"] is None
+    assert meta["thread_root_message_id"] is None
+    assert auto_reply_kwargs(meta) == {}
 
 
 def test_real_sdk_unavailable_backend_prevents_targeted_send(sdk):
