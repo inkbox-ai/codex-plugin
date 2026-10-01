@@ -205,11 +205,155 @@ return typed answers; unsupported forms require using Codex directly or cancelin
 the interaction. URL-based requests require completing the displayed URL step
 before replying `DONE`.
 
+## Slack preview
+
+Set `INKBOX_SLACK_ENABLED=true` to add Slack to the gateway. This requires an
+Inkbox SDK exposing `client.slack` and an API with Slack support; the existing
+SDK minimum remains usable when Slack is off. Connect a workspace to the same
+Inkbox identity to exchange messages; the receiver can start before installation.
+Run `inkbox-codex setup` to opt in interactively. The wizard offers **Connect Slack
+now?**, selects a saved provisioning workspace, waits for app preparation, prints
+an installation link to open in your browser, and polls until that workspace is
+connected. Keep the link private and complete authorization in the same browser.
+This flow requires an SDK exposing `client.slack.list_provisioning_workspaces`
+and identity-wide webhook subscriptions. Setup uses the bridge's existing claimed
+agent key for workspace credentials, app preparation, and installation; no extra
+admin key is needed. A newly self-signed-up identity must be claimed first. An
+organization admin key is also supported when already configured for the bridge.
+
+If you need to add a provisioning workspace or renew its credentials, the wizard
+prompts for a masked Slack app-configuration access/refresh token pair from
+[Your App Configuration Tokens](https://api.slack.com/apps). Inkbox verifies and
+stores the pair for your organization; the bridge does not save it locally.
+If the pair is rejected, setup explains the credential issue and offers another
+attempt without leaving the wizard. Other errors identify the failed step and
+HTTP status when available; they do not silently retry app creation or expose tokens.
+These are not bot tokens. Each identity's app is permanently bound to one
+workspace. Existing connections need no new installation; manage permission
+refreshes in the Inkbox console. After installation, add the bot to the channels
+where you want to use it.
+
+Existing connections are shown on reruns. You can skip connecting, press Ctrl+C
+during either wait, or rerun after the five-minute wait expires. Rerunning setup
+and declining full reconfiguration still offers Slack onboarding. Declining Slack
+turns it off only in this bridge; it does not disconnect the workspace or disable
+Slack for other clients. On startup, the gateway registers the subscriptions below.
+
+**Work indicators.** Accepted threaded Slack requests use the native agent
+loading indicator, without adding reaction bubbles. It stays while work is queued
+or running, switches to awaiting-input during questions or approvals, and returns
+to ready after completion, failure, or cancellation. Overlapping requests in the
+same thread share one indicator. Mention-mode context does not start it.
+Slack's native Stop button cancels work in the matching engaged thread, subject to
+the same allowed-sender policy. Ordinary main-DM messages receive replies in the
+main DM and share conversation context, without a native status indicator.
+Instead, the exact DM message receives 👀 while queued, running, or waiting for
+input. It is removed after success or cancellation; a failed turn or reply delivery
+replaces it with ❌. These reactions do not start a thread.
+An explicit native @mention starts a thread beneath that message; messages already
+inside a thread stay there. Threaded replies and their indicators use the same
+thread. Continue there for follow-ups, approval answers, and commands; each thread
+keeps its own saved context.
+Native status needs an app declared as a Slack Agent (including `assistant:write`),
+`chat:write`, SDK processing-status support, and workspace feature availability.
+Existing installations may need an app-configuration update and reauthorization.
+Unsupported or uncertain updates are logged without
+blocking replies or falling back to reactions. Restart cleanup clears unfinished
+native status, marks interrupted DM work with ❌, and removes pending indicators
+from the previous reaction version. Reaction failures do not block replies.
+
+No separate Slack bot token is needed at runtime. Slack subscriptions use
+`slack.dm_received`, `slack.group_dm_received`, `slack.mention_received`,
+`slack.thread_reply_received`, and `slack.session_stopped` with no Slack-specific
+filter. The gateway also
+recognizes `slack.channel_message_received`, while its local attention rules keep
+unrelated channel chatter from waking Codex. Update the API and receiver together
+when upgrading from the older incoming-message preview event.
+Incoming messages can match several categories; the payload's `message_kinds`
+retains the full classification even when only one event type is selected.
+Replies remain deduplicated by the stable event ID, not the selected category.
+
+- By default, DMs, group DMs, and mentions wake Codex. New requests start a thread;
+  follow-ups in an already-engaged thread continue its conversation without
+  another mention. Unrelated channel messages and bot messages do not wake it.
+- With `INKBOX_GROUP_REPLY_MODE=mention`, Slack channels, group DMs, and their
+  threads require a native @mention of this agent on each new message to generate
+  a reply, even after the agent has joined the thread. Unmentioned follow-ups are
+  context only: no reply, tool execution, or interruption of an active turn.
+  Direct DMs are unchanged. Bridge commands and the requesting sender's answers
+  to pending approval/question prompts still work without a mention.
+- Each workspace/conversation/thread gets a separate, resumable Codex session.
+  When supplied by Inkbox, the sender's linked contact ID and Slack profile fields
+  are included as context. Email and phone may be absent. The bridge does not
+  match contacts itself, merge conversations, or grant permissions from profiles.
+- Replies and approval prompts stay on the originating Slack route. Only the
+  requesting sender can answer a pending group-thread approval.
+- Messages are limited to 12,000 characters per send. The bridge rejects longer
+  replies before sending; it does not split or automatically retry them.
+- Six tools list workspaces, list conversations, read messages/threads, search
+  retained text, send explicitly requested messages, and inspect send outcomes.
+  Ordinary final replies are sent automatically; do not send them again by tool.
+- Unconfirmed sends are logged with their action ID when available, never
+  automatically resent. Reuse the exact idempotency key when retrying an explicit
+  send. Webhook duplicate suppression follows the gateway's existing bounded,
+  in-memory behavior.
+- Attachments are exposed as metadata in this first version. File transfer and
+  arbitrary reaction tools are not included.
+
+`INKBOX_ALLOWED_USERS` accepts Slack user IDs or workspace-qualified `T_ID:U_ID`
+entries. An empty list admits all human senders whose events reach the identity.
+Slack subscriptions are additive: starting this gateway does not remove another
+Slack receiver. Existing active subscriptions at this receiver's URL, including
+mixed-event subscriptions, are reused; only missing events are registered.
+Paused overlapping subscriptions require attention in the console before startup.
+Stop/remove any previous Slack receiver if it should no longer reply.
+
+### Isolated Slack harness
+
+The harness uses the same gateway, sessions, signing verification, tools, and
+reply path. It registers **only Slack** and does not change email, phone,
+iMessage, or A2A subscriptions. Credentials are read into the process from the
+selected file, never copied into its state directory. Use a separate directory
+and port from your regular gateway. Run only one gateway on an identity’s tunnel
+at a time, or pass `--public-url` for a separately reachable receiver.
+
+After installing this checkout and a Slack-capable SDK, run a read-only preflight:
+
+```bash
+python -m inkbox_codex.slack_harness \
+  --credentials-file ~/.env --api-key-env INKBOX_API_KEY \
+  --identity "$INKBOX_IDENTITY" --base-url "$INKBOX_BASE_URL" \
+  --state-dir ~/.inkbox-codex-slack --project-dir "$PWD" \
+  --signing-env-file /path/to/identity.env
+```
+
+Add `--run` to connect the identity’s existing tunnel and register the signed Slack receiver. The signing
+file must contain the identity's existing `INKBOX_SIGNING_KEY`; the harness never
+creates or rotates keys. `--allow-user T_ID:U_ID` can be repeated. Ctrl+C stops
+the local receiver; its subscription remains available for the next run.
+`--group-reply-mode mention` enables mention-only group/thread replies in the
+harness; it otherwise follows `INKBOX_GROUP_REPLY_MODE`, defaulting to `auto`.
+The webhook still includes thread messages so quiet context and approval answers
+can reach the session.
+
+In mention mode, test a native @mention, an unmentioned follow-up in the same
+thread, and another @mention: expect reply, silence, reply, with the quiet message
+available as context for the last reply.
+
+For manual acceptance: DM the agent, mention it in a channel, continue in that
+thread without a mention, ask for recent thread history or retained-text search,
+then exercise an approval and `/status`. Replies should stay in the right thread;
+unrelated channels and bot messages should remain quiet. The preflight does not
+send messages. Live delivery can only be verified after connecting the workspace
+and starting the harness.
+
+Offline regression harness: `python -m pytest -q tests/test_slack.py tests/test_slack_harness.py`.
+
 ## Sessions
 
 Direct-message sessions are keyed by Inkbox contact, so one person = one conversation across channels. Group SMS messages share a session keyed by the group conversation, separate from direct messages and other groups, while retaining each sender's contact details. Codex session ids are persisted in `~/.inkbox-codex/sessions.json` and resumed across bridge restarts — your conversation picks up where it left off. Replies go out on the channel you last used. If a voice call ends before Codex finishes a voice reply, that late voice reply is dropped instead of silently switching to SMS or email.
 
-**Group replies.** The setup wizard offers **Automatic** (default) or **Mention required** for group SMS and iMessage, saved as `INKBOX_GROUP_REPLY_MODE=auto|mention`. Automatic keeps the existing behavior: the agent decides whether to answer. Mention mode starts a reply only when the new message itself includes `@agent` or `@<agent-handle>` as a whole mention, case-insensitively; older messages, links, and email addresses do not count. Other messages and group reactions are added to Codex's context without generating a reply or a typing indicator. While a turn is running, background messages wait until it finishes before being appended. Appended context persists with the Codex thread; messages still waiting in the bridge's queue are not persisted across a restart. Direct messages are unchanged. Commands such as `/stop`, and answers to the agent's pending questions from the sender it asked, do not require a mention.
+**Group replies.** The setup wizard offers **Automatic** (default) or **Mention required** for group SMS, iMessage, and Slack, saved as `INKBOX_GROUP_REPLY_MODE=auto|mention`. Automatic keeps the existing behavior: the agent decides whether to answer. For SMS/iMessage, mention mode starts a reply only when the new message itself includes `@agent` or `@<agent-handle>` as a whole mention, case-insensitively; older messages, links, and email addresses do not count. Slack requires a native @mention of the agent, including on follow-ups in an engaged thread. Other messages and group reactions are added to Codex's context without generating a reply or a typing indicator. While a turn is running, background messages wait until it finishes before being appended. Appended context persists with the Codex thread; messages still waiting in the bridge's queue are not persisted across a restart. Direct messages are unchanged. Commands such as `/stop`, and answers to the agent's pending questions from the sender it asked, do not require a mention.
 
 ### Companion conversations (preview)
 
@@ -327,7 +471,7 @@ uses POSIX file locking (Linux/macOS).
 
 Run `inkbox-codex setup` to change the choice without reconfiguring your identity, or edit `.env`, then restart the bridge to apply it. For background mode, use `inkbox-codex restart`; for a systemd installation, use `systemctl --user restart inkbox-codex.service`. Mention mode requires a Codex version supporting `thread/inject_items`.
 
-**Typing indicator.** While Codex works on a turn, the bridge keeps a typing indicator alive on your iMessage thread (refreshed every few seconds, since it expires) so you can see it's busy. SMS, email, and voice have no typing indicator, so this is iMessage-only.
+**Typing indicator.** While Codex works on a turn, the bridge keeps a typing indicator alive on your iMessage thread (refreshed every few seconds, since it expires) so you can see it's busy. SMS, email, and voice have no typing indicator. Slack threads use the native agent status described above.
 
 **Delivery failures.** Outbound messages can silently fail — a carrier filters an SMS, an iMessage is declined, an email bounces. Inkbox reports these asynchronously (`text.delivery_failed`, `imessage.delivery_failed`, `message.bounced`/`message.failed`). The bridge catches them and wakes the affected contact's session to tell Codex *which* message didn't land and *why*, so it can retry or reach you another way (a different channel, or a call) using its Inkbox tools. The notice runs as a side-effect turn — Codex acts via tools rather than replying on the channel that just failed — and repeat webhooks for the same message are de-duplicated so it can't loop. `text.delivery_unconfirmed` is different: it only means the carrier couldn't *confirm* delivery (the message usually landed), so it's logged for debugging without waking Codex — waking there would resend a message that was likely delivered.
 
@@ -507,7 +651,7 @@ with both deterministic and real-model gateway runs, without SMS reset traffic.
 | `INKBOX_ALLOW_ALL_USERS` | no | `false` | Allow all senders admitted by Inkbox contact rules. |
 | `INKBOX_BRIDGE_PORT` | no | `8767` | Local webhook server port. |
 | `INKBOX_PERMISSION_TIMEOUT_S` | no | `600` | Seconds to wait for a permission/poll reply. |
-| `INKBOX_GROUP_REPLY_MODE` | no | `auto` | Group SMS/iMessage and Companion email replies: `auto` lets the agent decide; `mention` requires `@agent` or `@<agent-handle>` in the new message. Other messages become context without starting a turn. Also configurable in setup. |
+| `INKBOX_GROUP_REPLY_MODE` | no | `auto` | Group SMS/iMessage, Slack, and Companion email replies: `auto` lets the agent decide; `mention` requires a native Slack @mention, SMS/iMessage `@agent` or `@<agent-handle>`, or Companion email addressed To the agent. Other messages become context without starting a turn. Also configurable in setup. |
 | `INKBOX_COMPANION_RESPONSE_MODE` | no | `safe` | Companion SMS/MMS, iMessage, and email: `safe` wakes only for direct access; `relaxed` permits any delivered sender. Both honor Auto/Mention. Sponsored and unknown access stays context-only in Safe mode. Also configurable in setup. |
 | `INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS` | no | `false` | Auto-accept Codex MCP prompts for Inkbox tools only. The setup wizard writes `true` when you trust the agent to send through Inkbox without per-call approval. |
 | `INKBOX_A2A_PROGRESS_INTERVAL_SECONDS` | no | `180` | Seconds between progress updates for active inbound A2A tasks. Set to `0` to disable periodic updates. |

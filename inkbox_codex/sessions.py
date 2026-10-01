@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 SendFn = Callable[[str, str, str, Dict[str, Any]], Awaitable[Any]]
 # gateway.send_typing(chat_id, mode, meta) signature.
 TypingFn = Callable[[str, str, Dict[str, Any]], Awaitable[Any]]
+TurnActivityFn = Callable[[str, str, Dict[str, Any], str], Awaitable[Any]]
 # gateway.health_report() signature.
 HealthFn = Callable[[], Awaitable[str]]
 # gateway._note_sync_send_failure(chat_id, mode, meta, reply, reason) signature:
@@ -96,6 +97,8 @@ class _Turn:
     reply_meta: Optional[Dict[str, Any]] = None
     completion: Optional["asyncio.Future[Optional[str]]"] = None
     before_submit: Optional[Callable[[], Awaitable[None]]] = None
+    activity_started: bool = False
+    delivery_failed: bool = False
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Codex as a turn.
@@ -376,6 +379,7 @@ class ContactSession:
         typing_fn: Optional[TypingFn] = None,
         health_fn: Optional[HealthFn] = None,
         on_send_failure: Optional[SendFailureFn] = None,
+        turn_activity_fn: Optional[TurnActivityFn] = None,
     ):
         self.chat_id = chat_id
         self.cfg = cfg
@@ -383,6 +387,7 @@ class ContactSession:
         self.typing_fn = typing_fn
         self.health_fn = health_fn
         self.on_send_failure = on_send_failure
+        self.turn_activity_fn = turn_activity_fn
         self.mcp_server_config = dict(mcp_server_config or {})
         # Stamp this session's id into the tool process env so Inkbox tools
         # (e.g. place-call line resolution) know which conversation they
@@ -586,7 +591,11 @@ class ContactSession:
         meta = dict(meta or {})
         raw_text = str(meta.get("raw_text", text))
         command = _control_command(raw_text)
-        is_group = mode in {"sms", "imessage"} and meta.get("conversation_kind") == "group"
+        if mode == "slack" and meta.get("slack_native_stop") and command == "stop":
+            self.mode, self.reply_meta = mode, meta
+            await self._stop_turn()
+            return
+        is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
         pending_reply = self.pending is not None and not self.pending.future.done()
         if is_group and pending_reply:
             pending_reply = (
@@ -594,12 +603,20 @@ class ContactSession:
                 and meta.get("sender") == self._reply_route(self._current_turn)[1].get("sender")
                 and (self.pending.kind != "permission" or parse_permission_reply(raw_text) is not None)
             )
+        mentioned = (
+            meta.get("slack_mentioned") is True if mode == "slack"
+            else mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity)
+        )
         context_only = (
+            mode == "slack" and is_group
+            and self.pending is not None and not self.pending.future.done()
+            and meta.get("sender") != self._reply_route(self._current_turn)[1].get("sender")
+        ) or (
             is_group
             and self.cfg.group_reply_mode == "mention"
             and not command
             and not pending_reply
-            and not mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity)
+            and not mentioned
         )
         if context_only:
             await self._queue.put(_Turn(
@@ -651,11 +668,13 @@ class ContactSession:
 
         # Tag the message with its channel + sender so Codex knows where it
         # is and who it's talking to (the static system prompt can't).
-        await self._queue.put(_Turn(
+        turn = _Turn(
             text=frame_inbound(mode, meta, text),
             reply_mode=mode,
             reply_meta=dict(meta),
-        ))
+        )
+        await self._notify_turn_activity(turn, "accepted")
+        await self._queue.put(turn)
 
         # Texting again while Codex is mid-turn behaves like hitting Esc and
         # typing a new message: interrupt the running turn so the worker drops
@@ -672,9 +691,24 @@ class ContactSession:
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())
 
+    async def _notify_turn_activity(self, turn: _Turn, state: str) -> None:
+        if self.turn_activity_fn is None or turn.reply_mode != "slack":
+            return
+        if state == "accepted":
+            turn.activity_started = True
+        elif not turn.activity_started:
+            return
+        elif state in {"completed", "failed", "cancelled"}:
+            turn.activity_started = False
+        try:
+            await self.turn_activity_fn(self.chat_id, "slack", turn.reply_meta or {}, state)
+        except Exception:
+            logger.warning("Turn activity update failed; continuing the conversation")
+
     async def _drain(self) -> None:
         while not self._queue.empty():
             turn = await self._queue.get()
+            outcome = "cancelled"
             try:
                 if turn.completion is not None:
                     if turn.completion.cancelled():
@@ -696,9 +730,11 @@ class ContactSession:
                     await self._flush_context()
                     continue
                 await self._run_turn(turn)
+                outcome = "cancelled" if self._interrupting else "failed" if turn.delivery_failed else "completed"
                 if turn.completion is not None and not turn.completion.done():
                     turn.completion.set_result(None)
             except Exception as exc:
+                outcome = "cancelled" if self._interrupting else "failed"
                 if turn.completion is not None:
                     if not turn.completion.done():
                         turn.completion.set_exception(exc)
@@ -724,6 +760,8 @@ class ContactSession:
                         )
                 except Exception:
                     logger.exception("[session %s] could not send the error notice", self.chat_id)
+            finally:
+                await self._notify_turn_activity(turn, outcome)
 
     async def _flush_context(self) -> None:
         if not self._pending_context:
@@ -785,6 +823,7 @@ class ContactSession:
                 turn = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            await self._notify_turn_activity(turn, "cancelled")
             if turn.completion is not None and not turn.completion.done():
                 turn.completion.set_result(None)
             if turn.future is not None and not turn.future.done():
@@ -1051,6 +1090,7 @@ class ContactSession:
         try:
             await self._reply(reply, turn=turn)
         except Exception as exc:
+            turn.delivery_failed = True
             if turn.completion is not None:
                 # The durable receiver owns retries; never create another model
                 # turn or switch recipient after an ambiguous Companion send.
@@ -1179,6 +1219,8 @@ class ContactSession:
             identity_handle=self.identity_info.get("handle", ""),
             email_address=self.identity_info.get("email", ""),
             phone_number=self.identity_info.get("phone", ""),
+            channels=("email, SMS, iMessage, Slack, and voice calls" if self.cfg.slack_enabled
+                      else "email, SMS, iMessage, and voice calls"),
         )
         client = CodexAppServerClient(
             self.cfg,
@@ -1347,7 +1389,10 @@ class ContactSession:
                 else "\nInclude @agent before your answer (for example, @agent allow)."
             )
         sending = asyncio.create_task(self._reply(prompt_text, turn=self._current_turn))
+        turn = self._current_turn
         try:
+            if turn is not None:
+                await self._notify_turn_activity(turn, "waiting")
             done, _ = await asyncio.wait({sending, pending.future}, return_when=asyncio.FIRST_COMPLETED)
             if pending.future in done and (pending.future.cancelled() or pending.future.result() is None):
                 return None
@@ -1365,6 +1410,8 @@ class ContactSession:
                 pending.future.cancel()
             if self.pending is pending:
                 self.pending = None
+            if turn is not None and not self._interrupting:
+                await self._notify_turn_activity(turn, "resumed")
 
     def _reply_route(self, turn: Optional[_Turn] = None) -> tuple[str, Dict[str, Any]]:
         if turn is not None and turn.reply_mode is not None and turn.reply_meta is not None:
@@ -1405,12 +1452,14 @@ class SessionManager:
         typing_fn: Optional[TypingFn] = None,
         health_fn: Optional[HealthFn] = None,
         on_send_failure: Optional[SendFailureFn] = None,
+        turn_activity_fn: Optional[TurnActivityFn] = None,
     ):
         self.cfg = cfg
         self.send_fn = send_fn
         self.typing_fn = typing_fn
         self.health_fn = health_fn
         self.on_send_failure = on_send_failure
+        self.turn_activity_fn = turn_activity_fn
         self.mcp_server_config = dict(mcp_server_config or {})
         self.identity_info = identity_info
         self.sessions: Dict[str, ContactSession] = {}
@@ -1440,6 +1489,10 @@ class SessionManager:
         if self._session_ids.pop(chat_id, None) is not None:
             self._persist()
 
+    def has_session(self, chat_id: str) -> bool:
+        """Whether this conversation has already engaged the agent."""
+        return chat_id in self.sessions or chat_id in self._session_ids
+
     def get(self, chat_id: str) -> ContactSession:
         """Fetch or lazily create the session for one remote party.
 
@@ -1463,6 +1516,7 @@ class SessionManager:
                 typing_fn=self.typing_fn,
                 health_fn=self.health_fn,
                 on_send_failure=self.on_send_failure,
+                turn_activity_fn=self.turn_activity_fn,
             )
             self.sessions[chat_id] = session
         return session

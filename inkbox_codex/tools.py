@@ -800,6 +800,12 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
         return client.get_identity(identity_handle)
 
     def _run() -> Any:
+        if name.startswith("inkbox_slack_"):
+            from .slack import run_tool
+
+            if not read_config().slack_enabled:
+                raise ValueError("Enable INKBOX_SLACK_ENABLED to use Slack tools")
+            return run_tool(client, identity_handle, name, args)
         if name == "inkbox_whoami":
             identity = _identity()
             phone = identity.phone_number
@@ -1299,8 +1305,10 @@ def _place_call_tool_entry(voice_stack: VoiceStack) -> Dict[str, Any]:
 
 def mcp_tool_list() -> List[Dict[str, Any]]:
     """Return MCP ``tools/list`` entries for every Inkbox tool."""
+    from .slack import SLACK_TOOLS
+
     cfg = read_config()
-    return [
+    return (SLACK_TOOLS if cfg.slack_enabled else []) + [
         _place_call_tool_entry(cfg.voice_stack)
         if spec.name == "inkbox_place_call"
         else {
@@ -1318,6 +1326,7 @@ def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]
         "INKBOX_API_KEY": cfg.api_key,
         "INKBOX_IDENTITY": cfg.identity,
         "INKBOX_BASE_URL": cfg.base_url,
+        "INKBOX_SLACK_ENABLED": "1" if cfg.slack_enabled else "0",
         "INKBOX_VOICE_STACK": cfg.voice_stack.value,
         "INKBOX_VOICE_AI_AUTHORITY_MODE": cfg.voice_ai_authority_mode,
         "INKBOX_VOICEMAIL_DETECTION": cfg.voicemail_detection,
@@ -1339,4 +1348,8 @@ def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]
     if cfg.auto_approve_inkbox_tools:
         server["default_tools_approval_mode"] = "approve"
     tool_names = [f"mcp__inkbox__{spec.name}" for spec in TOOL_SPECS]
+    if cfg.slack_enabled:
+        from .slack import SLACK_TOOLS
+
+        tool_names.extend(f"mcp__inkbox__{tool['name']}" for tool in SLACK_TOOLS)
     return server, tool_names

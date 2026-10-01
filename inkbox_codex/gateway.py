@@ -955,6 +955,7 @@ class InkboxGateway:
         self._public_host: str = ""
         self._runner: Any = None
         self.sessions: Optional[SessionManager] = None
+        self._slack_activity = None
         self._companion_receiver = None
         self._codex_ready: Optional[bool] = None
         self._codex_readiness_detail = "startup has not been checked"
@@ -1058,6 +1059,13 @@ class InkboxGateway:
         # webhook can arrive immediately after the subscription write, and its
         # side-effect turn needs a queue ready before we acknowledge it.
         server_config, _tool_names = build_inkbox_mcp_server_config(self.cfg)
+        if self.cfg.slack_enabled:
+            from .daemon import state_dir
+            from .slack_activity import SlackActivity
+            self._slack_activity = SlackActivity(
+                self._inkbox.slack, state_dir() / f"slack-activity-{self._identity.id}.json",
+            )
+            await self._slack_activity.recover()
         self.sessions = SessionManager(
             cfg=self.cfg,
             send_fn=self.send_to_contact,
@@ -1066,6 +1074,7 @@ class InkboxGateway:
             typing_fn=self.send_typing,
             health_fn=self.health_report,
             on_send_failure=self._note_sync_send_failure,
+            turn_activity_fn=self._slack_activity.notify if self._slack_activity else None,
         )
         self._companion().recover()
         await asyncio.to_thread(self._patch_identity_objects)
@@ -1157,6 +1166,8 @@ class InkboxGateway:
 
     def _patch_identity_objects(self) -> None:
         """Point the identity's mailbox/phone/iMessage events at this server."""
+        if self.cfg.slack_enabled and not self.cfg.skip_webhook_reconcile:
+            self._reconcile_slack()
         if self.cfg.skip_webhook_reconcile:
             logger.info(
                 "[bridge] leaving webhook subscriptions alone; expecting them "
@@ -1303,6 +1314,8 @@ class InkboxGateway:
             await self._companion_receiver.close()
         if self.sessions is not None:
             await self.sessions.close_all()
+        if getattr(self, "_slack_activity", None) is not None:
+            await self._slack_activity.close()
         if self._runner is not None:
             await self._runner.cleanup()
         if self._tunnel is not None:
@@ -1756,7 +1769,7 @@ class InkboxGateway:
             bool: True for a recognised Inkbox event shape.
         """
         if event_type and event_type.startswith(
-            ("message.", "text.", "imessage.", "a2a.", "call.")
+            ("message.", "text.", "imessage.", "a2a.", "call.", "slack.")
         ):
             return True
         explicit_call_id = envelope.get("call_id") or envelope.get("callId")
@@ -1888,6 +1901,10 @@ class InkboxGateway:
                 if len(self._call_meta_by_id) > 100:
                     self._call_meta_by_id.pop(next(iter(self._call_meta_by_id)), None)
             return web.json_response({"ok": True})
+        from .slack import SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT
+
+        if event_type in (*SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT):
+            return await self._on_slack_received(envelope)
         if event_type == "message.received":
             return await self._on_mail_received(envelope)
         if event_type == "text.received":
@@ -3728,6 +3745,41 @@ class InkboxGateway:
         ])
         return f"{marker}\n{policy}"
 
+    def _reconcile_slack(self) -> None:
+        from .slack import reconcile_subscription
+
+        reconcile_subscription(
+            self._inkbox, self._identity.id,
+            f"{self._public_url}{DEFAULT_WEBHOOK_PATH}?channel=slack",
+        )
+
+    async def _on_slack_received(self, envelope: Dict[str, Any]) -> "web.Response":
+        from .slack import SLACK_STOP_EVENT, inbound_message, inbound_stop
+
+        if not self.cfg.slack_enabled:
+            return web.json_response({"ok": True, "ignored": "slack-disabled"})
+        if self.sessions is None or self._identity is None:
+            raise RuntimeError("Slack sessions are not ready")
+        parse = inbound_stop if envelope.get("event_type") == SLACK_STOP_EVENT else inbound_message
+        incoming = parse(envelope, str(self._identity.id))
+        if incoming is None:
+            return web.json_response({"ok": True, "ignored": "slack-message"})
+        chat_id, body, meta = incoming
+        if not self._sender_allowed(meta["sender"], meta["actor_id"]):
+            return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
+        if not meta["slack_addressed"] and not self.sessions.has_session(chat_id):
+            return web.json_response({"ok": True, "ignored": "unwatched-thread"})
+        event_key = f"slack:{envelope['id']}"
+        if self._dedup_begin(event_key):
+            return web.json_response({"ok": True, "deduped": True})
+        try:
+            await self.sessions.get(chat_id).handle_inbound(body, "slack", meta)
+        except BaseException:
+            self._dedup_rollback(event_key)
+            raise
+        self._dedup_commit(event_key)
+        return web.json_response({"ok": True})
+
     async def _on_text_received(self, envelope: Dict[str, Any]) -> "web.Response":
         data = envelope.get("data") or {}
         message = data.get("text_message") or {}
@@ -4134,6 +4186,10 @@ class InkboxGateway:
         Returns:
             Optional[str]: The recovery prompt, or None once the cap is hit.
         """
+        if mode == "slack":
+            # A failed request may still have posted. Never generate a resend.
+            logger.error("[bridge] Slack reply failed or unconfirmed; no automatic retry")
+            return None
         meta = meta or {}
         conversation_id = str(meta.get("conversation_id") or "")
         target = str(meta.get("to") or meta.get("sender") or "")
@@ -4810,6 +4866,11 @@ class InkboxGateway:
             )
             return
 
+        if mode == "slack":
+            from .slack import send_reply
+
+            await asyncio.to_thread(send_reply, self._inkbox, meta, content)
+            return
         if mode == "sms":
             text = strip_markdown(content)
             if len(text) > SMS_MAX_LENGTH:

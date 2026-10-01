@@ -114,6 +114,7 @@ class BridgeConfig:
     # provision them ahead of time, where the destination is fixed or this
     # API key may not change it; they must already point at this bridge.
     skip_webhook_reconcile: bool = False
+    slack_enabled: bool = False
     # Wake the agent on unrecognised (external) webhooks. Off by default;
     # registered third-party providers bypass it once their secret is set.
     external_events_enabled: bool = False
@@ -237,6 +238,7 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         allow_all_users=env_flag("INKBOX_ALLOW_ALL_USERS", False),
         require_signature=env_flag("INKBOX_REQUIRE_SIGNATURE", True),
         skip_webhook_reconcile=env_flag("INKBOX_SKIP_WEBHOOK_RECONCILE", False),
+        slack_enabled=env_flag("INKBOX_SLACK_ENABLED", False),
         external_events_enabled=env_flag("INKBOX_EXTERNAL_EVENTS_ENABLED", False),
         contact_memories_enabled=env_flag("INKBOX_CONTACT_MEMORIES_ENABLED", True),
         group_reply_mode=group_reply_mode,
