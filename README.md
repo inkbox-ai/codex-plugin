@@ -239,16 +239,20 @@ and declining full reconfiguration still offers Slack onboarding. Declining Slac
 turns it off only in this bridge; it does not disconnect the workspace or disable
 Slack for other clients. On startup, the gateway registers the subscriptions below.
 
-**Work indicators.** Accepted requests in Slack threads use the native agent
+**Work indicators.** Accepted Slack requests use the native agent
 loading indicator, without adding reaction bubbles. It stays while work is queued
 or running, switches to awaiting-input during questions or approvals, and returns
 to ready after completion, failure, or cancellation. Overlapping requests in the
 same thread share one indicator. Mention-mode context does not start it.
 Slack's native Stop button cancels work in the matching engaged thread, subject to
-the same allowed-sender policy. Ordinary unthreaded DMs keep replying in the main
-DM without opening a thread just to display status.
-Native status needs `chat:write`, SDK processing-status support, and workspace
-feature availability. Unsupported or uncertain updates are logged without
+the same allowed-sender policy. A new main-DM message starts a thread beneath that
+message; the indicator and answer use that same thread. Continue there for
+follow-ups, approval answers, and commands. A new main-DM message starts a separate
+conversation; existing threaded conversations keep their saved context.
+Native status needs an app declared as a Slack Agent (including `assistant:write`),
+`chat:write`, SDK processing-status support, and workspace feature availability.
+Existing installations may need an app-configuration update and reauthorization.
+Unsupported or uncertain updates are logged without
 blocking replies or falling back to reactions. Restart cleanup clears unfinished
 native status and removes pending indicators from the previous reaction version.
 
@@ -263,7 +267,7 @@ Incoming messages can match several categories; the payload's `message_kinds`
 retains the full classification even when only one event type is selected.
 Replies remain deduplicated by the stable event ID, not the selected category.
 
-- By default, DMs, group DMs, and mentions wake Codex. Channel replies start a thread;
+- By default, DMs, group DMs, and mentions wake Codex. New requests start a thread;
   follow-ups in an already-engaged thread continue its conversation without
   another mention. Unrelated channel messages and bot messages do not wake it.
 - With `INKBOX_GROUP_REPLY_MODE=mention`, Slack channels, group DMs, and their

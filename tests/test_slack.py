@@ -115,13 +115,20 @@ def test_retry_after_session_admission_failure(gw):
     assert len(gw.sessions.turns) == 1
 
 
-def test_dm_and_thread_sessions_are_separate_and_preserve_coordinates():
+def test_dm_request_and_followup_share_thread_but_new_requests_are_isolated():
     top = inbound_message(event(conversation_id="D_TEST", message_kinds=["dm"]), IDENTITY)
     threaded = inbound_message(event(conversation_id="D_TEST", message_kinds=["dm", "thread"],
                                      thread_ts="1234567890.000001"), IDENTITY)
-    assert top[0] != threaded[0]
-    assert top[2]["thread_ts"] is None
+    assert top[0] == threaded[0]
+    assert top[2]["thread_ts"] == "1234567890.000001"
     assert threaded[2]["thread_ts"] == "1234567890.000001"
+    assert top[2]["conversation_kind"] == threaded[2]["conversation_kind"] == "direct"
+    new_request = inbound_message(event(conversation_id="D_TEST", message_kinds=["dm"],
+                                        message_ts="1234567890.000002"), IDENTITY)
+    assert new_request[0] != top[0]
+    assert new_request[2]["thread_ts"] == "1234567890.000002"
+    other_dm = inbound_message(event(conversation_id="D_OTHER", message_kinds=["dm"]), IDENTITY)
+    assert other_dm[0] != top[0]
     other_workspace = inbound_message(event(connection_id="another-connection"), IDENTITY)
     assert other_workspace[0] != inbound_message(event(), IDENTITY)[0]
 

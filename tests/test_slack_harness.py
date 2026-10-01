@@ -115,6 +115,7 @@ def test_signed_http_event_runs_session_and_posts_one_reply(tmp_path, monkeypatc
     from aiohttp import ClientSession, web
     from inkbox_codex.webhook_providers import inkbox as verifier
     from inkbox import verify_webhook
+    from inkbox_codex.slack_activity import SlackActivity
 
     monkeypatch.setattr(verifier, "verify_webhook", verify_webhook)
     monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
@@ -125,7 +126,10 @@ def test_signed_http_event_runs_session_and_posts_one_reply(tmp_path, monkeypatc
         gateway._identity = NS(id=IDENTITY)
         client = gateway._inkbox = Mock()
         client.slack.send_message.return_value = NS(id="action-1", status="sent")
-        gateway.sessions = SessionManager(cfg, gateway.send_to_contact, {}, {"handle": "agent"})
+        client.slack.set_processing_status.return_value = NS(status="succeeded")
+        activity = SlackActivity(client.slack, tmp_path / "activity.json")
+        gateway.sessions = SessionManager(cfg, gateway.send_to_contact, {}, {"handle": "agent"},
+                                          turn_activity_fn=activity.notify)
         payload = event(conversation_id=conversation, message_kinds=kinds, thread_ts=thread)
         payload["event_type"] = event_type
         # An unmentioned thread reply belongs to a conversation already engaged.
@@ -159,13 +163,19 @@ def test_signed_http_event_runs_session_and_posts_one_reply(tmp_path, monkeypatc
                     async with http.post(url, data=body, headers=headers) as response:
                         assert response.status == 200
                 await session._worker
+                await activity.flush()
                 assert len(prompts) == 1 and "inkbox:slack" in prompts[0]
                 call = client.slack.send_message.call_args
                 assert client.slack.send_message.call_count == 1
                 assert call.args == (CONNECTION,)
                 assert call.kwargs["conversation_id"] == conversation
-                assert call.kwargs["thread_ts"] == (None if kinds == ["dm"] else "1234567890.000001")
+                assert call.kwargs["thread_ts"] == "1234567890.000001"
                 assert call.kwargs["text"] == "*Hello from Codex*"
+                status_calls = client.slack.set_processing_status.call_args_list
+                assert [call.args for call in status_calls] == [
+                    (CONNECTION, conversation, "1234567890.000001", "processing"),
+                    (CONNECTION, conversation, "1234567890.000001", "active"),
+                ]
                 unrelated = json.dumps({"event_type": "text.received", "companion": {"test": True}}).encode()
                 async with http.post(url, data=unrelated) as response:
                     assert (await response.json())["ignored"] == "non-slack"

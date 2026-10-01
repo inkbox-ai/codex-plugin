@@ -154,7 +154,7 @@ def test_native_failure_does_not_block_turn_or_fall_back_to_reactions(tmp_path, 
     asyncio.run(scenario())
 
 
-def test_unthreaded_dm_and_other_channels_do_not_open_agent_threads(tmp_path):
+def test_incomplete_routes_and_other_channels_do_not_open_agent_threads(tmp_path):
     async def scenario():
         sdk = resource()
         tracker = SlackActivity(sdk, tmp_path / "activity.json")

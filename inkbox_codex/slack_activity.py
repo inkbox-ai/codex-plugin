@@ -68,7 +68,7 @@ class SlackActivity:
     async def notify(self, _chat_id: str, mode: str, meta: dict, state: str) -> None:
         if mode != "slack" or self._closing or not self._supported:
             return
-        # A status on an unthreaded DM would open a thread we do not reply into.
+        # Use the same thread as replies, including the first request in a DM.
         fields = [meta.get("connection_id"), meta.get("conversation_id"), meta.get("thread_ts")]
         event_id = meta.get("source_event_id")
         if not all(isinstance(value, str) and value for value in [*fields, event_id]):
