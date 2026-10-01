@@ -247,6 +247,9 @@ same thread share one indicator. Mention-mode context does not start it.
 Slack's native Stop button cancels work in the matching engaged thread, subject to
 the same allowed-sender policy. Ordinary main-DM messages receive replies in the
 main DM and share conversation context, without a native status indicator.
+Instead, the exact DM message receives 👀 while queued, running, or waiting for
+input. It is removed after success or cancellation; a failed turn or reply delivery
+replaces it with ❌. These reactions do not start a thread.
 An explicit native @mention starts a thread beneath that message; messages already
 inside a thread stay there. Threaded replies and their indicators use the same
 thread. Continue there for follow-ups, approval answers, and commands; each thread
@@ -256,7 +259,8 @@ Native status needs an app declared as a Slack Agent (including `assistant:write
 Existing installations may need an app-configuration update and reauthorization.
 Unsupported or uncertain updates are logged without
 blocking replies or falling back to reactions. Restart cleanup clears unfinished
-native status and removes pending indicators from the previous reaction version.
+native status, marks interrupted DM work with ❌, and removes pending indicators
+from the previous reaction version. Reaction failures do not block replies.
 
 No separate Slack bot token is needed at runtime. Slack subscriptions use
 `slack.dm_received`, `slack.group_dm_received`, `slack.mention_received`,

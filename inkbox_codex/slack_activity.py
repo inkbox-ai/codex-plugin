@@ -1,4 +1,4 @@
-"""Best-effort, ordered native Slack status with restart cleanup."""
+"""Best-effort, ordered Slack turn indicators with restart cleanup."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ class SlackActivity:
         self._tails: dict[str, asyncio.Task] = {}
         self._closing = False
         self._supported = callable(getattr(resource, "set_processing_status", None))
+        self._reactions_supported = all(callable(getattr(resource, method, None))
+                                        for method in ("add_reaction", "remove_reaction"))
 
     def _persist(self) -> None:
         try:
@@ -56,8 +58,14 @@ class SlackActivity:
                 if record["state"] != "active":
                     record = {**record, "state": "active", "token": uuid4().hex}
             elif isinstance(record.get("message_ts"), str) and record["message_ts"]:
-                # Retire indicators left by the previous reaction-based implementation.
-                record = {**record, "state": "completed"}
+                if record.get("indicator") == "reaction":
+                    if record.get("state") not in {"processing", "completed", "failed"}:
+                        continue
+                    if record["state"] == "processing":
+                        record = {**record, "state": "failed", "token": uuid4().hex}
+                else:
+                    # Retire indicators left by the previous reaction-based implementation.
+                    record = {**record, "state": "completed"}
             else:
                 continue
             valid[key] = record
@@ -66,14 +74,20 @@ class SlackActivity:
             self._schedule(key, record)
 
     async def notify(self, _chat_id: str, mode: str, meta: dict, state: str) -> None:
-        if mode != "slack" or self._closing or not self._supported:
+        if mode != "slack" or self._closing:
             return
-        # Only threaded replies use native status; ordinary DMs must stay unthreaded.
-        fields = [meta.get("connection_id"), meta.get("conversation_id"), meta.get("thread_ts")]
+        native = bool(meta.get("thread_ts"))
+        if native:
+            if not self._supported:
+                return
+        elif meta.get("conversation_kind") != "direct" or not self._reactions_supported:
+            return
+        timestamp_field = "thread_ts" if native else "message_ts"
+        fields = [meta.get("connection_id"), meta.get("conversation_id"), meta.get(timestamp_field)]
         event_id = meta.get("source_event_id")
         if not all(isinstance(value, str) and value for value in [*fields, event_id]):
             return
-        key = hashlib.sha256(json.dumps(fields).encode()).hexdigest()
+        key = hashlib.sha256(json.dumps(fields if native else ["reaction", *fields]).encode()).hexdigest()
         active = self._active.get(key, {})
         if state == "accepted":
             if event_id in active:
@@ -91,14 +105,17 @@ class SlackActivity:
             return
         if active:
             self._active[key] = active
-            desired = "suspended" if "suspended" in active.values() else "processing"
+            desired = "suspended" if native and "suspended" in active.values() else "processing"
         else:
             self._active.pop(key, None)
-            desired = "active"
+            desired = "active" if native else "failed" if state == "failed" else "completed"
         if self._records.get(key, {}).get("state") == desired:
             return
-        self._schedule(key, dict(zip(("connection_id", "conversation_id", "thread_ts"), fields),
-                                 state=desired, token=uuid4().hex))
+        record = dict(zip(("connection_id", "conversation_id", timestamp_field), fields),
+                      state=desired, token=uuid4().hex)
+        if not native:
+            record["indicator"] = "reaction"
+        self._schedule(key, record)
 
     def _schedule(self, key: str, record: dict) -> None:
         self._records[key] = record
@@ -118,10 +135,18 @@ class SlackActivity:
             await previous
         state = record["state"]
         native = "thread_ts" in record
-        changes = [("set_processing_status", record["thread_ts"], state)] if native else [
-            ("remove_reaction", record["message_ts"], "eyes"),
-            ("remove_reaction", record["message_ts"], "x"),
-        ]
+        if native:
+            changes = [("set_processing_status", record["thread_ts"], state)]
+        elif record.get("indicator") == "reaction":
+            timestamp = record["message_ts"]
+            if state == "processing":
+                changes = [("add_reaction", timestamp, "eyes"), ("remove_reaction", timestamp, "x")]
+            elif state == "failed":
+                changes = [("remove_reaction", timestamp, "eyes"), ("add_reaction", timestamp, "x")]
+            else:
+                changes = [("remove_reaction", timestamp, "eyes")]
+        else:
+            changes = [("remove_reaction", record["message_ts"], name) for name in ("eyes", "x")]
         succeeded = True
         for method, timestamp, value in changes:
             operation_key = hashlib.sha256(
@@ -154,14 +179,14 @@ class SlackActivity:
                         "transport_timeout", "connection_failed", "transport_error", "upstream_unavailable",
                     } else "unconfirmed"
                     outcome = operation.status if operation.status in {"failed", "unknown", "in_progress"} else "invalid"
-                    logger.warning("Slack native status/cleanup not confirmed (status=%s, reason=%s); "
+                    logger.warning("Slack turn indicator not confirmed (status=%s, reason=%s); "
                                    "the agent turn is unaffected", outcome, reason)
                 elif native:
                     logger.info("Slack native status confirmed: %s", state)
             except Exception:
                 succeeded = False
-                logger.warning("Slack native status/cleanup failed; check connection permissions and API availability")
-        if succeeded and state in {"active", "completed"} and self._records.get(key) is record:
+                logger.warning("Slack turn indicator failed; check connection permissions and API availability")
+        if succeeded and state in {"active", "completed", "failed"} and self._records.get(key) is record:
             self._records.pop(key, None)
             self._persist()
 
@@ -174,7 +199,8 @@ class SlackActivity:
         for key in self._active:
             record = self._records.get(key)
             if record is not None:
-                self._schedule(key, {**record, "state": "active", "token": uuid4().hex})
+                state = "active" if "thread_ts" in record else "completed"
+                self._schedule(key, {**record, "state": state, "token": uuid4().hex})
         self._active.clear()
         try:
             await asyncio.wait_for(self.flush(), timeout=5)

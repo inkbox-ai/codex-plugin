@@ -1,4 +1,4 @@
-"""Native Slack status follows admitted turns, not context-only messages."""
+"""Slack indicators follow admitted turns, not context-only messages."""
 
 import asyncio
 import json
@@ -19,12 +19,98 @@ def route(event="event-1", message="1234567890.000002"):
 
 def resource():
     sdk = Mock()
-    sdk.set_processing_status.return_value = sdk.remove_reaction.return_value = NS(status="succeeded")
+    sdk.set_processing_status.return_value = sdk.remove_reaction.return_value = sdk.add_reaction.return_value = NS(status="succeeded")
     return sdk
 
 
 def statuses(sdk):
     return [call.args[3] for call in sdk.set_processing_status.call_args_list]
+
+
+def dm(event="event-1", message="1234567890.000002"):
+    return {**route(event, message), "thread_ts": None, "conversation_kind": "direct", "slack_mentioned": False}
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
+def test_dm_reactions_follow_exact_message_without_creating_thread(tmp_path, outcome):
+    async def scenario():
+        sdk = resource()
+        tracker = SlackActivity(sdk, tmp_path / "activity.json")
+        for state in ("accepted", "accepted", "waiting", "resumed"):
+            await tracker.notify("dm", "slack", dm(), state)
+        await tracker.flush()
+        assert [call.args[3] for call in sdk.add_reaction.call_args_list] == ["eyes"]
+        for state in (outcome, outcome):
+            await tracker.notify("dm", "slack", dm(), state)
+        await tracker.flush()
+        assert [call.args[3] for call in sdk.add_reaction.call_args_list] == (["eyes", "x"] if outcome == "failed" else ["eyes"])
+        assert [call.args[3] for call in sdk.remove_reaction.call_args_list] == ["x", "eyes"]
+        assert all(call.args[:3] == (dm()["connection_id"], "C123", dm()["message_ts"])
+                   for call in sdk.mock_calls)
+        assert json.loads(tracker.state_path.read_text()) == {}
+        sdk.set_processing_status.assert_not_called()
+    asyncio.run(scenario())
+
+
+def test_dm_messages_and_thread_on_same_anchor_keep_independent_indicators(tmp_path):
+    async def scenario():
+        sdk = resource()
+        tracker = SlackActivity(sdk, tmp_path / "activity.json")
+        first, second = dm(), dm("event-2", "1234567890.000003")
+        thread = {**route("event-3"), "thread_ts": first["message_ts"]}
+        for meta in (first, second, thread):
+            await tracker.notify("chat", "slack", meta, "accepted")
+        await tracker.notify("chat", "slack", first, "cancelled")
+        await tracker.flush()
+        assert statuses(sdk) == ["processing"]
+        removed_eyes = [call.args[2] for call in sdk.remove_reaction.call_args_list if call.args[3] == "eyes"]
+        assert removed_eyes == [first["message_ts"]]
+        assert len(json.loads(tracker.state_path.read_text())) == 2
+        await tracker.close()
+        assert statuses(sdk) == ["processing", "active"]
+        assert json.loads(tracker.state_path.read_text()) == {}
+        assert [call.args[3] for call in sdk.add_reaction.call_args_list] == ["eyes", "eyes"]
+    asyncio.run(scenario())
+
+
+def test_restart_marks_interrupted_dm_failed_and_retries_cleanup_with_same_keys(tmp_path):
+    async def scenario():
+        sdk = resource()
+        path = tmp_path / "activity.json"
+        tracker = SlackActivity(sdk, path)
+        await tracker.notify("dm", "slack", dm(), "accepted")
+        await tracker.flush()
+        sdk.remove_reaction.return_value = NS(status="unknown")
+        restarted = SlackActivity(sdk, path)
+        await restarted.recover()
+        await restarted.flush()
+        assert sdk.add_reaction.call_args.args[3] == "x"
+        assert [r["state"] for r in json.loads(path.read_text()).values()] == ["failed"]
+        keys = [call.kwargs["idempotency_key"] for call in sdk.mock_calls[-2:]]
+        sdk.remove_reaction.return_value = NS(status="succeeded")
+        restarted_again = SlackActivity(sdk, path)
+        await restarted_again.recover()
+        await restarted_again.flush()
+        assert [call.kwargs["idempotency_key"] for call in sdk.mock_calls[-2:]] == keys
+        assert json.loads(path.read_text()) == {}
+        # Once recorded successfully, failure markers stay on the message across restarts.
+        sdk.reset_mock()
+        await SlackActivity(sdk, path).recover()
+        assert not sdk.mock_calls
+    asyncio.run(scenario())
+
+
+def test_reactions_work_without_native_status_capability(tmp_path):
+    async def scenario():
+        sdk = NS(add_reaction=Mock(return_value=NS(status="succeeded")),
+                 remove_reaction=Mock(return_value=NS(status="succeeded")))
+        tracker = SlackActivity(sdk, tmp_path / "activity.json")
+        await tracker.notify("dm", "slack", dm(), "accepted")
+        await tracker.notify("dm", "slack", dm(), "completed")
+        await tracker.flush()
+        sdk.add_reaction.assert_called_once()
+        assert json.loads(tracker.state_path.read_text()) == {}
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
@@ -174,14 +260,19 @@ def test_old_sdk_does_not_break_conversations(tmp_path):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("failure", [None, "model", "delivery"])
+@pytest.mark.parametrize("failure", [None, "model", "delivery", "reaction"])
 def test_session_reports_acceptance_and_final_outcome_after_reply(tmp_path, monkeypatch, failure):
     monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
     async def scenario():
         session = make_session([])
         events = []
+        sdk = resource()
+        if failure == "reaction":
+            sdk.add_reaction.side_effect = RuntimeError("unavailable")
+        tracker = SlackActivity(sdk, tmp_path / "activity.json")
         async def notify(_chat, _mode, meta, state):
             events.append((meta["source_event_id"], state))
+            await tracker.notify(_chat, _mode, meta, state)
         session.turn_activity_fn = notify
         class Client:
             thread_id = None
@@ -199,9 +290,14 @@ def test_session_reports_acceptance_and_final_outcome_after_reply(tmp_path, monk
         session._ensure_client = ensure
         session.send_fn = send
         session.on_send_failure = lambda *args: None
-        await session.handle_inbound("hello", "slack", route())
+        await session.handle_inbound("hello", "slack", dm())
         await session._worker
-        assert events == [("event-1", "accepted"), ("event-1", "failed" if failure else "completed")]
+        await tracker.flush()
+        failed = failure in {"model", "delivery"}
+        assert events == [("event-1", "accepted"), ("event-1", "failed" if failed else "completed")]
+        assert [call.args[3] for call in sdk.add_reaction.call_args_list] == (["eyes", "x"] if failed else ["eyes"])
+        assert sdk.remove_reaction.call_args.args[2:] == (dm()["message_ts"], "eyes")
+        sdk.set_processing_status.assert_not_called()
     asyncio.run(scenario())
 
 
@@ -334,6 +430,44 @@ def test_native_status_through_actual_sdk_http_transport(tmp_path, monkeypatch):
                 await tracker.notify("chat", "slack", route(), state)
             await tracker.flush()
             assert requests == ["processing", "suspended", "processing", "active"]
+    asyncio.run(scenario())
+
+
+def test_dm_reactions_through_actual_sdk_http_transport(tmp_path, monkeypatch):
+    import httpx
+    from inkbox import Inkbox
+    slack = pytest.importorskip("inkbox.slack")
+    if not hasattr(slack.SlackResource, "add_reaction"):
+        pytest.skip("SDK predates Slack reactions")
+    requests = []
+    keys = []
+    base = f"/api/v1/slack/connections/{dm()['connection_id']}/conversations/C123/messages/{dm()['message_ts']}/reactions"
+    def handle(request):
+        assert request.headers["X-API-Key"] == "test-key"
+        keys.append(request.headers["Idempotency-Key"])
+        if request.method == "POST":
+            assert request.url.path == base
+            name = json.loads(request.content)["name"]
+        else:
+            assert request.method == "DELETE" and request.url.path.startswith(base + "/")
+            name = request.url.path.rsplit("/", 1)[1]
+        requests.append((request.method, name))
+        return httpx.Response(200, json={
+            "id": "00000000-0000-4000-8000-000000000002", "connection_id": dm()["connection_id"],
+            "operation": "reaction_add" if request.method == "POST" else "reaction_remove",
+            "status": "succeeded", "conversation_id": "C123", "message_ts": dm()["message_ts"],
+        })
+    monkeypatch.setattr(httpx, "HTTPTransport", lambda **kwargs: httpx.MockTransport(handle))
+    async def scenario():
+        with Inkbox(api_key="test-key", base_url="https://example.com") as client:
+            tracker = SlackActivity(client.slack, tmp_path / "activity.json")
+            await tracker.notify("dm", "slack", dm(), "accepted")
+            await tracker.notify("dm", "slack", dm(), "failed")
+            await tracker.flush()
+            assert requests == [("POST", "eyes"), ("DELETE", "x"), ("DELETE", "eyes"), ("POST", "x")]
+            assert len(set(keys)) == 4
+            assert all(key.startswith("codex:activity:") and len(key) <= 128 for key in keys)
+            assert json.loads(tracker.state_path.read_text()) == {}
     asyncio.run(scenario())
 
 
