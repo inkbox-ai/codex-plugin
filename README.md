@@ -239,6 +239,16 @@ and declining full reconfiguration still offers Slack onboarding. Declining Slac
 turns it off only in this bridge; it does not disconnect the workspace or disable
 Slack for other clients. On startup, the gateway registers the subscriptions below.
 
+**Work indicators.** An accepted Slack request adds 👀 to the thread's root
+message (or the triggering message in an unthreaded DM). It stays while requests
+for that anchor are queued or running. Completion removes it; a failed turn or
+failed reply delivery replaces it with ❌. New work clears a previous failure.
+Mention-mode context, local commands, and approval answers do not create another
+indicator. Stopping work clears the busy indicator without marking a failure.
+After an unexpected gateway exit, restart cleanup marks unfinished work failed.
+Reactions require `reactions:write` and SDK reaction support; failures are logged
+without blocking the conversation or blindly retrying an uncertain operation.
+
 No separate Slack bot token is needed at runtime. Slack subscriptions use
 `slack.dm_received`, `slack.group_dm_received`, `slack.mention_received`, and
 `slack.thread_reply_received` with no Slack-specific filter. The gateway also
@@ -274,7 +284,7 @@ Replies remain deduplicated by the stable event ID, not the selected category.
   send. Webhook duplicate suppression follows the gateway's existing bounded,
   in-memory behavior.
 - Attachments are exposed as metadata in this first version. File transfer,
-  reactions, and processing indicators are not included.
+  arbitrary reaction tools, and native processing-status updates are not included.
 
 `INKBOX_ALLOWED_USERS` accepts Slack user IDs or workspace-qualified `T_ID:U_ID`
 entries. An empty list admits all human senders whose events reach the identity.

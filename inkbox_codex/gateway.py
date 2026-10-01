@@ -955,6 +955,7 @@ class InkboxGateway:
         self._public_host: str = ""
         self._runner: Any = None
         self.sessions: Optional[SessionManager] = None
+        self._slack_activity = None
         self._companion_receiver = None
         self._codex_ready: Optional[bool] = None
         self._codex_readiness_detail = "startup has not been checked"
@@ -1058,6 +1059,13 @@ class InkboxGateway:
         # webhook can arrive immediately after the subscription write, and its
         # side-effect turn needs a queue ready before we acknowledge it.
         server_config, _tool_names = build_inkbox_mcp_server_config(self.cfg)
+        if self.cfg.slack_enabled:
+            from .daemon import state_dir
+            from .slack_activity import SlackActivity
+            self._slack_activity = SlackActivity(
+                self._inkbox.slack, state_dir() / f"slack-activity-{self._identity.id}.json",
+            )
+            await self._slack_activity.recover()
         self.sessions = SessionManager(
             cfg=self.cfg,
             send_fn=self.send_to_contact,
@@ -1066,6 +1074,7 @@ class InkboxGateway:
             typing_fn=self.send_typing,
             health_fn=self.health_report,
             on_send_failure=self._note_sync_send_failure,
+            turn_activity_fn=self._slack_activity.notify if self._slack_activity else None,
         )
         self._companion().recover()
         await asyncio.to_thread(self._patch_identity_objects)
@@ -1305,6 +1314,8 @@ class InkboxGateway:
             await self._companion_receiver.close()
         if self.sessions is not None:
             await self.sessions.close_all()
+        if getattr(self, "_slack_activity", None) is not None:
+            await self._slack_activity.close()
         if self._runner is not None:
             await self._runner.cleanup()
         if self._tunnel is not None:

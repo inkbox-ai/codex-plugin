@@ -57,12 +57,14 @@ jobs:
           from inkbox.slack import SlackResource
           from inkbox.webhook_subscriptions import WebhookSubscriptionsResource
           assert callable(SlackResource.list_provisioning_workspaces)
+          assert callable(SlackResource.add_reaction)
+          assert callable(SlackResource.remove_reaction)
           assert "scope" in inspect.signature(WebhookSubscriptionsResource.list).parameters
           PY
       - name: Slack onboarding, routing, signed receiver, and SDK contracts
         run: >-
           pytest -q tests/test_setup_slack.py tests/test_setup_wizard.py
-          tests/test_prompts.py tests/test_slack.py tests/test_slack_harness.py
+          tests/test_prompts.py tests/test_slack.py tests/test_slack_activity.py tests/test_slack_harness.py
           tests/test_tools.py::test_coding_agent_tool_tier_is_registered
 
   # Contract suite against the REAL Codex host at its freshest main cut. This is

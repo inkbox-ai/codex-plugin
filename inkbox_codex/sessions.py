@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 SendFn = Callable[[str, str, str, Dict[str, Any]], Awaitable[Any]]
 # gateway.send_typing(chat_id, mode, meta) signature.
 TypingFn = Callable[[str, str, Dict[str, Any]], Awaitable[Any]]
+TurnActivityFn = Callable[[str, str, Dict[str, Any], str], Awaitable[Any]]
 # gateway.health_report() signature.
 HealthFn = Callable[[], Awaitable[str]]
 # gateway._note_sync_send_failure(chat_id, mode, meta, reply, reason) signature:
@@ -96,6 +97,8 @@ class _Turn:
     reply_meta: Optional[Dict[str, Any]] = None
     completion: Optional["asyncio.Future[Optional[str]]"] = None
     before_submit: Optional[Callable[[], Awaitable[None]]] = None
+    activity_started: bool = False
+    delivery_failed: bool = False
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Codex as a turn.
@@ -376,6 +379,7 @@ class ContactSession:
         typing_fn: Optional[TypingFn] = None,
         health_fn: Optional[HealthFn] = None,
         on_send_failure: Optional[SendFailureFn] = None,
+        turn_activity_fn: Optional[TurnActivityFn] = None,
     ):
         self.chat_id = chat_id
         self.cfg = cfg
@@ -383,6 +387,7 @@ class ContactSession:
         self.typing_fn = typing_fn
         self.health_fn = health_fn
         self.on_send_failure = on_send_failure
+        self.turn_activity_fn = turn_activity_fn
         self.mcp_server_config = dict(mcp_server_config or {})
         # Stamp this session's id into the tool process env so Inkbox tools
         # (e.g. place-call line resolution) know which conversation they
@@ -659,11 +664,13 @@ class ContactSession:
 
         # Tag the message with its channel + sender so Codex knows where it
         # is and who it's talking to (the static system prompt can't).
-        await self._queue.put(_Turn(
+        turn = _Turn(
             text=frame_inbound(mode, meta, text),
             reply_mode=mode,
             reply_meta=dict(meta),
-        ))
+        )
+        await self._notify_turn_activity(turn, "accepted")
+        await self._queue.put(turn)
 
         # Texting again while Codex is mid-turn behaves like hitting Esc and
         # typing a new message: interrupt the running turn so the worker drops
@@ -680,9 +687,24 @@ class ContactSession:
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())
 
+    async def _notify_turn_activity(self, turn: _Turn, state: str) -> None:
+        if self.turn_activity_fn is None or turn.reply_mode != "slack":
+            return
+        if state == "accepted":
+            turn.activity_started = True
+        elif not turn.activity_started:
+            return
+        else:
+            turn.activity_started = False
+        try:
+            await self.turn_activity_fn(self.chat_id, "slack", turn.reply_meta or {}, state)
+        except Exception:
+            logger.warning("Turn activity update failed; continuing the conversation")
+
     async def _drain(self) -> None:
         while not self._queue.empty():
             turn = await self._queue.get()
+            outcome = "cancelled"
             try:
                 if turn.completion is not None:
                     if turn.completion.cancelled():
@@ -704,9 +726,11 @@ class ContactSession:
                     await self._flush_context()
                     continue
                 await self._run_turn(turn)
+                outcome = "cancelled" if self._interrupting else "failed" if turn.delivery_failed else "completed"
                 if turn.completion is not None and not turn.completion.done():
                     turn.completion.set_result(None)
             except Exception as exc:
+                outcome = "cancelled" if self._interrupting else "failed"
                 if turn.completion is not None:
                     if not turn.completion.done():
                         turn.completion.set_exception(exc)
@@ -732,6 +756,8 @@ class ContactSession:
                         )
                 except Exception:
                     logger.exception("[session %s] could not send the error notice", self.chat_id)
+            finally:
+                await self._notify_turn_activity(turn, outcome)
 
     async def _flush_context(self) -> None:
         if not self._pending_context:
@@ -793,6 +819,7 @@ class ContactSession:
                 turn = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            await self._notify_turn_activity(turn, "cancelled")
             if turn.completion is not None and not turn.completion.done():
                 turn.completion.set_result(None)
             if turn.future is not None and not turn.future.done():
@@ -1059,6 +1086,7 @@ class ContactSession:
         try:
             await self._reply(reply, turn=turn)
         except Exception as exc:
+            turn.delivery_failed = True
             if turn.completion is not None:
                 # The durable receiver owns retries; never create another model
                 # turn or switch recipient after an ambiguous Companion send.
@@ -1415,12 +1443,14 @@ class SessionManager:
         typing_fn: Optional[TypingFn] = None,
         health_fn: Optional[HealthFn] = None,
         on_send_failure: Optional[SendFailureFn] = None,
+        turn_activity_fn: Optional[TurnActivityFn] = None,
     ):
         self.cfg = cfg
         self.send_fn = send_fn
         self.typing_fn = typing_fn
         self.health_fn = health_fn
         self.on_send_failure = on_send_failure
+        self.turn_activity_fn = turn_activity_fn
         self.mcp_server_config = dict(mcp_server_config or {})
         self.identity_info = identity_info
         self.sessions: Dict[str, ContactSession] = {}
@@ -1477,6 +1507,7 @@ class SessionManager:
                 typing_fn=self.typing_fn,
                 health_fn=self.health_fn,
                 on_send_failure=self.on_send_failure,
+                turn_activity_fn=self.turn_activity_fn,
             )
             self.sessions[chat_id] = session
         return session
