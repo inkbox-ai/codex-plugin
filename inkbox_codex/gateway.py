@@ -83,6 +83,12 @@ try:
         VoiceStack,
         call_contexts_dir,
         inkbox_client_kwargs,
+        imessage_threading_capability,
+    )
+    from .imessage import (
+        IMessageState, auto_reply_kwargs, source_metadata,
+        write_turn_context, read_turn_context, clear_turn_context,
+        clear_identity_turn_contexts,
     )
     from .companion import Receiver as CompanionReceiver, CompanionError, inbox_summary
     from .codex_client import CodexTurnResult, probe_codex
@@ -112,7 +118,8 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
         release_a2a_progress_gate,
         try_acquire_a2a_progress_gate,
     )
-    from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, VoiceStack, call_contexts_dir, inkbox_client_kwargs
+    from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, VoiceStack, call_contexts_dir, inkbox_client_kwargs, imessage_threading_capability
+    from imessage import IMessageState, auto_reply_kwargs, source_metadata, write_turn_context, read_turn_context, clear_turn_context, clear_identity_turn_contexts
     from companion import Receiver as CompanionReceiver, CompanionError, inbox_summary
     from codex_client import CodexTurnResult, probe_codex
     from a2a_delegations import find_by_task as find_a2a_delegation
@@ -957,6 +964,7 @@ class InkboxGateway:
         self.sessions: Optional[SessionManager] = None
         self._slack_activity = None
         self._companion_receiver = None
+        self._imessage_state = None
         self._codex_ready: Optional[bool] = None
         self._codex_readiness_detail = "startup has not been checked"
         self._codex_checked_at: Optional[float] = None
@@ -1035,6 +1043,10 @@ class InkboxGateway:
 
         self._inkbox = Inkbox(**inkbox_client_kwargs(self.cfg.api_key, self.cfg.base_url))
         self._identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+        if self.cfg.imessage_threaded_replies:
+            supported, detail = imessage_threading_capability(self._identity)
+            if not supported:
+                raise RuntimeError(detail)
 
         mailbox = getattr(self._identity, "mailbox", None)
         phone = getattr(self._identity, "phone_number", None)
@@ -1075,8 +1087,13 @@ class InkboxGateway:
             health_fn=self.health_report,
             on_send_failure=self._note_sync_send_failure,
             turn_activity_fn=self._slack_activity.notify if self._slack_activity else None,
+            imessage_turn_fn=self._imessage_turn_state if self.cfg.imessage_threaded_replies else None,
         )
-        self._companion().recover()
+        receiver = self._companion()  # Acquire the existing single-gateway inbox lock first.
+        clear_identity_turn_contexts(self.cfg)
+        if self.cfg.imessage_threaded_replies:
+            await self._recover_imessage_inputs()
+        receiver.recover()
         await asyncio.to_thread(self._patch_identity_objects)
         await self._catch_up_a2a_tasks()
         await self._recover_hosted_call_completions()
@@ -1328,6 +1345,77 @@ class InkboxGateway:
     # Inbound: webhooks
     # ------------------------------------------------------------------
 
+    def _threaded_imessage_state(self) -> IMessageState:
+        if self._imessage_state is None:
+            self._imessage_state = IMessageState(self.cfg)
+        return self._imessage_state
+
+    async def _imessage_turn_state(self, chat_id, state, meta, text=None):
+        """Checkpoint ordinary inputs; Companion retains its own receipt owner."""
+        store = self._threaded_imessage_state()
+        ordinary = not meta.get("companion")
+        if state == "admitted":
+            # Only recovery sets this local marker; inbound metadata is built
+            # explicitly, never copied wholesale from a webhook.
+            if meta.pop("_imessage_replay", False):
+                return True
+            return store.admit(chat_id, text, meta)
+        if state == "consumed":
+            if ordinary:
+                store.mark(meta, "running", chat_id=chat_id)
+            return
+        if state == "started":
+            if ordinary:
+                store.mark(meta, "running", chat_id=chat_id)
+            context = write_turn_context(chat_id, self.cfg, meta)
+            meta["imessage_context_nonce"] = context["nonce"]
+            return
+        if state == "result":
+            context = read_turn_context(chat_id)
+            owned = context and context.get("nonce") == meta.get("imessage_context_nonce")
+            sent = (context or {}).get("sent_outputs", []) if owned else []
+            duplicate = bool(text and any(
+                output.get("text") in {text, strip_markdown(text)}
+                and output.get("target") in context.get("admitted_source_ids", [])
+                for output in sent
+            ))
+            if ordinary:
+                if duplicate or not text or text.strip() == "[SILENT]":
+                    store.mark(meta, "done", chat_id=chat_id)
+                else:
+                    store.mark(meta, "reply_pending", reply=text, chat_id=chat_id)
+            return duplicate
+        if state in {"done", "cancelled", "uncertain"}:
+            if ordinary:
+                store.mark(meta, state, chat_id=chat_id)
+            # A control message can finish while another turn is still using
+            # its tools. Never remove that other turn's source allowlist.
+            context = read_turn_context(chat_id)
+            if context and context.get("nonce") == meta.get("imessage_context_nonce"):
+                clear_turn_context(chat_id)
+
+    async def _recover_imessage_inputs(self):
+        store = self._threaded_imessage_state()
+        pending = store.replay_pending()  # running/sending become uncertain
+        for item in store.pending_replies():
+            meta, chat_id = item["meta"], item["chat_id"]
+            if not self._sender_allowed(str(meta.get("sender") or "")):
+                store.mark(meta, "cancelled", chat_id=chat_id)
+                continue
+            try:
+                await self.send_to_contact(chat_id, item["reply"], "imessage", {**meta, "imessage_final_reply": True})
+            except Exception:
+                # No automatic retry after crossing the send checkpoint.
+                store.mark(meta, "uncertain", chat_id=chat_id)
+                logger.warning("[bridge] retained an iMessage reply after a delivery error; check receipt state before retrying")
+        for item in pending:
+            meta = item["meta"]
+            if not self._sender_allowed(str(meta.get("sender") or "")):
+                store.mark(meta, "cancelled", chat_id=item["chat_id"])
+                continue
+            meta["_imessage_replay"] = True
+            await self.sessions.get(item["chat_id"]).handle_inbound(item["text"], "imessage", meta)
+
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         return web.json_response({"ok": True, "identity": self.cfg.identity, **await self._readiness()})
 
@@ -1347,11 +1435,18 @@ class InkboxGateway:
             self.sessions is not None and self._companion_receiver is not None
             and startup_ok and inbox["readable"] and not inbox.get("blocked_conversations")
         )
-        return {
+        result = {
             "ready": ready,
             "codex": {"startup_ok": startup_ok, "checked_at": checked_at},
             "companion": inbox,
         }
+        if self.cfg.imessage_threaded_replies:
+            try:
+                result["imessage_threading"] = {"enabled": True, **self._threaded_imessage_state().summary()}
+            except (OSError, sqlite3.Error):
+                result["imessage_threading"] = {"enabled": True, "readable": False}
+                result["ready"] = False
+        return result
 
     def _prune_dedup_ids(self) -> None:
         now = time.time()
@@ -3982,6 +4077,11 @@ class InkboxGateway:
             "conversation_kind": "group" if is_group else "direct",
             "raw_text": text,
         }
+        if self.cfg.imessage_threaded_replies:
+            meta.update(source_metadata(message, envelope.get("id")))
+            meta["sender_access"] = message.get("sender_access")
+            if media:
+                meta["attachments"] = media
         # A fresh inbound starts a fresh logical reply — reset its failed-send budget.
         self._clear_outbound_failures("imessage", conversation_id, sender, chat_id=chat_id)
         await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
@@ -4333,6 +4433,23 @@ class InkboxGateway:
         message_id = str(message.get("id") or "")
         if self._already_notified(message_id):
             return web.json_response({"ok": True, "deduped": True})
+        if self.cfg.imessage_threaded_replies:
+            store = self._threaded_imessage_state()
+            store.mark_delivery_failed(message_id)
+            route = store.lookup_outbound(message_id)
+            if route and route.get("chat_id"):
+                notice = (
+                    "Delivery status only, not a new request: iMessage " + message_id
+                    + " failed in conversation " + str(route["meta"].get("conversation_id") or "")
+                    + ". Do not automatically resend or switch to an unthreaded reply."
+                )
+                if self.sessions is not None:
+                    await self.sessions.get(route["chat_id"]).append_delivery_notice(notice, "imessage", route["meta"])
+                return web.json_response({"ok": True, "retained": "failed-threaded-output"})
+            # The callback may beat the send response (or its durable record).
+            # Missing correlation is never permission to invoke legacy retries.
+            logger.warning("[bridge] retained an iMessage delivery failure pending output correlation")
+            return web.json_response({"ok": True, "retained": "unmatched-imessage-failure"})
         recipient = str(message.get("remote_number") or "").strip()
         body = str(message.get("content") or "").strip()
         reason = str(
@@ -4799,6 +4916,16 @@ class InkboxGateway:
                 lines.append(f"Companion: {inbox['quarantined_count']} earlier inputs have unconfirmed outcomes; new messages can continue")
         else:
             lines.append("Companion: receipt state unavailable")
+        if self.cfg.imessage_threaded_replies:
+            summary = status["imessage_threading"]
+            if summary.get("readable") is False:
+                lines.append("iMessage threading: receipt state unavailable")
+            else:
+                lines.append(
+                    f"iMessage threading: {summary['pending']} pending inputs; "
+                    f"{summary['reply_pending']} saved answers; {summary['uncertain']} unconfirmed outcomes; "
+                    f"{summary['outbound_failed_count']} failed outputs"
+                )
         lines.append(f"Readiness: {'ready' if status['ready'] else 'degraded'} (startup and queue checks only)")
         return "\n".join(lines)
 
@@ -4897,13 +5024,44 @@ class InkboxGateway:
                 conversation_id = str(chat_id).split(":", 1)[1]
             if not conversation_id:
                 raise ValueError(f"No iMessage conversation id for chat {chat_id}")
+            kwargs = {"conversation_id": conversation_id, "text": text}
+            if self.cfg.imessage_threaded_replies:
+                supported, detail = imessage_threading_capability(identity)
+                if not supported:
+                    raise RuntimeError(detail)
+                kwargs.update(auto_reply_kwargs(meta))
+                target = kwargs.get("reply_to_message_id")
+                if target:
+                    sources = {str(source.get("id")) for source in meta.get("imessage_sources", [])}
+                    if str(target) not in sources:
+                        raise ValueError("iMessage reply target is not part of this admitted turn")
+                    source = await asyncio.to_thread(identity.get_imessage, target)
+                    if str(self._field(source, "conversation_id") or "") != conversation_id:
+                        raise ValueError("iMessage reply target belongs to a different conversation")
+                    # Old backends can ignore unknown request fields. A bounded
+                    # native endpoint read must succeed before a targeted send.
+                    # Never add fetched history to a Companion activation.
+                    page = await asyncio.to_thread(identity.get_imessage_thread, target, limit=1)
+                    if str(self._field(page, "conversation_id") or "") != conversation_id:
+                        raise ValueError("Native iMessage reply support could not be verified for this conversation")
+                key_data = [self.cfg.base_url, self.cfg.identity, chat_id,
+                            meta.get("companion_receipt_token") or meta.get("imessage_event_ids")
+                            or meta.get("imessage_event_id") or meta.get("message_id"),
+                            "final" if meta.get("imessage_final_reply") or meta.get("companion_reply_event_id")
+                            else uuid.uuid4().hex, kwargs]
+                kwargs["idempotency_key"] = "codex-imsg-" + hashlib.sha256(
+                    json.dumps(key_data, sort_keys=True).encode()
+                ).hexdigest()
             if meta.get("companion"):
                 self._companion().reply_sending(meta)
-            await asyncio.to_thread(
-                identity.send_imessage,
-                conversation_id=conversation_id,
-                text=text,
-            )
+            elif self.cfg.imessage_threaded_replies and meta.get("imessage_final_reply"):
+                self._threaded_imessage_state().mark(meta, "sending", chat_id=chat_id)
+            message = await asyncio.to_thread(identity.send_imessage, **kwargs)
+            if self.cfg.imessage_threaded_replies:
+                store = self._threaded_imessage_state()
+                store.record_outbound(message, meta, chat_id)
+                if not meta.get("companion") and meta.get("imessage_final_reply"):
+                    store.mark(meta, "done", chat_id=chat_id)
         else:  # email
             message_id = str(meta.get("message_id") or "").strip()
             if not message_id:

@@ -46,6 +46,7 @@ try:
         call_contexts_dir,
         channel_hints_path,
         hosted_sms_turn_context_path,
+        imessage_threading_capability,
         read_config,
     )
     from .delivery_policy import sms_tool_failure_kind
@@ -71,6 +72,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
         call_contexts_dir,
         channel_hints_path,
         hosted_sms_turn_context_path,
+        imessage_threading_capability,
         read_config,
     )
     from delivery_policy import sms_tool_failure_kind
@@ -537,6 +539,99 @@ def _json_safe(value: Any) -> Any:
     return str(getattr(value, "value", value))
 
 
+def _imessage_value(message: Any, name: str) -> Any:
+    """Read SDK message fields without deriving missing reply relationships."""
+    return message.get(name) if isinstance(message, dict) else getattr(message, name, None)
+
+
+def _require_imessage_threading(identity: Any) -> None:
+    """Reject unavailable opt-in operations before any send or media upload."""
+    if not read_config().imessage_threaded_replies:
+        raise ValueError("Enable INKBOX_IMESSAGE_THREADED_REPLIES to use native reply tools")
+    capable, detail = imessage_threading_capability(identity)
+    if not capable:
+        raise RuntimeError(detail)
+
+
+def _imessage_page_options(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate bounded cursor pagination for one chronological thread page."""
+    limit = args.get("limit", 50)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+        raise ValueError("limit must be an integer between 1 and 200")
+    cursor = args.get("cursor")
+    if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > 1024):
+        raise ValueError("cursor must be a nonempty string of at most 1024 characters")
+    return {"limit": limit, "cursor": cursor}
+
+
+def _imessage_active_context(identity_handle: str, *, required: bool = False) -> Dict[str, Any] | None:
+    """Bind a chat tool process to its currently admitted identity and environment."""
+    from .imessage import read_turn_context
+
+    context = read_turn_context()
+    if context is None:
+        if required and os.getenv("INKBOX_CODEX_CHAT_ID"):
+            raise ValueError("No active iMessage turn is available for this reply")
+        return None
+    cfg = read_config()
+    if (
+        context.get("identity") != identity_handle
+        or str(context.get("base_url") or "").rstrip("/") != str(cfg.base_url or "").rstrip("/")
+    ):
+        if required:
+            raise ValueError("The active iMessage turn belongs to a different identity or API environment")
+        return None
+    return context
+
+
+def _imessage_reply_options(
+    identity: Any, args: Dict[str, Any], conversation_id: str, context: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Validate a native target against the current identity's visible message."""
+    if not any(key in args for key in ("reply_to_message_id", "plain_reply_fallback", "idempotency_key")):
+        return {}
+    _require_imessage_threading(identity)
+    options: Dict[str, Any] = {}
+    target = args.get("reply_to_message_id")
+    if target is not None:
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("reply_to_message_id must be a nonempty message ID")
+        if not conversation_id or args.get("to") is not None:
+            raise ValueError("reply_to_message_id requires conversation_id and cannot be used with to")
+        target = target.strip()
+        if context is not None:
+            from .imessage import validate_tool_target
+
+            validate_tool_target(context, conversation_id, target)
+        message = identity.get_imessage(target)
+        if str(_imessage_value(message, "conversation_id") or "") != conversation_id:
+            raise ValueError("The reply target must belong to the selected iMessage conversation")
+        # A local SDK upgrade does not prove the serving API accepts reply fields.
+        page = identity.get_imessage_thread(target, limit=1)
+        if str(_imessage_value(page, "conversation_id") or "") != conversation_id:
+            raise ValueError("Native iMessage reply support could not be verified for this conversation")
+        fallback = args.get("plain_reply_fallback", True)
+        if not isinstance(fallback, bool):
+            raise ValueError("plain_reply_fallback must be a boolean")
+        options.update(reply_to_message_id=target, plain_reply_fallback=fallback)
+    key = args.get("idempotency_key")
+    if key is not None:
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("idempotency_key must be a nonempty string")
+        options["idempotency_key"] = key
+    return options
+
+
+def _imessage_send_result(message: Any) -> Dict[str, Any]:
+    """Return accepted-send metadata; queued state is not proof of delivery."""
+    return {
+        "sent": True,
+        **{name: _json_safe(_imessage_value(message, name)) for name in (
+            "id", "status", "conversation_id", "reply_to_message_id", "thread_id", "thread_root_message_id",
+        )},
+    }
+
+
 def _tool_result(data: Any) -> Dict[str, Any]:
     return {
         "content": [
@@ -898,6 +993,11 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
             to_list = _normalize_imessage_recipients(args.get("to"))
             if bool(to_list) == bool(conversation_id):
                 raise ValueError("Specify exactly one of `to` or `conversation_id`.")
+            threaded = read_config().imessage_threaded_replies
+            context = _imessage_active_context(
+                identity_handle, required=args.get("reply_to_message_id") is not None,
+            ) if threaded else None
+            reply_options = _imessage_reply_options(identity, args, conversation_id, context)
             if to_list is not None and not to_list:
                 raise ValueError("`to` must include at least one recipient.")
             if to_list and len(to_list) > IMESSAGE_MAX_GROUP_RECIPIENTS:
@@ -911,7 +1011,7 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                     "Starting an iMessage group requires a dedicated outbound iMessage "
                     "line. Reply to an existing group with conversation_id."
                 )
-            kwargs: Dict[str, Any] = {"text": text}
+            kwargs: Dict[str, Any] = {"text": text, **reply_options}
             if conversation_id:
                 kwargs["conversation_id"] = conversation_id
             else:
@@ -919,7 +1019,38 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
             media_path = str(args.get("media_path") or "").strip()
             if media_path:
                 kwargs["media_urls"] = [_upload_media_url(identity, media_path)]
+            if threaded:
+                if context is not None and context.get("conversation_id") == conversation_id:
+                    from .imessage import validate_tool_target
+
+                    validate_tool_target(context, conversation_id, reply_options.get("reply_to_message_id"))
+                    kwargs.setdefault("idempotency_key", str(uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        json.dumps([
+                            context["nonce"], conversation_id, text, media_path,
+                            reply_options.get("reply_to_message_id"),
+                            reply_options.get("plain_reply_fallback"),
+                        ]),
+                    )))
+                else:
+                    context = None
             msg = identity.send_imessage(**kwargs)
+            if threaded:
+                result = _imessage_send_result(msg)
+                if context is not None:
+                    from .imessage import record_accepted_tool_send, record_tool_send
+
+                    try:
+                        # Preserve the accepted message's original route even if a
+                        # concurrent stop has already retired its active turn.
+                        record_accepted_tool_send(context, msg, kwargs["idempotency_key"], text=text,
+                                                  target=reply_options.get("reply_to_message_id"))
+                        record_tool_send(context, msg, kwargs["idempotency_key"], text=text,
+                                         target=reply_options.get("reply_to_message_id"))
+                    except Exception:
+                        # The send was accepted even if a concurrent stop closed its turn.
+                        result["warning"] = "Message accepted; reply correlation could not be saved. Do not resend."
+                return result
             return {"sent": True, "id": str(getattr(msg, "id", ""))}
 
         if name == "inkbox_place_call":
@@ -1066,6 +1197,33 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
             return _identity().get_imessage_conversation(
                 str(args["conversation_id"]), limit=int(args.get("limit") or 50)
             )
+
+        if name in {"inkbox_get_imessage_thread", "inkbox_get_imessage_conversation_thread"}:
+            identity = _identity()
+            _require_imessage_threading(identity)
+            options = _imessage_page_options(args)
+            context = _imessage_active_context(identity_handle, required=True)
+            if context is not None and (context.get("companion") or context.get("companion_scope_id")):
+                raise ValueError("Use the supplied Companion history; native thread reads are unavailable in this turn")
+            if name == "inkbox_get_imessage_thread":
+                message_id = str(args.get("message_id") or "").strip()
+                if not message_id:
+                    raise ValueError("message_id is required")
+                if context is not None:
+                    from .imessage import validate_tool_target
+
+                    message = identity.get_imessage(message_id)
+                    validate_tool_target(context, str(_imessage_value(message, "conversation_id") or ""), None)
+                return identity.get_imessage_thread(message_id, **options)
+            conversation_id = str(args.get("conversation_id") or "").strip()
+            thread_id = str(args.get("thread_id") or "").strip()
+            if not conversation_id or not thread_id:
+                raise ValueError("conversation_id and thread_id are required")
+            if context is not None:
+                from .imessage import validate_tool_target
+
+                validate_tool_target(context, conversation_id, None)
+            return identity.get_imessage_conversation_thread(conversation_id, thread_id, **options)
 
         if name == "inkbox_lookup_contact":
             keys = ("email", "phone", "email_domain", "email_contains", "phone_contains")
@@ -1356,14 +1514,67 @@ def _place_call_tool_entry(voice_stack: VoiceStack) -> Dict[str, Any]:
     }
 
 
+IMESSAGE_THREAD_TOOLS = [
+    {
+        "name": "inkbox_get_imessage_thread",
+        "description": "Read one visible iMessage reply thread from a message ID, oldest first. "
+        "Returns one bounded page and next_cursor; nullable ancestry is preserved.",
+        "inputSchema": _schema({
+            "message_id": _str("A visible message in the reply thread."),
+            "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+            "cursor": _str("next_cursor from the previous page of this thread.", max_length=1024),
+        }, ["message_id"]),
+    },
+    {
+        "name": "inkbox_get_imessage_conversation_thread",
+        "description": "Read one visible iMessage thread within its conversation, oldest first. "
+        "The opaque thread_id is not a root message ID. Returns one page and next_cursor.",
+        "inputSchema": _schema({
+            "conversation_id": _str("The existing iMessage conversation ID."),
+            "thread_id": _str("Opaque thread_id returned by a message or thread read."),
+            "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+            "cursor": _str("next_cursor from the previous page of this thread.", max_length=1024),
+        }, ["conversation_id", "thread_id"]),
+    },
+]
+
+
+def _imessage_send_tool_entry(spec: ToolSpec) -> Dict[str, Any]:
+    """Extend the send schema without mutating the default-off tool contract."""
+    return {
+        "name": spec.name,
+        "description": spec.description + " An optional reply_to_message_id targets a visible message "
+        "in that conversation. The returned message may be queued; actual reply metadata can change "
+        "before delivery. Failed or uncertain sends must not be retried as untargeted messages.",
+        "inputSchema": {
+            **spec.input_schema,
+            "properties": {
+                **spec.input_schema["properties"],
+                "reply_to_message_id": _str("Visible source message ID to answer; requires conversation_id, never to."),
+                "plain_reply_fallback": {
+                    "type": "boolean", "default": True,
+                    "description": "Allow an ordinary reply in the same conversation when native threading is unsupported. "
+                    "False requires native threading. Ignored without a target; never a client-side resend.",
+                },
+                "idempotency_key": _str("Stable key for one exact logical send. Reuse unchanged on retry; "
+                    "use a new key for different content, target, or fallback policy."),
+            },
+        },
+    }
+
+
 def mcp_tool_list() -> List[Dict[str, Any]]:
     """Return MCP ``tools/list`` entries for every Inkbox tool."""
     from .slack import SLACK_TOOLS
 
     cfg = read_config()
-    return (SLACK_TOOLS if cfg.slack_enabled else []) + [
+    return (SLACK_TOOLS if cfg.slack_enabled else []) + (
+        IMESSAGE_THREAD_TOOLS if cfg.imessage_threaded_replies else []
+    ) + [
         _place_call_tool_entry(cfg.voice_stack)
         if spec.name == "inkbox_place_call"
+        else _imessage_send_tool_entry(spec)
+        if spec.name == "inkbox_send_imessage" and cfg.imessage_threaded_replies
         else {
             "name": spec.name,
             "description": spec.description,
@@ -1380,6 +1591,7 @@ def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]
         "INKBOX_IDENTITY": cfg.identity,
         "INKBOX_BASE_URL": cfg.base_url,
         "INKBOX_SLACK_ENABLED": "1" if cfg.slack_enabled else "0",
+        "INKBOX_IMESSAGE_THREADED_REPLIES": "1" if cfg.imessage_threaded_replies else "0",
         "INKBOX_VOICE_STACK": cfg.voice_stack.value,
         "INKBOX_VOICE_AI_AUTHORITY_MODE": cfg.voice_ai_authority_mode,
         "INKBOX_VOICEMAIL_DETECTION": cfg.voicemail_detection,
@@ -1402,6 +1614,8 @@ def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]
     if cfg.auto_approve_inkbox_tools:
         server["default_tools_approval_mode"] = "approve"
     tool_names = [f"mcp__inkbox__{spec.name}" for spec in TOOL_SPECS]
+    if cfg.imessage_threaded_replies:
+        tool_names.extend(f"mcp__inkbox__{tool['name']}" for tool in IMESSAGE_THREAD_TOOLS)
     if cfg.slack_enabled:
         from .slack import SLACK_TOOLS
 

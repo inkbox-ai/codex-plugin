@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 import httpx
 
 from .codex_client import recover_saved_answer
+from .imessage import source_metadata
 
 logger = logging.getLogger(__name__)
 MAX_BYTES = 8 * 1024 * 1024
@@ -621,7 +622,7 @@ class Receiver:
 
     def meta(self, event, *, source_id=None, author=None, text=None, reply=None, initialization=False,
              sponsor=None, context_only=False):
-        return {
+        meta = {
             "companion": True, "companion_scope_id": event.scope,
             "companion_activation_id": event.activation, "companion_sequence": event.sequence,
             "companion_initialization": initialization,
@@ -640,6 +641,16 @@ class Receiver:
             "sender": author or event.author, "to": author or event.author,
             "raw_text": event.text if text is None else text,
         }
+        if self.cfg.imessage_threaded_replies and event.mode == "imessage":
+            # The admitted live source, not an earlier sponsor, is the native
+            # reply anchor. A live-first initialization may instead be answering
+            # a different trigger; do not borrow the live message's ancestry.
+            message = event.envelope["data"]["message"]
+            if initialization and source_id and source_id != event.source_id:
+                message = {"id": source_id, "content": ""}
+            meta.update(source_metadata(message, event.event_id))
+            meta["imessage_threaded_replies"] = True
+        return meta
 
     def check_reply_route(self, meta):
         event = Event.parse(meta["companion_envelope"])

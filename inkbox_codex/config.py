@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import hashlib
+import inspect
 import os
 from dataclasses import dataclass, field
 from enum import Enum
@@ -115,6 +116,7 @@ class BridgeConfig:
     # API key may not change it; they must already point at this bridge.
     skip_webhook_reconcile: bool = False
     slack_enabled: bool = False
+    imessage_threaded_replies: bool = False
     # Wake the agent on unrecognised (external) webhooks. Off by default;
     # registered third-party providers bypass it once their secret is set.
     external_events_enabled: bool = False
@@ -145,6 +147,36 @@ class BridgeConfig:
 def inkbox_base_url_kwargs(base_url: str | None = None) -> Dict[str, str]:
     normalized = str(base_url or "").strip()
     return {"base_url": normalized} if normalized else {}
+
+
+def imessage_threading_capability(identity: Any) -> tuple[bool, str]:
+    """Check local SDK support without asserting remote API availability."""
+    requirements = {
+        "send_imessage": {"reply_to_message_id", "plain_reply_fallback", "idempotency_key"},
+        "get_imessage": set(),
+        "get_imessage_thread": {"limit", "cursor"},
+        "get_imessage_conversation_thread": {"limit", "cursor"},
+    }
+    missing = []
+    for name, keywords in requirements.items():
+        method = getattr(identity, name, None)
+        if not callable(method):
+            missing.append(name)
+            continue
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            missing.append(name)
+            continue
+        if not keywords.issubset(parameters):
+            missing.append(name)
+    if missing:
+        return False, (
+            "Threaded iMessage replies require an Inkbox SDK with native reply and "
+            "thread-read support (0.7.12 or newer when available). Upgrade the SDK "
+            "or set INKBOX_IMESSAGE_THREADED_REPLIES=false. Missing: " + ", ".join(missing)
+        )
+    return True, "SDK native-reply APIs available; backend support is not verified"
 
 
 @lru_cache(maxsize=1)
@@ -239,6 +271,7 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         require_signature=env_flag("INKBOX_REQUIRE_SIGNATURE", True),
         skip_webhook_reconcile=env_flag("INKBOX_SKIP_WEBHOOK_RECONCILE", False),
         slack_enabled=env_flag("INKBOX_SLACK_ENABLED", False),
+        imessage_threaded_replies=env_flag("INKBOX_IMESSAGE_THREADED_REPLIES", False),
         external_events_enabled=env_flag("INKBOX_EXTERNAL_EVENTS_ENABLED", False),
         contact_memories_enabled=env_flag("INKBOX_CONTACT_MEMORIES_ENABLED", True),
         group_reply_mode=group_reply_mode,
