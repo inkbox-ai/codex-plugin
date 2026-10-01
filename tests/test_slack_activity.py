@@ -122,7 +122,8 @@ def test_upgrade_removes_leftover_reactions_without_adding_any(tmp_path):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("failure", ["exception", "unknown", "feature_disabled"])
+@pytest.mark.parametrize("failure", ["exception", "unknown", "feature_disabled", "feature_not_enabled",
+                                    "app_not_eligible", "private-token"])
 def test_native_failure_does_not_block_turn_or_fall_back_to_reactions(tmp_path, failure, caplog):
     async def scenario():
         sdk = resource()
@@ -140,6 +141,8 @@ def test_native_failure_does_not_block_turn_or_fall_back_to_reactions(tmp_path, 
         sdk.add_reaction.assert_not_called()
         sdk.remove_reaction.assert_not_called()
         assert "private-token" not in caplog.text
+        if failure in {"feature_disabled", "feature_not_enabled", "app_not_eligible"}:
+            assert f"status=failed, reason={failure}" in caplog.text
         keys = [call.kwargs["idempotency_key"] for call in sdk.set_processing_status.call_args_list]
         sdk.set_processing_status.side_effect = None
         sdk.set_processing_status.return_value = NS(status="succeeded")

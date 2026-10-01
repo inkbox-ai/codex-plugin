@@ -136,9 +136,16 @@ class SlackActivity:
                 if operation.status != "succeeded":
                     succeeded = False
                     code = getattr(operation, "error_code", None)
-                    reason = code if code in {"feature_disabled", "missing_scope", "not_allowed_token_type",
-                                              "channel_not_found", "thread_ts_required"} else "unconfirmed"
-                    logger.warning("Slack native status/cleanup not confirmed (%s); the agent turn is unaffected", reason)
+                    reason = code if code in {
+                        "feature_disabled", "feature_not_enabled", "app_not_eligible",
+                        "missing_scope", "not_allowed_token_type", "channel_not_found",
+                        "thread_ts_required", "thread_not_found", "invalid_response",
+                        "method_not_supported_for_channel_type", "upstream_rejected",
+                        "provider_error", "not_in_channel", "no_permission", "outcome_unknown",
+                    } else "unconfirmed"
+                    outcome = operation.status if operation.status in {"failed", "unknown", "in_progress"} else "invalid"
+                    logger.warning("Slack native status/cleanup not confirmed (status=%s, reason=%s); "
+                                   "the agent turn is unaffected", outcome, reason)
                 elif native:
                     logger.info("Slack native status confirmed: %s", state)
             except Exception:
