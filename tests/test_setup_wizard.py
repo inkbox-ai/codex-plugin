@@ -159,7 +159,7 @@ def test_install_command_prefers_uv_when_available(monkeypatch):
         "install",
         "--python",
         "/tmp/venv/bin/python",
-        "inkbox>=0.5.9,<1.0.0",
+        "inkbox>=0.7.11,<1.0.0",
         "aiohttp>=3.9",
     ]]
 
@@ -169,10 +169,10 @@ def test_install_command_falls_back_to_pip_and_ensurepip(monkeypatch):
     monkeypatch.setattr(setup_wizard.shutil, "which", lambda _name: None)
 
     assert setup_wizard._install_commands() == [
-        [["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.5.9,<1.0.0", "aiohttp>=3.9"]],
+        [["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.7.11,<1.0.0", "aiohttp>=3.9"]],
         [
             ["/tmp/venv/bin/python", "-m", "ensurepip", "--upgrade"],
-            ["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.5.9,<1.0.0", "aiohttp>=3.9"],
+            ["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.7.11,<1.0.0", "aiohttp>=3.9"],
         ],
     ]
 
@@ -191,7 +191,21 @@ def test_missing_sdk_guidance_prints_interpreter(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "/tmp/venv/bin/python" in out
     assert "uv pip install --python" in out
-    assert "inkbox>=0.5.9,<1.0.0" in out
+    assert "inkbox>=0.7.11,<1.0.0" in out
+
+
+@pytest.mark.parametrize("version,accepted", [
+    ("0.7.3", False), ("0.7.10", False), ("0.7.11", True),
+])
+def test_setup_requires_supported_sdk(monkeypatch, capsys, version, accepted):
+    symbols = {"Inkbox": object()}
+    monkeypatch.setattr(setup_wizard, "_load_inkbox_symbols", lambda: symbols)
+    monkeypatch.setattr("importlib.metadata.version", lambda _: version)
+    monkeypatch.setattr(setup_wizard, "_is_interactive_stdin", lambda: False)
+
+    assert setup_wizard._ensure_inkbox_sdk() == (symbols if accepted else None)
+    if not accepted:
+        assert "older than 0.7.11" in capsys.readouterr().out
 
 
 # ----------------------------------------------------------------------

@@ -113,6 +113,13 @@ Codex can read and write the organization's shared Inkbox contacts.
 - Use inkbox_delete_contact only after the target contact is explicit and confirmed.
 - There is no vCard export/import, contact access, or contact rule tool in this harness.
 - Every identity in the organization can read contacts. Creating, updating, or deleting a contact affects the shared address book.
+
+# Inkbox Vault
+
+- Use inkbox_list_vault_secrets to find the requested credential by name and UUID.
+- For a 2FA or TOTP code, use inkbox_get_totp_code with the login secret's UUID. It returns the current code and seconds_remaining; request a fresh code if it expires.
+- Use inkbox_get_vault_secret only when the task needs the credential itself. Use it for the requested task without repeating credentials in messages unless explicitly requested.
+- If the vault is locked, ask the human to configure INKBOX_VAULT_KEY locally and restart the bridge. Never ask them to send the unlock key in chat or as a tool argument.
 """.strip()
 
 

@@ -14,11 +14,14 @@ except ImportError:  # pragma: no cover - surfaced through initialize/tools call
     Inkbox = None  # type: ignore
 
 try:
+    from . import __version__
     from .config import inkbox_client_kwargs
     from .tools import call_inkbox_tool, mcp_tool_list
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import inkbox_client_kwargs
     from tools import call_inkbox_tool, mcp_tool_list
+
+    from inkbox_codex import __version__
 
 
 def _response(message_id: Any, result: Any) -> Dict[str, Any]:
@@ -58,7 +61,7 @@ class InkboxMcpServer:
                     "capabilities": {"tools": {}},
                     "serverInfo": {
                         "name": "inkbox-codex",
-                        "version": "0.2.9",
+                        "version": __version__,
                     },
                 },
             )
