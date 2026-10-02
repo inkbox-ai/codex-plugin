@@ -11,12 +11,14 @@ import pytest
 
 from inkbox_codex.codex_client import CodexAppServerClient
 from inkbox_codex.config import BridgeConfig
+from inkbox_codex.daemon import _maybe_load_env_file
 from inkbox_codex.tools import build_inkbox_mcp_server_config
 from tests.fixtures.vault_api import LOGIN_ID, TOTP_SEED, VAULT_KEY, VaultAPI
 
 
 @pytest.mark.skipif(shutil.which("codex") is None, reason="needs the codex CLI on PATH")
-def test_host_lists_vault_and_generates_totp(tmp_path, monkeypatch):
+@pytest.mark.parametrize("key", [VAULT_KEY, "Wrong-example-key-42!"])
+def test_host_loads_vault_key_from_env_file_and_isolates_unlock_errors(tmp_path, monkeypatch, key):
     api = VaultAPI()
 
     class Handler(BaseHTTPRequestHandler):
@@ -41,7 +43,13 @@ def test_host_lists_vault_and_generates_totp(tmp_path, monkeypatch):
         'base_url = "http://127.0.0.1:1/v1"\nwire_api = "responses"\n'
     )
     monkeypatch.setenv("CODEX_HOME", str(home))
-    monkeypatch.setenv("INKBOX_VAULT_KEY", VAULT_KEY)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("INKBOX_VAULT_KEY", raising=False)
+    monkeypatch.delenv("INKBOX_CODEX_VAULT_KEY", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"INKBOX_CODEX_VAULT_KEY={key}\n")
+    monkeypatch.setenv("INKBOX_CODEX_ENV_FILE", str(env_file))
+    _maybe_load_env_file()
     cfg = BridgeConfig(api_key="synthetic-agent-key", identity="example-agent",
                        base_url=f"http://127.0.0.1:{http.server_port}",
                        project_dir=str(tmp_path), codex_bin=shutil.which("codex"),
@@ -54,20 +62,29 @@ def test_host_lists_vault_and_generates_totp(tmp_path, monkeypatch):
         try:
             thread = await asyncio.wait_for(client.connect(), 20)
             for tool, arguments in (
+                ("inkbox_list_contacts", {}),
                 ("inkbox_list_vault_secrets", {"secret_type": "login"}),
                 ("inkbox_get_totp_code", {"secret_id": LOGIN_ID}),
+                ("inkbox_list_contacts", {}),
             ):
                 result = await asyncio.wait_for(client._request("mcpServer/tool/call", {
                     "threadId": thread, "server": "inkbox", "tool": tool, "arguments": arguments,
                 }), 20)
-                assert not result.get("isError"), result
                 data = json.loads(result["content"][0]["text"])
-                if tool == "inkbox_list_vault_secrets":
-                    assert [s["id"] for s in data] == [LOGIN_ID]
+                if tool == "inkbox_get_totp_code" and key != VAULT_KEY:
+                    assert result["isError"]
+                    assert "No vault key matched" in data["error"]
                 else:
-                    assert len(data["code"]) == 8 and data["code"].isdigit()
-                    assert 0 < data["seconds_remaining"] <= 30
-                for value in (VAULT_KEY, TOTP_SEED, "synthetic-password"):
+                    assert not result.get("isError"), result
+                    if tool == "inkbox_list_vault_secrets":
+                        assert [s["id"] for s in data] == [LOGIN_ID]
+                        assert all(not r.url.path.endswith("/unlock") for r in api.requests)
+                    elif tool == "inkbox_get_totp_code":
+                        assert len(data["code"]) == 8 and data["code"].isdigit()
+                        assert 0 < data["seconds_remaining"] <= 30
+                    else:
+                        assert data == []
+                for value in (key, VAULT_KEY, TOTP_SEED, "synthetic-password"):
                     assert value not in json.dumps(result)
         finally:
             await client.disconnect()

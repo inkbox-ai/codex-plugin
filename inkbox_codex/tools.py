@@ -405,7 +405,7 @@ TOOL_SPECS: List[ToolSpec] = [
     ToolSpec(
         "inkbox_get_vault_secret",
         "Fetch and decrypt one Inkbox Vault credential by secret_id from "
-        "inkbox_list_vault_secrets. Requires INKBOX_VAULT_KEY in the bridge environment. "
+        "inkbox_list_vault_secrets. Requires INKBOX_CODEX_VAULT_KEY in the bridge environment. "
         "For a 2FA code, use inkbox_get_totp_code instead.",
         _schema({"secret_id": {
             **_str("Secret UUID from inkbox_list_vault_secrets."), "format": "uuid",
@@ -415,7 +415,7 @@ TOOL_SPECS: List[ToolSpec] = [
         "inkbox_get_totp_code",
         "Generate the current 2FA/TOTP code for an Inkbox Vault login secret. "
         "Returns the code and expiry timing, without the password or TOTP seed. "
-        "Requires INKBOX_VAULT_KEY in the bridge environment.",
+        "Requires INKBOX_CODEX_VAULT_KEY in the bridge environment.",
         _schema({"secret_id": {
             **_str("Login secret UUID from inkbox_list_vault_secrets."), "format": "uuid",
         }}, ["secret_id"]),
@@ -1139,10 +1139,13 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 raise ValueError("secret_id must be a UUID from inkbox_list_vault_secrets") from None
             vault = client.vault.unlocked
             if vault is None:
-                raise ValueError(
-                    "Vault is locked. Set INKBOX_VAULT_KEY in the bridge's local "
-                    "environment and restart it. Do not send the key in chat."
-                )
+                vault_key = os.getenv("INKBOX_CODEX_VAULT_KEY")
+                if not vault_key:
+                    raise ValueError(
+                        "Vault is locked. Set INKBOX_CODEX_VAULT_KEY in the bridge's local "
+                        "environment and restart it. Do not send the key in chat."
+                    )
+                vault = client.vault.unlock(vault_key)
             if name == "inkbox_get_totp_code":
                 return vault.get_totp_code(secret_id)
             secret = _json_safe(vault.get_secret(secret_id))
@@ -1392,7 +1395,7 @@ def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]
         "command": sys.executable,
         "args": ["-m", "inkbox_codex.mcp_stdio"],
         "env": env,
-        "env_vars": ["INKBOX_VAULT_KEY"],
+        "env_vars": ["INKBOX_CODEX_VAULT_KEY"],
         "startup_timeout_sec": 10.0,
         "tool_timeout_sec": 60.0,
     }

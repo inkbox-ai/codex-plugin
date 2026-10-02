@@ -22,6 +22,7 @@ class VaultAPI:
         self.requests = []
         self.denied = False
         self.initialized = True
+        self.unlock_timeout = False
         self.details = {}
         self.set_secret(LOGIN_ID, "login", {
             "username": "agent@example.com", "password": "synthetic-password",
@@ -42,6 +43,8 @@ class VaultAPI:
         self.requests.append(request)
         assert request.method == "GET"
         assert request.headers["X-API-Key"] == "synthetic-agent-key"
+        if request.url.path == "/api/v1/contacts":
+            return httpx.Response(200, json=[])
         path = request.url.path.removeprefix("/api/v1/vault")
         if path == "/info":
             if not self.initialized:
@@ -53,6 +56,8 @@ class VaultAPI:
                 "key_count": 1, "secret_count": len(self.details), "recovery_key_count": 0,
             })
         if path == "/unlock":
+            if self.unlock_timeout:
+                raise httpx.ReadTimeout("Vault request timed out", request=request)
             if request.url.params["auth_hash"] != self.key.auth_hash:
                 return httpx.Response(200, json={"wrapped_org_encryption_key": None})
             return httpx.Response(200, json={

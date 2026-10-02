@@ -639,7 +639,7 @@ without opening a browser for each request.
 
 1. Store the credential in your Inkbox Vault and grant the agent identity access.
    For 2FA, use a **login** secret with TOTP configured.
-2. Set `INKBOX_VAULT_KEY` to your vault unlock key in the bridge's local environment
+2. Set `INKBOX_CODEX_VAULT_KEY` to your vault unlock key in the bridge's local environment
    or its `.env` file (normally `~/.inkbox-codex/.env`). This is separate from
    `INKBOX_API_KEY`. Keep the key out of chat and source control.
 3. Restart the bridge with `inkbox-codex restart`, or restart its service if you
@@ -656,8 +656,17 @@ results include `has_totp` instead of the TOTP seed. Listing returns metadata on
 and works without an unlock key. The tools follow the API key's access scope, so
 use the agent-scoped key configured by setup.
 
-The SDK unlocks the vault when it creates a client if `INKBOX_VAULT_KEY` is set.
-An incorrect key prevents client initialization; correct it locally and restart.
+The bridge unlocks the vault only when a credential or 2FA tool needs it. An
+incorrect bridge vault key or failed unlock returns a tool error; messaging and
+metadata listing remain available. Correct the key locally and restart, or retry
+after a temporary service failure.
+
+Use the bridge-specific `INKBOX_CODEX_VAULT_KEY` rather than the SDK-wide
+`INKBOX_VAULT_KEY` or `vault_key` in `~/.inkbox/config`. Those SDK-wide settings
+trigger eager unlocking for every SDK client, including the messaging gateway.
+If you followed earlier instructions using `INKBOX_VAULT_KEY`, rename that setting
+and remove any SDK-wide vault key used only by this bridge before restarting.
+
 If the requested secret is missing, check its access grant to this agent. A login
 without TOTP must have it configured before the agent can generate codes.
 
@@ -668,7 +677,7 @@ without TOTP must have it configured before the agent can generate codes.
 | `INKBOX_API_KEY` | yes | - | Agent-scoped Inkbox API key. |
 | `INKBOX_IDENTITY` | yes | - | Inkbox agent identity handle. |
 | `INKBOX_SIGNING_KEY` | inbound | - | Webhook HMAC secret for signed inbound events. |
-| `INKBOX_VAULT_KEY` | vault reads / 2FA | - | Vault unlock key, supplied locally. The SDK unlocks at client initialization. See [Vault and 2FA codes](#vault-and-2fa-codes). |
+| `INKBOX_CODEX_VAULT_KEY` | vault reads / 2FA | - | Vault unlock key, supplied locally and used only when a credential or 2FA tool needs it. See [Vault and 2FA codes](#vault-and-2fa-codes). |
 | `CODEX_PROJECT_DIR` | yes | cwd | Directory Codex works in. |
 | `CODEX_MODEL` | no | CLI default | Model override for bridged sessions. |
 | `INKBOX_REQUIRE_SIGNATURE` | no | `true` | Refuse unsigned inbound webhooks unless `false`. |

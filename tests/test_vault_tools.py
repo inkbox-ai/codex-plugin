@@ -20,6 +20,7 @@ def vault(monkeypatch, tmp_path):
     monkeypatch.setenv("INKBOX_IDENTITY", "example-agent")
     monkeypatch.setenv("INKBOX_BASE_URL", "https://api.example.com")
     monkeypatch.delenv("INKBOX_VAULT_KEY", raising=False)
+    monkeypatch.delenv("INKBOX_CODEX_VAULT_KEY", raising=False)
     monkeypatch.setattr("inkbox._config._CONFIG_PATH", tmp_path / "missing-config")
     monkeypatch.setattr("inkbox._http.httpx.HTTPTransport", lambda **kw: httpx.MockTransport(api.respond))
     server = InkboxMcpServer()
@@ -37,8 +38,10 @@ def call(server, name, **arguments):
     return result, json.loads(result["content"][0]["text"])
 
 
-def test_metadata_listing_without_unlock_key(vault):
+@pytest.mark.parametrize("key", ["", "Wrong-example-key-42!"])
+def test_metadata_listing_does_not_unlock(vault, monkeypatch, key):
     server, api = vault
+    monkeypatch.setenv("INKBOX_CODEX_VAULT_KEY", key)
     result, secrets = call(server, "inkbox_list_vault_secrets", secret_type="login")
     assert not result.get("isError")
     assert [s["id"] for s in secrets] == [LOGIN_ID]
@@ -53,14 +56,14 @@ def test_locked_vault_explains_local_configuration(vault, name):
     server, api = vault
     result, data = call(server, name, secret_id=LOGIN_ID)
     assert result["isError"]
-    assert "INKBOX_VAULT_KEY" in data["error"]
+    assert "INKBOX_CODEX_VAULT_KEY" in data["error"]
     assert "restart" in data["error"]
     assert not api.requests
 
 
 def test_totp_returns_rfc_code_and_expiry_without_credentials(vault, monkeypatch):
     server, api = vault
-    monkeypatch.setenv("INKBOX_VAULT_KEY", VAULT_KEY)
+    monkeypatch.setenv("INKBOX_CODEX_VAULT_KEY", VAULT_KEY)
     monkeypatch.setattr("inkbox.vault.totp.time.time", lambda: 1111111109)
     result, data = call(server, "inkbox_get_totp_code", secret_id=LOGIN_ID)
     assert not result.get("isError")
@@ -83,7 +86,7 @@ def test_totp_returns_rfc_code_and_expiry_without_credentials(vault, monkeypatch
 ])
 def test_get_one_credential_omits_totp_seed(vault, monkeypatch, secret_id, payload, has_totp):
     server, _ = vault
-    monkeypatch.setenv("INKBOX_VAULT_KEY", VAULT_KEY)
+    monkeypatch.setenv("INKBOX_CODEX_VAULT_KEY", VAULT_KEY)
     result, secret = call(server, "inkbox_get_vault_secret", secret_id=secret_id)
     assert not result.get("isError")
     assert secret["id"] == secret_id
@@ -97,7 +100,7 @@ def test_get_one_credential_omits_totp_seed(vault, monkeypatch, secret_id, paylo
 @pytest.mark.parametrize("failure", ["denied", "deleted"])
 def test_reads_refetch_instead_of_using_unlock_snapshot(vault, monkeypatch, name, failure):
     server, api = vault
-    monkeypatch.setenv("INKBOX_VAULT_KEY", VAULT_KEY)
+    monkeypatch.setenv("INKBOX_CODEX_VAULT_KEY", VAULT_KEY)
     result, _ = call(server, name, secret_id=LOGIN_ID)
     assert not result.get("isError")
     if failure == "denied":
@@ -114,7 +117,7 @@ def test_reads_refetch_instead_of_using_unlock_snapshot(vault, monkeypatch, name
 def test_totp_rejects_wrong_type_and_missing_configuration(vault, monkeypatch, secret_id, error):
     server, api = vault
     api.set_secret(LOGIN_ID, "login", {"username": "agent@example.com", "password": "synthetic-password"})
-    monkeypatch.setenv("INKBOX_VAULT_KEY", VAULT_KEY)
+    monkeypatch.setenv("INKBOX_CODEX_VAULT_KEY", VAULT_KEY)
     result, data = call(server, "inkbox_get_totp_code", secret_id=secret_id)
     assert result["isError"]
     assert error in data["error"]
@@ -129,19 +132,52 @@ def test_invalid_secret_id_never_reaches_api(vault, secret_id):
     assert not api.requests
 
 
-@pytest.mark.parametrize("failure,error", [("wrong_key", "No vault key matched"), ("uninitialized", "not been initialized")])
-def test_sdk_unlock_errors_are_actionable(vault, monkeypatch, failure, error):
+@pytest.mark.parametrize("name", ["inkbox_get_vault_secret", "inkbox_get_totp_code"])
+@pytest.mark.parametrize("failure,error", [
+    ("wrong_key", "No vault key matched"),
+    ("uninitialized", "not been initialized"),
+    ("timeout", "timed out"),
+])
+def test_unlock_failure_is_a_tool_error_and_non_vault_calls_survive(vault, monkeypatch, name, failure, error):
     server, api = vault
-    monkeypatch.setenv("INKBOX_VAULT_KEY", "Wrong-example-key-42!" if failure == "wrong_key" else VAULT_KEY)
+    key = "Wrong-example-key-42!" if failure == "wrong_key" else VAULT_KEY
+    monkeypatch.setenv("INKBOX_CODEX_VAULT_KEY", key)
     api.initialized = failure != "uninitialized"
-    with pytest.raises(ValueError, match=error):
-        call(server, "inkbox_get_totp_code", secret_id=LOGIN_ID)
+    api.unlock_timeout = failure == "timeout"
+    result, _ = call(server, "inkbox_list_contacts")
+    assert not result.get("isError")
+    assert [r.url.path for r in api.requests] == ["/api/v1/contacts"]
+
+    result, data = call(server, name, secret_id=LOGIN_ID)
+    assert result["isError"]
+    assert error in data["error"]
+    assert key not in json.dumps(result)
+    result, _ = call(server, "inkbox_list_contacts")
+    assert not result.get("isError")
+    assert server._client.vault.unlocked is None
+
+    monkeypatch.setenv("INKBOX_CODEX_VAULT_KEY", VAULT_KEY)
+    api.initialized = True
+    api.unlock_timeout = False
+    result, _ = call(server, name, secret_id=LOGIN_ID)
+    assert not result.get("isError")
+
+
+def test_login_without_totp_returns_credential_and_false_flag(vault, monkeypatch):
+    server, api = vault
+    api.set_secret(LOGIN_ID, "login", {"username": "agent@example.com", "password": "synthetic-password"})
+    monkeypatch.setenv("INKBOX_CODEX_VAULT_KEY", VAULT_KEY)
+    result, data = call(server, "inkbox_get_vault_secret", secret_id=LOGIN_ID)
+    assert not result.get("isError")
+    assert data["has_totp"] is False
+    assert data["payload"]["password"] == "synthetic-password"
+    assert "totp" not in data["payload"]
 
 
 def test_mcp_forwards_vault_key_by_environment_name(monkeypatch):
-    monkeypatch.setenv("INKBOX_VAULT_KEY", VAULT_KEY)
+    monkeypatch.setenv("INKBOX_CODEX_VAULT_KEY", VAULT_KEY)
     config, names = build_inkbox_mcp_server_config(BridgeConfig())
-    assert "INKBOX_VAULT_KEY" in config["env_vars"]
+    assert "INKBOX_CODEX_VAULT_KEY" in config["env_vars"]
     assert VAULT_KEY not in json.dumps(config)
     assert "mcp__inkbox__inkbox_get_totp_code" in names
 
