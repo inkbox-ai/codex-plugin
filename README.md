@@ -207,10 +207,10 @@ before replying `DONE`.
 
 ## Slack preview
 
-Set `INKBOX_SLACK_ENABLED=true` to add Slack to the gateway. This requires an
-Inkbox SDK exposing `client.slack` and an API with Slack support; the existing
-SDK minimum remains usable when Slack is off. Connect a workspace to the same
-Inkbox identity to exchange messages; the receiver can start before installation.
+Set `INKBOX_SLACK_ENABLED=true` to add Slack to the gateway. Inkbox SDK 0.7.11
+includes the required Slack methods; the API must also support Slack. Connect a
+workspace to the same Inkbox identity to exchange messages; the receiver can
+start before installation.
 Run `inkbox-codex setup` to opt in interactively. The wizard offers **Connect Slack
 now?**, selects a saved provisioning workspace, waits for app preparation, prints
 an installation link to open in your browser, and polls until that workspace is
@@ -433,9 +433,9 @@ and are unaffected by the Companion response setting.
   In Mention mode, address email To the agent or prefix answers and controls with `@agent`, for example
   `@agent allow` or `@agent /stop`; escalation prompts remind you of this.
 
-**SDK requirement:** The bridge requires Inkbox SDK **0.7.3 or newer**, including
+**SDK requirement:** The bridge requires Inkbox SDK **0.7.11 or newer** (below 1.0.0), including
 `client.companion.load_initialization` and `activation_messages`. Installation
-resolves the published SDK; CI tests the released `inkbox==0.7.3` minimum across
+resolves the published SDK; CI tests the released `inkbox==0.7.11` minimum across
 unit, real-host, and live-channel lanes. No preview source checkout is needed.
 An unsupported SDK produces an explicit webhook error; the bridge never falls
 back to submitting only the trigger.
@@ -632,6 +632,44 @@ with both deterministic and real-model gateway runs, without SMS reset traffic.
 - **iMessage** — `inkbox_send_imessage(..., media_path=...)` (uploaded + sent, ≤10 MB).
 - **SMS/MMS** — `inkbox_send_sms(..., media_paths=[...])` (uploaded + sent; `media_urls` also accepts already-hosted URLs).
 
+## Vault and 2FA codes
+
+Codex can access credentials and generate current 2FA codes from Inkbox Vault
+without opening a browser for each request.
+
+1. Store the credential in your Inkbox Vault and grant the agent identity access.
+   For 2FA, use a **login** secret with TOTP configured.
+2. Set `INKBOX_CODEX_VAULT_KEY` to your vault unlock key in the bridge's local environment
+   or its `.env` file (normally `~/.inkbox-codex/.env`). This is separate from
+   `INKBOX_API_KEY`. Keep the key out of chat and source control.
+3. Restart the bridge with `inkbox-codex restart`, or restart its service if you
+   run it through a service manager.
+4. Ask: "Get the current 2FA code for my Example login from Inkbox Vault."
+
+The agent uses `inkbox_list_vault_secrets` to find the login, then calls
+`inkbox_get_totp_code` with its `secret_id`. The result includes `code`,
+`period_start`, `period_end` (Unix timestamps), and `seconds_remaining`. Request
+a fresh code if it expires. This tool returns neither the password nor the TOTP seed.
+
+`inkbox_get_vault_secret` retrieves one credential when the task needs it. Login
+results include `has_totp` instead of the TOTP seed. Listing returns metadata only
+and works without an unlock key. The tools follow the API key's access scope, so
+use the agent-scoped key configured by setup.
+
+The bridge unlocks the vault only when a credential or 2FA tool needs it. An
+incorrect bridge vault key or failed unlock returns a tool error; messaging and
+metadata listing remain available. Correct the key locally and restart, or retry
+after a temporary service failure.
+
+Use the bridge-specific `INKBOX_CODEX_VAULT_KEY` rather than the SDK-wide
+`INKBOX_VAULT_KEY` or `vault_key` in `~/.inkbox/config`. Those SDK-wide settings
+trigger eager unlocking for every SDK client, including the messaging gateway.
+If you followed earlier instructions using `INKBOX_VAULT_KEY`, rename that setting
+and remove any SDK-wide vault key used only by this bridge before restarting.
+
+If the requested secret is missing, check its access grant to this agent. A login
+without TOTP must have it configured before the agent can generate codes.
+
 ## Config reference
 
 | Env var | Required | Default | Description |
@@ -639,6 +677,7 @@ with both deterministic and real-model gateway runs, without SMS reset traffic.
 | `INKBOX_API_KEY` | yes | - | Agent-scoped Inkbox API key. |
 | `INKBOX_IDENTITY` | yes | - | Inkbox agent identity handle. |
 | `INKBOX_SIGNING_KEY` | inbound | - | Webhook HMAC secret for signed inbound events. |
+| `INKBOX_CODEX_VAULT_KEY` | vault reads / 2FA | - | Vault unlock key, supplied locally and used only when a credential or 2FA tool needs it. See [Vault and 2FA codes](#vault-and-2fa-codes). |
 | `CODEX_PROJECT_DIR` | yes | cwd | Directory Codex works in. |
 | `CODEX_MODEL` | no | CLI default | Model override for bridged sessions. |
 | `INKBOX_REQUIRE_SIGNATURE` | no | `true` | Refuse unsigned inbound webhooks unless `false`. |
@@ -684,6 +723,7 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_list_imessage_conversations` · `inkbox_get_imessage_conversation` — browse iMessage threads and history (find the `conversation_id` to send into).
 - `inkbox_lookup_contact` · `inkbox_list_contacts` · `inkbox_get_contact` — resolve and read address-book contacts (reverse-lookup by email/phone, free-text search, or full record by id).
 - `inkbox_create_contact` · `inkbox_update_contact` · `inkbox_delete_contact` — save, edit, and remove organization-wide contacts. Changes affect the shared address book. vCard export/import is not exposed.
+- `inkbox_list_vault_secrets` · `inkbox_get_vault_secret` · `inkbox_get_totp_code`: find vault credentials, retrieve one credential, or generate a current 2FA code. See [Vault and 2FA codes](#vault-and-2fa-codes).
 - `inkbox_a2a_call` · `inkbox_a2a_check` · `inkbox_a2a_reply` — delegate work to another agent and follow its task.
 - `inkbox_list_a2a_tasks` · `inkbox_list_a2a_messages` — page and search this identity's inbound and outbound A2A history, with participant, task, context, role, state, and timestamp filters.
 - `inkbox_a2a_complete` · `inkbox_a2a_ask_caller` · `inkbox_a2a_fail` — commit the outcome of a verified inbound A2A task. These tools are rejected outside that task's isolated session.
@@ -692,7 +732,7 @@ Inbound A2A tasks acknowledge pickup immediately. While a task remains active,
 the worker sends a short progress update about every three minutes by default;
 these updates are visible in task history without starting a requester turn.
 
-The bridge requires Inkbox SDK 0.7.3 or newer.
+The bridge requires Inkbox SDK 0.7.11 or newer (below 1.0.0).
 
 On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 

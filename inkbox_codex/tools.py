@@ -392,6 +392,35 @@ TOOL_SPECS: List[ToolSpec] = [
         _schema({"contact_id": _str("Contact id.")}, ["contact_id"]),
     ),
     ToolSpec(
+        "inkbox_list_vault_secrets",
+        "List accessible Inkbox Vault secret metadata, without credential values. "
+        "Use this first to find the secret_id for a credential or 2FA code.",
+        _schema({
+            "secret_type": _enum(
+                ["login", "api_key", "key_pair", "ssh_key", "other"],
+                "Optional credential type filter.",
+            ),
+        }),
+    ),
+    ToolSpec(
+        "inkbox_get_vault_secret",
+        "Fetch and decrypt one Inkbox Vault credential by secret_id from "
+        "inkbox_list_vault_secrets. Requires INKBOX_CODEX_VAULT_KEY in the bridge environment. "
+        "For a 2FA code, use inkbox_get_totp_code instead.",
+        _schema({"secret_id": {
+            **_str("Secret UUID from inkbox_list_vault_secrets."), "format": "uuid",
+        }}, ["secret_id"]),
+    ),
+    ToolSpec(
+        "inkbox_get_totp_code",
+        "Generate the current 2FA/TOTP code for an Inkbox Vault login secret. "
+        "Returns the code and expiry timing, without the password or TOTP seed. "
+        "Requires INKBOX_CODEX_VAULT_KEY in the bridge environment.",
+        _schema({"secret_id": {
+            **_str("Login secret UUID from inkbox_list_vault_secrets."), "format": "uuid",
+        }}, ["secret_id"]),
+    ),
+    ToolSpec(
         "inkbox_a2a_call",
         "Send a task to an A2A 1.0 Agent Card.",
         _schema({
@@ -984,7 +1013,7 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 call = identity.place_call(**call_kwargs)
             except TypeError:
                 raise RuntimeError(
-                    "configured call options require inkbox SDK 0.5.9 or newer"
+                    "configured call options require inkbox SDK 0.7.11 or newer"
                 )
             except Exception as exc:
                 if "no_shared_connection" in str(exc):
@@ -1099,6 +1128,30 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
         if name == "inkbox_delete_contact":
             client.contacts.delete(str(args["contact_id"]))
             return {"deleted": str(args["contact_id"])}
+
+        if name == "inkbox_list_vault_secrets":
+            return client.vault.list_secrets(secret_type=args.get("secret_type"))
+
+        if name in {"inkbox_get_vault_secret", "inkbox_get_totp_code"}:
+            try:
+                secret_id = str(uuid.UUID(str(args.get("secret_id") or "")))
+            except ValueError:
+                raise ValueError("secret_id must be a UUID from inkbox_list_vault_secrets") from None
+            vault = client.vault.unlocked
+            if vault is None:
+                vault_key = os.getenv("INKBOX_CODEX_VAULT_KEY")
+                if not vault_key:
+                    raise ValueError(
+                        "Vault is locked. Set INKBOX_CODEX_VAULT_KEY in the bridge's local "
+                        "environment and restart it. Do not send the key in chat."
+                    )
+                vault = client.vault.unlock(vault_key)
+            if name == "inkbox_get_totp_code":
+                return vault.get_totp_code(secret_id)
+            secret = _json_safe(vault.get_secret(secret_id))
+            if secret["secret_type"] == "login":
+                secret["has_totp"] = secret["payload"].pop("totp", None) is not None
+            return secret
 
         if name in {"inkbox_list_a2a_tasks", "inkbox_list_a2a_messages"}:
             limit = int(args.get("limit") or 50)
@@ -1342,6 +1395,7 @@ def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]
         "command": sys.executable,
         "args": ["-m", "inkbox_codex.mcp_stdio"],
         "env": env,
+        "env_vars": ["INKBOX_CODEX_VAULT_KEY"],
         "startup_timeout_sec": 10.0,
         "tool_timeout_sec": 60.0,
     }

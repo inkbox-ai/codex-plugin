@@ -58,10 +58,12 @@ jobs:
           echo "GATEWAY_LOG=$RUNNER_TEMP/gateway.log" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/codex-home" "$RUNNER_TEMP/project"
 
+      - uses: astral-sh/setup-uv@v8.1.0
+
       - name: Install bridge + test deps
         run: |
-          pip install \
-            "inkbox==0.7.3" \
+          uv pip install --system \
+            "inkbox==0.7.11" \
             -e . pytest
 
       # @alpha is the prerelease channel cut from codex main near-daily — the
