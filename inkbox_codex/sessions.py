@@ -103,7 +103,6 @@ class _Turn:
     before_submit: Optional[Callable[[], Awaitable[None]]] = None
     activity_started: bool = False
     delivery_failed: bool = False
-    reply_route_frozen: bool = False
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Codex as a turn.
@@ -431,8 +430,6 @@ class ContactSession:
         self._imessage_burst_key: Optional[tuple] = None
         self._imessage_burst_started = 0.0
         self._imessage_burst_task: Optional[asyncio.Task] = None
-        # Ordinary source-aware turns, from collection through final delivery.
-        self._imessage_open_turns: Dict[int, _Turn] = {}
         self._shutting_down = False
 
     # ------------------------------------------------------------------
@@ -731,8 +728,7 @@ class ContactSession:
                 return False
 
         if self._threaded_imessage(mode) and not meta.get("companion") and not meta.get("reaction"):
-            for route in self._collect_imessage(text, meta):
-                await self._imessage_state("overlapped", route)
+            self._collect_imessage(text, meta)
             return True
 
         self._flush_imessage_burst()
@@ -787,8 +783,9 @@ class ContactSession:
             }]
         if not meta.get("imessage_event_ids"):
             meta["imessage_event_ids"] = [meta["imessage_event_id"]] if meta.get("imessage_event_id") else []
-        if ContactSession._imessage_reply_context(meta) and message_id:
-            meta["imessage_reply_target"] = message_id
+        # An admitted source, not timing or native ancestry, selects the reply.
+        # No source means no target: never borrow one from session history.
+        meta["imessage_reply_target"] = message_id
         return meta
 
     async def _imessage_state(self, state: str, meta: Dict[str, Any], text: str = "") -> Any:
@@ -814,14 +811,13 @@ class ContactSession:
             "companion_scope_id", "companion_activation_id", "identity_id",
         )) + (reply_context,)
 
-    def _collect_imessage(self, text: str, meta: Dict[str, Any]) -> list[Dict[str, Any]]:
+    def _collect_imessage(self, text: str, meta: Dict[str, Any]) -> None:
         key = self._imessage_compatible_key(meta)
         if self._imessage_burst is not None and (key != self._imessage_burst_key or meta.get("attachments")):
             self._flush_imessage_burst()
         loop = asyncio.get_running_loop()
         if self._imessage_burst is None:
             self._imessage_burst = _Turn(text="", reply_mode="imessage", reply_meta=deepcopy(meta))
-            self._imessage_open_turns[id(self._imessage_burst)] = self._imessage_burst
             self._imessage_burst_parts = [text]
             self._imessage_burst_key = key
             self._imessage_burst_started = loop.time()
@@ -834,38 +830,17 @@ class ContactSession:
             if first_id:
                 route["imessage_reply_target"] = first_id
         turn = self._imessage_burst
-        # A later request may arrive well outside the burst window while work
-        # is still queued/running. Anchor each answer to its OWN source, never
-        # to the newer request. A result already checkpointed for delivery is
-        # immutable, but still makes the arriving request an overlapping one.
-        overlapping = [other for other in self._imessage_open_turns.values()
-                       if other is not turn and meta.get("conversation_id")
-                       and all((other.reply_meta or {}).get(field) == meta.get(field)
-                               for field in ("conversation_id", "identity_id",
-                                             "companion_scope_id", "companion_activation_id"))]
-        routed = []
-        if overlapping:
-            for candidate in [*overlapping, turn]:
-                route = candidate.reply_meta
-                if candidate.reply_route_frozen:
-                    continue
-                first_id = route["imessage_sources"][0].get("id")
-                if first_id:
-                    if not route.get("imessage_reply_target"):
-                        route["imessage_reply_target"] = first_id
-                    routed.append(route)
         turn.text = frame_inbound("imessage", turn.reply_meta, "\n\n".join(self._imessage_burst_parts))
         if self._imessage_burst_task is not None:
             self._imessage_burst_task.cancel()
         if meta.get("attachments") or meta.get("reaction"):
             self._flush_imessage_burst()
-            return routed
+            return
         deadline = min(
             loop.time() + IMESSAGE_BURST_QUIET_SECONDS,
             self._imessage_burst_started + IMESSAGE_BURST_MAX_SECONDS,
         )
         self._imessage_burst_task = asyncio.create_task(self._wait_imessage_burst(deadline))
-        return routed
 
     async def _wait_imessage_burst(self, deadline: float) -> None:
         await asyncio.sleep(max(0.0, deadline - asyncio.get_running_loop().time()))
@@ -972,7 +947,6 @@ class ContactSession:
                 outcome = "uncertain"
                 raise
             finally:
-                self._imessage_open_turns.pop(id(turn), None)
                 await self._notify_turn_activity(turn, outcome)
                 if tracked_imessage:
                     state = "done" if outcome == "completed" else "cancelled" if outcome == "cancelled" else "uncertain"
@@ -1061,7 +1035,6 @@ class ContactSession:
         if running or parked:
             await self._cancel_pending_turn()
         for turn in dropped:
-            self._imessage_open_turns.pop(id(turn), None)
             if self._threaded_turn(turn):
                 await self._imessage_state("cancelled", turn.reply_meta or {})
             if turn.completion is not None and not turn.completion.done():
@@ -1080,7 +1053,6 @@ class ContactSession:
         await self._cancel_pending_turn()
         buffered = self._take_imessage_burst()
         if buffered is not None:
-            self._imessage_open_turns.pop(id(buffered), None)
             await self._imessage_state("cancelled", buffered.reply_meta or {})
         # Discard messages queued but not yet started. Settle any capture-turn
         # futures (consult / post-call / failure recovery) so their awaiters
@@ -1090,7 +1062,6 @@ class ContactSession:
                 turn = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            self._imessage_open_turns.pop(id(turn), None)
             await self._notify_turn_activity(turn, "cancelled")
             if self._threaded_turn(turn):
                 await self._imessage_state("cancelled", turn.reply_meta or {})
@@ -1272,7 +1243,6 @@ class ContactSession:
             reply_text = turn_result.text if turn.capture_tools else turn_result
             reply = reply_text.strip()
             if self._threaded_turn(turn) and not self._interrupting and not self._shutting_down:
-                turn.reply_route_frozen = True
                 already_sent = await self._imessage_state("result", turn.reply_meta or {}, reply)
                 if already_sent is True:
                     reply = "[SILENT]"
@@ -1717,7 +1687,6 @@ class ContactSession:
     async def close(self, *, shutting_down: bool = False) -> None:
         if shutting_down:
             self._shutting_down = True
-            self._imessage_open_turns.clear()
             # Unsubmitted receipts remain admitted for recovery after restart.
             self._take_imessage_burst()
         self._cancel_interactions()

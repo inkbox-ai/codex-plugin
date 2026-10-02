@@ -587,12 +587,17 @@ def _imessage_active_context(identity_handle: str, *, required: bool = False) ->
 def _imessage_reply_options(
     identity: Any, args: Dict[str, Any], conversation_id: str, context: Dict[str, Any] | None,
 ) -> Dict[str, Any]:
-    """Validate a native target against the current identity's visible message."""
-    if not any(key in args for key in ("reply_to_message_id", "plain_reply_fallback", "idempotency_key")):
+    """Select and validate bridge-owned routing; never accept a model target."""
+    if any(key in args for key in ("reply_to_message_id", "plain_reply_fallback")):
+        _require_imessage_threading(identity)
+        raise ValueError("The bridge selects iMessage reply routing automatically; omit reply_to_message_id and plain_reply_fallback.")
+    target = None
+    if context is not None and context.get("conversation_id") == conversation_id:
+        target = (context.get("route_meta") or {}).get("imessage_reply_target")
+    if target is None and "idempotency_key" not in args:
         return {}
     _require_imessage_threading(identity)
     options: Dict[str, Any] = {}
-    target = args.get("reply_to_message_id")
     if target is not None:
         if not isinstance(target, str) or not target.strip():
             raise ValueError("reply_to_message_id must be a nonempty message ID")
@@ -610,10 +615,7 @@ def _imessage_reply_options(
         page = identity.get_imessage_thread(target, limit=1)
         if str(_imessage_value(page, "conversation_id") or "") != conversation_id:
             raise ValueError("Native iMessage reply support could not be verified for this conversation")
-        fallback = args.get("plain_reply_fallback", True)
-        if not isinstance(fallback, bool):
-            raise ValueError("plain_reply_fallback must be a boolean")
-        options.update(reply_to_message_id=target, plain_reply_fallback=fallback)
+        options.update(reply_to_message_id=target, plain_reply_fallback=True)
     key = args.get("idempotency_key")
     if key is not None:
         if not isinstance(key, str) or not key.strip():
@@ -995,7 +997,7 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 raise ValueError("Specify exactly one of `to` or `conversation_id`.")
             threaded = read_config().imessage_threaded_replies
             context = _imessage_active_context(
-                identity_handle, required=args.get("reply_to_message_id") is not None,
+                identity_handle,
             ) if threaded else None
             reply_options = _imessage_reply_options(identity, args, conversation_id, context)
             if to_list is not None and not to_list:
@@ -1543,19 +1545,16 @@ def _imessage_send_tool_entry(spec: ToolSpec) -> Dict[str, Any]:
     """Extend the send schema without mutating the default-off tool contract."""
     return {
         "name": spec.name,
-        "description": spec.description + " An optional reply_to_message_id targets a visible message "
-        "in that conversation. The returned message may be queued; actual reply metadata can change "
+        "description": spec.description + " The bridge selects reply routing automatically: "
+        "same-conversation sends in an active message turn reply to its trigger; "
+        "sends without a message trigger start fresh. Do not supply reply routing arguments. "
+        "The returned message may be queued; actual reply metadata can change "
         "before delivery. Failed or uncertain sends must not be retried as untargeted messages.",
         "inputSchema": {
             **spec.input_schema,
             "properties": {
-                **spec.input_schema["properties"],
-                "reply_to_message_id": _str("Visible source message ID to answer; requires conversation_id, never to."),
-                "plain_reply_fallback": {
-                    "type": "boolean", "default": True,
-                    "description": "Allow an ordinary reply in the same conversation when native threading is unsupported. "
-                    "False requires native threading. Ignored without a target; never a client-side resend.",
-                },
+                **{key: value for key, value in spec.input_schema["properties"].items()
+                   if key not in {"reply_to_message_id", "plain_reply_fallback"}},
                 "idempotency_key": _str("Stable key for one exact logical send. Reuse unchanged on retry; "
                     "use a new key for different content, target, or fallback policy."),
             },

@@ -94,6 +94,14 @@ def sdk(monkeypatch, tmp_path):
     client.close()
 
 
+def active_source(monkeypatch):
+    from inkbox_codex.imessage import write_turn_context
+    monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")
+    write_turn_context("contact", BridgeConfig(identity="agent", base_url="https://example.com"), {
+        "conversation_id": CONVERSATION_ID, **source_metadata(message()),
+    })
+
+
 def tool(sdk, name="inkbox_send_imessage", **arguments):
     result = asyncio.run(call_inkbox_tool(sdk.client, "agent", name, arguments))
     return result, json.loads(result["content"][0]["text"])
@@ -103,18 +111,17 @@ def posts(sdk):
     return [request for request in sdk.requests if request.method == "POST"]
 
 
-@pytest.mark.parametrize("strict", [False, True])
-def test_real_sdk_target_policy_identity_and_key_reach_wire(sdk, strict):
+def test_real_sdk_bridge_selected_target_policy_identity_and_key_reach_wire(sdk, monkeypatch):
+    active_source(monkeypatch)
     result, payload = tool(
-        sdk, conversation_id=CONVERSATION_ID, text="Answer", reply_to_message_id=SOURCE_ID,
-        plain_reply_fallback=not strict, idempotency_key="one-logical-output",
+        sdk, conversation_id=CONVERSATION_ID, text="Answer", idempotency_key="one-logical-output",
     )
     assert not result.get("isError"), payload
     assert len(posts(sdk)) == 1
     request = posts(sdk)[0]
     assert json.loads(request.content) == {
         "conversation_id": CONVERSATION_ID, "text": "Answer", "reply_to_message_id": SOURCE_ID,
-        "plain_reply_fallback": not strict,
+        "plain_reply_fallback": True,
     }
     assert request.url.params["agent_identity_id"] == IDENTITY_ID
     assert request.headers["Idempotency-Key"] == "one-logical-output"
@@ -130,9 +137,10 @@ def test_real_sdk_target_policy_identity_and_key_reach_wire(sdk, strict):
     assert payload["thread_id"] is None
 
 
-def test_real_sdk_plain_fallback_preserves_actual_standalone_thread(sdk):
+def test_real_sdk_plain_fallback_preserves_actual_standalone_thread(sdk, monkeypatch):
+    active_source(monkeypatch)
     sdk.outbound.update(thread_id=THREAD_ID, service="sms", was_downgraded=True)
-    result, payload = tool(sdk, conversation_id=CONVERSATION_ID, text="Answer", reply_to_message_id=SOURCE_ID)
+    result, payload = tool(sdk, conversation_id=CONVERSATION_ID, text="Answer")
     assert not result.get("isError"), payload
     assert json.loads(posts(sdk)[0].content)["plain_reply_fallback"] is True
     assert payload["reply_to_message_id"] is None
@@ -161,14 +169,14 @@ def test_real_sdk_thread_pages_keep_cursor_identity_and_null_metadata(sdk, name,
 
 
 @pytest.mark.parametrize("ancestry,expected_target", [
-    ({"reply_to_message_id": None, "thread_id": None, "thread_root_message_id": None}, None),
-    ({"reply_to_message_id": None, "thread_id": THREAD_ID, "thread_root_message_id": None}, None),
-    ({"reply_to_message_id": None, "thread_id": THREAD_ID, "thread_root_message_id": SOURCE_ID}, None),
+    ({"reply_to_message_id": None, "thread_id": None, "thread_root_message_id": None}, SOURCE_ID),
+    ({"reply_to_message_id": None, "thread_id": THREAD_ID, "thread_root_message_id": None}, SOURCE_ID),
+    ({"reply_to_message_id": None, "thread_id": THREAD_ID, "thread_root_message_id": SOURCE_ID}, SOURCE_ID),
     ({"reply_to_message_id": None, "thread_id": THREAD_ID, "thread_root_message_id": ROOT_ID}, SOURCE_ID),
     ({"reply_to_message_id": PARENT_ID, "thread_id": None, "thread_root_message_id": None}, SOURCE_ID),
     ({"reply_to_message_id": PARENT_ID, "thread_id": THREAD_ID, "thread_root_message_id": ROOT_ID}, SOURCE_ID),
 ])
-def test_real_sdk_ancestry_controls_reply_route_without_inventing_references(sdk, ancestry, expected_target):
+def test_real_sdk_trigger_controls_reply_route_without_inventing_ancestry(sdk, ancestry, expected_target):
     sdk.source.update(ancestry)
     identity = sdk.client.get_identity("agent")
     received = identity.get_imessage(SOURCE_ID)
@@ -198,20 +206,22 @@ def test_real_sdk_absent_ancestry_stays_unknown(sdk):
     assert meta["reply_to_message_id"] is None
     assert meta["thread_id"] is None
     assert meta["thread_root_message_id"] is None
-    assert auto_reply_kwargs(meta) == {}
+    assert auto_reply_kwargs(meta) == {"reply_to_message_id": SOURCE_ID, "plain_reply_fallback": True}
 
 
-def test_real_sdk_unavailable_backend_prevents_targeted_send(sdk):
+def test_real_sdk_unavailable_backend_prevents_targeted_send(sdk, monkeypatch):
+    active_source(monkeypatch)
     sdk.thread_status = 404
-    result, payload = tool(sdk, conversation_id=CONVERSATION_ID, text="Answer", reply_to_message_id=SOURCE_ID)
+    result, payload = tool(sdk, conversation_id=CONVERSATION_ID, text="Answer")
     assert result["isError"] is True
     assert payload["status_code"] == 404
     assert not posts(sdk)
 
 
-def test_real_sdk_target_rejection_does_not_trigger_plain_resend(sdk):
+def test_real_sdk_target_rejection_does_not_trigger_plain_resend(sdk, monkeypatch):
+    active_source(monkeypatch)
     sdk.send_status = 422
-    result, payload = tool(sdk, conversation_id=CONVERSATION_ID, text="Answer", reply_to_message_id=SOURCE_ID)
+    result, payload = tool(sdk, conversation_id=CONVERSATION_ID, text="Answer")
     assert result["isError"] is True
     assert payload["status_code"] == 422
     assert payload["error_code"] == "imessage_reply_target_unavailable"

@@ -115,6 +115,20 @@ def test_overlapping_requests_checkpoint_source_targets_before_ack_and_send():
     asyncio.run(run())
 
 
+def test_single_triggered_answer_then_unsolicited_send_starts_fresh():
+    from tests.test_imessage_sessions import make_session, finish_burst
+
+    async def run():
+        gw, identity = bridge()
+        session, _, _ = make_session(hook=gw._imessage_turn_state, send=gw.send_to_contact)
+        await session.handle_inbound("Hi", "imessage", metadata("source", parent=None))
+        await finish_burst(session)
+        await gw.send_to_contact("contact-example", "Scheduled update", "imessage", {"conversation_id": "conversation"})
+        assert [call["reply_to_message_id"] for call in identity.calls] == ["source", None]
+        assert identity.preflights == [("source", 1)]
+    asyncio.run(run())
+
+
 def test_gateway_keeps_actual_queued_metadata_and_stable_idempotency():
     async def run():
         gw, identity = bridge()
@@ -300,7 +314,7 @@ def test_companion_live_native_reply_targets_live_source_not_sponsor():
         assert meta["thread_id"] == "opaque-native-thread"
         initial = r.meta(event, source_id=original["data"]["message"]["id"], initialization=True)
         assert initial["message_id"] == original["data"]["message"]["id"]
-        assert initial["imessage_reply_target"] is None
+        assert initial["imessage_reply_target"] == original["data"]["message"]["id"]
         assert initial["thread_id"] is None
     finally:
         r.inbox.close()

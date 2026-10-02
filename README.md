@@ -500,15 +500,19 @@ sending an unthreaded reply. The existing SDK minimum is unchanged when disabled
   one-event-per-turn receipts and activation boundaries; they are not coalesced.
 - **New requests during work:** follow-ups queue behind the current turn; they do
   not interrupt it. This preview does not start parallel model runs or child agents.
-  Overlapping ordinary iMessage requests get answers anchored to their own first
-  source, even when the requests arrive seconds apart. An answer already saved
-  for delivery keeps its original route; it is not resent or retargeted.
-- **Where answers appear:** an isolated standalone message still gets a normal chat
-  reply. An explicit native reply is answered against its current source message.
-  A combined burst's default answer targets its first source. Codex can instead
-  use `inkbox_send_imessage(reply_to_message_id=...)` for individual answers to
-  admitted sources, then return `[SILENT]` to avoid another automatic answer.
+  Timing does not change the reply target. An answer already saved for delivery
+  keeps its original route; it is not resent or retargeted.
+- **Where answers appear:** every message-triggered answer replies to its source,
+  including isolated standalone messages. A combined burst's default answer
+  targets its first source. The bridge owns this decision; the model cannot
+  select a different target or turn threading off for an answer. Same-conversation
+  send tools use the same trigger. After an explicit send, Codex returns `[SILENT]`
+  to avoid another automatic answer.
   A final answer exactly matching an observed targeted tool send is suppressed too.
+- **Proactive messages:** cron jobs, reminders, and other sends without a current
+  message trigger start fresh, without a reply target. The bridge never picks the
+  last message from conversation history. Scheduled jobs must run independently,
+  without inheriting the active chat's tool-process environment.
 - **No audience changes:** targeted tools must use a visible source in the same
   conversation; in a running chat they must also belong to that active input.
   Opaque native thread IDs are not message IDs or new Codex sessions. Replies use
@@ -775,7 +779,7 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_send_email` — send email; attach local files with `attachment_paths`.
 - `inkbox_send_sms` — send SMS/MMS; attach local files with `media_paths` (or hosted `media_urls`).
 - `inkbox_send_imessage` — send into an iMessage conversation; attach a local file with `media_path`.
-- `inkbox_get_imessage_thread` · `inkbox_get_imessage_conversation_thread` — bounded native-thread pages, available only with `INKBOX_IMESSAGE_THREADED_REPLIES=true`; the send tool then also accepts `reply_to_message_id`, `plain_reply_fallback`, and `idempotency_key`.
+- `inkbox_get_imessage_thread` · `inkbox_get_imessage_conversation_thread` — bounded native-thread pages, available only with `INKBOX_IMESSAGE_THREADED_REPLIES=true`; reply targets and fallback policy are bridge-owned, while the send tool also accepts `idempotency_key`.
 - `inkbox_list_text_conversations` · `inkbox_get_text_conversation` — browse SMS threads and history.
 - `inkbox_list_imessage_conversations` · `inkbox_get_imessage_conversation` — browse iMessage threads and history (find the `conversation_id` to send into).
 - `inkbox_lookup_contact` · `inkbox_list_contacts` · `inkbox_get_contact` — resolve and read address-book contacts (reverse-lookup by email/phone, free-text search, or full record by id).

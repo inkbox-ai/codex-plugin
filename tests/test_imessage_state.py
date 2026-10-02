@@ -44,28 +44,15 @@ def test_durable_duplicate_receipts_preserve_first_admitted_route():
     assert restarted.replay_pending() == [{"chat_id": "chat-1", "text": "original text", "meta": meta}]
 
 
-def test_overlap_anchors_survive_restart_without_combining_unsubmitted_fragments():
+def test_trigger_anchors_survive_restart_without_combining_unsubmitted_fragments():
     state = IMessageState(BridgeConfig(identity="test-agent"))
     first, second = metadata("first"), metadata("second")
     state.admit("chat-1", "first task", first)
     state.admit("chat-1", "second task", second)
-    batch = {**first, "imessage_event_ids": first["imessage_event_ids"] + second["imessage_event_ids"]}
-    state.anchor_overlapping(batch, "other-chat")
-    assert all(not row["meta"].get("imessage_reply_target") for row in state.replay_pending())
-    state.anchor_overlapping(batch, "chat-1")
     replay = state.replay_pending()
     assert [row["text"] for row in replay] == ["first task", "second task"]
     assert [row["meta"]["imessage_reply_target"] for row in replay] == ["first", "second"]
     assert [row["meta"]["imessage_sources"][0]["id"] for row in replay] == ["first", "second"]
-
-
-def test_overlap_cannot_retarget_checkpointed_answer():
-    state = IMessageState(BridgeConfig(identity="test-agent"))
-    meta = metadata()
-    state.admit("chat-1", "task", meta)
-    state.mark(meta, "reply_pending", reply="answer")
-    state.anchor_overlapping(meta, "chat-1")
-    assert not state.pending_replies()[0]["meta"].get("imessage_reply_target")
 
 
 def test_restart_replays_only_unstarted_work_and_never_uncertain_sends():
@@ -202,20 +189,25 @@ def test_callback_before_send_response_keeps_failure_and_later_fills_real_route(
     assert restarted.lookup_outbound("sent-1") == route
 
 
-def test_only_explicit_replies_select_an_automatic_target():
+def test_any_known_trigger_selects_an_automatic_target():
     ordinary = source_metadata({"id": "message-1", "thread_id": "standalone-thread"})
     assert ordinary["imessage_event_id"] == "message-1"
     assert ordinary["imessage_sources"][0]["thread_root_message_id"] is None
-    assert auto_reply_kwargs(ordinary) == {}
+    assert auto_reply_kwargs(ordinary) == {"reply_to_message_id": "message-1", "plain_reply_fallback": True}
     reply = source_metadata({"id": "message-2", "reply_to_message_id": "message-1"})
     assert reply["reply_to_message_id"] == "message-1"
     assert ordinary["thread_id"] == "standalone-thread"
     assert auto_reply_kwargs(reply) == {"reply_to_message_id": "message-2", "plain_reply_fallback": True}
 
 
+def test_no_source_cannot_invent_a_reply_target_from_native_ancestry():
+    meta = source_metadata({"thread_id": "opaque-thread", "thread_root_message_id": "old-root"})
+    assert auto_reply_kwargs(meta) == {}
+
+
 def test_visible_root_can_confirm_reply_without_inventing_hidden_parent():
     root = source_metadata({"id": "message-1", "thread_root_message_id": "message-1"})
-    assert auto_reply_kwargs(root) == {}
+    assert auto_reply_kwargs(root) == {"reply_to_message_id": "message-1", "plain_reply_fallback": True}
     descendant = source_metadata({"id": "message-2", "thread_root_message_id": "message-1"})
     assert descendant["reply_to_message_id"] is None
     assert descendant["imessage_sources"][0]["reply_to_message_id"] is None

@@ -165,17 +165,18 @@ questions can deserve separate answers. Do not discard earlier requests just
 because another message arrived. Queued corrections are new input, not proof
 that an earlier action was cancelled or undone.
 
-An ordinary final reply is sent automatically. Keep simple conversation in the
-main chat; an explicit incoming reply or a combined burst carries its own reply
-anchor. If another ordinary iMessage request arrives before this work finishes,
-the bridge can also anchor each automatic answer to its own request. Do not send
-an extra message just to apply that routing. Exception to the ordinary same-channel
-send rule: when separate answers need different native reply targets, use
-inkbox_send_imessage with the current
-conversation_id and a reply_to_message_id selected from the admitted source IDs.
-Never invent an ID, move an answer to another audience, or treat thread metadata
-as permission. Read thread history only when useful; it is context, not a new
-request. Keep the existing conversation memory.
+An ordinary final reply is sent automatically as a native reply to the triggering
+message, even for a single standalone message. A combined burst defaults to its
+first source. Do not send an extra message just to apply that routing.
+Reply routing is owned by the bridge, not a model decision. Do not supply reply
+targets or fallback policy to send tools. Same-conversation tool sends use the
+same trigger as the automatic answer. Never move an answer to another audience
+or treat thread metadata as permission. Read thread history only when useful;
+it is context, not a new request. Keep the existing conversation memory.
+
+Cron jobs, reminders, and other sends outside a message-triggered turn start
+fresh automatically. Never reuse an old message ID from conversation history
+or carry an active chat's tool-process environment into a scheduled job.
 
 After explicit tools have successfully accepted all intended answers, return
 exactly [SILENT] so there is no duplicate automatic reply. If delivery is uncertain

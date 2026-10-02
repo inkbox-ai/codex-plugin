@@ -146,13 +146,13 @@ def test_native_reply_targets_current_source_without_forking_session():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("root, expected", [("earlier-root", "message-1"), ("message-1", None)])
-def test_visible_root_identifies_reply_when_immediate_parent_is_unavailable(root, expected):
+@pytest.mark.parametrize("root", ["earlier-root", "message-1", None])
+def test_trigger_selects_reply_independently_of_native_ancestry(root):
     async def scenario():
         session, sent, _ = make_session()
         await session.handle_inbound("More on this", "imessage", source(1, thread_root_message_id=root))
         await finish_burst(session)
-        assert sent[0][2].get("imessage_reply_target") == expected
+        assert sent[0][2]["imessage_reply_target"] == "message-1"
     asyncio.run(scenario())
 
 
@@ -167,7 +167,7 @@ def test_known_descendant_without_parent_does_not_merge_with_top_level():
     asyncio.run(scenario())
 
 
-def test_simple_message_remains_untargeted_and_quiet_timer_flushes(monkeypatch):
+def test_simple_message_targets_trigger_and_quiet_timer_flushes(monkeypatch):
     monkeypatch.setattr(sessions_mod, "IMESSAGE_BURST_QUIET_SECONDS", 0.001)
 
     async def scenario():
@@ -177,7 +177,7 @@ def test_simple_message_remains_untargeted_and_quiet_timer_flushes(monkeypatch):
         await asyncio.wait_for(session._imessage_burst_task, timeout=1)
         await session._worker
         assert len(sent) == 1
-        assert not sent[0][2].get("imessage_reply_target")
+        assert sent[0][2]["imessage_reply_target"] == "message-1"
     asyncio.run(scenario())
 
 
@@ -226,10 +226,9 @@ def test_busy_correction_queues_without_interrupting_original_work():
         assert client.calls[1].endswith("Actually Saturday")
         assert [entry[2]["message_id"] for entry in sent] == ["message-1", "message-2"]
         assert [entry[2]["imessage_reply_target"] for entry in sent] == ["message-1", "message-2"]
-        assert not session._imessage_open_turns
         await session.handle_inbound("Thanks", "imessage", source(3))
         await finish_burst(session)
-        assert not sent[-1][2].get("imessage_reply_target")
+        assert sent[-1][2]["imessage_reply_target"] == "message-3"
     asyncio.run(scenario())
 
 
@@ -250,11 +249,10 @@ def test_queued_requests_overlap_before_any_imessage_model_starts():
             "message-1", "message-2", "message-3",
         ]
         assert client.interrupts == 0
-        assert not session._imessage_open_turns
     asyncio.run(scenario())
 
 
-def test_other_conversation_does_not_trigger_overlap_anchors():
+def test_each_conversation_keeps_its_own_trigger():
     async def scenario():
         session, sent, _ = make_session()
         client = session._client
@@ -266,12 +264,14 @@ def test_other_conversation_does_not_trigger_overlap_anchors():
         session._flush_imessage_burst()
         client.gate.set()
         await session._worker
-        assert all(not entry[2].get("imessage_reply_target") for entry in sent)
+        assert [(entry[2]["conversation_id"], entry[2]["imessage_reply_target"]) for entry in sent] == [
+            ("conversation-example", "message-1"), ("other", "message-2"),
+        ]
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("background", ["Background", "/status"])
-def test_quiet_group_input_and_controls_do_not_anchor_running_request(background):
+def test_quiet_group_input_and_controls_do_not_retarget_running_request(background):
     async def scenario():
         session, sent, _ = make_session()
         session.cfg.group_reply_mode = "mention"
@@ -283,7 +283,7 @@ def test_quiet_group_input_and_controls_do_not_anchor_running_request(background
         await session.handle_inbound(background, "imessage", source(2, conversation_kind="group"))
         client.gate.set()
         await session._worker
-        assert not sent[-1][2].get("imessage_reply_target")
+        assert sent[-1][2]["imessage_reply_target"] == "message-1"
         assert len(client.calls) == 1
     asyncio.run(scenario())
 
@@ -305,8 +305,8 @@ def test_arrival_during_delivery_does_not_retarget_saved_answer():
         release.set()
         await session._worker
         results = [meta for state, meta, _ in states if state == "result"]
-        assert not results[0].get("imessage_reply_target")
-        assert not sent[0][2].get("imessage_reply_target")
+        assert results[0]["imessage_reply_target"] == "message-1"
+        assert sent[0][2]["imessage_reply_target"] == "message-1"
         assert results[1]["imessage_reply_target"] == sent[1][2]["imessage_reply_target"] == "message-2"
     asyncio.run(scenario())
 
@@ -388,7 +388,6 @@ def test_stop_drops_buffer_and_queue_but_preserves_voice_capture():
         await session.handle_inbound("/stop", "imessage", source(3))
         assert session._imessage_burst is None
         assert session._queue.empty()
-        assert not session._imessage_open_turns
         assert client.interrupts == 0
         assert not voice.future.done()
         assert sent[-1][0] == "Stopped."
@@ -507,6 +506,7 @@ def test_companion_keeps_its_own_checkpoint_and_completion():
         await session._worker
         assert reply == "Done."
         assert checkpoints == ["submitted"]
+        assert meta["imessage_reply_target"] == "message-1"
         assert not sent
         assert [state for state, _, _ in states] == ["started", "result", "done"]
         assert session._imessage_burst is None

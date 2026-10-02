@@ -47,7 +47,7 @@ def _id(value: Any) -> str | None:
 
 
 def source_metadata(message: Any, event_id: str | None = None) -> dict[str, Any]:
-    """Keep native IDs nullable; a standalone thread ID is not a reply request."""
+    """Anchor a reply to its trigger without inferring any native ancestry."""
     message_id = _id(_field(message, "id"))
     source = {
         "id": message_id,
@@ -57,15 +57,12 @@ def source_metadata(message: Any, event_id: str | None = None) -> dict[str, Any]
         )},
     }
     receipt_id = _id(event_id) or message_id
-    is_reply = bool(source["reply_to_message_id"] or (
-        source["thread_root_message_id"] and source["thread_root_message_id"] != message_id
-    ))
     return {
         "message_id": message_id,
         "imessage_event_id": receipt_id,
         "imessage_event_ids": [receipt_id] if receipt_id else [],
         "imessage_sources": [source] if message_id else [],
-        "imessage_reply_target": message_id if is_reply else None,
+        "imessage_reply_target": message_id,
         **{name: source[name] for name in ("reply_to_message_id", "thread_id", "thread_root_message_id")},
     }
 
@@ -154,30 +151,6 @@ class IMessageState:
                 seen.add(anchor)
                 result.append(self._receipt(row))
         return result
-
-    def anchor_overlapping(self, meta: dict[str, Any], chat_id: str) -> None:
-        """Retain own-source anchors without advancing work or merging receipts.
-
-        Pending fragments can replay separately after a restart, so each
-        receipt must keep an anchor from its own admitted sources. Started
-        batches already share the full source list and therefore first source.
-        Never change a saved/sending answer's route.
-        """
-        with self._db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            for event_id in _event_ids(meta):
-                row = db.execute(
-                    "SELECT meta FROM receipts WHERE event_id=? AND chat_id=? AND state IN ('pending','running')",
-                    (event_id, chat_id),
-                ).fetchone()
-                if row is None:
-                    continue
-                saved = json.loads(row["meta"])
-                sources = saved.get("imessage_sources") or []
-                target = sources[0].get("id") if sources else None
-                if target and not saved.get("imessage_reply_target"):
-                    saved["imessage_reply_target"] = target
-                    db.execute("UPDATE receipts SET meta=? WHERE event_id=?", (_json(saved), event_id))
 
     def mark(self, meta: dict[str, Any], state: str, reply: Any = None, chat_id: str | None = None) -> None:
         if state not in _STATES:

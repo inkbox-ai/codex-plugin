@@ -98,7 +98,8 @@ def test_schema_does_not_leak_opt_in_fields_after_flag_is_disabled(monkeypatch):
     enabled = {tool["name"]: tool for tool in tools.mcp_tool_list()}
     assert "inkbox_get_imessage_conversation_thread" in enabled
     properties = enabled["inkbox_send_imessage"]["inputSchema"]["properties"]
-    assert {"reply_to_message_id", "plain_reply_fallback", "idempotency_key"} <= properties.keys()
+    assert "idempotency_key" in properties
+    assert not {"reply_to_message_id", "plain_reply_fallback"} & properties.keys()
     monkeypatch.setenv("INKBOX_IMESSAGE_THREADED_REPLIES", "false")
     assert tools.mcp_tool_list() == before
 
@@ -125,15 +126,15 @@ def test_off_rejects_new_arguments_instead_of_silently_flattening(extra):
 
 def test_native_send_preserves_exact_target_policy_and_key(monkeypatch):
     enable(monkeypatch)
+    active_turn(monkeypatch)
     identity = Identity()
     identity.result = Message(reply_to_message_id="source-1", thread_id="native-thread", thread_root_message_id="root")
-    result, payload = call(identity, conversation_id="conversation-1", text="answer", reply_to_message_id="source-1",
-                           plain_reply_fallback=False, idempotency_key="stable-output-key")
+    result, payload = call(identity, conversation_id="conversation-1", text="answer", idempotency_key="stable-output-key")
     assert not result.get("isError")
     assert identity.reads == [("message", "source-1"), ("thread", "source-1", 1, None)]
     assert identity.sent == [{
         "conversation_id": "conversation-1", "text": "answer", "reply_to_message_id": "source-1",
-        "plain_reply_fallback": False, "idempotency_key": "stable-output-key",
+        "plain_reply_fallback": True, "idempotency_key": "stable-output-key",
     }]
     assert payload["status"] == "pending"
     assert payload["reply_to_message_id"] == "source-1"
@@ -142,9 +143,10 @@ def test_native_send_preserves_exact_target_policy_and_key(monkeypatch):
 
 def test_fallback_reports_actual_metadata_without_inventing_native_parent(monkeypatch):
     enable(monkeypatch)
+    active_turn(monkeypatch)
     identity = Identity()
     identity.result = Message(thread_id="standalone-thread")
-    _, payload = call(identity, conversation_id="conversation-1", text="answer", reply_to_message_id="source-1")
+    _, payload = call(identity, conversation_id="conversation-1", text="answer")
     assert identity.sent[0]["plain_reply_fallback"] is True
     assert payload["reply_to_message_id"] is None
     assert payload["thread_root_message_id"] is None
@@ -153,11 +155,12 @@ def test_fallback_reports_actual_metadata_without_inventing_native_parent(monkey
 
 def test_target_from_another_conversation_never_uploads_or_sends(monkeypatch):
     enable(monkeypatch)
+    active_turn(monkeypatch)
     identity = Identity()
     identity.target.conversation_id = "other-conversation"
     upload = []
     monkeypatch.setattr(tools, "_upload_media_url", lambda *args: upload.append(args))
-    result, _ = call(identity, conversation_id="conversation-1", text="answer", reply_to_message_id="source-1",
+    result, _ = call(identity, conversation_id="conversation-1", text="answer",
                      media_path="example.png")
     assert result["isError"] is True
     assert not identity.sent and not upload
@@ -168,16 +171,17 @@ def test_reply_target_cannot_be_used_with_recipients(monkeypatch):
     identity = Identity()
     result, payload = call(identity, to="+15551234567", text="answer", reply_to_message_id="source-1")
     assert result["isError"] is True
-    assert "cannot be used with to" in payload["error"]
+    assert "bridge selects iMessage reply routing automatically" in payload["error"]
     assert not identity.reads and not identity.sent
 
 
 @pytest.mark.parametrize("error", [TimeoutError("outcome unknown"), ValueError("target unavailable")])
 def test_failed_targeted_send_is_never_retried_as_plain(monkeypatch, error):
     enable(monkeypatch)
+    active_turn(monkeypatch)
     identity = Identity()
     identity.error = error
-    result, _ = call(identity, conversation_id="conversation-1", text="answer", reply_to_message_id="source-1")
+    result, _ = call(identity, conversation_id="conversation-1", text="answer")
     assert result["isError"] is True
     assert len(identity.sent) == 1
     assert identity.sent[0]["reply_to_message_id"] == "source-1"
@@ -185,8 +189,9 @@ def test_failed_targeted_send_is_never_retried_as_plain(monkeypatch, error):
 
 def test_old_sdk_is_actionable_only_when_opted_in(monkeypatch):
     enable(monkeypatch)
+    active_turn(monkeypatch)
     identity = SimpleNamespace(send_imessage=lambda **kwargs: pytest.fail("must not send"))
-    result, payload = call(identity, conversation_id="conversation-1", text="answer", reply_to_message_id="source-1")
+    result, payload = call(identity, conversation_id="conversation-1", text="answer")
     assert result["isError"] is True
     assert "0.7.12 or newer when available" in payload["error"]
     assert "INKBOX_IMESSAGE_THREADED_REPLIES=false" in payload["error"]
@@ -194,37 +199,77 @@ def test_old_sdk_is_actionable_only_when_opted_in(monkeypatch):
 
 
 def active_turn(monkeypatch, **meta):
-    from inkbox_codex.imessage import write_turn_context
+    from inkbox_codex.imessage import source_metadata, write_turn_context
 
     monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact-1")
     return write_turn_context("contact-1", BridgeConfig(identity="agent"), {
-        "conversation_id": "conversation-1", "message_id": "source-1", **meta,
+        "conversation_id": "conversation-1",
+        **source_metadata({"id": meta.get("message_id", "source-1")}), **meta,
     })
+
+
+def test_active_send_defaults_to_trigger_without_model_selecting_target(monkeypatch):
+    from inkbox_codex.imessage import read_turn_context
+
+    enable(monkeypatch)
+    active_turn(monkeypatch)
+    identity = Identity()
+    result, _ = call(identity, conversation_id="conversation-1", text="answer")
+    assert not result.get("isError")
+    assert identity.sent[0]["reply_to_message_id"] == "source-1"
+    assert identity.sent[0]["plain_reply_fallback"] is True
+    assert read_turn_context()["sent_outputs"][0]["target"] == "source-1"
+
+
+@pytest.mark.parametrize("override", [
+    {"reply_to_message_id": None}, {"reply_to_message_id": "source-1"},
+    {"reply_to_message_id": "different-source"}, {"plain_reply_fallback": False},
+    {"plain_reply_fallback": True},
+])
+def test_model_cannot_override_bridge_reply_routing(monkeypatch, override):
+    enable(monkeypatch)
+    active_turn(monkeypatch)
+    identity = Identity()
+    result, payload = call(identity, conversation_id="conversation-1", text="answer", **override)
+    assert result["isError"] is True
+    assert "bridge selects iMessage reply routing automatically" in payload["error"]
+    assert not identity.sent and not identity.reads
+
+
+def test_later_scheduled_send_does_not_reuse_previous_trigger(monkeypatch):
+    from inkbox_codex.imessage import clear_turn_context
+
+    enable(monkeypatch)
+    active_turn(monkeypatch)
+    identity = Identity()
+    result, _ = call(identity, conversation_id="conversation-1", text="answer")
+    assert not result.get("isError")
+    clear_turn_context("contact-1")
+    result, _ = call(identity, conversation_id="conversation-1", text="Later reminder")
+    assert not result.get("isError")
+    assert [message["reply_to_message_id"] for message in identity.sent] == ["source-1", None]
 
 
 def test_backend_thread_capability_failure_does_not_send(monkeypatch):
     enable(monkeypatch)
+    active_turn(monkeypatch)
     identity = Identity()
 
     def missing_endpoint(message_id, *, limit=50, cursor=None):
         raise RuntimeError("thread API unavailable")
 
     identity.get_imessage_thread = missing_endpoint
-    result, payload = call(identity, conversation_id="conversation-1", text="answer", reply_to_message_id="source-1")
+    result, payload = call(identity, conversation_id="conversation-1", text="answer")
     assert result["isError"] is True
     assert payload["error"] == "thread API unavailable"
     assert identity.sent == []
 
 
-@pytest.mark.parametrize("target,active", [("unadmitted", True), ("source-1", False)])
-def test_chat_bound_target_requires_admitted_active_source(monkeypatch, target, active):
+def test_default_target_must_be_an_admitted_source(monkeypatch):
     enable(monkeypatch)
-    if active:
-        active_turn(monkeypatch)
-    else:
-        monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact-1")
+    active_turn(monkeypatch, imessage_reply_target="unadmitted")
     identity = Identity()
-    result, _ = call(identity, conversation_id="conversation-1", text="answer", reply_to_message_id=target)
+    result, _ = call(identity, conversation_id="conversation-1", text="answer")
     assert result["isError"] is True
     assert not identity.sent and not identity.reads
 
@@ -234,7 +279,7 @@ def test_context_identity_and_environment_cannot_be_reused(monkeypatch):
     active_turn(monkeypatch)
     monkeypatch.setenv("INKBOX_BASE_URL", "https://example.com")
     identity = Identity()
-    result, payload = call(identity, conversation_id="conversation-1", text="answer", reply_to_message_id="source-1")
+    result, payload = call(identity, "inkbox_get_imessage_thread", message_id="source-1")
     assert result["isError"] is True
     assert "different identity or API environment" in payload["error"]
     assert not identity.sent and not identity.reads
@@ -250,7 +295,7 @@ def test_stale_context_after_preflight_cannot_send_into_next_turn(monkeypatch):
         return identity.page
 
     identity.get_imessage_thread = preflight
-    result, payload = call(identity, conversation_id="conversation-1", text="answer", reply_to_message_id="source-1")
+    result, payload = call(identity, conversation_id="conversation-1", text="answer")
     assert result["isError"] is True
     assert "matching active iMessage turn" in payload["error"]
     assert not identity.sent
@@ -262,9 +307,9 @@ def test_active_tool_send_records_actual_output_and_stable_key(monkeypatch):
     enable(monkeypatch)
     active_turn(monkeypatch)
     identity = Identity()
-    arguments = {"conversation_id": "conversation-1", "text": "answer", "reply_to_message_id": "source-1"}
+    arguments = {"conversation_id": "conversation-1", "text": "answer"}
     first, _ = call(identity, **arguments)
-    second, _ = call(identity, **arguments, plain_reply_fallback=True)
+    second, _ = call(identity, **arguments)
     assert not first.get("isError") and not second.get("isError")
     assert identity.sent[0]["idempotency_key"] == identity.sent[1]["idempotency_key"]
     recorded = read_turn_context()["sent_outputs"]
@@ -286,7 +331,7 @@ def test_accepted_send_is_not_reported_as_failed_when_correlation_storage_fails(
 
     monkeypatch.setattr(imessage, "record_tool_send", unavailable)
     identity = Identity()
-    result, payload = call(identity, conversation_id="conversation-1", text="answer", reply_to_message_id="source-1")
+    result, payload = call(identity, conversation_id="conversation-1", text="answer")
     assert not result.get("isError")
     assert payload["id"] == "outbound-1"
     assert "Do not resend" in payload["warning"]
@@ -306,7 +351,7 @@ def test_accepted_send_after_stop_preserves_original_route_without_touching_next
         return identity.result
 
     identity.send_imessage = send
-    result, payload = call(identity, conversation_id="conversation-1", text="answer", reply_to_message_id="source-1")
+    result, payload = call(identity, conversation_id="conversation-1", text="answer")
     assert not result.get("isError")
     assert payload["id"] == "outbound-1"
     assert "Do not resend" in payload["warning"]
