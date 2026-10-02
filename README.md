@@ -500,8 +500,10 @@ sending an unthreaded reply. The existing SDK minimum is unchanged when disabled
   one-event-per-turn receipts and activation boundaries; they are not coalesced.
 - **New requests during work:** follow-ups queue behind the current turn; they do
   not interrupt it. This preview does not start parallel model runs or child agents.
-  Replies keep the original turn's route even if another message arrives.
-- **Where answers appear:** a single standalone message still gets a normal chat
+  Overlapping ordinary iMessage requests get answers anchored to their own first
+  source, even when the requests arrive seconds apart. An answer already saved
+  for delivery keeps its original route; it is not resent or retargeted.
+- **Where answers appear:** an isolated standalone message still gets a normal chat
   reply. An explicit native reply is answered against its current source message.
   A combined burst's default answer targets its first source. Codex can instead
   use `inkbox_send_imessage(reply_to_message_id=...)` for individual answers to

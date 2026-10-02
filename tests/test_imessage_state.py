@@ -44,6 +44,30 @@ def test_durable_duplicate_receipts_preserve_first_admitted_route():
     assert restarted.replay_pending() == [{"chat_id": "chat-1", "text": "original text", "meta": meta}]
 
 
+def test_overlap_anchors_survive_restart_without_combining_unsubmitted_fragments():
+    state = IMessageState(BridgeConfig(identity="test-agent"))
+    first, second = metadata("first"), metadata("second")
+    state.admit("chat-1", "first task", first)
+    state.admit("chat-1", "second task", second)
+    batch = {**first, "imessage_event_ids": first["imessage_event_ids"] + second["imessage_event_ids"]}
+    state.anchor_overlapping(batch, "other-chat")
+    assert all(not row["meta"].get("imessage_reply_target") for row in state.replay_pending())
+    state.anchor_overlapping(batch, "chat-1")
+    replay = state.replay_pending()
+    assert [row["text"] for row in replay] == ["first task", "second task"]
+    assert [row["meta"]["imessage_reply_target"] for row in replay] == ["first", "second"]
+    assert [row["meta"]["imessage_sources"][0]["id"] for row in replay] == ["first", "second"]
+
+
+def test_overlap_cannot_retarget_checkpointed_answer():
+    state = IMessageState(BridgeConfig(identity="test-agent"))
+    meta = metadata()
+    state.admit("chat-1", "task", meta)
+    state.mark(meta, "reply_pending", reply="answer")
+    state.anchor_overlapping(meta, "chat-1")
+    assert not state.pending_replies()[0]["meta"].get("imessage_reply_target")
+
+
 def test_restart_replays_only_unstarted_work_and_never_uncertain_sends():
     state = IMessageState(BridgeConfig(identity="test-agent"))
     for index, phase in enumerate(("pending", "running", "sending", "done", "cancelled", "failed")):

@@ -84,6 +84,37 @@ def test_inbound_preserves_source_authority_and_media_boundary():
     asyncio.run(run())
 
 
+def test_overlapping_requests_checkpoint_source_targets_before_ack_and_send():
+    from tests.test_imessage_sessions import make_session
+
+    async def run():
+        gw, identity = bridge()
+        session, _, _ = make_session(hook=gw._imessage_turn_state, send=gw.send_to_contact)
+        client = session._client
+        client.gate = asyncio.Event()
+        await session.handle_inbound("First task", "imessage", metadata("first", parent=None))
+        session._flush_imessage_burst()
+        await client.started.wait()
+        await session.handle_inbound("Second task", "imessage", metadata("second", parent=None))
+        session._flush_imessage_burst()
+        await session.handle_inbound("Third task", "imessage", metadata("third", parent=None))
+        session._flush_imessage_burst()
+        store = gw._threaded_imessage_state()
+        assert store.summary()["pending"] == 2
+        # Inspect the durable state before releasing the first model, without
+        # invoking startup recovery against a still-running worker.
+        with store._db() as db:
+            rows = db.execute("SELECT meta,state FROM receipts ORDER BY rowid").fetchall()
+        assert [row["state"] for row in rows] == ["running", "pending", "pending"]
+        assert [json.loads(row["meta"])["imessage_reply_target"] for row in rows] == ["first", "second", "third"]
+        client.gate.set()
+        await session._worker
+        assert [call["reply_to_message_id"] for call in identity.calls] == ["first", "second", "third"]
+        assert all(call["plain_reply_fallback"] is True for call in identity.calls)
+        assert store.summary()["done"] == 3
+    asyncio.run(run())
+
+
 def test_gateway_keeps_actual_queued_metadata_and_stable_idempotency():
     async def run():
         gw, identity = bridge()

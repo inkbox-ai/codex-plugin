@@ -225,6 +225,89 @@ def test_busy_correction_queues_without_interrupting_original_work():
         assert len(client.calls) == 2
         assert client.calls[1].endswith("Actually Saturday")
         assert [entry[2]["message_id"] for entry in sent] == ["message-1", "message-2"]
+        assert [entry[2]["imessage_reply_target"] for entry in sent] == ["message-1", "message-2"]
+        assert not session._imessage_open_turns
+        await session.handle_inbound("Thanks", "imessage", source(3))
+        await finish_burst(session)
+        assert not sent[-1][2].get("imessage_reply_target")
+    asyncio.run(scenario())
+
+
+def test_queued_requests_overlap_before_any_imessage_model_starts():
+    async def scenario():
+        session, sent, _ = make_session()
+        client = session._client
+        client.gate = asyncio.Event()
+        capture = asyncio.create_task(session.run_consult("Voice consult"))
+        await client.started.wait()
+        for number in (1, 2, 3):
+            await session.handle_inbound(f"Request {number}", "imessage", source(number))
+            session._flush_imessage_burst()
+        client.gate.set()
+        await capture
+        await session._worker
+        assert [entry[2]["imessage_reply_target"] for entry in sent] == [
+            "message-1", "message-2", "message-3",
+        ]
+        assert client.interrupts == 0
+        assert not session._imessage_open_turns
+    asyncio.run(scenario())
+
+
+def test_other_conversation_does_not_trigger_overlap_anchors():
+    async def scenario():
+        session, sent, _ = make_session()
+        client = session._client
+        client.gate = asyncio.Event()
+        await session.handle_inbound("First", "imessage", source(1))
+        session._flush_imessage_burst()
+        await client.started.wait()
+        await session.handle_inbound("Elsewhere", "imessage", source(2, conversation_id="other"))
+        session._flush_imessage_burst()
+        client.gate.set()
+        await session._worker
+        assert all(not entry[2].get("imessage_reply_target") for entry in sent)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("background", ["Background", "/status"])
+def test_quiet_group_input_and_controls_do_not_anchor_running_request(background):
+    async def scenario():
+        session, sent, _ = make_session()
+        session.cfg.group_reply_mode = "mention"
+        client = session._client
+        client.gate = asyncio.Event()
+        await session.handle_inbound("@example-agent help", "imessage", source(1, conversation_kind="group"))
+        session._flush_imessage_burst()
+        await client.started.wait()
+        await session.handle_inbound(background, "imessage", source(2, conversation_kind="group"))
+        client.gate.set()
+        await session._worker
+        assert not sent[-1][2].get("imessage_reply_target")
+        assert len(client.calls) == 1
+    asyncio.run(scenario())
+
+
+def test_arrival_during_delivery_does_not_retarget_saved_answer():
+    async def scenario():
+        sending, release = asyncio.Event(), asyncio.Event()
+
+        async def send(*_):
+            sending.set()
+            await release.wait()
+
+        session, sent, states = make_session(send=send)
+        await session.handle_inbound("First", "imessage", source(1))
+        session._flush_imessage_burst()
+        await sending.wait()
+        await session.handle_inbound("Second", "imessage", source(2))
+        session._flush_imessage_burst()
+        release.set()
+        await session._worker
+        results = [meta for state, meta, _ in states if state == "result"]
+        assert not results[0].get("imessage_reply_target")
+        assert not sent[0][2].get("imessage_reply_target")
+        assert results[1]["imessage_reply_target"] == sent[1][2]["imessage_reply_target"] == "message-2"
     asyncio.run(scenario())
 
 
@@ -305,6 +388,7 @@ def test_stop_drops_buffer_and_queue_but_preserves_voice_capture():
         await session.handle_inbound("/stop", "imessage", source(3))
         assert session._imessage_burst is None
         assert session._queue.empty()
+        assert not session._imessage_open_turns
         assert client.interrupts == 0
         assert not voice.future.done()
         assert sent[-1][0] == "Stopped."

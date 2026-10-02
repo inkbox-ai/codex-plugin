@@ -81,7 +81,7 @@ jobs:
       - name: Install bridge and pinned native-reply SDK preview
         run: >-
           pip install -e . pytest httpx
-          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@b8521b61b4073bb0c5ae324a73dd7eda319be057#subdirectory=sdk/python"
+          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@b4cc89e7aecd782d44c97f4214f3e9a322ee962a#subdirectory=sdk/python"
       - name: Require native reply support
         run: |
           python - <<'PY'

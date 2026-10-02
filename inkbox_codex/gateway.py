@@ -1364,6 +1364,10 @@ class InkboxGateway:
             if ordinary:
                 store.mark(meta, "running", chat_id=chat_id)
             return
+        if state == "overlapped":
+            if ordinary:
+                store.anchor_overlapping(meta, chat_id)
+            return
         if state == "started":
             if ordinary:
                 store.mark(meta, "running", chat_id=chat_id)
