@@ -300,6 +300,36 @@ def test_callback_before_send_response_never_wakes_legacy_retry():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("data,chat_id", [
+    ({"contacts": [{"id": "contact-proactive"}], "message": {
+        "conversation_id": "conversation", "remote_number": "+15550100100",
+    }}, "contact-proactive"),
+    ({"message": {"conversation_id": "conversation"}}, "imessage:conversation"),
+    ({"message": {"remote_number": "+15550100100"}}, "+15550100100"),
+])
+def test_uncorrelated_failure_reaches_conversation_once_without_retry(data, chat_id):
+    async def run():
+        gw, _ = bridge()
+        notice = AsyncMock()
+        gw.sessions = NS(get=Mock(return_value=NS(append_delivery_notice=notice)))
+        gw._notify_delivery_failure = AsyncMock()
+        envelope = {"data": {**data, "message": {**data["message"], "id": "proactive-output"}}}
+        await gw._on_imessage_delivery_failed(envelope)
+        duplicate = await gw._on_imessage_delivery_failed(envelope)
+        gw.sessions.get.assert_called_once_with(chat_id)
+        notice.assert_awaited_once()
+        assert "proactive-output" in notice.await_args.args[0]
+        assert "Do not automatically resend" in notice.await_args.args[0]
+        assert notice.await_args.args[1] == "imessage"
+        assert notice.await_args.args[2].get("imessage_reply_target") is None
+        assert json.loads(duplicate.text)["deduped"] is True
+        gw._notify_delivery_failure.assert_not_awaited()
+        store = gw._threaded_imessage_state()
+        assert store.summary()["outbound_failed_count"] == 1
+        assert store.lookup_outbound("proactive-output")["unknown_route"] is True
+    asyncio.run(run())
+
+
 def test_companion_live_native_reply_targets_live_source_not_sponsor():
     original = fixture("imessage")
     r, _, session, _ = harness(original)

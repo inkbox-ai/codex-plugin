@@ -4437,6 +4437,18 @@ class InkboxGateway:
             store = self._threaded_imessage_state()
             store.mark_delivery_failed(message_id)
             route = store.lookup_outbound(message_id)
+            correlated = bool(route and route.get("chat_id"))
+            if not correlated:
+                # Standalone tool sends have no active-turn record, and a
+                # callback can also arrive before that record is written.
+                # Preserve the notice using the webhook's ordinary chat route,
+                # without inventing a trigger or waking a retrying model turn.
+                recipient = str(message.get("remote_number") or "").strip()
+                conversation_id = str(message.get("conversation_id") or message.get("conversationId") or "").strip()
+                route = {
+                    "chat_id": self._chat_key(data, recipient, self._thread_key("imessage", conversation_id)),
+                    "meta": {"conversation_id": conversation_id or None},
+                }
             if route and route.get("chat_id"):
                 notice = (
                     "Delivery status only, not a new request: iMessage " + message_id
@@ -4445,7 +4457,9 @@ class InkboxGateway:
                 )
                 if self.sessions is not None:
                     await self.sessions.get(route["chat_id"]).append_delivery_notice(notice, "imessage", route["meta"])
-                return web.json_response({"ok": True, "retained": "failed-threaded-output"})
+                return web.json_response({"ok": True, "retained": (
+                    "failed-threaded-output" if correlated else "unmatched-imessage-failure"
+                )})
             # The callback may beat the send response (or its durable record).
             # Missing correlation is never permission to invoke legacy retries.
             logger.warning("[bridge] retained an iMessage delivery failure pending output correlation")
