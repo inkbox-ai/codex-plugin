@@ -8,11 +8,11 @@ import sqlite3
 from typing import List, Tuple
 
 try:
-    from .config import VoiceStack, inkbox_client_kwargs, read_config
+    from .config import VoiceStack, imessage_threading_capability, inkbox_client_kwargs, read_config
     from .codex_client import probe_codex
     from .companion import inbox_summary
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import VoiceStack, inkbox_client_kwargs, read_config
+    from config import VoiceStack, imessage_threading_capability, inkbox_client_kwargs, read_config
     from codex_client import probe_codex
     from companion import inbox_summary
 
@@ -70,6 +70,19 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
         checks.append(("inkbox SDK", True, "installed"))
     except ImportError:
         checks.append(("inkbox SDK", False, "uv pip install 'inkbox>=0.7.11,<1.0.0'"))
+
+    checks.append((
+        "INKBOX_IMESSAGE_THREADED_REPLIES", True,
+        "true" if cfg.imessage_threaded_replies else "false (disabled)",
+    ))
+    if cfg.imessage_threaded_replies:
+        try:
+            from inkbox.agent_identity import AgentIdentity
+        except ImportError:
+            checks.append(("iMessage threading SDK", False, "Inkbox SDK is unavailable"))
+        else:
+            capable, detail = imessage_threading_capability(AgentIdentity)
+            checks.append(("iMessage threading SDK", capable, detail))
 
     try:
         import aiohttp  # noqa: F401

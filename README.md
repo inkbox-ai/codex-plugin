@@ -475,7 +475,65 @@ Run `inkbox-codex setup` to change the choice without reconfiguring your identit
 
 **Delivery failures.** Outbound messages can silently fail — a carrier filters an SMS, an iMessage is declined, an email bounces. Inkbox reports these asynchronously (`text.delivery_failed`, `imessage.delivery_failed`, `message.bounced`/`message.failed`). The bridge catches them and wakes the affected contact's session to tell Codex *which* message didn't land and *why*, so it can retry or reach you another way (a different channel, or a call) using its Inkbox tools. The notice runs as a side-effect turn — Codex acts via tools rather than replying on the channel that just failed — and repeat webhooks for the same message are de-duplicated so it can't loop. `text.delivery_unconfirmed` is different: it only means the carrier couldn't *confirm* delivery (the message usually landed), so it's logged for debugging without waking Codex — waking there would resend a message that was likely delivered.
 
-**Interrupt by texting again.** Messaging the agent again while it's mid-turn works like pressing Esc in Codex and typing a new message: the running turn is interrupted, its partial answer is dropped, and Codex picks up your new message instead. (A reply while it's waiting on a permission/poll still answers that escalation — interrupting only applies while it's actively working.)
+**Interrupt by texting again.** By default, messaging the agent again while it's mid-turn works like pressing Esc in Codex and typing a new message: the running turn is interrupted, its partial answer is dropped, and Codex picks up your new message instead. (A reply while it's waiting on a permission/poll still answers that escalation — interrupting only applies while it's actively working.) The opt-in iMessage behavior below queues follow-ups instead.
+
+### Native iMessage replies (opt-in preview)
+
+Set this in the running gateway's environment and restart its existing service:
+
+```dotenv
+INKBOX_IMESSAGE_THREADED_REPLIES=true
+```
+
+The default is `false`; there is no new setup-wizard step. Enabling requires the
+SDK's native reply/thread-read support (install Python SDK **0.7.13 or newer**)
+and an API environment serving those endpoints. `doctor` distinguishes local SDK support
+from backend capability; a targeted reply also checks the native endpoint before
+sending. The bridge fails explicitly if support is missing, rather than silently
+sending an unthreaded reply. The existing SDK minimum is unchanged when disabled.
+
+- **Several quick messages:** ordinary iMessage inputs from the same sender,
+  conversation, and reply context collect for 750 ms of quiet, up to 2 seconds.
+  Codex receives their text and source IDs in order. Different senders or explicit
+  native threads stay separate. Companion inputs retain their existing ordered,
+  one-event-per-turn receipts and activation boundaries; they are not coalesced.
+- **New requests during work:** follow-ups queue behind the current turn; they do
+  not interrupt it. This preview does not start parallel model runs or child agents.
+  Timing does not change the reply target. An answer already saved for delivery
+  keeps its original route; it is not resent or retargeted.
+- **Where answers appear:** every message-triggered answer replies to its source,
+  including isolated standalone messages. A combined burst's default answer
+  targets its first source. The bridge owns this decision; the model cannot
+  select a different target or turn threading off for an answer. Same-conversation
+  send tools use the same trigger. After an explicit send, Codex returns `[SILENT]`
+  to avoid another automatic answer.
+  A final answer exactly matching an observed targeted tool send is suppressed too.
+- **Proactive messages:** cron jobs, reminders, and other sends without a current
+  message trigger start fresh, without a reply target. The bridge never picks the
+  last message from conversation history. Scheduled jobs must run independently,
+  without inheriting the active chat's tool-process environment.
+- **No audience changes:** targeted tools must use a visible source in the same
+  conversation; in a running chat they must also belong to that active input.
+  Opaque native thread IDs are not message IDs or new Codex sessions. Replies use
+  the API's message IDs; missing parent/root IDs remain unknown, never inferred
+  from a thread ID. A visible ancestor root can identify a reply even when its
+  immediate parent is unavailable. Native thread-read tools return one bounded
+  chronological page and do not broaden Companion activation history.
+- **Fallback and failures:** `plain_reply_fallback=true` delegates an eligible
+  same-conversation fallback to the API. A timeout or arbitrary send failure never
+  triggers a client-side unthreaded resend. Accepted sends are queued, not proof of
+  delivery. Correlated late failures are retained and added as context to the
+  original session without waking a retrying model turn; `/health` reports counts.
+- **Restart behavior:** ordinary inputs are saved before acknowledgement. Only
+  known-unsubmitted inputs and saved, not-yet-sent answers resume automatically.
+  Interrupted model work and uncertain sends remain retained for inspection, not
+  replay. Do not delete receipts or resend blindly. `/stop` cancels this iMessage
+  conversation's queued work without cancelling a voice consult on the same contact.
+
+Set the variable back to `false` and restart to restore the previous behavior and
+tool schema. This does not erase retained receipts; inspect unfinished work before
+re-enabling. Identity, contact rules, approvals, other channels, and voice settings
+are unchanged.
 
 **Control commands.** A handful of slash-commands steer the conversation itself and are handled by the bridge instead of being sent to Codex (works on any channel):
 
@@ -691,6 +749,7 @@ without TOTP must have it configured before the agent can generate codes.
 | `INKBOX_BRIDGE_PORT` | no | `8767` | Local webhook server port. |
 | `INKBOX_PERMISSION_TIMEOUT_S` | no | `600` | Seconds to wait for a permission/poll reply. |
 | `INKBOX_GROUP_REPLY_MODE` | no | `auto` | Group SMS/iMessage, Slack, and Companion email replies: `auto` lets the agent decide; `mention` requires a native Slack @mention, SMS/iMessage `@agent` or `@<agent-handle>`, or Companion email addressed To the agent. Other messages become context without starting a turn. Also configurable in setup. |
+| `INKBOX_IMESSAGE_THREADED_REPLIES` | no | `false` | Preview native iMessage replies, ordinary burst collection, and queued follow-ups. Requires a compatible SDK and API; see [Native iMessage replies](#native-imessage-replies-opt-in-preview). Environment-only; no wizard change. |
 | `INKBOX_COMPANION_RESPONSE_MODE` | no | `safe` | Companion SMS/MMS, iMessage, and email: `safe` wakes only for direct access; `relaxed` permits any delivered sender. Both honor Auto/Mention. Sponsored and unknown access stays context-only in Safe mode. Also configurable in setup. |
 | `INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS` | no | `false` | Auto-accept Codex MCP prompts for Inkbox tools only. The setup wizard writes `true` when you trust the agent to send through Inkbox without per-call approval. |
 | `INKBOX_A2A_PROGRESS_INTERVAL_SECONDS` | no | `180` | Seconds between progress updates for active inbound A2A tasks. Set to `0` to disable periodic updates. |
@@ -719,6 +778,7 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_send_email` — send email; attach local files with `attachment_paths`.
 - `inkbox_send_sms` — send SMS/MMS; attach local files with `media_paths` (or hosted `media_urls`).
 - `inkbox_send_imessage` — send into an iMessage conversation; attach a local file with `media_path`.
+- `inkbox_get_imessage_thread` · `inkbox_get_imessage_conversation_thread` — bounded native-thread pages, available only with `INKBOX_IMESSAGE_THREADED_REPLIES=true`; reply targets and fallback policy are bridge-owned, while the send tool also accepts `idempotency_key`.
 - `inkbox_list_text_conversations` · `inkbox_get_text_conversation` — browse SMS threads and history.
 - `inkbox_list_imessage_conversations` · `inkbox_get_imessage_conversation` — browse iMessage threads and history (find the `conversation_id` to send into).
 - `inkbox_lookup_contact` · `inkbox_list_contacts` · `inkbox_get_contact` — resolve and read address-book contacts (reverse-lookup by email/phone, free-text search, or full record by id).
