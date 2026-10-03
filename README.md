@@ -308,6 +308,46 @@ mixed-event subscriptions, are reused; only missing events are registered.
 Paused overlapping subscriptions require attention in the console before startup.
 Stop/remove any previous Slack receiver if it should no longer reply.
 
+### Slack contact rules and Companion
+
+Manage person/workspace contact rules and Companion access in Inkbox. The bridge
+uses those decisions; enabling Slack does not create rules or grant people access.
+Signed Slack messages label admission with `data.sender_access`: `direct` means
+normal contact rules admitted the sender, **not** that they are the Companion
+sponsor; `sponsored` means a Companion ride-along. Sponsored messages require a
+verified Companion envelope. Explicit null/unknown access is ignored; older
+ordinary Slack webhooks without this field retain their existing behavior.
+
+Slack Companion requires an API environment supporting Slack initialization and
+**Python SDK 0.7.14 or newer** with that support. Until that SDK release is
+published, this is a preview requiring a compatible SDK build. Ordinary Slack
+continues to support SDK 0.7.11; other channels keep their existing requirements.
+No new setup wizard or permission setting is needed:
+
+```text
+INKBOX_SLACK_ENABLED=true
+INKBOX_COMPANION_RESPONSE_MODE=safe
+INKBOX_GROUP_REPLY_MODE=mention
+```
+
+- **Safe** keeps sponsored messages as context. **Relaxed** allows them to start
+  work. Both honor Auto/Mention; Slack uses the signed native-mention flag, not
+  text that merely looks like `@agent`.
+- Initialization loads all authorized history before the current message. If the
+  first delivery arrives after the original trigger, history stays context-only;
+  only the current message can start work. Duplicate deliveries do not repeat it.
+- Sessions and replies stay within the verified connection, channel, native
+  thread, and activation. A null thread remains a top-level message. An external
+  person's home workspace is verified independently of the app's installation.
+- The exact activation is checked again before model work and before sending.
+  Revoked access or a replacement activation cannot reuse the old grant.
+- Native Slack Stop targets only the matching active request and sender.
+  Approval answers still belong to the prompted sender; ride-along access never
+  grants control of another person's work.
+- `INKBOX_SLACK_ENABLED=false` blocks new Slack work, recovered pending Slack
+  receipts, and automatic Slack replies. Pending receipts remain saved for a
+  later re-enable; iMessage, voice, and other channels are unchanged.
+
 ### Isolated Slack harness
 
 The harness uses the same gateway, sessions, signing verification, tools, and
@@ -357,7 +397,7 @@ Direct-message sessions are keyed by Inkbox contact, so one person = one convers
 
 ### Companion conversations (preview)
 
-Verified SMS/MMS, iMessage and email webhooks may include a **top-level**
+Verified SMS/MMS, iMessage, email, and Slack webhooks may include a **top-level**
 `companion` object. Webhooks without it (or with `null`) retain normal routing.
 The bridge loads the full authorized initialization snapshot using the Inkbox
 SDK, including every page, and submits **one combined input**. The sponsor trigger
@@ -376,7 +416,8 @@ existing identity:
 - **Group replies:** `INKBOX_GROUP_REPLY_MODE=auto|mention`, also applied to
   Companion email. **Automatic** lets an eligible message start a turn; the
   agent decides whether a reply is warranted. **Mention required** additionally
-  requires `@agent` or `@<agent-handle>` in the current message's own text.
+  requires `@agent` or `@<agent-handle>` in the current SMS/iMessage text, or a
+  native Slack @mention. Slack direct messages do not require a mention.
   For Companion email, putting the agent's mailbox in the current message's
   **To** recipients also counts as a mention. Address matching is case-insensitive
   and supports display names; **Cc/Bcc alone do not count**. Quoted headers,
@@ -384,14 +425,15 @@ existing identity:
   Reply-all may retain the agent in To and therefore satisfy this gate again.
 
 The signed webhook supplies `sender_access` on `data.text_message` for SMS/MMS
-or `data.message` for iMessage/email. `direct` means contact rules permitted the
-message without sponsorship, including allowed-by-default senders; `sponsored`
+or `data.message` for iMessage/email, and directly on `data` for Slack. `direct`
+means contact rules permitted the message without sponsorship, including allowed-by-default senders; `sponsored`
 means delivery was authorized through sponsorship. Neither value grants command
 permissions or establishes permanent trust. Access is not inferred from the
 sender's contact record, sponsor identity, or Companion phase.
 
 **Wake** below means context plus a model turn; **Context** means context only.
-These rules apply equally to SMS/MMS, iMessage, and email Companion inputs.
+These response gates also apply to Slack Companion inputs. Slack rejects
+explicit null/unknown access before admission rather than treating it as context.
 
 | Companion mode | Group replies | Direct, no mention | Direct, mention | Sponsored, no mention | Sponsored, mention |
 |---|---|---|---|---|---|
@@ -424,19 +466,22 @@ and are unaffected by the Companion response setting.
 - Replies use the original group conversation ID, or the SDK-approved email
   reply context's **stored message UUID** with canonical reply-all. They never
   fall back to privately messaging the latest author. Local sponsor restrictions
-  remain in force. Live turns and replies use the signed conversation scope and
-  saved sponsor message without additional activation lookups. Replies reuse the
+  remain in force. SMS/MMS, iMessage, and email use the signed conversation scope
+  and saved sponsor message. Slack also verifies the native destination and
+  rechecks the exact activation before model work and sending. Replies reuse the
   identity loaded at startup.
 - Only a live reply by the prompted, locally allowed sender that passes both
   response gates can answer an approval request. Historical or context-only
   approval-looking text cannot. Sponsor slash controls also require both gates.
   In Mention mode, address email To the agent or prefix answers and controls with `@agent`, for example
-  `@agent allow` or `@agent /stop`; escalation prompts remind you of this.
+  `@agent allow` or `@agent /stop`; on Slack, mention the native bot instead.
+  Escalation prompts remind you of this.
 
 **SDK requirement:** The bridge requires Inkbox SDK **0.7.11 or newer** (below 1.0.0), including
 `client.companion.load_initialization` and `activation_messages`. Installation
 resolves the published SDK; CI tests the released `inkbox==0.7.11` minimum across
-unit, real-host, and live-channel lanes. No preview source checkout is needed.
+unit, real-host, and live-channel lanes. Slack Companion is the optional
+exception: see its SDK 0.7.14 preview requirement above.
 An unsupported SDK produces an explicit webhook error; the bridge never falls
 back to submitting only the trigger.
 
@@ -750,7 +795,7 @@ without TOTP must have it configured before the agent can generate codes.
 | `INKBOX_PERMISSION_TIMEOUT_S` | no | `600` | Seconds to wait for a permission/poll reply. |
 | `INKBOX_GROUP_REPLY_MODE` | no | `auto` | Group SMS/iMessage, Slack, and Companion email replies: `auto` lets the agent decide; `mention` requires a native Slack @mention, SMS/iMessage `@agent` or `@<agent-handle>`, or Companion email addressed To the agent. Other messages become context without starting a turn. Also configurable in setup. |
 | `INKBOX_IMESSAGE_THREADED_REPLIES` | no | `false` | Preview native iMessage replies, ordinary burst collection, and queued follow-ups. Requires a compatible SDK and API; see [Native iMessage replies](#native-imessage-replies-opt-in-preview). Environment-only; no wizard change. |
-| `INKBOX_COMPANION_RESPONSE_MODE` | no | `safe` | Companion SMS/MMS, iMessage, and email: `safe` wakes only for direct access; `relaxed` permits any delivered sender. Both honor Auto/Mention. Sponsored and unknown access stays context-only in Safe mode. Also configurable in setup. |
+| `INKBOX_COMPANION_RESPONSE_MODE` | no | `safe` | Companion SMS/MMS, iMessage, email, and Slack: `safe` wakes only for direct access; `relaxed` permits any delivered sender. Both honor Auto/Mention. Sponsored access stays context-only in Safe mode; Slack rejects explicit unknown access labels. Also configurable in setup. |
 | `INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS` | no | `false` | Auto-accept Codex MCP prompts for Inkbox tools only. The setup wizard writes `true` when you trust the agent to send through Inkbox without per-call approval. |
 | `INKBOX_A2A_PROGRESS_INTERVAL_SECONDS` | no | `180` | Seconds between progress updates for active inbound A2A tasks. Set to `0` to disable periodic updates. |
 | `INKBOX_VOICE_STACK` | no | `inkbox_tts_stt` | `inkbox_voice_ai`, `openai_realtime`, or `inkbox_tts_stt`. When absent, legacy Realtime settings remain compatible. |

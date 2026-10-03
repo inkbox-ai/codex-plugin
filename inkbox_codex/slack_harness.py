@@ -47,7 +47,7 @@ class SlackHarness(InkboxGateway):
             return web.Response(status=400, text="invalid json")
         if not isinstance(envelope, dict):
             return web.Response(status=400, text="invalid json")
-        if not str(envelope.get("event_type") or "").startswith("slack.") or envelope.get("companion"):
+        if not str(envelope.get("event_type") or "").startswith("slack."):
             return web.json_response({"ok": True, "ignored": "non-slack"})
         return await super()._handle_webhook(request)
 

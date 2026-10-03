@@ -654,7 +654,7 @@ def test_current_events_preserve_mention_only_thread_context(gw):
 
 
 def stop_event(**overrides):
-    payload = event(message_ts=None, thread_ts="1234567890.000001", message_kinds=[],
+    payload = event(message_ts=None, thread_ts="1234567890.000001", message_kinds=[], sender_access=None,
                     event={"type": "agent_session_stopped", "streaming_message_ts": []}, **overrides)
     payload["id"] = "stop-event"
     payload["event_type"] = "slack.session_stopped"

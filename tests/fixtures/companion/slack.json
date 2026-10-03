@@ -1,0 +1,72 @@
+{
+  "id": "evt_slack_source_103",
+  "event_type": "slack.mention_received",
+  "timestamp": "2026-01-01T12:02:00+00:00",
+  "data": {
+    "identity_id": "40000000-0000-4000-8000-000000000010",
+    "connection_id": "40000000-0000-4000-8000-000000000011",
+    "workspace_id": "TINSTALL",
+    "conversation_id": "CEXAMPLE",
+    "actor_id": "UALICE",
+    "message_ts": "1767268920.000103",
+    "thread_ts": "1767268800.000100",
+    "message_kinds": ["channel", "thread", "mention"],
+    "sender_access": "direct",
+    "event": {
+      "type": "message",
+      "user": "UALICE",
+      "text": "<@UBOT> Please summarize the current plan.",
+      "ts": "1767268920.000103",
+      "thread_ts": "1767268800.000100"
+    }
+  },
+  "companion": {
+    "scope_id": "40000000-0000-4000-8000-000000000001",
+    "activation_id": "40000000-0000-4000-8000-000000000002",
+    "conversation_id": "40000000-0000-4000-8000-000000000003",
+    "channel": "slack",
+    "phase": "initialization",
+    "sequence": 1,
+    "history": [
+      {
+        "id": "40000000-0000-4000-8000-000000000101",
+        "author": "THOME:UBOB",
+        "occurred_at": "2026-01-01T12:00:00+00:00",
+        "text": "The design is ready for review.",
+        "historical": true,
+        "is_trigger": false,
+        "attachments": [],
+        "sender_access": "sponsored"
+      },
+      {
+        "id": "40000000-0000-4000-8000-000000000102",
+        "author": "THOME:UCAROL",
+        "occurred_at": "2026-01-01T12:01:00+00:00",
+        "text": "I can check the draft tomorrow.",
+        "historical": true,
+        "is_trigger": false,
+        "attachments": [],
+        "sender_access": "sponsored"
+      },
+      {
+        "id": "40000000-0000-4000-8000-000000000103",
+        "author": "THOME:UALICE",
+        "occurred_at": "2026-01-01T12:02:00+00:00",
+        "text": "<@UBOT> Please summarize the current plan.",
+        "historical": false,
+        "is_trigger": true,
+        "attachments": [],
+        "sender_access": "direct"
+      }
+    ],
+    "history_complete": true,
+    "history_next_cursor": null,
+    "reply_context": {
+      "channel": "slack",
+      "conversation_id": "40000000-0000-4000-8000-000000000003",
+      "connection_id": "40000000-0000-4000-8000-000000000011",
+      "slack_conversation_id": "CEXAMPLE",
+      "thread_ts": "1767268800.000100"
+    }
+  }
+}
