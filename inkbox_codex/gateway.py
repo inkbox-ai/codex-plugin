@@ -1942,6 +1942,15 @@ class InkboxGateway:
                 secret=self._provider_secret("inkbox"),
             ):
                 return web.Response(status=401, text="Companion requires a valid Inkbox signature")
+            if str(envelope.get("event_type") or "").startswith("slack."):
+                from .slack import inbound_message
+
+                if not self.cfg.slack_enabled:
+                    return web.json_response({"ok": True, "ignored": "slack-disabled"})
+                if self._identity is None or self.sessions is None:
+                    raise RuntimeError("Slack sessions are not ready")
+                if inbound_message(envelope, str(self._identity.id)) is None:
+                    return web.json_response({"ok": True, "ignored": "slack-message"})
             try:
                 fresh = await self._companion().accept(envelope)
             except CompanionError as exc:
@@ -3860,6 +3869,9 @@ class InkboxGateway:
         if incoming is None:
             return web.json_response({"ok": True, "ignored": "slack-message"})
         chat_id, body, meta = incoming
+        if envelope.get("event_type") == SLACK_STOP_EVENT and self._companion_receiver is not None:
+            if await self._companion_receiver.stop_slack(meta):
+                return web.json_response({"ok": True})
         if not self._sender_allowed(meta["sender"], meta["actor_id"]):
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
         if not meta["slack_addressed"] and not self.sessions.has_session(chat_id):
@@ -5010,6 +5022,13 @@ class InkboxGateway:
         if mode == "slack":
             from .slack import send_reply
 
+            if not self.cfg.slack_enabled:
+                raise RuntimeError("Slack is disabled")
+            if meta.get("companion"):
+                from .companion import Event
+
+                await self._companion().authorize_slack(Event.parse(meta["companion_envelope"]))
+                self._companion().reply_sending(meta)
             await asyncio.to_thread(send_reply, self._inkbox, meta, content)
             return
         if mode == "sms":

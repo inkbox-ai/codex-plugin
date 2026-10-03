@@ -54,6 +54,13 @@ def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] |
     data = envelope.get("data")
     if not isinstance(data, dict) or data.get("identity_id") != identity_id:
         return None
+    # Older deliveries omit the label. An explicit denial/unknown label must
+    # never become an ordinary request, and ride-alongs need their scoped grant.
+    if "sender_access" in data and (
+        data["sender_access"] not in ("direct", "sponsored")
+        or (data["sender_access"] == "sponsored" and not envelope.get("companion"))
+    ):
+        return None
     event = data.get("event")
     if not isinstance(event, dict) or not envelope.get("id"):
         return None
@@ -99,6 +106,8 @@ def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] |
         "slack_mentioned": "mention" in kinds,
         "slack_addressed": bool(set(kinds) & {"dm", "group_dm", "mention"}),
     }
+    if "sender_access" in data:
+        meta["sender_access"] = data["sender_access"]
     # Sender context never changes workspace/thread isolation or approval ownership.
     sender_context = {}
     if isinstance(data.get("contact_id"), str):
@@ -126,8 +135,11 @@ def inbound_stop(envelope: dict, identity_id: str) -> tuple[str, str, dict] | No
     thread = data.get("thread_ts")
     if not isinstance(thread, str) or not thread:
         return None
+    # Native controls carry null access, not a contact-rule admission label.
+    # Their authority comes from the active request's exact actor and route.
+    control = {key: value for key, value in data.items() if key != "sender_access"}
     incoming = inbound_message({**envelope, "data": {
-        **data, "message_ts": thread, "message_kinds": ["thread"],
+        **control, "message_ts": thread, "message_kinds": ["thread"],
         "event": {"type": "message", "text": "/stop"},
     }}, identity_id)
     if incoming is not None:
