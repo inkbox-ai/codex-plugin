@@ -486,9 +486,8 @@ INKBOX_IMESSAGE_THREADED_REPLIES=true
 ```
 
 The default is `false`; there is no new setup-wizard step. Enabling requires the
-SDK's native reply/thread-read support (Python SDK **0.7.12 or newer when released**)
-and an API environment serving those endpoints. Until that SDK release is
-available, this is a development preview. `doctor` distinguishes local SDK support
+SDK's native reply/thread-read support (install Python SDK **0.7.13 or newer**)
+and an API environment serving those endpoints. `doctor` distinguishes local SDK support
 from backend capability; a targeted reply also checks the native endpoint before
 sending. The bridge fails explicitly if support is missing, rather than silently
 sending an unthreaded reply. The existing SDK minimum is unchanged when disabled.

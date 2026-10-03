@@ -193,7 +193,7 @@ def test_old_sdk_is_actionable_only_when_opted_in(monkeypatch):
     identity = SimpleNamespace(send_imessage=lambda **kwargs: pytest.fail("must not send"))
     result, payload = call(identity, conversation_id="conversation-1", text="answer")
     assert result["isError"] is True
-    assert "0.7.12 or newer when available" in payload["error"]
+    assert "Upgrade to SDK 0.7.13 or newer" in payload["error"]
     assert "INKBOX_IMESSAGE_THREADED_REPLIES=false" in payload["error"]
     assert imessage_threading_capability(Identity)[0] is True
 

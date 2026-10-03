@@ -173,7 +173,7 @@ def imessage_threading_capability(identity: Any) -> tuple[bool, str]:
     if missing:
         return False, (
             "Threaded iMessage replies require an Inkbox SDK with native reply and "
-            "thread-read support (0.7.12 or newer when available). Upgrade the SDK "
+            "thread-read support. Upgrade to SDK 0.7.13 or newer "
             "or set INKBOX_IMESSAGE_THREADED_REPLIES=false. Missing: " + ", ".join(missing)
         )
     return True, "SDK native-reply APIs available; backend support is not verified"

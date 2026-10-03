@@ -78,10 +78,10 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Install bridge and pinned native-reply SDK preview
+      - name: Install bridge and released native-reply SDK
         run: >-
           pip install -e . pytest httpx
-          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@b4cc89e7aecd782d44c97f4214f3e9a322ee962a#subdirectory=sdk/python"
+          "inkbox==0.7.13"
       - name: Require native reply support
         run: |
           python - <<'PY'
