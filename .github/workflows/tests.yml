@@ -96,6 +96,35 @@ jobs:
           tests/test_imessage_state.py tests/test_imessage_gateway.py
           tests/test_imessage_sdk.py tests/test_companion.py
 
+  # Test optional Slack initialization against its released SDK minimum.
+  # The ordinary Slack and other channel lanes keep testing the released floor.
+  slack-companion-sdk:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v8.1.0
+      - name: Install bridge and released Slack-aware SDK
+        run: >-
+          uv pip install --system -e . pytest httpx
+          "inkbox==0.7.14"
+      - name: Require Slack initialization support (do not silently skip)
+        run: python -c "from inkbox_codex.slack_companion import require_sdk_support; require_sdk_support()"
+      - name: Install Codex (freshest main prerelease)
+        run: bash "$GITHUB_WORKSPACE/tests/ci/install_codex.sh"
+      - name: Slack Companion receiver, SDK wires, and real host
+        run: >-
+          pytest -q tests/test_slack_companion.py tests/test_slack_companion_adapter.py
+          tests/test_slack_companion_sdk.py tests/contract/test_slack_companion_host.py
+          tests/test_slack.py tests/test_slack_activity.py tests/test_slack_harness.py
+          tests/test_companion.py tests/test_companion_response_modes.py
+
   # Contract suite against the REAL Codex host at its freshest main cut. This is
   # the lane that catches upstream drift in the app-server protocol (a renamed
   # method, a moved result field, a dropped notification) before it reaches a

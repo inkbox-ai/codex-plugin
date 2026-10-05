@@ -32,16 +32,18 @@ def dm(event="event-1", message="1234567890.000002"):
 
 
 @pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
-def test_dm_reactions_follow_exact_message_without_creating_thread(tmp_path, outcome):
+@pytest.mark.parametrize("kind", ["direct", "group"])
+def test_inline_reactions_follow_exact_message_without_creating_thread(tmp_path, outcome, kind):
     async def scenario():
         sdk = resource()
         tracker = SlackActivity(sdk, tmp_path / "activity.json")
+        meta = {**dm(), "conversation_kind": kind}
         for state in ("accepted", "accepted", "waiting", "resumed"):
-            await tracker.notify("dm", "slack", dm(), state)
+            await tracker.notify("chat", "slack", meta, state)
         await tracker.flush()
         assert [call.args[3] for call in sdk.add_reaction.call_args_list] == ["eyes"]
         for state in (outcome, outcome):
-            await tracker.notify("dm", "slack", dm(), state)
+            await tracker.notify("chat", "slack", meta, state)
         await tracker.flush()
         assert [call.args[3] for call in sdk.add_reaction.call_args_list] == (["eyes", "x"] if outcome == "failed" else ["eyes"])
         assert [call.args[3] for call in sdk.remove_reaction.call_args_list] == ["x", "eyes"]
@@ -109,6 +111,12 @@ def test_reactions_work_without_native_status_capability(tmp_path):
         await tracker.notify("dm", "slack", dm(), "completed")
         await tracker.flush()
         sdk.add_reaction.assert_called_once()
+        sdk.add_reaction.reset_mock()
+        sdk.remove_reaction.reset_mock()
+        await tracker.notify("thread", "slack", route(), "accepted")
+        await tracker.flush()
+        sdk.add_reaction.assert_not_called()
+        sdk.remove_reaction.assert_not_called()
         assert json.loads(tracker.state_path.read_text()) == {}
     asyncio.run(scenario())
 
@@ -245,7 +253,7 @@ def test_incomplete_routes_and_other_channels_do_not_open_agent_threads(tmp_path
         sdk = resource()
         tracker = SlackActivity(sdk, tmp_path / "activity.json")
         await tracker.notify("chat", "email", route(), "accepted")
-        await tracker.notify("chat", "slack", {**route(), "thread_ts": None}, "accepted")
+        await tracker.notify("chat", "slack", {**route(), "thread_ts": None, "message_ts": None}, "accepted")
         await tracker.flush()
         assert sdk.mock_calls == []
     asyncio.run(scenario())

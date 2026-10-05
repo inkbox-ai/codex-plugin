@@ -272,10 +272,11 @@ def test_subscription_reconciliation_does_not_remove_other_receivers():
         "agent_identity_id": IDENTITY,
         "url": "https://agent.example/webhook?channel=slack",
         "event_types": ["slack.dm_received", "slack.group_dm_received",
-                        "slack.mention_received", "slack.thread_reply_received", "slack.session_stopped"],
+                        "slack.channel_message_received", "slack.mention_received",
+                        "slack.thread_reply_received", "slack.session_stopped"],
     }
     assert set(created["event_types"]) == set(SLACK_SUBSCRIPTION_EVENTS)
-    assert "slack.channel_message_received" not in created["event_types"]
+    assert "slack.channel_message_received" in created["event_types"]
     client.webhooks.subscriptions.delete.assert_not_called()
     existing = NS(id="ours", status="active", **created)
     client.webhooks.subscriptions.list.return_value = [unrelated, existing]
@@ -285,7 +286,8 @@ def test_subscription_reconciliation_does_not_remove_other_receivers():
 
 
 @pytest.mark.parametrize("mixed", [False, True])
-def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection(mixed):
+@pytest.mark.parametrize("upgrade", [False, True])
+def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection(mixed, upgrade):
     slack = pytest.importorskip("inkbox.slack", reason="requires the Slack-capable SDK preview")
     if not hasattr(slack.SlackResource, "list_provisioning_workspaces"):
         pytest.skip("installed SDK predates identity-wide subscriptions")
@@ -300,13 +302,23 @@ def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection(mixed)
         "event_types": list(reversed(SLACK_SUBSCRIPTION_EVENTS)),
         "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
     }
-    if mixed:
-        rows.append({**row, "event_types": [*row["event_types"], "email.received"]})
+    if mixed or upgrade:
+        selected = [event for event in row["event_types"]
+                    if not upgrade or event != "slack.channel_message_received"]
+        rows.append({**row, "event_types": [*selected, *(["message.received"] if mixed else [])]})
 
     def handle(request):
         requests.append(request)
         if request.url.path == "/api/v1/webhooks/catalog":
             return httpx.Response(200, json={"supports_identity_subscriptions": True})
+        if request.method == "PATCH":
+            assert request.url.path == "/api/v1/webhooks/subscriptions/" + row["id"]
+            assert dict(request.url.params) == {"scope": "identity"}
+            assert json.loads(request.content) == {
+                "event_types": [*rows[0]["event_types"], "slack.channel_message_received"],
+            }
+            rows[0] = {**rows[0], **json.loads(request.content)}
+            return httpx.Response(200, json=rows[0])
         assert request.url.path == "/api/v1/webhooks/subscriptions"
         if request.method == "GET":
             assert request.url.params["agent_identity_id"] == IDENTITY
@@ -329,6 +341,7 @@ def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection(mixed)
         reconcile_subscription(client, IDENTITY, url)
         reconcile_subscription(client, IDENTITY, url)
     assert [request.method for request in requests] == (
+        ["GET", "GET", "PATCH", "GET", "GET"] if upgrade else
         ["GET", "GET", "GET", "GET"] if mixed else ["GET", "GET", "POST", "GET", "GET"])
 
 
@@ -337,25 +350,26 @@ def test_subscription_coverage_reuses_mixed_and_split_event_sets(split):
     client = Mock()
     url = "https://agent.example/webhook?channel=slack"
     first, *remaining = SLACK_SUBSCRIPTION_EVENTS
-    rows = [NS(url=url, status="active", event_types=["email.received", first])]
+    rows = [NS(id="ours", url=url, status="active", event_types=["message.received", first])]
     if split:
         rows.append(NS(url=url, status="active", event_types=remaining))
     client.webhooks.subscriptions.list.return_value = rows
     reconcile_subscription(client, IDENTITY, url)
     if split:
         client.webhooks.subscriptions.create.assert_not_called()
+        client.webhooks.subscriptions.update.assert_not_called()
     else:
-        client.webhooks.subscriptions.create.assert_called_once_with(
-            agent_identity_id=IDENTITY, url=url, event_types=remaining)
+        client.webhooks.subscriptions.update.assert_called_once_with(
+            "ours", event_types=["message.received", first, *remaining], scope="identity")
+        client.webhooks.subscriptions.create.assert_not_called()
     client.webhooks.subscriptions.delete.assert_not_called()
-    client.webhooks.subscriptions.update.assert_not_called()
 
 
 def test_paused_subscription_is_not_bypassed_by_new_registration():
     client = Mock()
     url = "https://agent.example/webhook?channel=slack"
     client.webhooks.subscriptions.list.return_value = [
-        NS(url=url, status="paused", event_types=["email.received", "slack.dm_received"])]
+        NS(url=url, status="paused", event_types=["message.received", "slack.dm_received"])]
     with pytest.raises(RuntimeError, match="paused"):
         reconcile_subscription(client, IDENTITY, url)
     client.webhooks.subscriptions.create.assert_not_called()
@@ -654,7 +668,7 @@ def test_current_events_preserve_mention_only_thread_context(gw):
 
 
 def stop_event(**overrides):
-    payload = event(message_ts=None, thread_ts="1234567890.000001", message_kinds=[],
+    payload = event(message_ts=None, thread_ts="1234567890.000001", message_kinds=[], sender_access=None,
                     event={"type": "agent_session_stopped", "streaming_message_ts": []}, **overrides)
     payload["id"] = "stop-event"
     payload["event_type"] = "slack.session_stopped"
@@ -718,14 +732,15 @@ def test_signed_stop_webhook_requires_valid_signature(gw, monkeypatch):
     asyncio.run(scenario())
 
 
-def test_existing_message_subscription_adds_only_native_stop(gw):
+def test_existing_message_subscription_extends_selection_for_native_stop(gw):
     client = Mock()
     url = "https://agent.example/webhook"
     client.webhooks.subscriptions.list.return_value = [NS(
-        url=url, status="active", event_types=[event for event in SLACK_SUBSCRIPTION_EVENTS
+        id="ours", url=url, status="active", event_types=[event for event in SLACK_SUBSCRIPTION_EVENTS
                                                 if event != "slack.session_stopped"],
     )]
     reconcile_subscription(client, IDENTITY, url)
-    client.webhooks.subscriptions.create.assert_called_once_with(
-        agent_identity_id=IDENTITY, url=url, event_types=["slack.session_stopped"],
+    client.webhooks.subscriptions.update.assert_called_once_with(
+        "ours", event_types=list(SLACK_SUBSCRIPTION_EVENTS), scope="identity",
     )
+    client.webhooks.subscriptions.create.assert_not_called()

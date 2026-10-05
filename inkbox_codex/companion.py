@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import asdict, dataclass, is_dataclass
 import fcntl
 import hashlib
@@ -19,6 +20,7 @@ import httpx
 
 from .codex_client import recover_saved_answer
 from .imessage import source_metadata
+from .slack import SLACK_INCOMING_EVENTS, inbound_message
 
 logger = logging.getLogger(__name__)
 MAX_BYTES = 8 * 1024 * 1024
@@ -103,6 +105,10 @@ def _receipt_content(envelope: dict) -> dict:
         key: value for key, value in envelope["companion"].items()
         if key not in {"history", "history_complete", "history_next_cursor"}
     }
+    if envelope.get("event_type") in SLACK_INCOMING_EVENTS:
+        # Optional contact/profile presentation may refresh on a retry.
+        content["data"] = {key: value for key, value in envelope["data"].items()
+                           if key not in {"actor_profile", "contact_id"}}
     return content
 
 
@@ -126,17 +132,27 @@ class Event:
     def parse(cls, envelope: dict) -> Event:
         try:
             metadata = envelope["companion"]
-            channel, mode, field, author_field, text_field, conversation_field = CHANNELS[envelope["event_type"]]
-            message = envelope["data"][field]
+            slack = envelope["event_type"] in SLACK_INCOMING_EVENTS
+            if slack:
+                channel = mode = "slack"
+                message = envelope["data"]
+                source = envelope["_codex_slack_source"]
+                author, text = source["author"], message["event"].get("text") or ""
+                source_id = source["id"]
+            else:
+                channel, mode, field, author_field, text_field, conversation_field = CHANNELS[envelope["event_type"]]
+                message = envelope["data"][field]
+                author = message.get(author_field) or message.get("remote_phone_number") or message.get("remote_number")
+                text, source_id = message.get(text_field) or "", message["id"]
             if not isinstance(metadata, dict) or not isinstance(message, dict):
                 raise CompanionError("Companion metadata and message must be objects")
             event_id = envelope["id"]
             if not isinstance(event_id, str) or not event_id or len(event_id) > 255:
                 raise CompanionError("Companion event requires a stable event ID")
             scope, conversation = _uuid(metadata["scope_id"]), _uuid(metadata["conversation_id"])
-            if metadata["channel"] != channel or _uuid(message[conversation_field]) != conversation:
+            if metadata["channel"] != channel or (not slack and _uuid(message[conversation_field]) != conversation):
                 raise CompanionError("Companion channel or conversation does not match its message")
-            if message.get("direction") != "inbound":
+            if not slack and message.get("direction") != "inbound":
                 raise CompanionError("Companion received events must be inbound")
             phase, sequence = metadata["phase"], metadata["sequence"]
             if phase not in {"ordinary", "initialization", "live"} or type(sequence) is not int or sequence < 1:
@@ -148,17 +164,15 @@ class Event:
                 "activation_id", "history", "history_complete", "history_next_cursor", "reply_context",
             )):
                 raise CompanionError("Ordinary Companion routing cannot contain activation context")
-            author = message.get(author_field) or message.get("remote_phone_number") or message.get("remote_number")
             if not isinstance(author, str) or not author.strip():
                 raise CompanionError("Companion message requires its actual author")
-            text = message.get(text_field) or ""
             if not isinstance(text, str):
                 raise CompanionError("Companion message text must be a string")
             access = message.get("sender_access")
             if access not in ("direct", "sponsored"):
                 access = None
             return cls(envelope, event_id, scope, activation, conversation, channel, mode,
-                       phase, sequence, _uuid(message["id"]), author.strip(), text, access)
+                       phase, sequence, _uuid(source_id), author.strip(), text, access)
         except (KeyError, TypeError) as exc:
             raise CompanionError("Incomplete Companion received event") from exc
 
@@ -167,6 +181,12 @@ class Event:
         # if the conversation/cohort scope has not changed.
         kind = "ordinary" if self.phase == "ordinary" else self.activation
         return f"companion:{identity}:{self.channel}:{self.scope}:{kind}"
+
+    def conversation_binding(self) -> str:
+        if self.channel != "slack":
+            return self.conversation
+        data = self.envelope["data"]
+        return json.dumps([self.conversation, data["connection_id"], data["conversation_id"]])
 
 
 class Inbox:
@@ -235,9 +255,17 @@ class Inbox:
             raise CompanionError("Companion event exceeds the input limit")
         with self.db:
             binding = self.db.execute("SELECT conversation,channel FROM scope_bindings WHERE scope=?", (event.scope,)).fetchone()
-            if binding is not None and binding != (event.conversation, event.channel):
+            conversation = event.conversation_binding()
+            if binding is not None and event.channel == binding[1] == "slack":
+                # Earlier previews included the first reply thread in this
+                # channel-wide binding. Keep its audience, not that one route.
+                previous = json.loads(binding[0])
+                if isinstance(previous, list) and len(previous) == 4 and previous[:3] == json.loads(conversation):
+                    self.db.execute("UPDATE scope_bindings SET conversation=? WHERE scope=?", (conversation, event.scope))
+                    binding = (conversation, event.channel)
+            if binding is not None and binding != (conversation, event.channel):
                 raise CompanionError("Companion scope changed its conversation or channel")
-            self.db.execute("INSERT OR IGNORE INTO scope_bindings VALUES(?,?,?)", (event.scope, event.conversation, event.channel))
+            self.db.execute("INSERT OR IGNORE INTO scope_bindings VALUES(?,?,?)", (event.scope, conversation, event.channel))
             old = self.db.execute("SELECT event_id,payload FROM events WHERE event_id=? OR (scope=? AND sequence=?)",
                                   (event.event_id, event.scope, event.sequence)).fetchone()
             if old:
@@ -350,6 +378,16 @@ class Receiver:
         return resource
 
     async def accept(self, envelope: dict) -> bool:
+        if envelope.get("event_type") in SLACK_INCOMING_EVENTS:
+            if not self.cfg.slack_enabled:
+                return False
+            from .slack_companion import prepare_envelope, require_sdk_support
+
+            try:
+                require_sdk_support()
+                envelope = await asyncio.to_thread(prepare_envelope, self.client, self.cfg.identity, envelope)
+            except ValueError as exc:
+                raise CompanionError(str(exc)) from exc
         event = Event.parse(envelope)
         if event.phase != "ordinary":
             self.resource()
@@ -359,13 +397,53 @@ class Receiver:
         receipt_state = self.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (event.event_id,)).fetchone()[0]
         if receipt_state == "pending" and event.phase == "live" and not self.inbox.source_submitted(event):
             session = self.sessions.get(event.session_key(self.namespace))
-            if self.sender_allowed(event.author):
+            if self.author_allowed(event, event.author):
                 if await session.companion_interaction(event.text, self.meta(event)):
                     with self.inbox.db:
                         self.inbox.remember_sources(event, [event.source_id])
                         self.inbox.db.execute("UPDATE events SET state='done' WHERE event_id=?", (event.event_id,))
         self.schedule(event.scope)
         return fresh
+
+    def author_allowed(self, event, author):
+        if event.channel == "slack":
+            # Keep ordinary installation-qualified entries without changing the canonical author.
+            actor = str(author or "").partition(":")[2]
+            workspace = event.envelope["data"]["workspace_id"]
+            return self.sender_allowed(author, actor, f"{workspace}:{actor}")
+        return self.sender_allowed(author)
+
+    async def stop_slack(self, meta):
+        """Apply the native Stop action only to its current actor and exact thread."""
+        matched = False
+        coordinates = (meta.get("connection_id"), meta.get("conversation_id"), meta.get("thread_ts"))
+        for session in list(self.active_sessions):
+            mode, route = session._reply_route(session._current_turn)
+            if mode != "slack" or not route.get("companion") or coordinates != (
+                route.get("connection_id"), route.get("conversation_id"), route.get("thread_ts"),
+            ):
+                continue
+            if not (session._turn_active or session.pending is not None):
+                continue
+            matched = True
+            if (meta.get("actor_id") == route.get("actor_id")
+                    and meta.get("workspace_id") == route.get("workspace_id")
+                    and self.sender_allowed(route.get("sender"), meta.get("actor_id"),
+                                            f"{meta.get('workspace_id')}:{meta.get('actor_id')}")):
+                await session._cancel_pending_turn()
+        return matched
+
+    async def authorize_slack(self, event):
+        """Recheck this activation, not a replacement grant on the same Slack thread."""
+        if not self.cfg.slack_enabled:
+            raise CompanionError("Slack is disabled")
+        page = await asyncio.to_thread(self.resource().activation_messages,
+                                       self.cfg.identity, event.activation, limit=1)
+        if (str(page.scope_id), str(page.activation_id), str(page.conversation_id), page.channel) != (
+            event.scope, event.activation, event.conversation, "slack",
+        ):
+            raise CompanionError("Companion Slack activation no longer matches the received scope")
+        self.validate_reply(event, _dict(page.reply_context))
 
     def schedule(self, scope):
         if not self.closing and (scope not in self.tasks or self.tasks[scope].done()):
@@ -402,6 +480,8 @@ class Receiver:
             event = self.inbox.next(scope)
             if event is None:
                 return
+            if event.channel == "slack" and not self.cfg.slack_enabled:
+                return  # Retain disabled-channel receipts for an explicit re-enable.
             try:
                 # A new delivery or restart may recheck a proven preflight
                 # failure, but never an ambiguous submission or send.
@@ -565,7 +645,37 @@ class Receiver:
             if changed != 1:
                 raise CompanionError("Companion reply is not awaiting delivery")
 
-    async def deliver_reply(self, event):
+    @asynccontextmanager
+    async def activity(self, event, meta, *, resume=False):
+        """Keep retryable work busy and restore saved replies after recovery."""
+        session = self.sessions.get(event.session_key(self.namespace))
+
+        async def notify(state):
+            if event.mode == "slack" and meta.get("companion_generates_reply") and session.turn_activity_fn:
+                try:
+                    await session.turn_activity_fn(session.chat_id, "slack", meta, state)
+                except Exception:
+                    logger.warning("Slack Companion activity update failed")
+
+        if resume:
+            await notify("accepted")
+        outcome = "failed"
+        try:
+            yield
+            outcome = "completed"
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except Exception as exc:
+            state = self.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (event.event_id,)).fetchone()
+            if self.retryable_read(exc) and state is not None and state[0] in {"pending", "reply_pending"}:
+                outcome = None  # No submission or send started; retain processing during retry.
+            raise
+        finally:
+            if outcome is not None:
+                await notify(outcome)
+
+    async def deliver_reply(self, event, *, resume_activity=False):
         row = self.inbox.db.execute(
             "SELECT content,meta,next_state FROM replies WHERE event_id=?", (event.event_id,),
         ).fetchone()
@@ -574,10 +684,12 @@ class Receiver:
         session = self.sessions.get(event.session_key(self.namespace))
         meta = json.loads(row[1])
         meta["companion_reply_event_id"] = event.event_id
-        await session.send_fn(session.chat_id, row[0], event.mode, meta)
-        with self.inbox.db:
-            self.inbox.db.execute("DELETE FROM replies WHERE event_id=?", (event.event_id,))
-            self.inbox.db.execute("UPDATE events SET state=? WHERE event_id=?", (row[2], event.event_id))
+        activity = self.activity(event, meta, resume=True) if resume_activity else nullcontext()
+        async with activity:
+            await session.send_fn(session.chat_id, row[0], event.mode, meta)
+            with self.inbox.db:
+                self.inbox.db.execute("DELETE FROM replies WHERE event_id=?", (event.event_id,))
+                self.inbox.db.execute("UPDATE events SET state=? WHERE event_id=?", (row[2], event.event_id))
 
     async def load(self, event):
         result = await asyncio.to_thread(self.resource().load_initialization,
@@ -590,12 +702,12 @@ class Receiver:
         triggers = [entry for entry in entries if entry.get("is_trigger") is True]
         if len(triggers) != 1 or triggers[0].get("historical") is not False:
             raise CompanionError("Companion snapshot needs exactly one current trigger")
-        if event.phase == "initialization" and (
+        if event.phase == "initialization" and event.channel != "slack" and (
             str(triggers[0]["id"]) != event.source_id
             or not same_author(event.channel, triggers[0]["author"], event.author)
         ):
             raise CompanionError("Companion snapshot trigger does not match the received message")
-        if not self.sender_allowed(triggers[0]["author"]):
+        if not self.author_allowed(event, triggers[0]["author"]):
             raise CompanionError("Companion sponsor is not permitted by local sender settings")
         reply = _dict(result.reply_context)
         self.validate_reply(event, reply)
@@ -612,13 +724,23 @@ class Receiver:
         return result, triggers[0], reply, text
 
     @staticmethod
-    def validate_reply(event, reply):
+    def validate_reply(event, reply, *, exact_thread=False):
         if reply.get("channel") != event.channel or _uuid(reply.get("conversation_id")) != event.conversation:
             raise CompanionError("Companion reply context does not match its conversation")
         if event.channel == "mail":
             _uuid(reply.get("reply_to_message_id"))
             if not (reply.get("to") or reply.get("cc")):
                 raise CompanionError("Companion email reply requires its approved audience")
+        if event.channel == "slack":
+            data = event.envelope["data"]
+            if (str(reply.get("connection_id")), reply.get("slack_conversation_id")) != (
+                data["connection_id"], data["conversation_id"],
+            ):
+                raise CompanionError("Companion Slack reply context does not match its connection or channel")
+            # The activation snapshot may retain an earlier trigger's thread.
+            # Only a saved outbound route must match this receipt's source.
+            if exact_thread and reply.get("thread_ts") != event.envelope["_codex_slack_source"]["thread_ts"]:
+                raise CompanionError("Companion Slack reply lost its source thread")
 
     def meta(self, event, *, source_id=None, author=None, text=None, reply=None, initialization=False,
              sponsor=None, context_only=False):
@@ -650,20 +772,37 @@ class Receiver:
                 message = {"id": source_id, "content": ""}
             meta.update(source_metadata(message, event.event_id))
             meta["imessage_threaded_replies"] = True
+        if event.channel == "slack":
+            incoming = inbound_message(event.envelope, event.envelope["data"]["identity_id"])
+            if incoming is None:
+                raise CompanionError("Invalid Companion Slack message")
+            meta.update(incoming[2])
+            meta.update(
+                sender=author or event.author,
+                companion_conversation_id=event.conversation,
+                thread_ts=event.envelope["_codex_slack_source"]["thread_ts"],
+                slack_bot_user_id=event.envelope["_codex_slack_source"].get("bot_user_id"),
+            )
         return meta
 
     def check_reply_route(self, meta):
         event = Event.parse(meta["companion_envelope"])
         if event.activation:
-            if not self.sender_allowed(meta.get("companion_sponsor") or meta.get("sender")):
+            if not self.author_allowed(event, meta.get("companion_sponsor") or meta.get("sender")):
                 raise CompanionError("Companion sponsor is no longer permitted locally")
             if event.channel == "mail":
                 saved = self.inbox.activation(event)
                 if saved is None or meta.get("message_id") != saved[0]:
                     raise CompanionError("Companion email reply lost its sponsor message")
-        elif not self.sender_allowed(event.author):
+        elif not self.author_allowed(event, event.author):
             raise CompanionError("Companion ordinary sender is no longer permitted")
-        if meta.get("conversation_id") != event.conversation:
+        if event.channel == "slack":
+            if not self.cfg.slack_enabled:
+                raise CompanionError("Slack is disabled")
+            self.validate_reply(event, {"channel": "slack", "conversation_id": meta.get("companion_conversation_id"),
+                "connection_id": meta.get("connection_id"), "slack_conversation_id": meta.get("conversation_id"),
+                "thread_ts": meta.get("thread_ts")}, exact_thread=True)
+        elif meta.get("conversation_id") != event.conversation:
             raise CompanionError("Companion reply lost its group conversation")
 
     async def submit(self, event, text, meta, *, trigger=None, source_ids=None):
@@ -676,8 +815,10 @@ class Receiver:
             session.resume_session_id = saved_thread[0]
         async def before_submit():
             if event.activation:
-                if not self.sender_allowed(meta["companion_sponsor"]):
+                if not self.author_allowed(event, meta["companion_sponsor"]):
                     raise CompanionError("Companion sponsor is no longer permitted locally")
+                if event.channel == "slack":
+                    await self.authorize_slack(event)
             with self.inbox.db:
                 thread_id = getattr(session._client, "thread_id", None)
                 if thread_id:
@@ -692,9 +833,10 @@ class Receiver:
                 if trigger:
                     self.inbox.db.execute("INSERT INTO activations VALUES(?,?,?,?,?) ON CONFLICT(scope,activation) DO UPDATE SET state=excluded.state",
                                           (event.scope, event.activation, trigger["id"], trigger["author"], "submitting"))
-        reply = await session.submit_companion(text, event.mode, meta, before_submit=before_submit)
-        self._settle_submission(event, reply, meta, trigger=trigger, source_ids=source_ids)
-        await self.deliver_reply(event)
+        async with self.activity(event, meta):
+            reply = await session.submit_companion(text, event.mode, meta, before_submit=before_submit)
+            self._settle_submission(event, reply, meta, trigger=trigger, source_ids=source_ids)
+            await self.deliver_reply(event)
 
     def _settle_submission(self, event, reply, meta, *, trigger=None, source_ids=None):
         # Initialization and its receipt transition atomically. Live-first needs
@@ -710,7 +852,7 @@ class Receiver:
                     "UPDATE activations SET state='initialized' WHERE scope=? AND activation=?",
                     (event.scope, event.activation),
                 )
-            state = "pending" if trigger and event.phase == "live" and trigger["id"] != event.source_id else "done"
+            state = "pending" if trigger and (event.phase == "live" or event.channel == "slack") and trigger["id"] != event.source_id else "done"
             if reply and reply.strip() != "[SILENT]":
                 self.inbox.db.execute("INSERT INTO replies VALUES(?,?,?,?)",
                                       (event.event_id, reply, json.dumps(meta), state))
@@ -721,11 +863,11 @@ class Receiver:
 
     async def process(self, event):
         # Retry only the saved answer, never the already acknowledged input.
-        await self.deliver_reply(event)
+        await self.deliver_reply(event, resume_activity=True)
         if self.inbox.source_submitted(event):
             return
         if event.phase == "ordinary":
-            if not self.sender_allowed(event.author):
+            if not self.author_allowed(event, event.author):
                 # Match ordinary inbound filtering: discard this input without
                 # blocking a later, permitted sponsor in the same scope.
                 return
@@ -751,11 +893,11 @@ class Receiver:
             await self.submit(event, text, self.meta(
                 event, source_id=trigger["id"], sponsor=trigger["author"],
                 reply=reply, initialization=True,
-                context_only=event.phase == "live" and event.source_id not in source_ids,
+                context_only=(event.phase == "live" or event.channel == "slack") and event.source_id not in source_ids,
             ), trigger=trigger, source_ids=source_ids)
-            if event.phase == "initialization" or self.inbox.source_submitted(event):
+            if (event.phase == "initialization" and event.channel != "slack") or self.inbox.source_submitted(event):
                 return
-        elif event.phase == "initialization":
+        elif event.phase == "initialization" and (event.channel != "slack" or saved[0] == event.source_id):
             if saved[0] != event.source_id:
                 raise CompanionError("A new Companion history batch requires a distinct activation ID")
             return
@@ -764,6 +906,11 @@ class Receiver:
         await self.submit(event, await self.live_text(event), self.meta(event, source_id=saved[0]))
 
     async def live_text(self, event):
+        if event.channel == "slack":
+            incoming = inbound_message(event.envelope, event.envelope["data"]["identity_id"])
+            if incoming is None:
+                raise CompanionError("Invalid Companion Slack message")
+            return incoming[1]
         message = event.envelope["data"]["text_message" if event.channel == "phone" else "message"]
         text = event.text
         if event.channel == "mail":

@@ -19,7 +19,7 @@ SLACK_ATTENTION_EVENTS = tuple(
     event for event in SLACK_INCOMING_EVENTS if event != "slack.channel_message_received"
 )
 SLACK_STOP_EVENT = "slack.session_stopped"
-SLACK_SUBSCRIPTION_EVENTS = (*SLACK_ATTENTION_EVENTS, SLACK_STOP_EVENT)
+SLACK_SUBSCRIPTION_EVENTS = (*SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT)
 SLACK_MAX_TEXT_LENGTH = 12000
 
 
@@ -35,14 +35,23 @@ def reconcile_subscription(client: Any, identity_id: Any, url: str) -> None:
     subscriptions = client.webhooks.subscriptions
     events = list(SLACK_SUBSCRIPTION_EVENTS)
     covered = set()
+    message_subscriptions = []
     for sub in subscriptions.list(agent_identity_id=identity_id, scope="identity", url=url):
         overlap = set(sub.event_types) & set(events)
         if sub.url == url and overlap:
             if sub.status != "active":
                 raise RuntimeError("The Slack subscription is paused; resume it before starting")
             covered.update(overlap)
+            if overlap.intersection(SLACK_INCOMING_EVENTS):
+                message_subscriptions.append(sub)
     missing = [event for event in events if event not in covered]
     if not missing:
+        return
+    if message_subscriptions:
+        # Extend the existing receiver: a second channel-only subscription
+        # would deliver mentions again under another event category.
+        sub = max(message_subscriptions, key=lambda item: len(set(item.event_types).intersection(SLACK_INCOMING_EVENTS)))
+        subscriptions.update(sub.id, event_types=list(dict.fromkeys([*sub.event_types, *missing])), scope="identity")
         return
     # A test receiver must not replace another receiver or another channel.
     subscriptions.create(
@@ -53,6 +62,13 @@ def reconcile_subscription(client: Any, identity_id: Any, url: str) -> None:
 def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] | None:
     data = envelope.get("data")
     if not isinstance(data, dict) or data.get("identity_id") != identity_id:
+        return None
+    # Older deliveries omit the label. An explicit denial/unknown label must
+    # never become an ordinary request, and ride-alongs need their scoped grant.
+    if "sender_access" in data and (
+        data["sender_access"] not in ("direct", "sponsored")
+        or (data["sender_access"] == "sponsored" and not envelope.get("companion"))
+    ):
         return None
     event = data.get("event")
     if not isinstance(event, dict) or not envelope.get("id"):
@@ -99,6 +115,8 @@ def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] |
         "slack_mentioned": "mention" in kinds,
         "slack_addressed": bool(set(kinds) & {"dm", "group_dm", "mention"}),
     }
+    if "sender_access" in data:
+        meta["sender_access"] = data["sender_access"]
     # Sender context never changes workspace/thread isolation or approval ownership.
     sender_context = {}
     if isinstance(data.get("contact_id"), str):
@@ -126,8 +144,11 @@ def inbound_stop(envelope: dict, identity_id: str) -> tuple[str, str, dict] | No
     thread = data.get("thread_ts")
     if not isinstance(thread, str) or not thread:
         return None
+    # Native controls carry null access, not a contact-rule admission label.
+    # Their authority comes from the active request's exact actor and route.
+    control = {key: value for key, value in data.items() if key != "sender_access"}
     incoming = inbound_message({**envelope, "data": {
-        **data, "message_ts": thread, "message_kinds": ["thread"],
+        **control, "message_ts": thread, "message_kinds": ["thread"],
         "event": {"type": "message", "text": "/stop"},
     }}, identity_id)
     if incoming is not None:

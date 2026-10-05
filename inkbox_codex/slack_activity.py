@@ -80,8 +80,9 @@ class SlackActivity:
         if native:
             if not self._supported:
                 return
-        elif meta.get("conversation_kind") != "direct" or not self._reactions_supported:
+        elif not self._reactions_supported:
             return
+        # Choose by reply destination: thread status or inline-message reaction.
         timestamp_field = "thread_ts" if native else "message_ts"
         fields = [meta.get("connection_id"), meta.get("conversation_id"), meta.get(timestamp_field)]
         event_id = meta.get("source_event_id")
@@ -193,6 +194,8 @@ class SlackActivity:
     async def flush(self) -> None:
         while self._tails:
             await asyncio.gather(*list(self._tails.values()), return_exceptions=True)
+            # An already-complete gather need not yield to the tail-cleanup callbacks.
+            await asyncio.sleep(0)
 
     async def close(self) -> None:
         self._closing = True
