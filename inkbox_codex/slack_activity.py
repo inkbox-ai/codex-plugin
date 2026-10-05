@@ -194,6 +194,8 @@ class SlackActivity:
     async def flush(self) -> None:
         while self._tails:
             await asyncio.gather(*list(self._tails.values()), return_exceptions=True)
+            # An already-complete gather need not yield to the tail-cleanup callbacks.
+            await asyncio.sleep(0)
 
     async def close(self) -> None:
         self._closing = True

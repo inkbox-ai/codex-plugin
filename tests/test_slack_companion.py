@@ -564,6 +564,105 @@ def test_activity_starts_only_for_work_and_finishes_after_delivery(tmp_path, mon
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("thread", [None, "1767268800.000100"])
+@pytest.mark.parametrize("restart_activity", [False, True])
+@pytest.mark.parametrize("stage", ["before-model", "before-send"])
+def test_retryable_preflight_finishes_actual_slack_activity(tmp_path, monkeypatch, thread, restart_activity, stage):
+    from inkbox_codex.slack_activity import SlackActivity
+
+    async def scenario():
+        initial = fixture()
+        initial["data"]["thread_ts"] = thread
+        gw, sdk, slack = gateway(monkeypatch, tmp_path, initial)
+        for method in ("set_processing_status", "add_reaction", "remove_reaction"):
+            getattr(slack, method).return_value = NS(status="succeeded")
+        tracker = SlackActivity(slack, tmp_path / "activity.json")
+        gw.sessions.turn_activity_fn = tracker.notify
+        authorize = sdk.activation_messages
+        calls = 0
+
+        def transient_preflight(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == (2 if stage == "before-model" else 3):
+                raise ConnectionError("temporary authorization lookup failure")
+            return authorize(*args, **kwargs)
+
+        sdk.activation_messages = transient_preflight
+        receiver = gw._companion()
+        try:
+            await receiver.accept(initial)
+            await drained(receiver)
+            await tracker.flush()
+            assert receiver.inbox.db.execute("SELECT state FROM events").fetchone()[0] == (
+                "pending" if stage == "before-model" else "reply_pending")
+            slack.send_message.assert_not_called()
+            if thread:
+                assert [call.args[3] for call in slack.set_processing_status.call_args_list] == ["processing"]
+                slack.add_reaction.assert_not_called()
+            else:
+                assert [call.args[3] for call in slack.add_reaction.call_args_list] == ["eyes"]
+                assert not any(call.args[3] == "eyes" for call in slack.remove_reaction.call_args_list)
+            if restart_activity:
+                await tracker.close()
+                tracker = SlackActivity(slack, tmp_path / "activity.json")
+                await tracker.recover()
+                await tracker.flush()
+                session_for(gw, initial).turn_activity_fn = tracker.notify
+            receiver.schedule(initial["companion"]["scope_id"])
+            await drained(receiver)
+            await tracker.flush()
+            assert receiver.inbox.db.execute("SELECT state FROM events").fetchone()[0] == "done"
+            assert slack.send_message.call_count == 1
+            assert len(session_for(gw, initial)._client.events) == 1
+            assert not tracker._active
+            assert json.loads(tracker.state_path.read_text()) == {}
+            if thread:
+                assert slack.set_processing_status.call_args.args[3] == "active"
+                slack.add_reaction.assert_not_called()
+            else:
+                assert slack.remove_reaction.call_args.args[3] == "eyes"
+                assert all(call.args[3] != "x" for call in slack.add_reaction.call_args_list)
+        finally:
+            await receiver.close()
+            await tracker.close()
+    asyncio.run(scenario())
+
+
+def test_graceful_receiver_shutdown_clears_inline_activity_without_failure(tmp_path, monkeypatch):
+    from inkbox_codex.slack_activity import SlackActivity
+
+    async def scenario():
+        initial = fixture()
+        initial["data"]["thread_ts"] = None
+        gw, _, slack = gateway(monkeypatch, tmp_path, initial)
+        slack.add_reaction.return_value = slack.remove_reaction.return_value = NS(status="succeeded")
+        tracker = SlackActivity(slack, tmp_path / "activity.json")
+        gw.sessions.turn_activity_fn = tracker.notify
+        receiver = gw._companion()
+        started = asyncio.Event()
+
+        class BlockingClient(Client):
+            async def run(self, text):
+                started.set()
+                await asyncio.Event().wait()
+
+        session_for(gw, initial)._client = BlockingClient()
+        try:
+            await receiver.accept(initial)
+            await asyncio.wait_for(started.wait(), 3)
+            await tracker.flush()
+            assert slack.add_reaction.call_args.args[3] == "eyes"
+        finally:
+            await receiver.close()
+            await tracker.flush()
+            await tracker.close()
+        assert [call.args[3] for call in slack.add_reaction.call_args_list] == ["eyes"]
+        assert slack.remove_reaction.call_args.args[3] == "eyes"
+        assert json.loads(tracker.state_path.read_text()) == {}
+    asyncio.run(scenario())
+
+
 def test_restart_after_late_initialization_snapshot_only_submits_current_source(tmp_path, monkeypatch):
     async def scenario():
         initial = fixture()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import asdict, dataclass, is_dataclass
 import fcntl
 import hashlib
@@ -641,7 +642,37 @@ class Receiver:
             if changed != 1:
                 raise CompanionError("Companion reply is not awaiting delivery")
 
-    async def deliver_reply(self, event):
+    @asynccontextmanager
+    async def activity(self, event, meta, *, resume=False):
+        """Keep retryable work busy and restore saved replies after recovery."""
+        session = self.sessions.get(event.session_key(self.namespace))
+
+        async def notify(state):
+            if event.mode == "slack" and meta.get("companion_generates_reply") and session.turn_activity_fn:
+                try:
+                    await session.turn_activity_fn(session.chat_id, "slack", meta, state)
+                except Exception:
+                    logger.warning("Slack Companion activity update failed")
+
+        if resume:
+            await notify("accepted")
+        outcome = "failed"
+        try:
+            yield
+            outcome = "completed"
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except Exception as exc:
+            state = self.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (event.event_id,)).fetchone()
+            if self.retryable_read(exc) and state is not None and state[0] in {"pending", "reply_pending"}:
+                outcome = None  # No submission or send started; retain processing during retry.
+            raise
+        finally:
+            if outcome is not None:
+                await notify(outcome)
+
+    async def deliver_reply(self, event, *, resume_activity=False):
         row = self.inbox.db.execute(
             "SELECT content,meta,next_state FROM replies WHERE event_id=?", (event.event_id,),
         ).fetchone()
@@ -650,10 +681,12 @@ class Receiver:
         session = self.sessions.get(event.session_key(self.namespace))
         meta = json.loads(row[1])
         meta["companion_reply_event_id"] = event.event_id
-        await session.send_fn(session.chat_id, row[0], event.mode, meta)
-        with self.inbox.db:
-            self.inbox.db.execute("DELETE FROM replies WHERE event_id=?", (event.event_id,))
-            self.inbox.db.execute("UPDATE events SET state=? WHERE event_id=?", (row[2], event.event_id))
+        activity = self.activity(event, meta, resume=True) if resume_activity else nullcontext()
+        async with activity:
+            await session.send_fn(session.chat_id, row[0], event.mode, meta)
+            with self.inbox.db:
+                self.inbox.db.execute("DELETE FROM replies WHERE event_id=?", (event.event_id,))
+                self.inbox.db.execute("UPDATE events SET state=? WHERE event_id=?", (row[2], event.event_id))
 
     async def load(self, event):
         result = await asyncio.to_thread(self.resource().load_initialization,
@@ -797,20 +830,10 @@ class Receiver:
                 if trigger:
                     self.inbox.db.execute("INSERT INTO activations VALUES(?,?,?,?,?) ON CONFLICT(scope,activation) DO UPDATE SET state=excluded.state",
                                           (event.scope, event.activation, trigger["id"], trigger["author"], "submitting"))
-        outcome = "failed"
-        try:
+        async with self.activity(event, meta):
             reply = await session.submit_companion(text, event.mode, meta, before_submit=before_submit)
             self._settle_submission(event, reply, meta, trigger=trigger, source_ids=source_ids)
             await self.deliver_reply(event)
-            outcome = "completed"
-        finally:
-            # Companion owns delivery after the host returns. Keep Slack's
-            # processing indicator until that delivery has a known outcome.
-            if event.mode == "slack" and meta.get("companion_generates_reply") and session.turn_activity_fn:
-                try:
-                    await session.turn_activity_fn(session.chat_id, "slack", meta, outcome)
-                except Exception:
-                    logger.warning("Slack Companion activity update failed")
 
     def _settle_submission(self, event, reply, meta, *, trigger=None, source_ids=None):
         # Initialization and its receipt transition atomically. Live-first needs
@@ -837,7 +860,7 @@ class Receiver:
 
     async def process(self, event):
         # Retry only the saved answer, never the already acknowledged input.
-        await self.deliver_reply(event)
+        await self.deliver_reply(event, resume_activity=True)
         if self.inbox.source_submitted(event):
             return
         if event.phase == "ordinary":
