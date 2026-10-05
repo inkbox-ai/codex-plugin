@@ -407,8 +407,10 @@ class Receiver:
 
     def author_allowed(self, event, author):
         if event.channel == "slack":
-            # Keep the existing workspace-qualified and bare-user allowlist forms.
-            return self.sender_allowed(author, str(author or "").partition(":")[2])
+            # Keep ordinary installation-qualified entries without changing the canonical author.
+            actor = str(author or "").partition(":")[2]
+            workspace = event.envelope["data"]["workspace_id"]
+            return self.sender_allowed(author, actor, f"{workspace}:{actor}")
         return self.sender_allowed(author)
 
     async def stop_slack(self, meta):
@@ -426,7 +428,8 @@ class Receiver:
             matched = True
             if (meta.get("actor_id") == route.get("actor_id")
                     and meta.get("workspace_id") == route.get("workspace_id")
-                    and self.sender_allowed(route.get("sender"), meta.get("actor_id"))):
+                    and self.sender_allowed(route.get("sender"), meta.get("actor_id"),
+                                            f"{meta.get('workspace_id')}:{meta.get('actor_id')}")):
                 await session._cancel_pending_turn()
         return matched
 

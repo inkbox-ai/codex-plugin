@@ -486,12 +486,32 @@ def test_same_actor_in_another_thread_cannot_control_active_work(tmp_path, monke
     asyncio.run(scenario())
 
 
+def test_installation_allowlist_preserves_canonical_author_and_workspace_scope(tmp_path, monkeypatch):
+    async def scenario():
+        initial = fixture()
+        gw, _, _ = gateway(monkeypatch, tmp_path, initial)
+        gw.cfg.allowed_users = ["TINSTALL:UALICE"]
+        receiver = gw._companion()
+        try:
+            event = Event.parse(prepared(initial))
+            assert receiver.author_allowed(event, "THOME:UALICE")
+            assert not receiver.author_allowed(event, "THOME:UBOB")
+            assert receiver.meta(event)["sender"] == "THOME:UALICE"
+            other = deepcopy(initial)
+            other["data"]["workspace_id"] = "TOTHER"
+            assert not receiver.author_allowed(Event.parse(prepared(other)), "THOME:UALICE")
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("change,stops", [(None, True), ("actor", False), ("thread", False), ("workspace", False)])
-def test_native_stop_targets_active_companion_actor_and_exact_route(tmp_path, monkeypatch, change, stops):
+@pytest.mark.parametrize("allowed_user", ["THOME:UALICE", "TINSTALL:UALICE", "UALICE"])
+def test_native_stop_targets_active_companion_actor_and_exact_route(tmp_path, monkeypatch, change, stops, allowed_user):
     async def scenario():
         initial = fixture()
         gw, _, slack = gateway(monkeypatch, tmp_path, initial)
-        gw.cfg.allowed_users = ["THOME:UALICE"]
+        gw.cfg.allowed_users = [allowed_user]
         receiver = gw._companion()
         started, finish = asyncio.Event(), asyncio.Event()
 

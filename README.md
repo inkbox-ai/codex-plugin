@@ -304,6 +304,9 @@ Replies remain deduplicated by the stable event ID, not the selected category.
 
 `INKBOX_ALLOWED_USERS` accepts Slack user IDs or workspace-qualified `T_ID:U_ID`
 entries. An empty list admits all human senders whose events reach the identity.
+For external Slack Connect users, Companion accepts home-workspace-qualified IDs
+as well as the installation-workspace-qualified IDs used by ordinary routing.
+Installation-qualified entries remain scoped to that installation workspace.
 Starting this gateway does not remove another Slack receiver. Existing active
 subscriptions at this receiver's URL, including
 mixed-event subscriptions, are extended with missing events without replacing
