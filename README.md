@@ -323,8 +323,7 @@ verified Companion envelope. Explicit null/unknown access is ignored; older
 ordinary Slack webhooks without this field retain their existing behavior.
 
 Slack Companion requires an API environment supporting Slack initialization and
-**Python SDK 0.7.14 or newer** with that support. Until that SDK release is
-published, this is a preview requiring a compatible SDK build. Ordinary Slack
+**Python SDK 0.7.14 or newer** with that support. Ordinary Slack
 continues to support SDK 0.7.11; other channels keep their existing requirements.
 No new setup wizard or permission setting is needed:
 
@@ -487,7 +486,7 @@ and are unaffected by the Companion response setting.
 `client.companion.load_initialization` and `activation_messages`. Installation
 resolves the published SDK; CI tests the released `inkbox==0.7.11` minimum across
 unit, real-host, and live-channel lanes. Slack Companion is the optional
-exception: see its SDK 0.7.14 preview requirement above.
+exception: see its SDK 0.7.14 requirement above.
 An unsupported SDK produces an explicit webhook error; the bridge never falls
 back to submitting only the trigger.
 

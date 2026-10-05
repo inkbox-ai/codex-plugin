@@ -96,7 +96,7 @@ jobs:
           tests/test_imessage_state.py tests/test_imessage_gateway.py
           tests/test_imessage_sdk.py tests/test_companion.py
 
-  # Pin the optional Slack initialization preview until its SDK is released.
+  # Test optional Slack initialization against its released SDK minimum.
   # The ordinary Slack and other channel lanes keep testing the released floor.
   slack-companion-sdk:
     runs-on: blacksmith-2vcpu-ubuntu-2404
@@ -110,10 +110,10 @@ jobs:
         with:
           node-version: "22"
       - uses: astral-sh/setup-uv@v8.1.0
-      - name: Install bridge and Slack-aware SDK candidate
+      - name: Install bridge and released Slack-aware SDK
         run: >-
           uv pip install --system -e . pytest httpx
-          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@ecba7e487bba2a2ac9efb12c4e010a88f8394e78#subdirectory=sdk/python"
+          "inkbox==0.7.14"
       - name: Require Slack initialization support (do not silently skip)
         run: python -c "from inkbox_codex.slack_companion import require_sdk_support; require_sdk_support()"
       - name: Install Codex (freshest main prerelease)
