@@ -58,6 +58,8 @@ def test_slack_quiet_context_survives_real_host_restart_then_one_mentioned_turn(
             await host.connect(resume_thread_id=thread_id)
             session._client = host
             next_event = live(initial, sequence=3, text="<@UBOT> Summarize the current progress.")
+            next_event["data"]["thread_ts"] = "1767268801.000100"
+            next_event["data"]["event"]["thread_ts"] = next_event["data"]["thread_ts"]
             await receiver.accept(next_event)
             await asyncio.wait_for(asyncio.gather(*receiver.tasks.values()), 30)
             assert len(requests) == 1
@@ -71,7 +73,7 @@ def test_slack_quiet_context_survives_real_host_restart_then_one_mentioned_turn(
             assert "sender_access=direct" in model_input
             call = slack.send_message.call_args
             assert call.kwargs["conversation_id"] == "CEXAMPLE"
-            assert call.kwargs["thread_ts"] == initial["data"]["thread_ts"]
+            assert call.kwargs["thread_ts"] == next_event["data"]["thread_ts"]
         finally:
             await receiver.close()
             await host.disconnect()

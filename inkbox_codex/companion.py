@@ -185,8 +185,7 @@ class Event:
         if self.channel != "slack":
             return self.conversation
         data = self.envelope["data"]
-        return json.dumps([self.conversation, data["connection_id"], data["conversation_id"],
-                           self.envelope["_codex_slack_source"]["thread_ts"]])
+        return json.dumps([self.conversation, data["connection_id"], data["conversation_id"]])
 
 
 class Inbox:
@@ -256,6 +255,13 @@ class Inbox:
         with self.db:
             binding = self.db.execute("SELECT conversation,channel FROM scope_bindings WHERE scope=?", (event.scope,)).fetchone()
             conversation = event.conversation_binding()
+            if binding is not None and event.channel == binding[1] == "slack":
+                # Earlier previews included the first reply thread in this
+                # channel-wide binding. Keep its audience, not that one route.
+                previous = json.loads(binding[0])
+                if isinstance(previous, list) and len(previous) == 4 and previous[:3] == json.loads(conversation):
+                    self.db.execute("UPDATE scope_bindings SET conversation=? WHERE scope=?", (conversation, event.scope))
+                    binding = (conversation, event.channel)
             if binding is not None and binding != (conversation, event.channel):
                 raise CompanionError("Companion scope changed its conversation or channel")
             self.db.execute("INSERT OR IGNORE INTO scope_bindings VALUES(?,?,?)", (event.scope, conversation, event.channel))
@@ -682,7 +688,7 @@ class Receiver:
         return result, triggers[0], reply, text
 
     @staticmethod
-    def validate_reply(event, reply):
+    def validate_reply(event, reply, *, exact_thread=False):
         if reply.get("channel") != event.channel or _uuid(reply.get("conversation_id")) != event.conversation:
             raise CompanionError("Companion reply context does not match its conversation")
         if event.channel == "mail":
@@ -691,10 +697,14 @@ class Receiver:
                 raise CompanionError("Companion email reply requires its approved audience")
         if event.channel == "slack":
             data = event.envelope["data"]
-            if (str(reply.get("connection_id")), reply.get("slack_conversation_id"), reply.get("thread_ts")) != (
-                data["connection_id"], data["conversation_id"], event.envelope["_codex_slack_source"]["thread_ts"],
+            if (str(reply.get("connection_id")), reply.get("slack_conversation_id")) != (
+                data["connection_id"], data["conversation_id"],
             ):
-                raise CompanionError("Companion Slack reply context does not match its connection or thread")
+                raise CompanionError("Companion Slack reply context does not match its connection or channel")
+            # The activation snapshot may retain an earlier trigger's thread.
+            # Only a saved outbound route must match this receipt's source.
+            if exact_thread and reply.get("thread_ts") != event.envelope["_codex_slack_source"]["thread_ts"]:
+                raise CompanionError("Companion Slack reply lost its source thread")
 
     def meta(self, event, *, source_id=None, author=None, text=None, reply=None, initialization=False,
              sponsor=None, context_only=False):
@@ -755,7 +765,7 @@ class Receiver:
                 raise CompanionError("Slack is disabled")
             self.validate_reply(event, {"channel": "slack", "conversation_id": meta.get("companion_conversation_id"),
                 "connection_id": meta.get("connection_id"), "slack_conversation_id": meta.get("conversation_id"),
-                "thread_ts": meta.get("thread_ts")})
+                "thread_ts": meta.get("thread_ts")}, exact_thread=True)
         elif meta.get("conversation_id") != event.conversation:
             raise CompanionError("Companion reply lost its group conversation")
 

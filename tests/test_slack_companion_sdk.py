@@ -61,8 +61,8 @@ class SlackWire:
             assert request.method == "GET"
             assert path.endswith("/" + self.envelope["companion"]["activation_id"] + "/messages")
             body = self.history.get(path, dict(request.url.params))
-            if self.failure == "wrong-thread":
-                body["reply_context"]["thread_ts"] = "1767268801.000100"
+            if self.failure == "wrong-channel":
+                body["reply_context"]["slack_conversation_id"] = "COTHER"
             elif self.failure == "wrong-connection":
                 body["reply_context"]["connection_id"] = "40000000-0000-4000-8000-000000000099"
             elif self.failure == "revoked":
@@ -87,12 +87,14 @@ def client_for(envelope, monkeypatch, wire):
 
 
 @pytest.mark.parametrize("thread", [None, "1767268800.000100"])
-def test_real_sdk_source_pagination_and_exact_slack_send(tmp_path, monkeypatch, thread):
+@pytest.mark.parametrize("snapshot_thread", [None, "1767268700.000100"])
+def test_real_sdk_source_pagination_and_exact_slack_send(tmp_path, monkeypatch, thread, snapshot_thread):
     async def scenario():
         initial = fixture()
         initial["data"]["thread_ts"] = thread
         initial["companion"]["reply_context"]["thread_ts"] = thread
         wire = SlackWire(initial)
+        wire.history.c["reply_context"]["thread_ts"] = snapshot_thread
         gw, _, _ = gateway(monkeypatch, tmp_path, initial, normalize=False)
         with client_for(initial, monkeypatch, wire) as client:
             gw._inkbox = client
@@ -121,7 +123,7 @@ def test_real_sdk_source_pagination_and_exact_slack_send(tmp_path, monkeypatch, 
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("failure", ["wrong-thread", "wrong-connection", "revoked"])
+@pytest.mark.parametrize("failure", ["wrong-channel", "wrong-connection", "revoked"])
 def test_sdk_snapshot_cannot_cross_route_or_admit_unavailable_history(tmp_path, monkeypatch, failure):
     async def scenario():
         initial = fixture()

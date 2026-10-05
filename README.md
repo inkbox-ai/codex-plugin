@@ -265,9 +265,9 @@ from the previous reaction version. Reaction failures do not block replies.
 No separate Slack bot token is needed at runtime. Slack subscriptions use
 `slack.dm_received`, `slack.group_dm_received`, `slack.mention_received`,
 `slack.thread_reply_received`, and `slack.session_stopped` with no Slack-specific
-filter. The gateway also
-recognizes `slack.channel_message_received`, while its local attention rules keep
-unrelated channel chatter from waking Codex. Update the API and receiver together
+filter. The gateway also subscribes to `slack.channel_message_received` for
+Companion context, while its local attention rules keep unrelated channel chatter
+from waking Codex. Update the API and receiver together
 when upgrading from the older incoming-message preview event.
 Incoming messages can match several categories; the payload's `message_kinds`
 retains the full classification even when only one event type is selected.
@@ -302,9 +302,11 @@ Replies remain deduplicated by the stable event ID, not the selected category.
 
 `INKBOX_ALLOWED_USERS` accepts Slack user IDs or workspace-qualified `T_ID:U_ID`
 entries. An empty list admits all human senders whose events reach the identity.
-Slack subscriptions are additive: starting this gateway does not remove another
-Slack receiver. Existing active subscriptions at this receiver's URL, including
-mixed-event subscriptions, are reused; only missing events are registered.
+Starting this gateway does not remove another Slack receiver. Existing active
+subscriptions at this receiver's URL, including
+mixed-event subscriptions, are extended with missing events without replacing
+their other settings. A new subscription is created only when no matching Slack
+message receiver exists.
 Paused overlapping subscriptions require attention in the console before startup.
 Stop/remove any previous Slack receiver if it should no longer reply.
 
@@ -336,14 +338,16 @@ INKBOX_GROUP_REPLY_MODE=mention
 - Initialization loads all authorized history before the current message. If the
   first delivery arrives after the original trigger, history stays context-only;
   only the current message can start work. Duplicate deliveries do not repeat it.
-- Sessions and replies stay within the verified connection, channel, native
-  thread, and activation. A null thread remains a top-level message. An external
+- Companion context is shared across threads within the verified connection,
+  channel, and activation. Each reply stays on its own source message's native
+  thread; a null thread remains a top-level message. Existing saved sessions are
+  preserved when upgrading from thread-bound previews. An external
   person's home workspace is verified independently of the app's installation.
 - The exact activation is checked again before model work and before sending.
   Revoked access or a replacement activation cannot reuse the old grant.
 - Native Slack Stop targets only the matching active request and sender.
-  Approval answers still belong to the prompted sender; ride-along access never
-  grants control of another person's work.
+  Approval answers still belong to the prompted sender and thread; ride-along
+  access never grants control of another person's work.
 - `INKBOX_SLACK_ENABLED=false` blocks new Slack work, recovered pending Slack
   receipts, and automatic Slack replies. Pending receipts remain saved for a
   later re-enable; iMessage, voice, and other channels are unchanged.

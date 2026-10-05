@@ -484,6 +484,10 @@ class ContactSession:
                 or meta.get("companion_activation_id") != route.get("companion_activation_id")
                 or not same_author(mode, meta.get("sender"), route.get("sender"))):
             return False
+        if mode == "slack" and any(
+            meta.get(key) != route.get(key) for key in ("connection_id", "conversation_id", "thread_ts")
+        ):
+            return False
         return True
 
     def companion_answer(self, text: str, meta: Dict[str, Any]) -> bool:

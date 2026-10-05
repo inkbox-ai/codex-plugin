@@ -10,7 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from inkbox_codex.companion import Event
+from inkbox_codex.companion import CompanionError, Event
 from inkbox_codex.config import BridgeConfig
 from inkbox_codex.gateway import InkboxGateway
 from inkbox_codex.sessions import ContactSession, SessionManager
@@ -68,6 +68,8 @@ def gateway(monkeypatch, tmp_path, envelope=None, *, response_mode="safe", reply
     gw = InkboxGateway(cfg)
     gw._identity = NS(id=envelope["data"]["identity_id"])
     sdk = SDK(envelope)
+    # Snapshot scope is channel-wide; the webhook keeps its message's route.
+    sdk.c["reply_context"]["thread_ts"] = None
     slack = Mock()
     slack.send_message.return_value = NS(id="action-test", status="sent")
     gw._inkbox = NS(companion=sdk, slack=slack)
@@ -146,6 +148,109 @@ def test_initialization_uses_native_reply_scope_and_original_sponsor(tmp_path, m
             assert [kind for kind, _ in session._client.events] == ["run", "run"]
             assert receiver.inbox.activation(Event.parse(prepared(initial)))[1] == "THOME:UALICE"
             assert slack.send_message.call_count == 2
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("snapshot_thread", [None, "1767268700.000100"])
+def test_channel_scope_keeps_shared_context_and_each_sources_reply_thread(tmp_path, monkeypatch, snapshot_thread):
+    async def scenario():
+        initial = fixture()
+        gw, sdk, slack = gateway(monkeypatch, tmp_path, initial)
+        sdk.c["reply_context"]["thread_ts"] = snapshot_thread
+        receiver = gw._companion()
+        try:
+            await receiver.accept(initial)
+            await drained(receiver)
+            session = session_for(gw, initial)
+            assert session._client is not None
+            for sequence, thread in ((2, "1767268801.000100"), (3, None)):
+                current = live(initial, sequence=sequence)
+                current["data"]["thread_ts"] = thread
+                current["data"]["event"]["thread_ts"] = thread
+                await receiver.accept(current)
+                await drained(receiver)
+                assert session_for(gw, current) is session
+            assert sdk.loads == 1
+            assert len(session._client.events) == 3
+            assert [call.kwargs["thread_ts"] for call in slack.send_message.call_args_list] == [
+                initial["data"]["thread_ts"], "1767268801.000100", None,
+            ]
+            assert receiver.inbox.db.execute("SELECT COUNT(*) FROM events WHERE state='done'").fetchone()[0] == 3
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
+
+
+def test_legacy_thread_binding_accepts_another_thread_but_not_another_channel(tmp_path, monkeypatch):
+    async def scenario():
+        initial = fixture()
+        gw, _, _ = gateway(monkeypatch, tmp_path, initial)
+        receiver = gw._companion()
+        event = Event.parse(prepared(initial))
+        try:
+            receiver.inbox.accept(event)
+            legacy = json.dumps([event.conversation, initial["data"]["connection_id"],
+                                 initial["data"]["conversation_id"], initial["data"]["thread_ts"]])
+            with receiver.inbox.db:
+                receiver.inbox.db.execute("UPDATE scope_bindings SET conversation=?", (legacy,))
+            await receiver.close()
+            gw, _, _ = gateway(monkeypatch, tmp_path, initial)
+            receiver = gw._companion()
+            other = live(initial)
+            other["data"]["thread_ts"] = "1767268801.000100"
+            assert receiver.inbox.accept(Event.parse(prepared(other)))
+            wrong = live(initial, sequence=3)
+            wrong["data"]["conversation_id"] = "COTHER"
+            with pytest.raises(CompanionError, match="changed its conversation"):
+                receiver.inbox.accept(Event.parse(prepared(wrong)))
+            binding = json.loads(receiver.inbox.db.execute("SELECT conversation FROM scope_bindings").fetchone()[0])
+            assert binding == [event.conversation, initial["data"]["connection_id"], "CEXAMPLE"]
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
+
+
+def test_saved_reply_cannot_move_to_another_thread_in_the_same_channel(tmp_path, monkeypatch):
+    async def scenario():
+        initial = fixture()
+        gw, _, _ = gateway(monkeypatch, tmp_path, initial)
+        receiver = gw._companion()
+        try:
+            meta = receiver.meta(Event.parse(prepared(initial)))
+            meta["thread_ts"] = "1767268801.000100"
+            with pytest.raises(CompanionError, match="thread"):
+                receiver.check_reply_route(meta)
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
+
+
+def test_unmentioned_channel_message_is_context_for_the_next_thread(tmp_path, monkeypatch):
+    async def scenario():
+        initial = fixture()
+        gw, _, slack = gateway(monkeypatch, tmp_path, initial)
+        receiver = gw._companion()
+        try:
+            await receiver.accept(initial)
+            await drained(receiver)
+            quiet = live(initial, actor="UBOB", access="sponsored", mentioned=False)
+            quiet["event_type"] = "slack.channel_message_received"
+            quiet["data"].update(thread_ts=None, message_kinds=["channel"])
+            quiet["data"]["event"].pop("thread_ts", None)
+            await receiver.accept(quiet)
+            await drained(receiver)
+            current = live(initial, sequence=3)
+            current["data"]["thread_ts"] = "1767268801.000100"
+            current["data"]["event"]["thread_ts"] = current["data"]["thread_ts"]
+            await receiver.accept(current)
+            await drained(receiver)
+            events = session_for(gw, initial)._client.events
+            assert [kind for kind, _ in events] == ["run", "context", "run"]
+            assert quiet["data"]["event"]["text"] in events[1][1]
+            assert slack.send_message.call_count == 2
+            assert slack.send_message.call_args.kwargs["thread_ts"] == current["data"]["thread_ts"]
         finally:
             await receiver.close()
     asyncio.run(scenario())
@@ -352,6 +457,30 @@ def test_native_mention_approval_requires_prompted_actor_and_activation(tmp_path
             assert future.done() is accepts
             if accepts:
                 assert future.result() == "yes"
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("command", ["yes", "/stop", "/reset"])
+def test_same_actor_in_another_thread_cannot_control_active_work(tmp_path, monkeypatch, command):
+    from inkbox_codex.escalation import PendingInteraction
+    from inkbox_codex.sessions import _Turn
+
+    async def scenario():
+        initial = fixture()
+        gw, _, _ = gateway(monkeypatch, tmp_path, initial)
+        receiver = gw._companion()
+        try:
+            session = session_for(gw, initial)
+            session._current_turn = _Turn(text="work", reply_mode="slack", reply_meta=receiver.meta(Event.parse(prepared(initial))))
+            future = asyncio.get_running_loop().create_future()
+            session.pending = PendingInteraction(kind="permission", future=future, prompt_text="Allow?")
+            answer = live(initial, text=f"<@UBOT> {command}")
+            answer["data"]["thread_ts"] = "1767268801.000100"
+            meta = receiver.meta(Event.parse(prepared(answer)))
+            assert not await session.companion_interaction(answer["data"]["event"]["text"], meta)
+            assert not future.done()
         finally:
             await receiver.close()
     asyncio.run(scenario())

@@ -113,7 +113,7 @@ jobs:
       - name: Install bridge and Slack-aware SDK candidate
         run: >-
           uv pip install --system -e . pytest httpx
-          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@d1e9fa3d8fcbf2df2e89dbe269fd5a4c425ae4a3#subdirectory=sdk/python"
+          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@ecba7e487bba2a2ac9efb12c4e010a88f8394e78#subdirectory=sdk/python"
       - name: Require Slack initialization support (do not silently skip)
         run: python -c "from inkbox_codex.slack_companion import require_sdk_support; require_sdk_support()"
       - name: Install Codex (freshest main prerelease)

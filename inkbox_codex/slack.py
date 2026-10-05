@@ -19,7 +19,7 @@ SLACK_ATTENTION_EVENTS = tuple(
     event for event in SLACK_INCOMING_EVENTS if event != "slack.channel_message_received"
 )
 SLACK_STOP_EVENT = "slack.session_stopped"
-SLACK_SUBSCRIPTION_EVENTS = (*SLACK_ATTENTION_EVENTS, SLACK_STOP_EVENT)
+SLACK_SUBSCRIPTION_EVENTS = (*SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT)
 SLACK_MAX_TEXT_LENGTH = 12000
 
 
@@ -35,14 +35,23 @@ def reconcile_subscription(client: Any, identity_id: Any, url: str) -> None:
     subscriptions = client.webhooks.subscriptions
     events = list(SLACK_SUBSCRIPTION_EVENTS)
     covered = set()
+    message_subscriptions = []
     for sub in subscriptions.list(agent_identity_id=identity_id, scope="identity", url=url):
         overlap = set(sub.event_types) & set(events)
         if sub.url == url and overlap:
             if sub.status != "active":
                 raise RuntimeError("The Slack subscription is paused; resume it before starting")
             covered.update(overlap)
+            if overlap.intersection(SLACK_INCOMING_EVENTS):
+                message_subscriptions.append(sub)
     missing = [event for event in events if event not in covered]
     if not missing:
+        return
+    if message_subscriptions:
+        # Extend the existing receiver: a second channel-only subscription
+        # would deliver mentions again under another event category.
+        sub = max(message_subscriptions, key=lambda item: len(set(item.event_types).intersection(SLACK_INCOMING_EVENTS)))
+        subscriptions.update(sub.id, event_types=list(dict.fromkeys([*sub.event_types, *missing])), scope="identity")
         return
     # A test receiver must not replace another receiver or another channel.
     subscriptions.create(
