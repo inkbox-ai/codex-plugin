@@ -76,12 +76,13 @@ class SlackActivity:
     async def notify(self, _chat_id: str, mode: str, meta: dict, state: str) -> None:
         if mode != "slack" or self._closing:
             return
-        native = bool(meta.get("thread_ts"))
-        if native:
-            if not self._supported:
-                return
-        elif meta.get("conversation_kind") != "direct" or not self._reactions_supported:
-            return
+        if meta.get("thread_ts") and self._supported:
+            self._notify_indicator(meta, state, native=True)
+        if self._reactions_supported:
+            self._notify_indicator(meta, state, native=False)
+
+    def _notify_indicator(self, meta: dict, state: str, *, native: bool) -> None:
+        # Native status is shared by the thread; reactions belong to each source.
         timestamp_field = "thread_ts" if native else "message_ts"
         fields = [meta.get("connection_id"), meta.get("conversation_id"), meta.get(timestamp_field)]
         event_id = meta.get("source_event_id")
