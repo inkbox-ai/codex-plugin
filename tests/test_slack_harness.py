@@ -179,10 +179,14 @@ def test_signed_http_event_runs_session_and_posts_one_reply(tmp_path, monkeypatc
                     (CONNECTION, conversation, reply_thread, "processing"),
                     (CONNECTION, conversation, reply_thread, "active"),
                 ] if reply_thread else [])
-                assert [call.args for call in client.slack.add_reaction.call_args_list] == [
-                    (CONNECTION, conversation, payload["data"]["message_ts"], "eyes")]
-                assert [call.args for call in client.slack.remove_reaction.call_args_list] == [
-                    (CONNECTION, conversation, payload["data"]["message_ts"], name) for name in ("x", "eyes")]
+                if reply_thread:
+                    client.slack.add_reaction.assert_not_called()
+                    client.slack.remove_reaction.assert_not_called()
+                else:
+                    assert [call.args for call in client.slack.add_reaction.call_args_list] == [
+                        (CONNECTION, conversation, payload["data"]["message_ts"], "eyes")]
+                    assert [call.args for call in client.slack.remove_reaction.call_args_list] == [
+                        (CONNECTION, conversation, payload["data"]["message_ts"], name) for name in ("x", "eyes")]
                 unrelated = json.dumps({"event_type": "text.received", "companion": {"test": True}}).encode()
                 async with http.post(url, data=unrelated) as response:
                     assert (await response.json())["ignored"] == "non-slack"

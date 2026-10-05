@@ -33,7 +33,7 @@ def dm(event="event-1", message="1234567890.000002"):
 
 @pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
 @pytest.mark.parametrize("kind", ["direct", "group"])
-def test_timeline_reactions_follow_exact_message_without_creating_thread(tmp_path, outcome, kind):
+def test_inline_reactions_follow_exact_message_without_creating_thread(tmp_path, outcome, kind):
     async def scenario():
         sdk = resource()
         tracker = SlackActivity(sdk, tmp_path / "activity.json")
@@ -59,7 +59,7 @@ def test_dm_messages_and_thread_on_same_anchor_keep_independent_indicators(tmp_p
         sdk = resource()
         tracker = SlackActivity(sdk, tmp_path / "activity.json")
         first, second = dm(), dm("event-2", "1234567890.000003")
-        thread = {**route("event-3", "1234567890.000004"), "thread_ts": first["message_ts"]}
+        thread = {**route("event-3"), "thread_ts": first["message_ts"]}
         for meta in (first, second, thread):
             await tracker.notify("chat", "slack", meta, "accepted")
         await tracker.notify("chat", "slack", first, "cancelled")
@@ -67,11 +67,11 @@ def test_dm_messages_and_thread_on_same_anchor_keep_independent_indicators(tmp_p
         assert statuses(sdk) == ["processing"]
         removed_eyes = [call.args[2] for call in sdk.remove_reaction.call_args_list if call.args[3] == "eyes"]
         assert removed_eyes == [first["message_ts"]]
-        assert len(json.loads(tracker.state_path.read_text())) == 3
+        assert len(json.loads(tracker.state_path.read_text())) == 2
         await tracker.close()
         assert statuses(sdk) == ["processing", "active"]
         assert json.loads(tracker.state_path.read_text()) == {}
-        assert [call.args[3] for call in sdk.add_reaction.call_args_list] == ["eyes", "eyes", "eyes"]
+        assert [call.args[3] for call in sdk.add_reaction.call_args_list] == ["eyes", "eyes"]
     asyncio.run(scenario())
 
 
@@ -102,22 +102,27 @@ def test_restart_marks_interrupted_dm_failed_and_retries_cleanup_with_same_keys(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("meta", [dm(), route()])
-def test_reactions_work_without_native_status_capability(tmp_path, meta):
+def test_reactions_work_without_native_status_capability(tmp_path):
     async def scenario():
         sdk = NS(add_reaction=Mock(return_value=NS(status="succeeded")),
                  remove_reaction=Mock(return_value=NS(status="succeeded")))
         tracker = SlackActivity(sdk, tmp_path / "activity.json")
-        await tracker.notify("chat", "slack", meta, "accepted")
-        await tracker.notify("chat", "slack", meta, "completed")
+        await tracker.notify("dm", "slack", dm(), "accepted")
+        await tracker.notify("dm", "slack", dm(), "completed")
         await tracker.flush()
         sdk.add_reaction.assert_called_once()
+        sdk.add_reaction.reset_mock()
+        sdk.remove_reaction.reset_mock()
+        await tracker.notify("thread", "slack", route(), "accepted")
+        await tracker.flush()
+        sdk.add_reaction.assert_not_called()
+        sdk.remove_reaction.assert_not_called()
         assert json.loads(tracker.state_path.read_text()) == {}
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
-def test_native_status_and_exact_message_reaction_start_and_clear_together(tmp_path, outcome):
+def test_native_status_starts_and_clears_without_reactions(tmp_path, outcome):
     async def scenario():
         sdk = resource()
         tracker = SlackActivity(sdk, tmp_path / "activity.json")
@@ -131,11 +136,9 @@ def test_native_status_and_exact_message_reaction_start_and_clear_together(tmp_p
                    for call in sdk.set_processing_status.call_args_list)
         assert json.loads(tracker.state_path.read_text()) == {}
         keys = [call.kwargs["idempotency_key"] for call in sdk.mock_calls]
-        assert len(set(keys)) == len(keys) and all(len(key) <= 128 for key in keys)
-        assert [call.args[3] for call in sdk.add_reaction.call_args_list] == (["eyes", "x"] if outcome == "failed" else ["eyes"])
-        assert [call.args[3] for call in sdk.remove_reaction.call_args_list] == ["x", "eyes"]
-        assert all(call.args[:3] == (route()["connection_id"], "C123", route()["message_ts"])
-                   for call in sdk.add_reaction.call_args_list + sdk.remove_reaction.call_args_list)
+        assert len(set(keys)) == 2 and all(len(key) <= 128 for key in keys)
+        sdk.add_reaction.assert_not_called()
+        sdk.remove_reaction.assert_not_called()
     asyncio.run(scenario())
 
 
@@ -150,8 +153,6 @@ def test_overlapping_messages_in_thread_and_duplicates_do_not_clear_busy_status(
         await tracker.notify("chat", "slack", route(), "cancelled")
         await tracker.flush()
         assert statuses(sdk) == ["processing"]
-        assert [call.args[2] for call in sdk.add_reaction.call_args_list] == [route()["message_ts"], second["message_ts"]]
-        assert [call.args[2] for call in sdk.remove_reaction.call_args_list if call.args[3] == "eyes"] == [route()["message_ts"]]
         await tracker.notify("chat", "slack", second, "completed")
         await tracker.flush()
         assert statuses(sdk) == ["processing", "active"]
@@ -162,7 +163,7 @@ def test_waiting_for_input_and_independent_threads(tmp_path):
     async def scenario():
         sdk = resource()
         tracker = SlackActivity(sdk, tmp_path / "activity.json")
-        other = {**route("event-2", "1234567890.000005"), "thread_ts": "1234567890.000004"}
+        other = {**route("event-2"), "thread_ts": "1234567890.000004"}
         await tracker.notify("first", "slack", route(), "accepted")
         await tracker.notify("second", "slack", other, "accepted")
         await tracker.flush()
@@ -172,7 +173,7 @@ def test_waiting_for_input_and_independent_threads(tmp_path):
         await tracker.flush()
         assert statuses(sdk)[-3:] == ["suspended", "processing", "active"]
         records = json.loads(tracker.state_path.read_text())
-        assert [(r["thread_ts"], r["state"]) for r in records.values() if "thread_ts" in r] == [(other["thread_ts"], "processing")]
+        assert [(r["thread_ts"], r["state"]) for r in records.values()] == [(other["thread_ts"], "processing")]
         await tracker.close()
         assert statuses(sdk)[-1] == "active"
         assert json.loads(tracker.state_path.read_text()) == {}
@@ -217,7 +218,7 @@ def test_upgrade_removes_leftover_reactions_without_adding_any(tmp_path):
 
 @pytest.mark.parametrize("failure", ["exception", "unknown", "feature_disabled", "feature_not_enabled",
                                     "app_not_eligible", "private-token"])
-def test_native_failure_does_not_block_independent_reactions(tmp_path, failure, caplog):
+def test_native_failure_does_not_block_turn_or_fall_back_to_reactions(tmp_path, failure, caplog):
     async def scenario():
         sdk = resource()
         if failure == "exception":
@@ -231,8 +232,8 @@ def test_native_failure_does_not_block_independent_reactions(tmp_path, failure, 
         await tracker.flush()
         assert statuses(sdk) == ["processing", "active"]
         assert len(json.loads(tracker.state_path.read_text())) == 1
-        assert [call.args[3] for call in sdk.add_reaction.call_args_list] == ["eyes", "x"]
-        assert [call.args[3] for call in sdk.remove_reaction.call_args_list] == ["x", "eyes"]
+        sdk.add_reaction.assert_not_called()
+        sdk.remove_reaction.assert_not_called()
         assert "private-token" not in caplog.text
         if failure in {"feature_disabled", "feature_not_enabled", "app_not_eligible"}:
             assert f"status=failed, reason={failure}" in caplog.text
@@ -416,32 +417,18 @@ def test_native_status_through_actual_sdk_http_transport(tmp_path, monkeypatch):
     if not hasattr(slack.SlackResource, "set_processing_status"):
         pytest.skip("SDK predates native Slack status")
     requests = []
-    reactions = []
-    base = f"/api/v1/slack/connections/{route()['connection_id']}/conversations/C123"
     def handle(request):
         assert request.headers["X-API-Key"] == "test-key"
         assert request.headers["Idempotency-Key"].startswith("codex:activity:")
-        result = {}
-        if request.url.path == f"{base}/processing-status":
-            assert request.method == "POST"
-            body = json.loads(request.content)
-            assert body["thread_ts"] == route()["thread_ts"]
-            requests.append(body["status"])
-            operation = "processing_status"
-            result = {"processing_status": body["status"], "agent_status": body["status"]}
-        else:
-            reaction_path = f"{base}/messages/{route()['message_ts']}/reactions"
-            if request.method == "POST":
-                assert request.url.path == reaction_path
-                reactions.append(("add", json.loads(request.content)["name"]))
-                operation = "reaction_add"
-            else:
-                assert request.method == "DELETE" and request.url.path.startswith(reaction_path + "/")
-                reactions.append(("remove", request.url.path.rsplit("/", 1)[-1]))
-                operation = "reaction_remove"
+        assert request.url.path == f"/api/v1/slack/connections/{route()['connection_id']}/conversations/C123/processing-status"
+        assert request.method == "POST"
+        body = json.loads(request.content)
+        assert body["thread_ts"] == route()["thread_ts"]
+        requests.append(body["status"])
         return httpx.Response(200, json={
             "id": "00000000-0000-4000-8000-000000000002", "connection_id": route()["connection_id"],
-            "operation": operation, "status": "succeeded", "conversation_id": "C123", **result,
+            "operation": "processing_status", "status": "succeeded", "conversation_id": "C123",
+            "processing_status": body["status"], "agent_status": body["status"],
         })
     monkeypatch.setattr(httpx, "HTTPTransport", lambda **kwargs: httpx.MockTransport(handle))
     async def scenario():
@@ -451,8 +438,6 @@ def test_native_status_through_actual_sdk_http_transport(tmp_path, monkeypatch):
                 await tracker.notify("chat", "slack", route(), state)
             await tracker.flush()
             assert requests == ["processing", "suspended", "processing", "active"]
-            assert reactions == [("add", "eyes"), ("remove", "x"), ("remove", "eyes")]
-            assert json.loads(tracker.state_path.read_text()) == {}
     asyncio.run(scenario())
 
 

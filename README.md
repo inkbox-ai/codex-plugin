@@ -239,18 +239,18 @@ and declining full reconfiguration still offers Slack onboarding. Declining Slac
 turns it off only in this bridge; it does not disconnect the workspace or disable
 Slack for other clients. On startup, the gateway registers the subscriptions below.
 
-**Work indicators.** Accepted Slack requests receive an 👀 reaction on the exact
-source message, including channel messages and thread replies. Threaded requests
-also use the native agent loading indicator. It stays while work is queued
+**Work indicators.** Replies inline in the main channel or DM use an 👀 reaction
+on the exact source message. Replies inside a thread use only the native agent
+loading indicator, without reaction bubbles. It stays while work is queued
 or running, switches to awaiting-input during questions or approvals, and returns
 to ready after completion, failure, or cancellation. Overlapping requests in the
-same thread share one native indicator, with independent per-message reactions.
+same thread share one native indicator.
 Mention-mode context does not start either indicator.
 Slack's native Stop button cancels work in the matching engaged thread, subject to
 the same allowed-sender policy. Ordinary main-DM messages receive replies in the
 main DM and share conversation context, without a native status indicator.
-The 👀 reaction stays while queued, running, or waiting for input on every
-accepted source. It is removed after success or cancellation; a failed turn or reply delivery
+For inline replies, 👀 stays while queued, running, or waiting for input.
+It is removed after success or cancellation; a failed turn or reply delivery
 replaces it with ❌. These reactions do not start a thread.
 An explicit native @mention starts a thread beneath that message; messages already
 inside a thread stay there. Threaded replies and their indicators use the same
@@ -259,9 +259,9 @@ keeps its own saved context.
 Native status needs an app declared as a Slack Agent (including `assistant:write`),
 `chat:write`, SDK processing-status support, and workspace feature availability.
 Existing installations may need an app-configuration update and reauthorization.
-Unsupported or uncertain updates are logged without blocking replies or the
-independent message reactions. Restart cleanup clears unfinished
-native status, marks interrupted messages with ❌, and removes pending indicators
+Unsupported or uncertain native updates are logged without blocking replies or
+falling back to thread reactions. Restart cleanup clears unfinished
+native status, marks interrupted inline work with ❌, and removes pending indicators
 from the previous reaction version. Reaction failures do not block replies.
 
 No separate Slack bot token is needed at runtime. Slack subscriptions use
