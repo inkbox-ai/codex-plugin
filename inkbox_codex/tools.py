@@ -895,6 +895,13 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
 
     args = dict(args or {})
     hosted_sms_context: Optional[Dict[str, Any]] = None
+    upload_context = None
+    if name == "inkbox_slack_upload_file":
+        from .slack_turns import capture
+        try:
+            upload_context = capture(identity_handle, read_config(), args)
+        except ValueError as exc:
+            return _tool_error(str(exc))
 
     if name == "inkbox_send_sms":
         text = str(args.get("text") or "")
@@ -931,7 +938,7 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
 
             if not read_config().slack_enabled:
                 raise ValueError("Enable INKBOX_SLACK_ENABLED to use Slack tools")
-            return run_tool(client, identity_handle, name, args)
+            return run_tool(client, identity_handle, name, args, upload_context=upload_context)
         if name == "inkbox_whoami":
             identity = _identity()
             phone = identity.phone_number

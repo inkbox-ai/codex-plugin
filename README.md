@@ -79,7 +79,7 @@ you (phone)  ── SMS / iMessage / email / call ──▶  Inkbox  ──▶  
 
 - When Codex needs you to pick between options (the `AskUserQuestion` tool), you get a numbered poll on whatever channel you're on, and your reply is fed back as the answer.
 - Each message you send is tagged with its channel, so Codex knows whether it's on SMS, iMessage, email, or a call.
-- A channel prompt is appended to Codex's system prompt so replies fit a phone: plain text, no markdown, short, jargon kept to a minimum ("saved and published the change", not "pushed to origin/main").
+- A channel prompt is appended to Codex's system prompt so replies fit a phone: plain text on phone channels, readable mrkdwn on Slack, short replies, jargon kept to a minimum ("saved and published the change", not "pushed to origin/main").
 - Codex also gets Inkbox tools (`inkbox_send_email`, `inkbox_send_sms`, `inkbox_send_imessage`, …) so it can proactively reach you — "email me the full report" works.
 
 ## Manual install
@@ -207,7 +207,7 @@ before replying `DONE`.
 
 ## Slack preview
 
-Set `INKBOX_SLACK_ENABLED=true` to add Slack to the gateway. Inkbox SDK 0.7.11
+Set `INKBOX_SLACK_ENABLED=true` to add Slack to the gateway. Inkbox SDK 0.7.15
 includes the required Slack methods; the API must also support Slack. Connect a
 workspace to the same Inkbox identity to exchange messages; the receiver can
 start before installation.
@@ -326,8 +326,7 @@ verified Companion envelope. Explicit null/unknown access is ignored; older
 ordinary Slack webhooks without this field retain their existing behavior.
 
 Slack Companion requires an API environment supporting Slack initialization and
-**Python SDK 0.7.14 or newer** with that support. Ordinary Slack
-continues to support SDK 0.7.11; other channels keep their existing requirements.
+**Python SDK 0.7.15 or newer**, the same released SDK floor as the other channels.
 No new setup wizard or permission setting is needed:
 
 ```text
@@ -395,7 +394,11 @@ unrelated channels and bot messages should remain quiet. The preflight does not
 send messages. Live delivery can only be verified after connecting the workspace
 and starting the harness.
 
-Offline regression harness: `python -m pytest -q tests/test_slack.py tests/test_slack_harness.py`.
+Local attachments use `inkbox_slack_upload_file`: provide a regular local file (1 byte–10 MiB), the original Slack destination and `source_event_id` from the request metadata, and a stable idempotency key. The tool reads relative paths from the original project directory and reports the upload operation. A local path in a reply is not an uploaded file. Unknown outcomes are retained without blind resends; inspect a returned operation with `inkbox_slack_get_operation`. A lost response retains a source-scoped idempotency key for read-only inspection when the SDK supports `get_operation_by_key`; SDK 0.7.15 cannot inspect a missing operation ID, and retains that unresolved receipt without resending.
+
+Tool activity uses one coalesced, edited progress message in the original conversation, separate from the final answer. Where an SDK with the complete task-stream interface and the connected Slack app support native task cards, progress uses that interface. SDK 0.7.15 keeps the edited-message fallback. Inline conversations remain inline; missing recipient-team metadata also uses the fallback. Stop waits for an outstanding turn-start acknowledgement and does not release later work until the host's terminal event.
+
+Offline regression harness: `python -m pytest -q tests/test_slack.py tests/test_slack_harness.py tests/test_slack_attachments.py tests/test_slack_progress.py tests/test_slack_streams.py`.
 
 ## Sessions
 
@@ -485,11 +488,10 @@ and are unaffected by the Companion response setting.
   `@agent allow` or `@agent /stop`; on Slack, mention the native bot instead.
   Escalation prompts remind you of this.
 
-**SDK requirement:** The bridge requires Inkbox SDK **0.7.11 or newer** (below 1.0.0), including
+**SDK requirement:** The bridge requires Inkbox SDK **0.7.15 or newer** (below 1.0.0), including
 `client.companion.load_initialization` and `activation_messages`. Installation
-resolves the published SDK; CI tests the released `inkbox==0.7.11` minimum across
-unit, real-host, and live-channel lanes. Slack Companion is the optional
-exception: see its SDK 0.7.14 requirement above.
+resolves the published SDK; CI tests the released `inkbox==0.7.15` minimum across
+unit, real-host, and live-channel lanes, including Slack Companion.
 An unsupported SDK produces an explicit webhook error; the bridge never falls
 back to submitting only the trigger.
 
@@ -845,7 +847,7 @@ Inbound A2A tasks acknowledge pickup immediately. While a task remains active,
 the worker sends a short progress update about every three minutes by default;
 these updates are visible in task history without starting a requester turn.
 
-The bridge requires Inkbox SDK 0.7.11 or newer (below 1.0.0).
+The bridge requires Inkbox SDK 0.7.15 or newer (below 1.0.0).
 
 On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 

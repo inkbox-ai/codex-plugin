@@ -13,7 +13,10 @@ logger = logging.getLogger(__name__)
 
 
 class SlackActivity:
-    def __init__(self, resource, state_path: Path):
+    def __init__(self, resource, state_path: Path, *, validate_route=None):
+        from .slack_progress import SlackProgress
+        self._progress = SlackProgress(resource, state_path.with_name(state_path.stem + "-progress.json"),
+                                       validate_route=validate_route)
         self.resource = resource
         self.state_path = state_path
         self._active: dict[str, dict[str, str]] = {}
@@ -35,6 +38,7 @@ class SlackActivity:
             logger.warning("Slack activity state could not be saved")
 
     async def recover(self) -> None:
+        await self._progress.recover()
         if not self._supported:
             logger.warning("Slack native status needs an SDK with processing-status support")
         try:
@@ -76,6 +80,7 @@ class SlackActivity:
     async def notify(self, _chat_id: str, mode: str, meta: dict, state: str) -> None:
         if mode != "slack" or self._closing:
             return
+        await self._progress.notify(_chat_id, meta, "interrupted" if state == "uncertain" else state)
         native = bool(meta.get("thread_ts"))
         if native:
             if not self._supported:
@@ -191,13 +196,18 @@ class SlackActivity:
             self._records.pop(key, None)
             self._persist()
 
+    async def progress(self, chat_id, meta, text):
+        return await self._progress.progress(chat_id, meta, text)
+
     async def flush(self) -> None:
+        await self._progress.flush()
         while self._tails:
             await asyncio.gather(*list(self._tails.values()), return_exceptions=True)
             # An already-complete gather need not yield to the tail-cleanup callbacks.
             await asyncio.sleep(0)
 
     async def close(self) -> None:
+        await self._progress.close()
         self._closing = True
         for key in self._active:
             record = self._records.get(key)

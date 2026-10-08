@@ -423,7 +423,7 @@ class Receiver:
                 route.get("connection_id"), route.get("conversation_id"), route.get("thread_ts"),
             ):
                 continue
-            if not (session._turn_active or session.pending is not None):
+            if not (session._current_turn is not None or session._turn_active or session.pending is not None):
                 continue
             matched = True
             if (meta.get("actor_id") == route.get("actor_id")

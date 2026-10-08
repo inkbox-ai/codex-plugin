@@ -1017,7 +1017,7 @@ class InkboxGateway:
         if not AIOHTTP_AVAILABLE:
             raise RuntimeError("aiohttp is not installed; run: pip install aiohttp")
         if not INKBOX_AVAILABLE:
-            raise RuntimeError("inkbox SDK is not installed; run: uv pip install 'inkbox>=0.7.11,<1.0.0'")
+            raise RuntimeError("inkbox SDK is not installed; run: uv pip install 'inkbox>=0.7.15,<1.0.0'")
         if not self.cfg.api_key or not self.cfg.identity:
             raise RuntimeError("INKBOX_API_KEY and INKBOX_IDENTITY must be set (see README)")
         if self.cfg.voice_stack_invalid_value:
@@ -1074,10 +1074,11 @@ class InkboxGateway:
         if self.cfg.slack_enabled:
             from .daemon import state_dir
             from .slack_activity import SlackActivity
+            from .slack import validate_connection
             self._slack_activity = SlackActivity(
                 self._inkbox.slack, state_dir() / f"slack-activity-{self._identity.id}.json",
+                validate_route=lambda meta: validate_connection(self._inkbox.slack, str(self._identity.id), meta),
             )
-            await self._slack_activity.recover()
         self.sessions = SessionManager(
             cfg=self.cfg,
             send_fn=self.send_to_contact,
@@ -1087,10 +1088,15 @@ class InkboxGateway:
             health_fn=self.health_report,
             on_send_failure=self._note_sync_send_failure,
             turn_activity_fn=self._slack_activity.notify if self._slack_activity else None,
+            turn_progress_fn=self._slack_activity.progress if self._slack_activity else None,
             imessage_turn_fn=self._imessage_turn_state if self.cfg.imessage_threaded_replies else None,
         )
         receiver = self._companion()  # Acquire the existing single-gateway inbox lock first.
+        if self._slack_activity is not None:
+            await self._slack_activity.recover()
         clear_identity_turn_contexts(self.cfg)
+        from .slack_turns import retire
+        retire(self.cfg)
         if self.cfg.imessage_threaded_replies:
             await self._recover_imessage_inputs()
         receiver.recover()
