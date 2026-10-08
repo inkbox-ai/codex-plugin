@@ -11,6 +11,48 @@ from inkbox_codex.codex_client import CodexAppServerClient, CodexAppServerError
 from inkbox_codex.config import BridgeConfig
 
 
+@pytest.mark.parametrize('ended_before_ack', [False, True])
+def test_stop_during_start_only_interrupts_that_turn(ended_before_ack):
+    async def scenario():
+        client = CodexAppServerClient(BridgeConfig(), developer_instructions='test')
+        client.thread_id = 'thread-1'
+        requests = []
+        client._proc = SimpleNamespace(stdin=SimpleNamespace(
+            write=lambda data: requests.append(json.loads(data))))
+        first = asyncio.create_task(client.run('first'))
+        await asyncio.sleep(0)
+        stop = asyncio.create_task(client.interrupt())
+        await asyncio.sleep(0)
+        assert not stop.done(), 'Stop must retain the outstanding start receipt'
+        if ended_before_ack:
+            client._handle_notification({'method': 'turn/completed', 'params': {
+                'turn': {'id': 'turn-1', 'status': 'completed'}}})
+        client._handle_response({'id': requests[0]['id'], 'result': {'turn': {'id': 'turn-1'}}})
+        for _ in range(10):
+            await asyncio.sleep(0)
+        interrupts = [request for request in requests if request['method'] == 'turn/interrupt']
+        assert len(interrupts) == (0 if ended_before_ack else 1)
+        if interrupts:
+            assert interrupts[0]['params'] == {'threadId': 'thread-1', 'turnId': 'turn-1'}
+            client._handle_response({'id': interrupts[0]['id'], 'result': {}})
+        await asyncio.wait_for(stop, 1)
+        if not ended_before_ack:
+            assert not first.done(), 'An interrupt acknowledgement is not a terminal event'
+            client._handle_notification({'method': 'turn/completed', 'params': {
+                'turn': {'id': 'turn-1', 'status': 'interrupted'}}})
+        await asyncio.wait_for(first, 1)
+        second = asyncio.create_task(client.run('second'))
+        await asyncio.sleep(0)
+        client._handle_response({'id': requests[-1]['id'], 'result': {'turn': {'id': 'turn-2'}}})
+        client._handle_notification({'method': 'item/completed', 'params': {'turnId': 'turn-2',
+            'item': {'type': 'agentMessage', 'text': 'Fresh answer'}}})
+        client._handle_notification({'method': 'turn/completed', 'params': {
+            'turn': {'id': 'turn-2', 'status': 'completed'}}})
+        assert await asyncio.wait_for(second, 1) == 'Fresh answer'
+        assert all(request['params']['turnId'] == 'turn-1' for request in interrupts)
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('failure', ['eof', 'reader-error', 'disconnect', 'resolved', 'turn-ended'])
 def test_closed_transport_cancels_its_pending_approval(failure, tmp_path, monkeypatch):
     from tests.test_sessions import make_session

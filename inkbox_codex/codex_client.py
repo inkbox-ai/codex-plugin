@@ -289,13 +289,25 @@ class CodexAppServerClient:
         })
 
     async def interrupt(self) -> None:
-        """Interrupt the active turn, if app-server has accepted one."""
-        if not self.thread_id or not self._current_turn_id:
+        """Interrupt only work present when Stop arrived, including a pending start."""
+        thread_id = self.thread_id
+        current = self._turns.get(self._current_turn_id or "")
+        starting = list(self._starting_turns.items())
+        if not thread_id:
             return
-        await self._request(
-            "turn/interrupt",
-            {"threadId": self.thread_id, "turnId": self._current_turn_id},
-        )
+        # Preserve the start request on cancellation; the session timeout owns
+        # process teardown if the host never acknowledges it.
+        pending = [self._pending[key] for key, _ in starting if key in self._pending]
+        if pending:
+            await asyncio.gather(*(asyncio.shield(future) for future in pending),
+                                 return_exceptions=True)
+        captures = ([current] if current is not None else []) + [capture for _, capture in starting]
+        for capture in captures:
+            if (capture.turn_id and not capture.future.done()
+                    and self._turns.get(capture.turn_id) is capture):
+                await self._request("turn/interrupt", {
+                    "threadId": thread_id, "turnId": capture.turn_id,
+                })
 
     async def disconnect(self) -> None:
         """Terminate the app-server process."""

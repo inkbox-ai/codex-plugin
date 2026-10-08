@@ -33,7 +33,7 @@ jobs:
 
       # Live helper regressions exercise the SDK's real pagination offline.
       - name: Install test deps
-        run: uv pip install --system pytest httpx aiohttp segno "inkbox==0.7.11" "audioop-lts>=0.2.1; python_version >= '3.13'"
+        run: uv pip install --system pytest httpx aiohttp segno "inkbox==0.7.15" "audioop-lts>=0.2.1; python_version >= '3.13'"
 
       - name: Run unit tests
         run: pytest -q
@@ -50,7 +50,7 @@ jobs:
       - uses: astral-sh/setup-uv@v8.1.0
       - name: Install bridge and released SDK
         run: >-
-          uv pip install --system -e . pytest httpx "inkbox==0.7.11"
+          uv pip install --system -e . pytest httpx "inkbox==0.7.15"
       - name: Require provisioning-workspace and identity-subscription support
         run: |
           python - <<'PY'
@@ -60,12 +60,15 @@ jobs:
           assert callable(SlackResource.list_provisioning_workspaces)
           assert callable(SlackResource.set_processing_status)
           assert callable(SlackResource.remove_reaction)
+          assert callable(SlackResource.upload_file)
+          assert callable(SlackResource.get_operation)
           assert "scope" in inspect.signature(WebhookSubscriptionsResource.list).parameters
           PY
       - name: Slack onboarding, routing, signed receiver, and SDK contracts
         run: >-
           pytest -q tests/test_setup_slack.py tests/test_setup_wizard.py
           tests/test_prompts.py tests/test_slack.py tests/test_slack_activity.py tests/test_slack_harness.py
+          tests/test_slack_attachments.py tests/test_slack_progress.py tests/test_slack_streams.py
           tests/test_tools.py::test_coding_agent_tool_tier_is_registered
 
   # Optional native replies use the real SDK contract without raising the
@@ -151,7 +154,7 @@ jobs:
       - name: Install bridge + test deps
         run: |
           uv pip install --system \
-            "inkbox==0.7.11" \
+            "inkbox==0.7.15" \
             -e . pytest
 
       # @alpha is the prerelease channel cut from codex main near-daily — the
@@ -179,7 +182,7 @@ jobs:
       - name: Install released SDK and test dependencies
         run: >-
           uv pip install --system -e . pytest httpx
-          "inkbox==0.7.11"
+          "inkbox==0.7.15"
       - name: Verify helper is present (do not silently skip its tests)
         run: python -c "from inkbox.companion import CompanionResource; assert callable(CompanionResource.load_initialization)"
       - name: Install Codex (freshest main prerelease)

@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+import os
+import stat
+from pathlib import Path
 import json
+import logging
 import re
 from typing import Any
 
+logger = logging.getLogger(__name__)
 
 SLACK_INCOMING_EVENTS = (
     "slack.dm_received",
@@ -21,6 +27,42 @@ SLACK_ATTENTION_EVENTS = tuple(
 SLACK_STOP_EVENT = "slack.session_stopped"
 SLACK_SUBSCRIPTION_EVENTS = (*SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT)
 SLACK_MAX_TEXT_LENGTH = 12000
+SLACK_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
+
+def file_payload(file_path, *, local_root=None, filename=None, title=None, initial_comment=None):
+    """Read a bounded regular local file; URLs and special files are not uploads."""
+    path = Path(file_path).expanduser()
+    if not path.is_absolute():
+        path = Path(local_root or Path.cwd()) / path
+    filename = path.name if filename is None else filename
+    if (not isinstance(filename, str) or not 1 <= len(filename) <= 255 or filename in {".", ".."}
+            or any(ord(c) < 32 or ord(c) == 127 or c in "/\\" for c in filename)):
+        raise ValueError("Provide a plain filename without paths or control characters")
+    for key, value, maximum in (("title", title, 255), ("initial_comment", initial_comment, SLACK_MAX_TEXT_LENGTH)):
+        if value is not None and (not isinstance(value, str) or len(value) > maximum or "\x00" in value):
+            raise ValueError(f"Invalid Slack {key}")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or not 1 <= info.st_size <= SLACK_MAX_UPLOAD_BYTES:
+            raise ValueError("Slack file must be a regular file containing 1 byte–10 MiB")
+        content = stream.read(SLACK_MAX_UPLOAD_BYTES + 1)
+    if not 1 <= len(content) <= SLACK_MAX_UPLOAD_BYTES:
+        raise ValueError("Slack file must contain 1 byte–10 MiB")
+    return {"filename": filename, "content_base64": base64.b64encode(content).decode("ascii"),
+            **({"title": title} if title is not None else {}),
+            **({"initial_comment": initial_comment} if initial_comment is not None else {})}
+
+
+def operation_summary(operation):
+    """Expose inspection coordinates and outcomes without file bytes or local paths."""
+    return {key: str(value) if key in {"id", "connection_id"} else value
+            for key in ("id", "connection_id", "operation", "status", "conversation_id", "thread_ts",
+                        "message_ts", "file_id", "error_code", "retry_after")
+            if (value := getattr(operation, key, None)) is not None}
+
+
 
 
 def slack_resource(client: Any) -> Any:
@@ -107,6 +149,7 @@ def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] |
         return None
     meta = {
         **{key: data[key] for key in fields},
+        "identity_id": identity_id,
         "thread_ts": root,
         "sender": f"{data['workspace_id']}:{data['actor_id']}",
         "conversation_kind": "direct" if direct else "group",
@@ -123,6 +166,8 @@ def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] |
         sender_context["contact_id"] = data["contact_id"]
     actor = data.get("actor_profile")
     if isinstance(actor, dict) and actor.get("id") == data["actor_id"]:
+        if isinstance(actor.get("team_id"), str) and actor["team_id"]:
+            meta["recipient_team_id"] = actor["team_id"]
         profile = actor.get("profile")
         profile = profile if isinstance(profile, dict) else {}
         sender_context.update({
@@ -154,6 +199,22 @@ def inbound_stop(envelope: dict, identity_id: str) -> tuple[str, str, dict] | No
     if incoming is not None:
         incoming[2]["slack_native_stop"] = True
     return incoming
+
+
+def validate_connection(resource: Any, identity_id: str, meta: dict) -> str | None:
+    """Fail closed on stale, ambiguous, disconnected or cross-identity routes."""
+    def field(item, key):
+        return item.get(key) if isinstance(item, dict) else getattr(item, key, None)
+    connections = field(resource.list_connections(identity_id), "connections")
+    if not isinstance(connections, list):
+        raise PermissionError("Slack connection ownership could not be verified")
+    matches = [item for item in connections if str(field(item, "id")) == meta.get("connection_id")]
+    if (len(matches) != 1 or str(field(matches[0], "identity_id")) != identity_id
+            or not meta.get("workspace_id") or field(matches[0], "workspace_id") != meta["workspace_id"]
+            or field(matches[0], "status") != "connected"):
+        raise PermissionError("Slack connection is not uniquely active for this identity and workspace")
+    bot = field(matches[0], "bot_user_id")
+    return bot if isinstance(bot, str) and bot else None
 
 
 def send_reply(client: Any, meta: dict, text: str) -> Any:
@@ -203,12 +264,19 @@ SLACK_TOOLS = [
            "thread_ts": _STRING, "idempotency_key": {
                "type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"}},
           ["connection_id", "conversation_id", "text", "idempotency_key"]),
+    _tool("upload_file", "Upload a local file to the original active Slack request. Copy source_event_id and destination from the inbound metadata. Reuse the same idempotency_key for identical content. Unknown outcomes must not be resent with a new key.",
+          {**_CONVERSATION, "thread_ts": _STRING, "source_event_id": _STRING, "file_path": _STRING,
+           "filename": _STRING, "title": _STRING, "initial_comment": _STRING,
+           "idempotency_key": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"}},
+          ["connection_id", "conversation_id", "source_event_id", "file_path", "idempotency_key"]),
+    _tool("get_operation", "Inspect a Slack attachment operation. Supply exactly one operation_id or returned idempotency_key; by-key inspection requires an SDK exposing get_operation_by_key. Unknown is not proof of failure.",
+          {**_CONNECTION, "operation_id": _STRING, "idempotency_key": _STRING}, ["connection_id"]),
     _tool("get_action", "Inspect a Slack send outcome by action ID; unknown is not proof of failure.",
           {**_CONNECTION, "action_id": _STRING}, ["connection_id", "action_id"]),
 ]
 
 
-def run_tool(client: Any, identity_handle: str, name: str, args: dict) -> Any:
+def run_tool(client: Any, identity_handle: str, name: str, args: dict, *, upload_context=None) -> Any:
     spec = next((tool for tool in SLACK_TOOLS if tool["name"] == name), None)
     if spec is None:
         raise ValueError(f"Unknown Slack tool: {name}")
@@ -233,6 +301,32 @@ def run_tool(client: Any, identity_handle: str, name: str, args: dict) -> Any:
         owned = resource.list_connections(identity.id).connections
         if not any(str(item.id) == connection for item in owned):
             raise ValueError("Slack connection does not belong to this identity")
+    if name == "inkbox_slack_upload_file":
+        if upload_context is None:
+            raise ValueError("A source-bound active Slack request is required for uploads")
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", args["idempotency_key"]):
+            raise ValueError("Invalid Slack idempotency_key")
+        payload = file_payload(args["file_path"], local_root=upload_context["project_dir"],
+            **{key: args[key] for key in ("filename", "title", "initial_comment") if key in args})
+        from .slack_turns import upload
+        return upload(client, upload_context, args, payload)
+    if name == "inkbox_slack_get_operation":
+        operation_id, key = args.get("operation_id"), args.get("idempotency_key")
+        if bool(operation_id) == bool(key):
+            raise ValueError("Supply exactly one operation_id or idempotency_key")
+        if key:
+            if not callable(getattr(type(resource), "get_operation_by_key", None)):
+                raise ValueError("This SDK cannot inspect an operation without its ID; upgrade to an SDK with get_operation_by_key. Keep the receipt and do not resend the upload.")
+            result = operation_summary(resource.get_operation_by_key(connection, idempotency_key=key))
+        else:
+            result = operation_summary(resource.get_operation(connection, operation_id))
+        from .config import read_config
+        from .slack_turns import reconcile
+        try:
+            reconcile(identity_handle, read_config(), connection, result, operation_id=operation_id, idempotency_key=key)
+        except OSError:
+            logger.warning("Slack attachment inspection succeeded but its local receipt was not saved")
+        return result
     if name == "inkbox_slack_search":
         return resource.search_messages(identity_id=identity.id, **args)
     if name == "inkbox_slack_send_message":

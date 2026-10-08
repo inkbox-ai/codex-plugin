@@ -384,6 +384,7 @@ class ContactSession:
         health_fn: Optional[HealthFn] = None,
         on_send_failure: Optional[SendFailureFn] = None,
         turn_activity_fn: Optional[TurnActivityFn] = None,
+        turn_progress_fn=None,
         imessage_turn_fn: Optional[IMessageTurnFn] = None,
     ):
         self.chat_id = chat_id
@@ -393,6 +394,7 @@ class ContactSession:
         self.health_fn = health_fn
         self.on_send_failure = on_send_failure
         self.turn_activity_fn = turn_activity_fn
+        self.turn_progress_fn = turn_progress_fn
         self.imessage_turn_fn = imessage_turn_fn
         self.mcp_server_config = dict(mcp_server_config or {})
         # Stamp this session's id into the tool process env so Inkbox tools
@@ -424,6 +426,7 @@ class ContactSession:
         self._resume_task: Optional[asyncio.Task] = None  # /resume pick in flight
         self._turn_active = False     # a Codex turn is mid-flight
         self._interrupting = False    # a new message asked us to abort it
+        self._slack_context = None
         self._current_turn: Optional[_Turn] = None  # the turn the worker is running
         self._imessage_burst: Optional[_Turn] = None
         self._imessage_burst_parts: list[str] = []
@@ -510,11 +513,11 @@ class ContactSession:
         if command in {"reset", "resume"}:
             # Unblock the receiver, then let its normal durable control path
             # reconcile the saved thread before handling the next receipt.
-            if self._turn_active or self.pending is not None or self._approval_waiters:
+            if self._current_turn is not None or self._turn_active or self.pending is not None or self._approval_waiters:
                 await self._cancel_pending_turn()
             return False
         if command:
-            if not (self._turn_active or self.pending is not None or self._approval_waiters):
+            if not (self._current_turn is not None or self._turn_active or self.pending is not None or self._approval_waiters):
                 return False
             mode, route = self._reply_route(self._current_turn)
             # Authorization uses the incoming message, but acknowledgments must
@@ -558,10 +561,22 @@ class ContactSession:
         if pending is not None and not pending.future.done():
             pending.future.set_result(None)
 
+    def _retire_slack_context(self):
+        if self._slack_context is not None:
+            from .slack_turns import end
+            try:
+                end(self._slack_context)
+            except OSError:
+                # Host cancellation must still run when receipt storage fails.
+                # A later turn must persist a new source before it can execute.
+                logger.warning("Slack tool context cleanup was not saved")
+
     async def _cancel_pending_turn(self) -> None:
         self._cancel_interactions()
-        if self._turn_active and self._client is not None:
+        self._retire_slack_context()
+        if self._current_turn is not None or self._turn_active:
             self._interrupting = True
+        if self._turn_active and self._client is not None:
             await self._interrupt_client()
 
     async def submit_companion(self, text: str, mode: str, meta: Dict[str, Any], *, before_submit) -> Optional[str]:
@@ -1019,7 +1034,7 @@ class ContactSession:
             None
         """
         had_work = (
-            self._turn_active or self.pending is not None or not self._queue.empty()
+            self._current_turn is not None or self._turn_active or self.pending is not None or not self._queue.empty()
             or self._imessage_burst is not None
         )
         await self._abort_in_flight()
@@ -1211,35 +1226,50 @@ class ContactSession:
                     tmp.unlink(missing_ok=True)
                     raise
             client = await self._ensure_client()
-            await self._flush_context()
-            if turn.before_submit is not None:
+            if not self._interrupting:
+                await self._flush_context()
+            if turn.before_submit is not None and not self._interrupting:
                 await turn.before_submit()
+            if self._interrupting:
+                if turn.future is not None and not turn.future.done():
+                    turn.future.set_result(CodexTurnResult(text="", mcp_tool_calls=(), aborted=True)
+                                           if turn.capture_tools else "")
+                return
+            if turn.reply_mode == "slack" and self.cfg.slack_enabled:
+                from .slack_turns import begin
+                self._slack_context = begin(self.chat_id, self.cfg, turn.reply_meta or {})
             if self._threaded_turn(turn):
                 turn.reply_meta["imessage_model_started"] = True
                 await self._imessage_state("started", turn.reply_meta, turn.text)
+            if turn.reply_mode == "slack" and self.turn_progress_fn is not None:
+                from .slack_streams import tool_progress
+                original_activity = turn.activity_handler
+                original_meta = deepcopy(turn.reply_meta or {})
+                def activity(item_type, tool_name):
+                    if original_activity is not None:
+                        original_activity(item_type, tool_name)
+                    if item_type not in {"mcpToolCall", "commandExecution", "fileChange", "webSearch", "collabAgentToolCall"}:
+                        return
+                    async def report():
+                        try:
+                            await self.turn_progress_fn(self.chat_id, original_meta, tool_progress(tool_name, item_type))
+                        except Exception:
+                            logger.warning("Slack tool progress could not be updated")
+                    asyncio.create_task(report())
+                turn.activity_handler = activity
             # Keep a typing indicator alive on the human's channel for the whole
             # turn, then always tear it down — even if the turn raises.
             self._turn_active = True
             typing_task = asyncio.create_task(self._typing_loop())
             timeout = max(0.0, float(self.cfg.codex_turn_timeout_s or 0.0))
-            if turn.capture_tools:
-                operation = (
-                    client.run_detailed(
-                        turn.text,
-                        activity_handler=turn.activity_handler,
-                    )
-                    if turn.activity_handler is not None
-                    else client.run_detailed(turn.text)
-                )
-            else:
-                operation = (
-                    client.run(
-                        turn.text,
-                        activity_handler=turn.activity_handler,
-                    )
-                    if turn.activity_handler is not None
-                    else client.run(turn.text)
-                )
+            async def submit():
+                # wait_for may schedule this coroutine after a Stop was handled.
+                if self._interrupting:
+                    return CodexTurnResult(text="", mcp_tool_calls=(), aborted=True) if turn.capture_tools else ""
+                run = client.run_detailed if turn.capture_tools else client.run
+                options = {"activity_handler": turn.activity_handler} if turn.activity_handler is not None else {}
+                return await run(turn.text, **options)
+            operation = submit()
             if timeout:
                 try:
                     turn_result = await asyncio.wait_for(operation, timeout=timeout)
@@ -1280,6 +1310,8 @@ class ContactSession:
                 return
             raise
         finally:
+            self._retire_slack_context()
+            self._slack_context = None
             self._cancel_interactions()
             if a2a_context_path is not None:
                 try:
@@ -1703,6 +1735,7 @@ class ContactSession:
         await self.send_fn(self.chat_id, text, *self._reply_route(turn))
 
     async def close(self, *, shutting_down: bool = False) -> None:
+        self._retire_slack_context()
         if shutting_down:
             self._shutting_down = True
             # Unsubmitted receipts remain admitted for recovery after restart.
@@ -1738,6 +1771,7 @@ class SessionManager:
         health_fn: Optional[HealthFn] = None,
         on_send_failure: Optional[SendFailureFn] = None,
         turn_activity_fn: Optional[TurnActivityFn] = None,
+        turn_progress_fn=None,
         imessage_turn_fn: Optional[IMessageTurnFn] = None,
     ):
         self.cfg = cfg
@@ -1746,6 +1780,7 @@ class SessionManager:
         self.health_fn = health_fn
         self.on_send_failure = on_send_failure
         self.turn_activity_fn = turn_activity_fn
+        self.turn_progress_fn = turn_progress_fn
         self.imessage_turn_fn = imessage_turn_fn
         self.mcp_server_config = dict(mcp_server_config or {})
         self.identity_info = identity_info
@@ -1804,6 +1839,7 @@ class SessionManager:
                 health_fn=self.health_fn,
                 on_send_failure=self.on_send_failure,
                 turn_activity_fn=self.turn_activity_fn,
+                turn_progress_fn=self.turn_progress_fn,
                 imessage_turn_fn=self.imessage_turn_fn,
             )
             self.sessions[chat_id] = session
