@@ -430,3 +430,19 @@ def test_budget_expires_after_ttl():
     prompts = gw.sessions.by_id["contact-9"].consulted
     assert len(prompts) == 2
     assert "attempt 1/%d" % MAX in prompts[1]
+
+
+def test_inline_failure_counts_once_without_retry_wakeup():
+    from inkbox_codex import send_outcome
+    gw = _gw()
+    send_outcome._mark("inline-failed", "inline")
+    envelope = _sms_fail(text_id="inline-failed")
+    _dispatch(gw, envelope, "text.delivery_failed")
+    _dispatch(gw, envelope, "text.delivery_failed")
+    assert not gw.sessions.by_id
+    assert max(row["attempts"] for row in gw._outbound_failure_state.values()) == 1
+    _dispatch(gw, _sms_fail(text_id="next-failed"), "text.delivery_failed")
+    assert len(gw.sessions.by_id["contact-9"].consulted) == 1
+    assert "attempt 2/3" in gw.sessions.by_id["contact-9"].consulted[0]
+    _dispatch(gw, _sms_fail(text_id="last-failed"), "text.delivery_failed")
+    assert len(gw.sessions.by_id["contact-9"].consulted) == 1
