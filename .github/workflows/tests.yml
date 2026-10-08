@@ -71,8 +71,7 @@ jobs:
           tests/test_slack_attachments.py tests/test_slack_progress.py tests/test_slack_streams.py
           tests/test_tools.py::test_coding_agent_tool_tier_is_registered
 
-  # Optional native replies use the real SDK contract without raising the
-  # released SDK floor for operators who leave the feature disabled.
+  # Exercise optional native replies against the shared released SDK floor.
   imessage-sdk:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
@@ -84,7 +83,7 @@ jobs:
       - name: Install bridge and released native-reply SDK
         run: >-
           pip install -e . pytest httpx
-          "inkbox==0.7.13"
+          "inkbox==0.7.15"
       - name: Require native reply support
         run: |
           python - <<'PY'
@@ -99,8 +98,7 @@ jobs:
           tests/test_imessage_state.py tests/test_imessage_gateway.py
           tests/test_imessage_sdk.py tests/test_companion.py
 
-  # Test optional Slack initialization against its released SDK minimum.
-  # The ordinary Slack and other channel lanes keep testing the released floor.
+  # Exercise Slack initialization against the same released SDK floor.
   slack-companion-sdk:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
@@ -116,7 +114,7 @@ jobs:
       - name: Install bridge and released Slack-aware SDK
         run: >-
           uv pip install --system -e . pytest httpx
-          "inkbox==0.7.14"
+          "inkbox==0.7.15"
       - name: Require Slack initialization support (do not silently skip)
         run: python -c "from inkbox_codex.slack_companion import require_sdk_support; require_sdk_support()"
       - name: Install Codex (freshest main prerelease)
