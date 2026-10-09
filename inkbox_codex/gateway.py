@@ -22,6 +22,8 @@ The bridge's runtime core:
 
 from __future__ import annotations
 
+from .send_outcome import reported_inline
+
 import asyncio
 import hashlib
 import json
@@ -4346,6 +4348,7 @@ class InkboxGateway:
         conversation_id: Optional[str] = None,
         target: Optional[str] = None,
         stage: str = "delivery_failed",
+        reported_inline_id: str = "",
     ) -> "web.Response":
         """Wake the agent's session to handle a failed outbound message.
 
@@ -4374,6 +4377,8 @@ class InkboxGateway:
             return web.json_response({"ok": True, "ignored": "no-sessions"})
         keys = _outbound_failure_keys(mode, conversation_id, target, chat_id=chat_id)
         attempts = self._record_outbound_failure(keys) if keys else OUTBOUND_FAILURE_MAX_ATTEMPTS
+        if await reported_inline(reported_inline_id):
+            return web.json_response({"ok": True, "reported_inline": True})
         if attempts >= OUTBOUND_FAILURE_MAX_ATTEMPTS:
             logger.error(
                 "[bridge] Outbound %s to %s failed %d/%d times (%s) — retry budget "
@@ -4442,7 +4447,7 @@ class InkboxGateway:
         logger.info("[bridge] SMS delivery failed to %s: %s", recipient, reason or event_type)
         return await self._notify_delivery_failure(
             chat_id, "SMS", recipient, body, reason or event_type,
-            mode="sms", conversation_id=conversation_id or None, target=recipient or None,
+            reported_inline_id=message_id, mode="sms", conversation_id=conversation_id or None, target=recipient or None,
         )
 
     async def _on_imessage_delivery_failed(self, envelope: Dict[str, Any]) -> "web.Response":
@@ -4496,7 +4501,7 @@ class InkboxGateway:
         logger.info("[bridge] iMessage delivery failed to %s: %s", recipient, reason)
         return await self._notify_delivery_failure(
             chat_id, "iMessage", recipient, body, reason,
-            mode="imessage", conversation_id=conversation_id or None, target=recipient or None,
+            reported_inline_id=message_id, mode="imessage", conversation_id=conversation_id or None, target=recipient or None,
         )
 
     async def _on_mail_delivery_failed(self, envelope: Dict[str, Any], event_type: str) -> "web.Response":

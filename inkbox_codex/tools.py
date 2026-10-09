@@ -8,6 +8,8 @@ the same Inkbox tool surface but exposes it as plain handlers that
 
 from __future__ import annotations
 
+from .send_outcome import poll_send_outcome
+
 import asyncio
 import dataclasses
 import json
@@ -993,7 +995,8 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
             if urls:
                 kwargs["media_urls"] = urls
             msg = identity.send_text(**kwargs)
-            return {"sent": True, "id": str(getattr(msg, "id", "")), "media": len(urls)}
+            return {"sent": True, "id": str(getattr(msg, "id", "")), "media": len(urls),
+                    **poll_send_outcome(client, identity, "sms", msg)}
 
         if name == "inkbox_send_imessage":
             text = str(args.get("text") or "")
@@ -1059,8 +1062,10 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                     except Exception:
                         # The send was accepted even if a concurrent stop closed its turn.
                         result["warning"] = "Message accepted; reply correlation could not be saved. Do not resend."
+                result.update(poll_send_outcome(client, identity, "imessage", msg, group=len(to_list or []) > 1))
                 return result
-            return {"sent": True, "id": str(getattr(msg, "id", ""))}
+            return {"sent": True, "id": str(getattr(msg, "id", "")),
+                    **poll_send_outcome(client, identity, "imessage", msg, group=len(to_list or []) > 1)}
 
         if name == "inkbox_place_call":
             snake_to_number = str(args.get("to_number") or "").strip()
