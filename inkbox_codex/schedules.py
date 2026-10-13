@@ -79,6 +79,8 @@ def next_cron(schedule: dict, after: float) -> float:
     try:
         base = datetime.fromtimestamp(after, ZoneInfo(schedule['timezone']))
         due = croniter(schedule['expression'], base, max_years_between_matches=8).get_next(datetime).timestamp()
+    except ZoneInfoNotFoundError:
+        raise ValueError('Use a valid IANA timezone; edit the saved schedule before resuming') from None
     except (ValueError, OverflowError):
         raise ValueError('Cron expression has no execution in the next eight years') from None
     if due <= after:

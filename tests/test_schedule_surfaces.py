@@ -195,3 +195,18 @@ def test_scheduled_readers_only_see_their_job(monkeypatch, capsys):
     assert run_cli(capsys, "show", other["id"])[0] == 1
     assert run_cli(capsys, "runs", other["id"])[0] == 1
     assert run_cli(capsys, "status")[0] == 1
+
+
+def test_cli_resume_invalidated_timezone_returns_error_without_traceback(capsys):
+    with ScheduleStore(schedule_path(read_config())) as store:
+        job = store.create('Morning review', 'Write a report',
+                           {'kind': 'cron', 'expression': '* * * * *', 'timezone': 'UTC'}, now=100)
+        schedule = dict(job['schedule'], timezone='Unavailable/Timezone')
+        store.db.execute('UPDATE jobs SET schedule=? WHERE id=?', (json.dumps(schedule), job['id']))
+        store.materialize(now=160)
+        assert store.get(job['id'])['enabled'] is False
+    code, error = run_cli(capsys, 'resume', job['id'])
+    assert code == 1
+    assert 'valid IANA timezone' in error['error']
+    with ScheduleStore(schedule_path(read_config())) as store:
+        assert store.get(job['id'])['enabled'] is False
