@@ -964,6 +964,7 @@ class InkboxGateway:
         self.sessions: Optional[SessionManager] = None
         self._slack_activity = None
         self._companion_receiver = None
+        self._scheduler = None
         self._imessage_state = None
         self._codex_ready: Optional[bool] = None
         self._codex_readiness_detail = "startup has not been checked"
@@ -1110,6 +1111,9 @@ class InkboxGateway:
             identity_info["phone"] or "(no phone)", self.cfg.project_dir,
         )
         try:
+            from .scheduler import Scheduler
+            self._scheduler = Scheduler(self.cfg)
+            await self._scheduler.start()
             await asyncio.Event().wait()  # serve until cancelled
         finally:
             await self._cleanup()
@@ -1306,6 +1310,9 @@ class InkboxGateway:
         logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
     async def _cleanup(self) -> None:
+        if getattr(self, '_scheduler', None) is not None:
+            await self._scheduler.close()
+            self._scheduler = None
         self._a2a_closing = True
         current = asyncio.current_task()
         admission_tasks = [
@@ -1446,6 +1453,9 @@ class InkboxGateway:
             "codex": {"startup_ok": startup_ok, "checked_at": checked_at},
             "companion": inbox,
         }
+        from .schedule_tools import schedule_status
+        result['scheduler'] = await asyncio.to_thread(schedule_status, self.cfg)
+        result['ready'] = bool(result['ready'] and result['scheduler']['healthy'])
         if self.cfg.imessage_threaded_replies:
             try:
                 result["imessage_threading"] = {"enabled": True, **self._threaded_imessage_state().summary()}
@@ -4941,6 +4951,8 @@ class InkboxGateway:
 
         lines.append(f"Codex: {_codex_health(self.cfg)}; {self._codex_readiness_detail}")
         status = await self._readiness()
+        from .schedule_tools import schedule_status_detail
+        lines.append('Scheduled jobs: ' + schedule_status_detail(status['scheduler']))
         inbox = status["companion"]
         if inbox["readable"]:
             lines.append(f"Companion: {inbox['unfinished_count']} unfinished receipts; {inbox['blocked_conversations']} blocked conversations")
