@@ -127,6 +127,7 @@ def _schedule_parser(sub) -> None:
                           help="enable future scheduled executions (default on)")
     for command in ("show", "pause", "resume", "delete", "run-now", "catch-up"):
         commands.add_parser(command).add_argument("job_id")
+    commands.add_parser("reset-session", help="start future executions with a fresh session (local administrator only)").add_argument("job_id")
     commands.add_parser("list", help="list saved jobs")
     runs = commands.add_parser("runs", help="inspect execution history and missed occurrences")
     runs.add_argument("job_id", nargs="?")
@@ -156,7 +157,7 @@ def _cmd_schedule(args) -> int:
         current_job = (os.getenv("INKBOX_SCHEDULE_JOB_ID") or "").strip()
         if command not in {"list", "show", "runs", "status"}:
             check_schedule_mutation()
-        if (owner is not None or current_job) and command in {"enable", "disable", "recover", "status"}:
+        if (owner is not None or current_job) and command in {"enable", "disable", "recover", "status", "reset-session"}:
             raise ValueError("This command is available only from the local administrator CLI.")
         if current_job and getattr(args, "job_id", None) not in {None, current_job}:
             raise ValueError("Scheduled jobs can inspect only their own execution history")
@@ -194,6 +195,8 @@ def _cmd_schedule(args) -> int:
                 result = store.enqueue(args.job_id, owner=owner)
             elif command == "catch-up":
                 result = store.catch_up(args.job_id, owner=owner)
+            elif command == "reset-session":
+                result = store.reset_session(args.job_id, owner=owner)
             elif command == "runs":
                 result = store.runs(job_id=current_job or args.job_id, owner=None if current_job else owner, limit=args.limit)
             elif command == "recover":

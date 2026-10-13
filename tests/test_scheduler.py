@@ -239,11 +239,11 @@ def test_process_fence_never_signals_a_reused_pid(monkeypatch):
     signalled = []
     monkeypatch.setattr(scheduler_module, "process_stamp", lambda pid: "different-process")
     monkeypatch.setattr(scheduler_module.os, "killpg", lambda *args: signalled.append(args))
-    assert not scheduler_module.fence_host({"host_pid": 123456, "host_start": "original-process"})
+    assert scheduler_module.fence_host({"host_pid": 123456, "host_start": "original-process"})
     assert signalled == []
 
 
-@pytest.mark.parametrize("original_boot,cleared", [("old-boot", True), ("current-boot", False)])
+@pytest.mark.parametrize("original_boot,cleared", [("old-boot", True), ("current-boot", True)])
 def test_process_fence_distinguishes_reboot_from_same_boot_pid_reuse(monkeypatch, original_boot, cleared):
     signalled = []
     read_text = scheduler_module.Path.read_text
@@ -260,13 +260,14 @@ def test_process_fence_distinguishes_reboot_from_same_boot_pid_reuse(monkeypatch
     assert signalled == []
 
 
-def test_restart_after_reboot_clears_old_host_but_requires_explicit_retry(environment, monkeypatch):
+@pytest.mark.parametrize('recorded_boot', ['old-boot', 'current-boot'])
+def test_restart_clears_replaced_host_but_requires_explicit_retry(environment, monkeypatch, recorded_boot):
     async def scenario():
         cfg, store, clock = environment
         job = add_job(store, clock, catch_up=True)
         clock.value += 60
         run = store.claim(now=clock())
-        store.mark_running(run["id"], "before-reboot-thread", host_pid=123456, host_start="old-boot:111")
+        store.mark_running(run["id"], "before-reboot-thread", host_pid=123456, host_start=f"{recorded_boot}:111")
         signalled = []
         read_text = scheduler_module.Path.read_text
 
@@ -382,3 +383,96 @@ def test_second_worker_cannot_recover_or_run_first_workers_inflight_work(environ
             await first.close()
 
     asyncio.run(scenario())
+
+
+def test_busy_online_worker_keeps_other_jobs_queued_beyond_grace(environment):
+    async def scenario():
+        cfg, store, clock = environment
+        first_job = add_job(store, clock)
+        second_job = add_job(store, clock)
+        clients = ClientFactory()
+        clients.gate = asyncio.Event()
+        scheduler = Scheduler(cfg, store=store, client_factory=clients, clock=clock)
+        try:
+            clock.value += 60
+            await scheduler.tick()
+            await asyncio.wait_for(clients.started.wait(), timeout=2)
+            # Regular heartbeats prove the worker is busy, not down.
+            for _ in range(4):
+                clock.value += 10
+                await scheduler.tick()
+            assert len(clients.clients) == 1
+            assert sorted(run['status'] for run in store.runs()) == ['pending', 'running']
+            clients.gate.set()
+            await asyncio.wait_for(scheduler.active, timeout=2)
+            await settle(scheduler)
+            assert len(clients.clients) == 2
+            assert store.runs(first_job['id'])[0]['status'] == 'succeeded'
+            assert store.runs(second_job['id'])[0]['status'] == 'succeeded'
+            assert store.status()['missed_pending'] == 0
+        finally:
+            clients.gate.set()
+            await scheduler.close()
+
+    asyncio.run(scenario())
+
+
+def test_pending_scheduled_run_expires_after_worker_outage(environment):
+    _, store, clock = environment
+    job = add_job(store, clock)
+    clock.value += 60
+    store.materialize(clock())
+    store.heartbeat(now=clock())
+    clock.value += 40
+    assert store.claim(clock()) is None
+    assert store.runs(job['id'])[0]['status'] == 'missed'
+
+
+def test_global_disable_retains_queued_schedule_as_missed_despite_fresh_heartbeat(environment):
+    _, store, clock = environment
+    job = add_job(store, clock)
+    clock.value += 60
+    store.materialize(clock())
+    store.set_enabled(False)
+    clock.value += 40
+    store.heartbeat(now=clock())
+    store.set_enabled(True)
+    assert store.claim(clock()) is None
+    assert store.status()['missed_pending'] == 1
+    store.update(job['id'], catch_up=True, now=clock())
+    run = store.claim(clock())
+    assert run['source'] == 'auto_catch_up' and run['count'] == 1
+
+
+def test_unknown_process_stamp_never_signals_or_clears_a_live_pid(monkeypatch):
+    signalled = []
+    monkeypatch.setattr(scheduler_module, 'process_stamp', lambda pid: 'current-process')
+    monkeypatch.setattr(scheduler_module.os, 'killpg', lambda *args: signalled.append(args))
+    assert not scheduler_module.fence_host({'host_pid': 123456, 'host_start': None})
+    assert signalled == []
+
+
+def test_invalidated_schedule_is_paused_without_stalling_other_jobs(environment, monkeypatch):
+    from inkbox_codex import schedules
+    _, store, clock = environment
+    broken = store.create('Cron task', 'Write report',
+                          {'kind': 'cron', 'expression': '* * * * *', 'timezone': 'UTC'}, now=clock())
+    healthy = add_job(store, clock)
+    real_next = schedules.next_cron
+
+    def next_cron(schedule, after):
+        if schedule['kind'] == 'cron':
+            raise schedules.ZoneInfoNotFoundError('Timezone no longer available')
+        return real_next(schedule, after)
+
+    monkeypatch.setattr(schedules, 'next_cron', next_cron)
+    clock.value += 60
+    run = store.claim(clock())
+    assert run['job_id'] == healthy['id']
+    assert store.get(broken['id'])['enabled'] is False
+    failed = store.runs(broken['id'])
+    assert len(failed) == 1 and failed[0]['status'] == 'failed'
+    assert failed[0]['source'] == 'schedule_error'
+    assert 'edit the schedule' in failed[0]['error']
+    store.materialize(clock())
+    assert len(store.runs(broken['id'])) == 1

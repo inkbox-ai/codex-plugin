@@ -276,8 +276,10 @@ class ScheduleStore:
     def _materialize_job(self, job, now):
         active = self._active(job['id'])
         if active and active['status'] == 'pending' and active['source'] == 'schedule' and active['last_due'] < now - GRACE_SECONDS:
-            self.db.execute("UPDATE runs SET status='missed',error='Execution missed its start window' WHERE id=?", (active['id'],))
-            active = None
+            heartbeat = self.db.execute('SELECT heartbeat FROM settings WHERE id=1').fetchone()[0]
+            if heartbeat is None or heartbeat < now - GRACE_SECONDS:
+                self.db.execute("UPDATE runs SET status='missed',error='Execution missed its start window while scheduler was unavailable' WHERE id=?", (active['id'],))
+                active = None
         due, schedule = job['next_run'], job['schedule']
         if due is not None and due <= now:
             first = last = due
@@ -322,7 +324,18 @@ class ScheduleStore:
                 return
             for job in self.list_jobs():
                 if job['enabled']:
-                    self._materialize_job(job, now)
+                    self.db.execute('SAVEPOINT materialize_job')
+                    try:
+                        self._materialize_job(job, now)
+                    except (ValueError, ZoneInfoNotFoundError, OverflowError):
+                        self.db.execute('ROLLBACK TO materialize_job')
+                        job = self.get(job['id'])
+                        due = job['next_run'] if job['next_run'] is not None else now
+                        run_id = self._insert_run(job, 'failed', 'schedule_error', due, due, 1, now)
+                        self.db.execute("UPDATE runs SET error='Schedule calculation failed; edit the schedule and resume the job',finished_at=? WHERE id=?", (now, run_id))
+                        self.db.execute('UPDATE jobs SET enabled=0 WHERE id=?', (job['id'],))
+                    finally:
+                        self.db.execute('RELEASE materialize_job')
 
     def enqueue(self, job_id, owner=None, now=None):
         now = timestamp(now)
@@ -420,6 +433,21 @@ class ScheduleStore:
                 new_id = run_id
         return self._run(new_id)
 
+    def reset_session(self, job_id, owner=None, now=None):
+        """Explicitly start the next execution in a fresh session; retain history."""
+        if owner is not None:
+            raise ValueError('Session reset is available only to the local administrator')
+        now = timestamp(now)
+        with self._transaction():
+            self.get(job_id)
+            if self._active(job_id):
+                raise ValueError('Resolve the active execution before resetting its session')
+            if self.db.execute('SELECT 1 FROM runs WHERE job_id=? AND host_pid IS NOT NULL LIMIT 1',
+                               (job_id,)).fetchone():
+                raise ValueError('Wait for the gateway to stop previous execution processes before resetting the session')
+            self.db.execute('UPDATE jobs SET thread_id=NULL,updated_at=? WHERE id=?', (now, job_id))
+        return self.get(job_id)
+
     def clear_host(self, run_id):
         self.db.execute('UPDATE runs SET host_pid=NULL,host_start=NULL WHERE id=?', (run_id,))
 
@@ -432,7 +460,10 @@ class ScheduleStore:
     def set_enabled(self, enabled):
         if not isinstance(enabled, bool):
             raise ValueError('enabled must be a boolean')
-        self.db.execute('UPDATE settings SET enabled=? WHERE id=1', (enabled,))
+        with self._transaction():
+            self.db.execute('UPDATE settings SET enabled=? WHERE id=1', (enabled,))
+            if not enabled:
+                self.db.execute("UPDATE runs SET status='missed',error='Scheduling disabled before execution' WHERE status='pending' AND source='schedule'")
         return self.status()
 
     def status(self):

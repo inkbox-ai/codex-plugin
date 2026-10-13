@@ -1455,7 +1455,6 @@ class InkboxGateway:
         }
         from .schedule_tools import schedule_status
         result['scheduler'] = await asyncio.to_thread(schedule_status, self.cfg)
-        result['ready'] = bool(result['ready'] and result['scheduler']['healthy'])
         if self.cfg.imessage_threaded_replies:
             try:
                 result["imessage_threading"] = {"enabled": True, **self._threaded_imessage_state().summary()}

@@ -79,7 +79,13 @@ def offline_host(tmp_path, monkeypatch):
 
 
 async def run_due(worker):
-    await worker.tick()
+    deadline = asyncio.get_running_loop().time() + 10
+    while True:
+        await worker.tick()
+        if worker.active is not None or asyncio.get_running_loop().time() >= deadline:
+            break
+        # A completed host's children can take another tick to finish exiting.
+        await asyncio.sleep(0.02)
     assert worker.active is not None, "No due execution was started"
     await asyncio.wait_for(asyncio.shield(worker.active), timeout=40)
 
@@ -329,3 +335,46 @@ asyncio.run(main())
             except ProcessLookupError:
                 pass
             _reap_test_group(host_pid)
+
+
+def test_real_host_missing_session_requires_explicit_reset_and_preserves_history(offline_host):
+    cfg, path, requests, _ = offline_host
+    clock = [START]
+
+    async def scenario():
+        with ScheduleStore(path) as store:
+            job = store.create('Session recovery', 'Write a report. smoke-aabbcc33',
+                               {'kind': 'interval', 'seconds': 60}, now=clock[0])
+            worker = Scheduler(cfg, store=store, clock=lambda: clock[0])
+            try:
+                await worker.start()
+                clock[0] += 60
+                await run_due(worker)
+                first = store.runs(job['id'])[0]
+                assert first['status'] == 'succeeded'
+                old_session = first['thread_id']
+                # Simulate a restored receipt whose Codex rollout is unavailable.
+                store.db.execute('UPDATE jobs SET thread_id=? WHERE id=?',
+                                 ('00000000-0000-4000-8000-000000000001', job['id']))
+                store.enqueue(job['id'], now=clock[0])
+                await run_due(worker)
+                assert store.runs(job['id'])[0]['status'] == 'failed'
+                assert len(requests) == 1  # No silent fresh-session replay.
+                for _ in range(100):
+                    await worker.tick()
+                    if not store.orphaned_hosts():
+                        break
+                    await asyncio.sleep(0.02)
+                store.reset_session(job['id'], now=clock[0])
+                store.enqueue(job['id'], now=clock[0])
+                await run_due(worker)
+                latest = store.runs(job['id'])[0]
+                assert latest['status'] == 'succeeded'
+                assert latest['thread_id'] != old_session
+                assert len(requests) == 2
+                assert any(run['thread_id'] == old_session and run['result'] == first['result']
+                           for run in store.runs(job['id']))
+            finally:
+                await worker.close()
+
+    asyncio.run(scenario())

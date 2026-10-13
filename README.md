@@ -715,7 +715,10 @@ result, and error. Plain Codex output is saved, not automatically sent to the la
 chat. To request a message, include the exact recipient and channel in the saved
 prompt. Scheduled turns use the configured sandbox and do not have a person
 available for interactive approval; choose tasks that can finish under the saved
-permissions. Jobs do not overlap their own executions.
+permissions. Jobs do not overlap their own executions. When a job already has an
+active or manually queued run, newly due occurrences are recorded as missed and
+follow that job's catch-up setting. Other jobs queued while the online worker is
+busy are preserved until the worker becomes available.
 
 ### Downtime, catch-up, and pausing
 
@@ -757,16 +760,43 @@ inkbox-codex schedule recover RUN_ID --action retry --acknowledge-duplicate-risk
 
 A run that fails before execution is recorded as `failed`; it is not automatically
 retried. The same recovery commands let you explicitly retry or dismiss it.
+If a saved schedule can no longer be calculated (for example, its timezone is
+unavailable), that job is paused with a failed history entry. Edit its schedule
+and resume it; other jobs continue running.
+
+If a job's saved Codex session is no longer available, connecting to that session
+fails rather than silently losing its conversation history. After inspecting the
+failure, a local administrator can reset the session for future executions:
+
+```bash
+inkbox-codex schedule pause JOB_ID
+inkbox-codex schedule runs JOB_ID
+# Resolve any uncertain execution before resetting (inspect effects first):
+# inkbox-codex schedule recover RUN_ID --action dismiss
+inkbox-codex schedule reset-session JOB_ID
+inkbox-codex schedule resume JOB_ID
+```
+
+Resetting clears only the job's current session reference. The saved prompt,
+schedule, and run history remain intact; the next execution starts a new session
+without prior conversation context. Reset is refused while an execution is
+pending, starting, running, uncertain, or still awaiting process cleanup. It does
+not retry a failed run or change any effects already performed. Use `recover`
+explicitly if that run should be retried after reset.
 
 `inkbox-codex doctor` and gateway readiness include scheduler counts and heartbeat
 freshness. A missing or stale heartbeat matters only when scheduling is enabled
 and jobs are enabled; an intentionally paused scheduler is not a startup failure.
-Uncertain executions are reported for inspection. These checks do not create job
-storage when no schedules exist.
+Uncertain executions are reported for inspection. Doctor alerts on scheduler
+health issues; scheduler diagnostics in the readiness response do not gate
+incoming-message readiness. These checks do not create job storage when no
+schedules exist.
 
-Global scheduler controls and uncertain-run recovery are local CLI operations.
-In chat, schedule tools manage the current conversation's jobs. Scheduled jobs
-cannot create or modify schedules themselves.
+Global scheduler controls, session resets, and uncertain-run recovery are local
+CLI operations. In chat, schedule tools manage the current conversation's jobs.
+The scheduling tool and CLI interfaces reject schedule mutations from scheduled
+turns. Tasks retain the configured Codex host permissions; scheduling does not
+change those permissions.
 
 ## Voice
 

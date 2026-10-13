@@ -44,8 +44,10 @@ def fence_host(run):
             pass
     current = process_stamp(pid)
     if current is not None:
-        if not run['host_start'] or current != run['host_start']:
+        if not run['host_start']:
             return False
+        if current != run['host_start']:
+            return True
         try:
             os.killpg(pid, signal.SIGKILL)
         except ProcessLookupError:
