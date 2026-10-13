@@ -140,6 +140,15 @@ def test_unknown_delivery_values_and_message_content_never_reach_output():
     ))
 
 
+def test_known_blocked_delivery_is_distinct_from_unknown_without_details():
+    trace = _trace(agent=_Texts([
+        _message("outbound", DRIVER, "private body", "blocked_spam_filter"),
+    ]))
+    result = _evidence(trace)
+    assert result["response_delivery_status_counts"] == {"blocked": 1}
+    assert "blocked_spam_filter" not in trace.summary()
+
+
 def test_call_trigger_diagnostic_is_bounded_and_does_not_query_sms_responses():
     rows = [_message("inbound", DRIVER, "different reference") for _ in range(100)]
     rows.append(_message("inbound", DRIVER, "request-ref"))

@@ -21,6 +21,8 @@ def _value(value) -> str:
 
 def _status(message) -> str:
     value = _value(getattr(message, "delivery_status", None))
+    if value == "blocked_spam_filter":
+        return "blocked"
     return value if value in _STATUSES else "unknown"
 
 
