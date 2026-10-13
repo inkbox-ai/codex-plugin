@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from inkbox_codex import cli, schedule_tools, tools
+from inkbox_codex import cli, schedule_tools, sessions, tools
 from inkbox_codex.config import BridgeConfig, read_config
 from inkbox_codex.mcp_stdio import InkboxMcpServer
 from inkbox_codex.prompts import build_channel_prompt
@@ -128,6 +128,42 @@ def test_chat_cannot_use_admin_commands(monkeypatch, capsys):
     for args in (("enable",), ("disable",), ("status",), ("recover", "run-id", "--action", "dismiss")):
         code, result = run_cli(capsys, *args)
         assert code == 1 and "local administrator" in result["error"]
+
+
+def test_conversation_host_environment_scopes_local_cli(monkeypatch, capsys):
+    captured = []
+
+    class Host:
+        def __init__(self, *args, **kwargs):
+            captured.append(kwargs["process_env"])
+
+        async def connect(self, resume):
+            return "conversation-thread"
+
+    monkeypatch.setattr(sessions, "CodexAppServerClient", Host)
+    cfg = read_config()
+    with ScheduleStore(schedule_path(cfg)) as store:
+        own = store.create("Own task", "Review status.", {"kind": "interval", "seconds": 60}, owner="contact:one")
+        other = store.create("Other task", "Review status.", {"kind": "interval", "seconds": 60}, owner="contact:two")
+
+    async def scenario():
+        for chat_id in ("contact:one", "contact:two"):
+            session = sessions.ContactSession(chat_id, cfg, None, {}, {})
+            await session._ensure_client()
+
+    asyncio.run(scenario())
+    for env, expected, hidden in ((captured[0], own, other), (captured[1], other, own)):
+        # Run the actual CLI with the environment supplied to that host.
+        with monkeypatch.context() as scoped:
+            scoped.setattr("os.environ", env)
+            assert [job["id"] for job in run_cli(capsys, "list")[1]] == [expected["id"]]
+            assert run_cli(capsys, "show", hidden["id"]) == (1, {"error": "Schedule not found"})
+            for args in (("disable",), ("recover", "run-id", "--action", "dismiss"),
+                         ("reset-session", expected["id"])):
+                code, result = run_cli(capsys, *args)
+                assert code == 1 and "local administrator" in result["error"]
+    # Per-host scoping must not change the local administrator's environment.
+    assert len(run_cli(capsys, "list")[1]) == 2
 
 
 def test_mcp_validates_arguments_and_hides_storage_errors(monkeypatch):

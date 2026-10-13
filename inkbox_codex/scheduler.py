@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import errno
 import fcntl
 import logging
 import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 
 from .codex_client import CodexAppServerClient
@@ -28,6 +31,63 @@ def process_stamp(pid):
         return result.stdout.strip() or None
     except (OSError, IndexError, subprocess.TimeoutExpired):
         return None
+
+
+def _pidfd_syscall(number, *args):
+    # Some portable Python builds omit pidfd wrappers despite kernel support.
+    if (sys.platform != 'linux' or os.uname().machine not in {'x86_64', 'aarch64'}
+            or ctypes.sizeof(ctypes.c_void_p) != 8):
+        raise OSError(errno.ENOSYS, 'Process handles are unavailable')
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    result = libc.syscall(number, *args)
+    if result == -1:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+    return result
+
+
+def _open_process_handle(pid):
+    if hasattr(os, 'pidfd_open'):
+        return os.pidfd_open(pid)
+    return _pidfd_syscall(434, pid, 0)
+
+
+def _kill_process_handle(descriptor):
+    if hasattr(signal, 'pidfd_send_signal'):
+        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+    else:
+        _pidfd_syscall(424, descriptor, signal.SIGKILL, ctypes.c_void_p(), 0)
+
+
+def _fence_leaderless_members(run):
+    """Signal only retained run-owned children, never a recycled group number."""
+    if not run.get('id'):
+        return
+    marker = f"INKBOX_SCHEDULE_RUN_ID={run['id']}".encode()
+    try:
+        processes = tuple(Path('/proc').iterdir())
+    except OSError:
+        return
+    for process in processes:
+        if not process.name.isdecimal():
+            continue
+        descriptor = None
+        try:
+            fields = (process / 'stat').read_text().rsplit(')', 1)[1].split()
+            if (int(fields[2]) != run['host_pid'] or int(fields[3]) != run['host_pid']
+                    or process.stat().st_uid != os.getuid()):
+                continue
+            descriptor = _open_process_handle(int(process.name))
+            if marker not in (process / 'environ').read_bytes().split(b'\0'):
+                continue
+            # A pidfd keeps signalling tied to this process even if its PID is reused.
+            _kill_process_handle(descriptor)
+        except (OSError, IndexError, ValueError):
+            continue
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
 
 def fence_host(run):
@@ -54,6 +114,8 @@ def fence_host(run):
             return True
         except OSError:
             return False
+    else:
+        _fence_leaderless_members(run)
     try:
         os.killpg(pid, 0)
     except ProcessLookupError:
@@ -73,6 +135,7 @@ class Scheduler:
         self.active = None
         self._loop_task = None
         self._lock = None
+        self._unrecorded_hosts = {}
 
     async def start(self):
         if self._loop_task is not None:
@@ -97,6 +160,14 @@ class Scheduler:
         self._loop_task = asyncio.create_task(self._loop())
 
     async def _fence_orphans(self):
+        for run_id, host in list(self._unrecorded_hosts.items()):
+            if await asyncio.to_thread(fence_host, host):
+                self.store.clear_host(run_id)
+            else:
+                self.store.record_host(run_id, host['host_pid'], host['host_start'])
+            self.store.finish(run_id, 'failed', error='Stopped before Codex initialization completed',
+                              now=self.clock())
+            self._unrecorded_hosts.pop(run_id)
         for run in self.store.orphaned_hosts():
             if await asyncio.to_thread(fence_host, run):
                 self.store.clear_host(run['id'])
@@ -158,13 +229,18 @@ class Scheduler:
                 'If a required action needs approval, explain that it was not performed. '
                 'The current saved task supersedes conflicting instructions in previous runs.'
             )
+            def process_started(pid):
+                host = {'id': run['id'], 'host_pid': pid, 'host_start': process_stamp(pid)}
+                self._unrecorded_hosts[run['id']] = host
+                self.store.record_host(run['id'], pid, host['host_start'])
+                self._unrecorded_hosts.pop(run['id'])
+
             client = self.client_factory(self.cfg, developer_instructions=instructions,
                                          mcp_server_config=server, isolate_process_group=True,
-                                         process_env=env)
+                                         process_env=env, process_started=process_started)
             async with asyncio.timeout(self.cfg.codex_turn_timeout_s):
                 thread_id = await client.connect(job['thread_id'])
-                pid = getattr(client, 'process_group_id', None)
-                self.store.mark_running(run['id'], thread_id, pid, await asyncio.to_thread(process_stamp, pid))
+                self.store.mark_running(run['id'], thread_id)
                 prompt = (f"Scheduled execution: {run['id']}\n"
                           f"Occurrences represented: {run['count']}\n"
                           f"Scheduled UTC range: {run['first_due']} through {run['last_due']}\n"
@@ -196,7 +272,16 @@ class Scheduler:
                             stopped = True
                 except Exception:
                     logger.warning('Scheduled execution process cleanup is not confirmed')
-            if outcome:
+            if stopped:
+                self._unrecorded_hosts.pop(run['id'], None)
+            elif run['id'] in self._unrecorded_hosts:
+                host = self._unrecorded_hosts[run['id']]
+                try:
+                    self.store.record_host(run['id'], host['host_pid'], host['host_start'])
+                    self._unrecorded_hosts.pop(run['id'])
+                except Exception:
+                    logger.warning('Scheduled process ownership could not be saved; execution remains blocked')
+            if outcome and run['id'] not in self._unrecorded_hosts:
                 self.store.finish(run['id'], outcome, result=result, error=error, now=self.clock())
             if stopped:
                 self.store.clear_host(run['id'])
@@ -210,6 +295,8 @@ class Scheduler:
             self.active.cancel()
             await asyncio.gather(self.active, return_exceptions=True)
             self.active = None
+        if self._unrecorded_hosts:
+            await self._fence_orphans()
         if self.store is not None and self._owns_store:
             self.store.close()
             self.store = None

@@ -171,6 +171,7 @@ class CodexAppServerClient:
         tools_enabled: bool = True,
         isolate_process_group: bool = False,
         process_env: Optional[Dict[str, str]] = None,
+        process_started: Optional[Callable[[int], None]] = None,
     ) -> None:
         self.cfg = cfg
         self.developer_instructions = developer_instructions
@@ -178,6 +179,7 @@ class CodexAppServerClient:
         self.approval_handler = approval_handler
         self.tools_enabled = tools_enabled
         self._process_env = process_env
+        self._process_started = process_started
         self._isolated_process_group = isolate_process_group and os.name == "posix"
         self._owns_process_group = os.name == "posix"
         self._process_group_id: Optional[int] = None
@@ -432,6 +434,9 @@ class CodexAppServerClient:
                       else "configured executable is not runnable")
             raise CodexStartupError(f"Codex startup failed: {detail}; check CODEX_BIN") from None
         self._process_group_id = self._proc.pid if self._owns_process_group else None
+        if self._process_started is not None:
+            # Persist ownership before initialization or any other awaited work.
+            self._process_started(self._proc.pid)
         self._reader_task = asyncio.create_task(self._reader_loop())
         self._stderr_task = asyncio.create_task(self._stderr_loop())
 

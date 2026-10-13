@@ -4,13 +4,16 @@ from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
+import sqlite3
 import subprocess
 import sys
+from types import SimpleNamespace
 from threading import Barrier
 
 import pytest
 
 from inkbox_codex.config import BridgeConfig
+from inkbox_codex import schedules as schedules_module
 from inkbox_codex.schedules import ScheduleStore, schedule_path
 
 
@@ -269,6 +272,174 @@ def test_disabling_automatic_catch_up_cancels_queued_automatic_work(store):
     store.catch_up(job["id"], now=resumed)
     explicit = store.claim(now=resumed)
     assert explicit["count"] == 3
+
+
+def test_disabling_catch_up_preserves_current_on_time_occurrence_after_restart(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    due = START + timedelta(minutes=2)
+    with ScheduleStore(path) as store:
+        job = every_minute(store, catch_up=True)
+        store.materialize(now=due)
+        pending = store.runs(job["id"])[0]
+        assert pending["count"] == 2
+    with ScheduleStore(path) as store:
+        store.update(job["id"], catch_up=False, now=due)
+        current = store.claim(now=due)
+        assert current["count"] == 1
+        assert current["first_due"] == due.timestamp()
+        assert current["last_due"] == due.timestamp()
+        assert store.status()["missed_pending"] == 1
+
+
+def test_current_occurrence_is_not_confused_with_later_missed_ticks(store):
+    job = every_minute(store, catch_up=True)
+    current = START + timedelta(minutes=2)
+    store.materialize(now=current)
+    later = START + timedelta(minutes=3, seconds=31)
+    store.materialize(now=later)
+    store.update(job["id"], catch_up=False, now=later)
+    assert store.claim(now=later) is None
+    missed = [run for run in store.runs(job["id"]) if run["status"] == "missed"]
+    assert sum(run["count"] for run in missed) == 3
+    assert any(run["first_due"] == run["last_due"] == current.timestamp() for run in missed)
+
+
+def test_legacy_store_upgrade_preserves_unclassified_coalesced_occurrence_count(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    due = START + timedelta(minutes=2)
+    later = START + timedelta(minutes=3, seconds=31)
+    with ScheduleStore(path) as store:
+        job = every_minute(store, catch_up=True)
+        store.materialize(now=due)
+        store.materialize(now=later)
+        store.db.execute('ALTER TABLE runs DROP COLUMN current_due')
+        store.db.execute('PRAGMA user_version=1')
+    with ScheduleStore(path) as store:
+        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 2
+        store.update(job["id"], catch_up=False, now=later)
+        assert store.claim(now=later) is None
+        assert store.status()["missed_pending"] == 3
+        unknown = [run for run in store.runs(job["id"]) if "Exact due time unavailable" in run["error"]]
+        assert len(unknown) == 1 and unknown[0]["count"] == 1
+        store.catch_up(job["id"], now=later)
+        assert store.claim(now=later)["count"] == 3
+
+
+def test_two_connections_can_upgrade_the_same_legacy_store(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with ScheduleStore(path) as store:
+        job = every_minute(store)
+        store.db.execute('ALTER TABLE runs DROP COLUMN current_due')
+        store.db.execute('PRAGMA user_version=1')
+    barrier = Barrier(2)
+
+    def open_store():
+        barrier.wait(timeout=5)
+        with ScheduleStore(path) as connection:
+            return connection.get(job["id"])["prompt"], connection.db.execute('PRAGMA user_version').fetchone()[0]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(open_store), pool.submit(open_store)]
+        results = [future.result(timeout=10) for future in futures]
+    assert results == [(job["prompt"], 2), (job["prompt"], 2)]
+
+
+def test_store_initialization_failure_closes_opened_connection(tmp_path, monkeypatch):
+    path = tmp_path / "broken.sqlite3"
+    path.write_bytes(b"not a database")
+    connections = []
+    connect = sqlite3.connect
+
+    def capture_connection(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(schedules_module.sqlite3, "connect", capture_connection)
+    with pytest.raises(sqlite3.DatabaseError):
+        ScheduleStore(path)
+    assert len(connections) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connections[0].execute('SELECT 1')
+
+
+@pytest.mark.parametrize("repair", [True, False])
+def test_invalid_saved_timezone_can_be_repaired_or_paused_with_failure_receipt(store, monkeypatch, repair):
+    job = store.create(
+        name="Clock repair", prompt="Write a report",
+        schedule={"kind": "cron", "expression": "* * * * *", "timezone": "UTC"},
+        now=START,
+    )
+    store.set_enabled(False)
+    zone_info = schedules_module.ZoneInfo
+
+    def missing_zone(name):
+        if name == "UTC":
+            raise schedules_module.ZoneInfoNotFoundError("Timezone unavailable")
+        return zone_info(name)
+
+    monkeypatch.setattr(schedules_module, "ZoneInfo", missing_zone)
+    now = START + timedelta(minutes=3, seconds=31)
+    changes = {"schedule": {"kind": "interval", "seconds": 60}} if repair else {"enabled": False}
+    updated = store.update(job["id"], now=now, **changes)
+    assert updated["enabled"] is repair
+    failures = [run for run in store.runs(job["id"]) if run["source"] == "schedule_error"]
+    assert len(failures) == 1
+    assert failures[0]["status"] == "failed"
+    assert "could not be counted" in failures[0]["error"]
+    assert failures[0]["first_due"] == (START + timedelta(minutes=1)).timestamp()
+    assert failures[0]["last_due"] == now.timestamp()
+    if repair:
+        store.set_enabled(True)
+        assert store.claim(now=now + timedelta(minutes=1))["job_id"] == job["id"]
+
+
+@pytest.mark.parametrize("command", ["catch_up", "update"])
+def test_backlog_commands_allow_other_writers_between_bounded_batches(tmp_path, monkeypatch, command):
+    path = tmp_path / "jobs.sqlite3"
+    with ScheduleStore(path) as store, ScheduleStore(path) as other:
+        job = store.create(
+            name="Backlog report", prompt="Write a report",
+            schedule={"kind": "cron", "expression": "* * * * *", "timezone": "UTC"},
+            now=START,
+        )
+        total = schedules_module.CRON_BATCH_SIZE * 2 + 7
+        now = START + timedelta(minutes=total, seconds=31)
+        committed_counts = []
+
+        def competing_write(_delay):
+            assert not store.db.in_transaction
+            other.heartbeat(now=now)
+            committed_counts.append(sum(run["count"] for run in other.runs(job["id"]) if run["status"] == "missed"))
+
+        monkeypatch.setattr(schedules_module, "time", SimpleNamespace(time=schedules_module.time.time, sleep=competing_write))
+        if command == "catch_up":
+            pending = store.catch_up(job["id"], now=now)
+            assert pending["count"] == total
+        else:
+            store.update(job["id"], schedule={"kind": "interval", "seconds": 3600}, now=now)
+        assert committed_counts == [schedules_module.CRON_BATCH_SIZE, schedules_module.CRON_BATCH_SIZE * 2]
+        assert sum(run["count"] for run in store.runs(job["id"]) if run["status"] == "missed") == total
+
+
+def test_host_receipt_is_durable_before_handshake_and_preserved_when_running(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    due = START + timedelta(minutes=1)
+    with ScheduleStore(path) as store:
+        job = every_minute(store)
+        run = store.claim(now=due)
+        store.record_host(run["id"], 123456, "test-boot:123")
+    with ScheduleStore(path) as store:
+        early = store.runs(job["id"])[0]
+        assert early["status"] == "starting"
+        assert early["host_pid"] == 123456
+        assert early["host_start"] == "test-boot:123"
+        store.mark_running(run["id"], "connected-thread")
+        store.recover_interrupted(now=due)
+        recovered = store.runs(job["id"])[0]
+        assert recovered["status"] == "uncertain"
+        assert recovered["host_pid"] == 123456
+        assert recovered["host_start"] == "test-boot:123"
 
 
 def test_disabling_automatic_catch_up_does_not_cancel_explicit_manual_request(store):

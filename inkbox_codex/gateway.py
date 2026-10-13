@@ -965,6 +965,8 @@ class InkboxGateway:
         self._slack_activity = None
         self._companion_receiver = None
         self._scheduler = None
+        self._scheduler_start_task = None
+        self._scheduler_start_error = None
         self._imessage_state = None
         self._codex_ready: Optional[bool] = None
         self._codex_readiness_detail = "startup has not been checked"
@@ -1111,12 +1113,42 @@ class InkboxGateway:
             identity_info["phone"] or "(no phone)", self.cfg.project_dir,
         )
         try:
-            from .scheduler import Scheduler
-            self._scheduler = Scheduler(self.cfg)
-            await self._scheduler.start()
+            self._scheduler_start_error = "Scheduled jobs are starting."
+            self._scheduler_start_task = asyncio.create_task(self._start_scheduler())
             await asyncio.Event().wait()  # serve until cancelled
         finally:
             await self._cleanup()
+
+    async def _start_scheduler(self) -> None:
+        """Retry scheduler startup without taking incoming conversations offline."""
+        from .scheduler import Scheduler
+
+        while True:
+            try:
+                self._scheduler = Scheduler(self.cfg)
+                await self._scheduler.start()
+            except Exception:
+                self._scheduler_start_error = (
+                    "Scheduled jobs could not start; retrying every 30 seconds. "
+                    "Check the scheduled-job storage and worker lock."
+                )
+                logger.error(self._scheduler_start_error)
+                # Do not replace a partially started worker until it has closed.
+                while self._scheduler is not None:
+                    try:
+                        await self._scheduler.close()
+                    except Exception:
+                        self._scheduler_start_error = (
+                            "Scheduled-job startup cleanup is incomplete; retrying every 30 seconds."
+                        )
+                        logger.error(self._scheduler_start_error)
+                        await asyncio.sleep(30)
+                    else:
+                        self._scheduler = None
+                await asyncio.sleep(30)
+            else:
+                self._scheduler_start_error = None
+                return
 
     async def _start_http_server(self) -> None:
         app = web.Application()
@@ -1310,9 +1342,17 @@ class InkboxGateway:
         logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
     async def _cleanup(self) -> None:
+        if getattr(self, '_scheduler_start_task', None) is not None:
+            self._scheduler_start_task.cancel()
+            await asyncio.gather(self._scheduler_start_task, return_exceptions=True)
+            self._scheduler_start_task = None
         if getattr(self, '_scheduler', None) is not None:
-            await self._scheduler.close()
-            self._scheduler = None
+            try:
+                await self._scheduler.close()
+            except Exception:
+                logger.error('Scheduled-job cleanup did not complete during gateway shutdown')
+            else:
+                self._scheduler = None
         self._a2a_closing = True
         current = asyncio.current_task()
         admission_tasks = [
@@ -1455,6 +1495,10 @@ class InkboxGateway:
         }
         from .schedule_tools import schedule_status
         result['scheduler'] = await asyncio.to_thread(schedule_status, self.cfg)
+        if getattr(self, '_scheduler_start_error', None):
+            result['scheduler'].update(
+                healthy=False, attention_required=True, last_error=self._scheduler_start_error,
+            )
         if self.cfg.imessage_threaded_replies:
             try:
                 result["imessage_threading"] = {"enabled": True, **self._threaded_imessage_state().summary()}

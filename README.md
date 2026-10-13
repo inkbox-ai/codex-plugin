@@ -740,6 +740,8 @@ inkbox-codex schedule enable
 
 Catch-up coalesces missed work; it does not replay every old occurrence. Global
 on/off is persistent and affects scheduling only, not incoming conversations.
+Turning automatic catch-up off releases queued missed work for later inspection
+without dropping a current scheduled occurrence.
 Disabling scheduling does not cancel an execution that has already started.
 Paused jobs and disabled scheduling do not discard the saved schedule or history.
 Resuming a paused interval or cron job starts from the current time: intentionally
@@ -760,6 +762,9 @@ inkbox-codex schedule recover RUN_ID --action retry --acknowledge-duplicate-risk
 
 A run that fails before execution is recorded as `failed`; it is not automatically
 retried. The same recovery commands let you explicitly retry or dismiss it.
+Recovery waits for the previous execution process to stop. If its identity cannot
+be confirmed safely, cleanup remains pending rather than stopping an unrelated
+process; inspect the local process and job history before proceeding.
 If a saved schedule can no longer be calculated (for example, its timezone is
 unavailable), that job is paused with a failed history entry. Edit its schedule
 and resume it; other jobs continue running.
@@ -791,6 +796,12 @@ Uncertain executions are reported for inspection. Doctor alerts on scheduler
 health issues; scheduler diagnostics in the readiness response do not gate
 incoming-message readiness. These checks do not create job storage when no
 schedules exist.
+
+If scheduled-job storage or the worker lock prevents startup, incoming
+conversations remain available. Readiness reports the scheduler error, and the
+gateway retries startup every 30 seconds after cleaning up the failed attempt.
+Repair the storage or resolve the other worker; saved jobs resume automatically
+once startup succeeds, subject to their catch-up and recovery settings.
 
 Global scheduler controls, session resets, and uncertain-run recovery are local
 CLI operations. In chat, schedule tools manage the current conversation's jobs.

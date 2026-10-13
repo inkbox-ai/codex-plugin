@@ -1536,6 +1536,8 @@ class ContactSession:
             developer_instructions=developer_instructions,
             mcp_server_config=self.mcp_server_config,
             approval_handler=self._handle_codex_request,
+            # Shell-invoked local commands use the same conversation as MCP.
+            process_env={**os.environ, "INKBOX_CODEX_CHAT_ID": self.chat_id},
         )
         # Capture what we resumed from before it's overwritten with the new
         # thread id below — otherwise the log claims every session resumed.

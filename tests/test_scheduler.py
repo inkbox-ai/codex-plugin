@@ -31,6 +31,8 @@ class FakeClient:
 
     async def connect(self, resume_thread_id=None):
         self.resumed = resume_thread_id
+        if self.process_group_id is not None:
+            self.options['process_started'](self.process_group_id)
         if self.factory.connect_error:
             raise self.factory.connect_error
         return resume_thread_id or f"dedicated-job-thread-{len(self.factory.clients)}"
@@ -235,12 +237,138 @@ def test_unconfirmed_process_cleanup_prevents_next_execution(environment, monkey
     asyncio.run(scenario())
 
 
+def test_failed_handshake_retains_host_until_cleanup_is_confirmed(environment, monkeypatch):
+    async def scenario():
+        cfg, store, clock = environment
+        job = add_job(store, clock)
+        clients = ClientFactory()
+        clients.connect_error = RuntimeError('Initialization failed')
+        clients.disconnect_error = RuntimeError('Cleanup is unavailable')
+        monkeypatch.setattr(scheduler_module, 'process_stamp', lambda pid: 'same-process')
+        monkeypatch.setattr(scheduler_module, 'fence_host', lambda run: False)
+
+        def factory(config, **options):
+            client = clients(config, **options)
+            client.process_group_id = 123456
+            return client
+
+        scheduler = Scheduler(cfg, store=store, client_factory=factory, clock=clock)
+        try:
+            clock.value += 60
+            await settle(scheduler)
+            run = store.runs(job['id'])[0]
+            assert run['status'] == 'failed'
+            assert run['thread_id'] is None
+            assert run['host_pid'] == 123456
+            assert run['host_start'] == 'same-process'
+            assert not clients.clients[0].prompts
+            with pytest.raises(ValueError, match='stop the previous execution'):
+                store.recover(run['id'], action='retry', acknowledge_duplicate_risk=True, now=clock())
+            clock.value += 60
+            await settle(scheduler)
+            assert len(clients.clients) == 1
+        finally:
+            await scheduler.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('persistent_failure', [False, True])
+def test_failed_host_receipt_write_is_retried_without_starting_more_work(
+    environment, monkeypatch, persistent_failure,
+):
+    async def scenario():
+        cfg, store, clock = environment
+        job = add_job(store, clock)
+        clients = ClientFactory()
+        clients.disconnect_error = RuntimeError('Cleanup is unavailable')
+        monkeypatch.setattr(scheduler_module, 'process_stamp', lambda pid: 'same-process')
+        monkeypatch.setattr(scheduler_module, 'fence_host', lambda run: False)
+        record_host = store.record_host
+        writes = []
+
+        def busy_receipt(*args):
+            writes.append(args)
+            if persistent_failure or len(writes) == 1:
+                import sqlite3
+                raise sqlite3.OperationalError('database is locked')
+            return record_host(*args)
+
+        monkeypatch.setattr(store, 'record_host', busy_receipt)
+
+        def factory(config, **options):
+            client = clients(config, **options)
+            client.process_group_id = 123456
+            return client
+
+        scheduler = Scheduler(cfg, store=store, client_factory=factory, clock=clock)
+        try:
+            clock.value += 60
+            await settle(scheduler)
+            assert len(writes) == 2
+            run = store.runs(job['id'])[0]
+            assert not clients.clients[0].prompts
+            if persistent_failure:
+                assert run['status'] == 'starting'
+                with pytest.raises(Exception, match='database is locked'):
+                    await scheduler.tick()
+                assert len(clients.clients) == 1
+                monkeypatch.setattr(store, 'record_host', record_host)
+                await scheduler.tick()
+                run = store.runs(job['id'])[0]
+            assert run['status'] == 'failed'
+            assert run['host_pid'] == 123456
+            assert not scheduler._unrecorded_hosts
+            clock.value += 60
+            await settle(scheduler)
+            assert len(clients.clients) == 1
+        finally:
+            await scheduler.close()
+
+    asyncio.run(scenario())
+
+
 def test_process_fence_never_signals_a_reused_pid(monkeypatch):
     signalled = []
     monkeypatch.setattr(scheduler_module, "process_stamp", lambda pid: "different-process")
     monkeypatch.setattr(scheduler_module.os, "killpg", lambda *args: signalled.append(args))
     assert scheduler_module.fence_host({"host_pid": 123456, "host_start": "original-process"})
     assert signalled == []
+
+
+def test_close_retries_unrecorded_host_ownership_before_releasing_worker(environment, monkeypatch):
+    async def scenario():
+        cfg, store, clock = environment
+        job = add_job(store, clock)
+        clients = ClientFactory()
+        clients.disconnect_error = RuntimeError('Cleanup is unavailable')
+        record_host = store.record_host
+        monkeypatch.setattr(scheduler_module, 'process_stamp', lambda pid: 'same-process')
+        monkeypatch.setattr(scheduler_module, 'fence_host', lambda run: False)
+
+        def busy_receipt(*args):
+            import sqlite3
+            raise sqlite3.OperationalError('database is locked')
+
+        monkeypatch.setattr(store, 'record_host', busy_receipt)
+
+        def factory(config, **options):
+            client = clients(config, **options)
+            client.process_group_id = 123456
+            return client
+
+        scheduler = Scheduler(cfg, store=store, client_factory=factory, clock=clock)
+        clock.value += 60
+        await settle(scheduler)
+        assert scheduler._unrecorded_hosts
+        monkeypatch.setattr(store, 'record_host', record_host)
+        await scheduler.close()
+        assert not scheduler._unrecorded_hosts
+        run = store.runs(job['id'])[0]
+        assert run['host_pid'] == 123456
+        assert run['status'] == 'failed'
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("original_boot,cleared", [("old-boot", True), ("current-boot", True)])

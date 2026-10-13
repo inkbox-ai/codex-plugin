@@ -378,3 +378,92 @@ def test_real_host_missing_session_requires_explicit_reset_and_preserves_history
                 await worker.close()
 
     asyncio.run(scenario())
+
+
+def test_worker_crash_during_real_host_initialization_keeps_cleanup_receipt(
+    offline_host, adopt_test_orphans,
+):
+    cfg, path, requests, _ = offline_host
+    marker = path.with_suffix('.initializing')
+    with ScheduleStore(path) as store:
+        job = store.create('Startup outage', 'Write a report.',
+                           {'kind': 'interval', 'seconds': 60}, now=START)
+    program = '''
+import asyncio
+import sys
+from pathlib import Path
+from inkbox_codex.codex_client import CodexAppServerClient
+from inkbox_codex.config import BridgeConfig
+from inkbox_codex.scheduler import Scheduler
+from inkbox_codex.schedules import ScheduleStore
+
+class WaitingClient(CodexAppServerClient):
+    async def _initialize(self):
+        Path(sys.argv[5]).write_text('initializing')
+        await asyncio.Event().wait()
+
+async def main():
+    cfg = BridgeConfig(identity='scheduler-contract-agent', api_key='',
+                      base_url=sys.argv[2], project_dir=sys.argv[3], codex_bin=sys.argv[4],
+                      codex_turn_timeout_s=60)
+    with ScheduleStore(Path(sys.argv[1])) as store:
+        scheduler = Scheduler(cfg, store=store, client_factory=WaitingClient,
+                              clock=lambda: float(sys.argv[6]))
+        await scheduler.start()
+        await asyncio.Event().wait()
+
+asyncio.run(main())
+'''
+    worker = subprocess.Popen(
+        [sys.executable, '-c', program, str(path), cfg.base_url, cfg.project_dir,
+         CODEX_BIN, str(marker), str(START + 60)],
+        cwd=Path(__file__).resolve().parents[2], start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    host_pid = None
+
+    async def scenario():
+        nonlocal host_pid
+        async with asyncio.timeout(10):
+            while not marker.exists():
+                assert worker.poll() is None, 'Scheduler exited before host initialization'
+                await asyncio.sleep(0.02)
+        with ScheduleStore(path) as store:
+            run = store.runs(job['id'])[0]
+            assert run['status'] == 'starting'
+            assert run['thread_id'] is None
+            host_pid = run['host_pid']
+            assert host_pid and run['host_start']
+            assert os.getpgid(host_pid) == host_pid
+            worker.kill()
+            await asyncio.to_thread(worker.wait, 5)
+            restarted = Scheduler(cfg, store=store, clock=lambda: START + 120)
+            try:
+                await restarted.start()
+                async with asyncio.timeout(10):
+                    while True:
+                        _reap_test_group(host_pid)
+                        await restarted.tick()
+                        if not store.orphaned_hosts():
+                            break
+                        await asyncio.sleep(0.02)
+                interrupted = next(item for item in store.runs(job['id']) if item['id'] == run['id'])
+                assert interrupted['status'] == 'uncertain'
+                assert interrupted['host_pid'] is None
+                assert restarted.active is None
+                assert requests == []
+            finally:
+                await restarted.close()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+        worker.communicate(timeout=5)
+        if host_pid:
+            try:
+                os.killpg(host_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _reap_test_group(host_pid)
