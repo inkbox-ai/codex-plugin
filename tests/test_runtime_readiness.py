@@ -201,3 +201,13 @@ def test_recovery_scheduling_failure_does_not_stop_heartbeat(monkeypatch, caplog
     asyncio.run(check())
     assert 'will retry automatically' in caplog.text
     assert 'private queue detail' not in caplog.text
+
+
+def test_scheduler_attention_is_visible_without_disabling_incoming_readiness(monkeypatch):
+    from inkbox_codex import schedule_tools
+    bridge = ready_gateway(monkeypatch)
+    scheduler = {'healthy': False, 'attention_required': True, 'orphan_hosts': 1}
+    monkeypatch.setattr(schedule_tools, 'schedule_status', lambda cfg: scheduler)
+    response = asyncio.run(bridge._handle_ready(None))
+    assert response.status == 200
+    assert json.loads(response.text)['scheduler'] == scheduler

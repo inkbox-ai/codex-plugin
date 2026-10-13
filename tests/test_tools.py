@@ -208,6 +208,11 @@ def test_coding_agent_tool_tier_is_registered():
         "inkbox_a2a_fail",
     }
 
+    expected.update({
+        "inkbox_schedule_add", "inkbox_schedule_list", "inkbox_schedule_update",
+        "inkbox_schedule_delete", "inkbox_schedule_run_now", "inkbox_schedule_history",
+        "inkbox_schedule_catch_up",
+    })
     assert names == expected
 
 

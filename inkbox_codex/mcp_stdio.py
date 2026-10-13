@@ -78,7 +78,8 @@ class InkboxMcpServer:
         if method == "tools/call":
             name = str(params.get("name") or "")
             args = params.get("arguments") or {}
-            result = await call_inkbox_tool(self._inkbox(), self.identity, name, args)
+            client = None if name.startswith("inkbox_schedule_") else self._inkbox()
+            result = await call_inkbox_tool(client, self.identity, name, args)
             return _response(message_id, result)
 
         return _error(message_id, -32601, f"method not found: {method}")

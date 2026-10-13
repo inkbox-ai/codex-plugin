@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.live.sms_diagnostics import SmsTrace
+
 REMOTE_KEY = os.environ.get("REMOTE_INKBOX_API_KEY")
 AUT_KEY = os.environ.get("CODEX_INKBOX_API_KEY")
 BASE_URL = os.environ.get("INKBOX_BASE_URL", "https://inkbox.ai")
@@ -83,12 +85,15 @@ def _plugin_tool_names() -> list[str]:
 def sms():
     remote = _client(REMOTE_KEY)
     aut = _client(AUT_KEY)
-    aut_phone, _aut_pid = _phone(aut)
-    _remote_phone, remote_pid = _phone(remote)
+    aut_phone, aut_pid = _phone(aut)
+    remote_phone, remote_pid = _phone(remote)
     # No opt-in/START needed: the server bypasses the missing-opt-in gate for
     # inter-agent traffic (the recipient is an Inkbox-managed number). Only an
     # explicit STOP/opt-out would block.
-    return {"remote": remote, "aut": aut, "aut_phone": aut_phone, "remote_pid": remote_pid}
+    return {
+        "remote": remote, "aut": aut, "aut_phone": aut_phone, "remote_pid": remote_pid,
+        "sms_trace": lambda: SmsTrace(remote, aut, remote_pid, aut_pid, remote_phone, aut_phone),
+    }
 
 
 def _inbound_from_aut(sms):
@@ -123,7 +128,7 @@ def _settle_inbound(sms) -> set:
     return before
 
 
-def _wait_new_inbound(sms, before: set, timeout_s: float, context: str) -> str:
+def _wait_new_inbound(sms, before: set, timeout_s: float, context: str, diagnostic=None) -> str:
     """Poll for the earliest inbound not in ``before``; return its body lowercased."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -134,10 +139,11 @@ def _wait_new_inbound(sms, before: set, timeout_s: float, context: str) -> str:
                 assert not bad, f"SMS reply is an error, not a real answer: {bad}\n{body[:200]}"
                 return body.lower()
         time.sleep(POLL_EVERY_S)
-    pytest.fail(f"no SMS reply within {timeout_s:.0f}s to: {context}")
+    detail = f"; {diagnostic()}" if diagnostic is not None else ""
+    pytest.fail(f"no SMS reply within {timeout_s:.0f}s to: {context}{detail}")
 
 
-def _diversify(text: str) -> str:
+def _diversify(text: str, *, reference: str | None = None) -> str:
     """Append a unique ref so no two driver sends share a body.
 
     Questions the agent answers reset the conversation cadence, but prompts that
@@ -147,15 +153,18 @@ def _diversify(text: str) -> str:
     inert to every reply-content assertion (they check the agent's answer, not
     the echoed question).
     """
-    return f"{text} (ref {uuid.uuid4().hex[:6]})"
+    return f"{text} (ref {reference or uuid.uuid4().hex[:6]})"
 
 
 def _ask_sms(sms, text: str, timeout_s: float = TIMEOUT_S) -> str:
     """Text the agent; return the reply body (lowercased), matched by new message id."""
     remote, aut_phone, pid = sms["remote"], sms["aut_phone"], sms["remote_pid"]
     before = _settle_inbound(sms)
-    remote.texts.send(pid, to=aut_phone, text=_diversify(text))
-    return _wait_new_inbound(sms, before, timeout_s, repr(text))
+    trace = sms["sms_trace"]()
+    reference = uuid.uuid4().hex[:6]
+    receipt = remote.texts.send(pid, to=aut_phone, text=_diversify(text, reference=reference))
+    trace.sent(receipt, reference)
+    return _wait_new_inbound(sms, before, timeout_s, repr(text), trace.summary)
 
 
 def _ask_sms_besteffort(sms, text: str, timeout_s: float) -> str | None:

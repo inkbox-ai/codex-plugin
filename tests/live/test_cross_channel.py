@@ -29,6 +29,8 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
+from tests.live.sms_diagnostics import SmsTrace
+
 REMOTE_KEY = os.environ.get("REMOTE_INKBOX_API_KEY")
 AUT_KEY = os.environ.get("CODEX_INKBOX_API_KEY")
 BASE_URL = os.environ.get("INKBOX_BASE_URL", "https://inkbox.ai")
@@ -120,6 +122,9 @@ def xc():
         "remote_email": remote_email, "remote_phone": remote_phone,
         "remote_pid": remote_pid,
         "aut_email": aut_email, "aut_phone": aut_phone,
+        "sms_trace": lambda **kwargs: SmsTrace(
+            remote, aut, remote_pid, str(anums[0].id), remote_phone, aut_phone, **kwargs,
+        ),
     }
 
 
@@ -135,6 +140,7 @@ def test_email_request_gets_sms_response(xc):
                 and _digits(getattr(m, "remote_phone_number", "") or "")[-10:] == tail]
 
     before = {m.id for m in _sms_from_aut()}
+    trace = xc["sms_trace"](response_token=token)
     remote.messages.send(
         xc["remote_email"], to=[xc["aut_email"]], subject=f"[{token}] text me please",
         body_text=f"Please send me a text message (SMS) that says: lalala {token}",
@@ -146,7 +152,9 @@ def test_email_request_gets_sms_response(xc):
             if m.id not in before and token in (getattr(m, "text", "") or "").lower():
                 return  # cross-channel confirmed: email request -> SMS response with the token
         time.sleep(POLL_EVERY_S)
-    pytest.fail(f"agent did not send an SMS containing {token!r} within {TIMEOUT_S:.0f}s")
+    pytest.fail(
+        f"no matching inbound SMS response within {TIMEOUT_S:.0f}s; {trace.summary()}"
+    )
 
 
 def test_sms_request_gets_email_response(xc):
@@ -169,7 +177,9 @@ def test_sms_request_gets_email_response(xc):
         ]
 
     before = {m.id for m in _email_from_aut()}
-    remote.texts.send(xc["remote_pid"], to=xc["aut_phone"], text=f"Please email me the code {token}.")
+    trace = xc["sms_trace"](expect_response=False)
+    receipt = remote.texts.send(xc["remote_pid"], to=xc["aut_phone"], text=f"Please email me the code {token}.")
+    trace.sent(receipt, token)
 
     deadline = time.monotonic() + TIMEOUT_S
     while time.monotonic() < deadline:
@@ -183,7 +193,9 @@ def test_sms_request_gets_email_response(xc):
             if token in hay:
                 return  # cross-channel confirmed: SMS request -> email response with the token
         time.sleep(POLL_EVERY_S)
-    pytest.fail(f"agent did not send an email containing {token!r} within {TIMEOUT_S:.0f}s")
+    pytest.fail(
+        f"no matching inbound email response within {TIMEOUT_S:.0f}s; {trace.summary()}"
+    )
 
 
 def _inbound_calls_from_aut(remote, remote_pid: str, aut_phone: str):
@@ -222,6 +234,7 @@ def _wait_for_new_call_pair(
     before_aut: set,
     driver_watermark: datetime,
     aut_watermark: datetime,
+    diagnostic=None,
 ):
     """Correlate one fresh driver inbound leg with one fresh AUT outbound leg."""
     deadline = time.monotonic() + TIMEOUT_S
@@ -246,8 +259,9 @@ def _wait_for_new_call_pair(
             break
         time.sleep(POLL_EVERY_S)
     else:
+        detail = f"; {diagnostic()}" if diagnostic is not None else ""
         pytest.fail(
-            f"agent did not persist both call legs within {TIMEOUT_S:.0f}s"
+            f"agent did not persist both call legs within {TIMEOUT_S:.0f}s{detail}"
         )
 
     time.sleep(CALL_DUPLICATE_GRACE_S)
@@ -320,17 +334,21 @@ def test_sms_request_gets_call(xc):
     # Fresh body each send: the agent replies by calling, not texting, so this
     # SMS never gets an SMS reply to reset the conversation cadence — two
     # identical no-reply sends would trip the duplicate_body rule (422).
-    remote.texts.send(
+    token = _token()
+    trace = xc["sms_trace"](expect_response=False)
+    receipt = remote.texts.send(
         remote_pid,
         to=aut_phone,
         text=(
             "Call me please with voicemail_detection disabled — give me a ring "
-            f"now. Even if you get this late, still call. (ref {_token()})"
+            f"now. Even if you get this late, still call. (ref {token})"
         ),
     )
+    trace.sent(receipt, token)
     call = _wait_for_new_call_pair(
         remote, aut,
         remote_pid=remote_pid, remote_phone=remote_phone, aut_phone=aut_phone,
+        diagnostic=trace.summary,
         **snapshot,
     )
     assert _voicemail_detection_value(call) == "disabled"

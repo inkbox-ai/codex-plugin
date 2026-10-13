@@ -665,6 +665,150 @@ Each explicit decision records its reason, timestamp, and previous/new state.
 Retirement does not claim that processing or delivery succeeded; retry uses a
 saved answer when available. Recovery commands refuse to race a running gateway.
 
+## Scheduled jobs
+
+Save one-off tasks, fixed intervals, or five-field cron schedules. Each job stores
+its complete prompt and keeps a dedicated Codex session across executions and
+gateway restarts. Schedules and execution history are local to the configured
+Inkbox identity, API address, and project directory under `INKBOX_CODEX_HOME`
+(default `~/.inkbox-codex`). They need no system cron service.
+
+Ask your agent to schedule work, or use the CLI (all results are JSON):
+
+```bash
+# A daily task, evaluated in an explicit IANA timezone.
+inkbox-codex schedule add --name "Morning summary" \
+  --cron '0 9 * * 1-5' --timezone America/New_York \
+  --prompt "Review the project's open tasks and save a concise summary."
+
+# Every hour, with a complete prompt read from a local UTF-8 file.
+inkbox-codex schedule add --name "Hourly check" --every 3600 \
+  --prompt-file ./hourly-check.txt --catch-up
+
+# One execution: use a future date and an explicit UTC offset.
+inkbox-codex schedule add --name "Reminder" --once '2030-01-02T09:00:00+00:00' \
+  --prompt "Summarize today's open tasks."
+
+inkbox-codex schedule list
+inkbox-codex schedule show JOB_ID
+inkbox-codex schedule runs JOB_ID --limit 20
+inkbox-codex schedule run-now JOB_ID
+inkbox-codex schedule pause JOB_ID
+inkbox-codex schedule resume JOB_ID
+inkbox-codex schedule update JOB_ID --prompt-file ./updated-task.txt --no-catch-up
+inkbox-codex schedule delete JOB_ID
+```
+
+Replace `JOB_ID` with the `id` returned by `add` or `list`. Intervals are seconds,
+minimum 60. Cron defaults to UTC when `--timezone` is omitted. One-off timestamps
+must include a UTC offset; ambiguous local dates are not accepted. During daylight
+saving transitions, a nonexistent cron local time advances to the next valid
+instant; a repeated autumn local time can run twice at distinct UTC times. Use
+UTC for fixed UTC timing. Job prompts
+may contain up to 64,000 characters. Editing a schedule restarts its timing from
+the edit; editing a prompt keeps the job's existing session. A job whose execution
+is already in progress cannot be deleted or have its prompt/schedule changed.
+
+**Execution and delivery:** the gateway and machine must be running. A saved job
+is not proof that it has executed: inspect `runs` for the outcome, `thread_id`,
+result, and error. Plain Codex output is saved, not automatically sent to the last
+chat. To request a message, include the exact recipient and channel in the saved
+prompt. Scheduled turns use the configured sandbox and do not have a person
+available for interactive approval; choose tasks that can finish under the saved
+permissions. Jobs do not overlap their own executions. When a job already has an
+active or manually queued run, newly due occurrences are recorded as missed and
+follow that job's catch-up setting. Other jobs queued while the online worker is
+busy are preserved until the worker becomes available.
+
+### Downtime, catch-up, and pausing
+
+Missed occurrences are tracked in durable history, including their count and the
+first/last due times. **Automatic catch-up defaults to off per job.** After an
+outage, enable it to combine missed occurrences into one catch-up run, or leave it
+off and inspect the misses before requesting a manual catch-up:
+
+```bash
+inkbox-codex schedule update JOB_ID --catch-up
+inkbox-codex schedule update JOB_ID --no-catch-up
+inkbox-codex schedule catch-up JOB_ID
+
+# Turn the whole scheduler off/on without deleting prompts, sessions, or history.
+inkbox-codex schedule disable
+inkbox-codex schedule status
+inkbox-codex schedule enable
+```
+
+Catch-up coalesces missed work; it does not replay every old occurrence. Global
+on/off is persistent and affects scheduling only, not incoming conversations.
+Turning automatic catch-up off releases queued missed work for later inspection
+without dropping a current scheduled occurrence.
+Disabling scheduling does not cancel an execution that has already started.
+Paused jobs and disabled scheduling do not discard the saved schedule or history.
+Resuming a paused interval or cron job starts from the current time: intentionally
+paused occurrences are not replayed. Re-enabling the whole scheduler accounts for
+downtime according to each job's catch-up setting. Run history timestamps are Unix
+seconds.
+
+If the process stops during execution, the run is marked `uncertain`, rather than
+automatically repeated. Inspect any effects already performed before deciding
+whether to dismiss it or explicitly retry (which can repeat those effects):
+
+```bash
+inkbox-codex schedule runs JOB_ID
+inkbox-codex schedule recover RUN_ID --action dismiss
+# Alternatively, after inspecting the interrupted execution:
+inkbox-codex schedule recover RUN_ID --action retry --acknowledge-duplicate-risk
+```
+
+A run that fails before execution is recorded as `failed`; it is not automatically
+retried. The same recovery commands let you explicitly retry or dismiss it.
+Recovery waits for the previous execution process to stop. If its identity cannot
+be confirmed safely, cleanup remains pending rather than stopping an unrelated
+process; inspect the local process and job history before proceeding.
+If a saved schedule can no longer be calculated (for example, its timezone is
+unavailable), that job is paused with a failed history entry. Edit its schedule
+and resume it; other jobs continue running.
+
+If a job's saved Codex session is no longer available, connecting to that session
+fails rather than silently losing its conversation history. After inspecting the
+failure, a local administrator can reset the session for future executions:
+
+```bash
+inkbox-codex schedule pause JOB_ID
+inkbox-codex schedule runs JOB_ID
+# Resolve any uncertain execution before resetting (inspect effects first):
+# inkbox-codex schedule recover RUN_ID --action dismiss
+inkbox-codex schedule reset-session JOB_ID
+inkbox-codex schedule resume JOB_ID
+```
+
+Resetting clears only the job's current session reference. The saved prompt,
+schedule, and run history remain intact; the next execution starts a new session
+without prior conversation context. Reset is refused while an execution is
+pending, starting, running, uncertain, or still awaiting process cleanup. It does
+not retry a failed run or change any effects already performed. Use `recover`
+explicitly if that run should be retried after reset.
+
+`inkbox-codex doctor` and gateway readiness include scheduler counts and heartbeat
+freshness. A missing or stale heartbeat matters only when scheduling is enabled
+and jobs are enabled; an intentionally paused scheduler is not a startup failure.
+Uncertain executions are reported for inspection. Doctor alerts on scheduler
+health issues; scheduler diagnostics in the readiness response do not gate
+incoming-message readiness. These checks do not create job storage when no
+schedules exist.
+
+If scheduled-job storage or the worker lock prevents startup, incoming
+conversations remain available. Readiness reports the scheduler error, and the
+gateway retries startup every 30 seconds after cleaning up the failed attempt.
+Repair the storage or resolve the other worker; saved jobs resume automatically
+once startup succeeds, subject to their catch-up and recovery settings.
+
+Global scheduler controls, session resets, and uncertain-run recovery are local
+CLI operations. In chat, schedule tools manage the current conversation's jobs.
+The scheduling tool and CLI interfaces reject schedule mutations from scheduled
+turns. Tasks retain the configured Codex host permissions; scheduling does not
+change those permissions.
+
 ## Voice
 
 The setup wizard has a **Phone call voice stack** section with three choices:
@@ -827,6 +971,7 @@ without TOTP must have it configured before the agent can generate codes.
 
 The agent reaches you (or third parties) through an in-process MCP server:
 
+- `inkbox_schedule_add` · `inkbox_schedule_list` · `inkbox_schedule_update` · `inkbox_schedule_delete` · `inkbox_schedule_run_now` · `inkbox_schedule_history` · `inkbox_schedule_catch_up` — persistent local jobs, dedicated sessions, and missed-run history. See [Scheduled jobs](#scheduled-jobs).
 - `inkbox_whoami` — its own identity: handle, mailbox, iMessage status, and its two calling lines (dedicated number vs shared iMessage line).
 - `inkbox_place_call` — place an outbound voice call over either line (`origination`: `dedicated_number` / `shared_imessage_number`) — see [Two calling lines](#two-calling-lines).
 - `inkbox_list_calls` · `inkbox_get_call_transcript` — browse call history and transcripts.

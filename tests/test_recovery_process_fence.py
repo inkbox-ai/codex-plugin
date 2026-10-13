@@ -41,9 +41,11 @@ def test_recovery_stops_native_descendant_before_fresh_turn(
     pid_file = tmp_path / 'native.pid'
     launcher = tmp_path / 'launcher'
     child_program = (
-        'import os, signal, time\n'
+        'import os, signal, time\nfrom pathlib import Path\n'
         'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
-        f'open({str(pid_file)!r}, "w").write(str(os.getpid()))\n'
+        # File existence is the readiness signal; publish only complete contents.
+        f'Path({str(pid_file.with_suffix(".tmp"))!r}).write_text(str(os.getpid()))\n'
+        f'os.replace({str(pid_file.with_suffix(".tmp"))!r}, {str(pid_file)!r})\n'
         'time.sleep(60)\n'
     )
     launcher.write_text(

@@ -14,6 +14,7 @@ import json
 import mimetypes
 import os
 import secrets
+import sqlite3
 import sys
 import time
 import uuid
@@ -893,6 +894,15 @@ def _hosted_call_reason(args: Dict[str, Any]) -> str:
 async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Run one Inkbox MCP tool and return an MCP ``tools/call`` result."""
 
+    if name.startswith("inkbox_schedule_"):
+        from .schedule_tools import dispatch_schedule_tool
+        try:
+            return _tool_result(await asyncio.to_thread(dispatch_schedule_tool, name, args, identity=identity_handle))
+        except ValueError as exc:
+            return _tool_error(str(exc))
+        except (OSError, sqlite3.Error):
+            return _tool_error("Could not access scheduled-job data.")
+
     args = dict(args or {})
     hosted_sms_context: Optional[Dict[str, Any]] = None
     upload_context = None
@@ -1572,9 +1582,10 @@ def _imessage_send_tool_entry(spec: ToolSpec) -> Dict[str, Any]:
 def mcp_tool_list() -> List[Dict[str, Any]]:
     """Return MCP ``tools/list`` entries for every Inkbox tool."""
     from .slack import SLACK_TOOLS
+    from .schedule_tools import SCHEDULE_TOOLS
 
     cfg = read_config()
-    return (SLACK_TOOLS if cfg.slack_enabled else []) + (
+    return SCHEDULE_TOOLS + (SLACK_TOOLS if cfg.slack_enabled else []) + (
         IMESSAGE_THREAD_TOOLS if cfg.imessage_threaded_replies else []
     ) + [
         _place_call_tool_entry(cfg.voice_stack)
@@ -1596,6 +1607,7 @@ def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]
         "INKBOX_API_KEY": cfg.api_key,
         "INKBOX_IDENTITY": cfg.identity,
         "INKBOX_BASE_URL": cfg.base_url,
+        "CODEX_PROJECT_DIR": str(Path(cfg.project_dir or os.getcwd()).expanduser().resolve()),
         "INKBOX_SLACK_ENABLED": "1" if cfg.slack_enabled else "0",
         "INKBOX_IMESSAGE_THREADED_REPLIES": "1" if cfg.imessage_threaded_replies else "0",
         "INKBOX_VOICE_STACK": cfg.voice_stack.value,
@@ -1619,7 +1631,10 @@ def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]
     }
     if cfg.auto_approve_inkbox_tools:
         server["default_tools_approval_mode"] = "approve"
+    from .schedule_tools import SCHEDULE_TOOLS
+
     tool_names = [f"mcp__inkbox__{spec.name}" for spec in TOOL_SPECS]
+    tool_names.extend(f"mcp__inkbox__{tool['name']}" for tool in SCHEDULE_TOOLS)
     if cfg.imessage_threaded_replies:
         tool_names.extend(f"mcp__inkbox__{tool['name']}" for tool in IMESSAGE_THREAD_TOOLS)
     if cfg.slack_enabled:

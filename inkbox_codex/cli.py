@@ -89,6 +89,129 @@ def _cmd_inbox(args) -> int:
             inbox.close()
 
 
+def _schedule_definition(args) -> dict | None:
+    if args.once is not None:
+        if args.timezone is not None:
+            raise ValueError("--timezone applies only to --cron; --once requires a timestamp with UTC offset")
+        return {"kind": "once", "at": args.once}
+    if args.every is not None:
+        if args.timezone is not None:
+            raise ValueError("--timezone applies only to --cron")
+        return {"kind": "interval", "seconds": args.every}
+    if args.cron is not None:
+        return {"kind": "cron", "expression": args.cron, "timezone": args.timezone or "UTC"}
+    if args.timezone is not None:
+        raise ValueError("Provide --cron when changing its timezone")
+    return None
+
+
+def _schedule_parser(sub) -> None:
+    schedule = sub.add_parser("schedule", help="manage persistent local scheduled jobs")
+    commands = schedule.add_subparsers(dest="schedule_command", required=True)
+    for command in ("add", "update"):
+        item = commands.add_parser(command, help=f"{command} a job with a stored prompt and dedicated session")
+        if command == "update":
+            item.add_argument("job_id")
+        item.add_argument("--name", required=command == "add")
+        prompt = item.add_mutually_exclusive_group(required=command == "add")
+        prompt.add_argument("--prompt", help="complete task instructions; include delivery recipient if needed")
+        prompt.add_argument("--prompt-file", help="read UTF-8 task instructions from a file")
+        timing = item.add_mutually_exclusive_group(required=command == "add")
+        timing.add_argument("--once", help="ISO 8601 timestamp including UTC offset")
+        timing.add_argument("--every", type=int, help="interval in seconds (minimum 60)")
+        timing.add_argument("--cron", help="five-field cron expression")
+        item.add_argument("--timezone", help="IANA timezone for --cron (default UTC)")
+        item.add_argument("--catch-up", action=argparse.BooleanOptionalAction, default=None,
+                          help="coalesce missed executions after downtime into one run (default off)")
+        item.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=None,
+                          help="enable future scheduled executions (default on)")
+    for command in ("show", "pause", "resume", "delete", "run-now", "catch-up"):
+        commands.add_parser(command).add_argument("job_id")
+    commands.add_parser("reset-session", help="start future executions with a fresh session (local administrator only)").add_argument("job_id")
+    commands.add_parser("list", help="list saved jobs")
+    runs = commands.add_parser("runs", help="inspect execution history and missed occurrences")
+    runs.add_argument("job_id", nargs="?")
+    runs.add_argument("--limit", type=int, default=50)
+    recover = commands.add_parser("recover", help="explicitly retry or dismiss an interrupted run")
+    recover.add_argument("run_id")
+    recover.add_argument("--action", choices=("retry", "dismiss"), required=True)
+    recover.add_argument("--acknowledge-duplicate-risk", action="store_true")
+    commands.add_parser("status", help="show scheduler state")
+    commands.add_parser("enable", help="enable scheduled execution globally")
+    commands.add_parser("disable", help="disable scheduled execution globally without deleting jobs")
+
+
+def _cmd_schedule(args) -> int:
+    import sqlite3
+    from pathlib import Path
+    from .schedule_tools import check_schedule_mutation, schedule_owner, schedule_status
+    from .schedules import ScheduleStore, schedule_path
+
+    daemon._maybe_load_env_file()
+    try:
+        cfg = read_config()
+        if not cfg.identity:
+            raise ValueError("Set INKBOX_IDENTITY before managing scheduled jobs.")
+        command = args.schedule_command
+        owner = schedule_owner()
+        current_job = (os.getenv("INKBOX_SCHEDULE_JOB_ID") or "").strip()
+        if command not in {"list", "show", "runs", "status"}:
+            check_schedule_mutation()
+        if (owner is not None or current_job) and command in {"enable", "disable", "recover", "status", "reset-session"}:
+            raise ValueError("This command is available only from the local administrator CLI.")
+        if current_job and getattr(args, "job_id", None) not in {None, current_job}:
+            raise ValueError("Scheduled jobs can inspect only their own execution history")
+        if command == "status":
+            print(json.dumps(schedule_status(cfg), indent=2))
+            return 0
+        with ScheduleStore(schedule_path(cfg)) as store:
+            if command in {"add", "update"}:
+                changes = {key: getattr(args, key) for key in ("name", "catch_up", "enabled") if getattr(args, key) is not None}
+                prompt = args.prompt
+                if args.prompt_file is not None:
+                    with Path(args.prompt_file).expanduser().open(encoding="utf-8") as source:
+                        prompt = source.read(64001)
+                if prompt is not None:
+                    changes["prompt"] = prompt
+                timing = _schedule_definition(args)
+                if timing is not None:
+                    changes["schedule"] = timing
+                if command == "add":
+                    result = store.create(owner=owner or "", **changes)
+                else:
+                    if not changes:
+                        raise ValueError("Provide at least one field to update")
+                    result = store.update(args.job_id, owner=owner, **changes)
+            elif command == "list":
+                result = [store.get(current_job)] if current_job else store.list_jobs(owner=owner)
+            elif command == "show":
+                result = store.get(args.job_id, owner=None if current_job else owner)
+            elif command in {"pause", "resume"}:
+                result = store.update(args.job_id, enabled=command == "resume", owner=owner)
+            elif command == "delete":
+                store.delete(args.job_id, owner=owner)
+                result = {"deleted": True, "job_id": args.job_id}
+            elif command == "run-now":
+                result = store.enqueue(args.job_id, owner=owner)
+            elif command == "catch-up":
+                result = store.catch_up(args.job_id, owner=owner)
+            elif command == "reset-session":
+                result = store.reset_session(args.job_id, owner=owner)
+            elif command == "runs":
+                result = store.runs(job_id=current_job or args.job_id, owner=None if current_job else owner, limit=args.limit)
+            elif command == "recover":
+                result = store.recover(args.run_id, action=args.action, acknowledge_duplicate_risk=args.acknowledge_duplicate_risk)
+            else:
+                result = store.set_enabled(command == "enable")
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}))
+    except (OSError, sqlite3.Error, UnicodeError):
+        print(json.dumps({"error": "Could not access scheduled-job data or the prompt file."}))
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI dispatcher.
 
@@ -135,6 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     recover_parser.add_argument("--acknowledge-duplicate-risk", action="store_true",
                                 help="confirm inspected uncertain turns or sends may run again")
 
+    _schedule_parser(sub)
     args = parser.parse_args(argv)
     if args.command == "setup":
         interactive_setup()
@@ -164,6 +288,8 @@ def main(argv: list[str] | None = None) -> int:
         return print_doctor()
     if args.command == "whoami":
         return _cmd_whoami()
+    if args.command == "schedule":
+        return _cmd_schedule(args)
     if args.command == "inbox":
         return _cmd_inbox(args)
     return 2

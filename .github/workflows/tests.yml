@@ -33,7 +33,7 @@ jobs:
 
       # Live helper regressions exercise the SDK's real pagination offline.
       - name: Install test deps
-        run: uv pip install --system pytest httpx aiohttp segno "inkbox==0.7.15" "audioop-lts>=0.2.1; python_version >= '3.13'"
+        run: uv pip install --system pytest httpx aiohttp segno "croniter>=6.2,<7" "tzdata>=2025.1" "inkbox==0.7.15" "audioop-lts>=0.2.1; python_version >= '3.13'"
 
       - name: Run unit tests
         run: pytest -q
@@ -101,7 +101,7 @@ jobs:
   # Exercise Slack initialization against the same released SDK floor.
   slack-companion-sdk:
     runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -167,7 +167,7 @@ jobs:
   # host, using the same supported SDK floor as the other verification lanes.
   companion-sdk:
     runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6

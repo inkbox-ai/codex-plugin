@@ -11,10 +11,12 @@ try:
     from .config import VoiceStack, imessage_threading_capability, inkbox_client_kwargs, read_config
     from .codex_client import probe_codex
     from .companion import inbox_summary
+    from .schedule_tools import schedule_status, schedule_status_detail
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import VoiceStack, imessage_threading_capability, inkbox_client_kwargs, read_config
     from codex_client import probe_codex
     from companion import inbox_summary
+    from schedule_tools import schedule_status, schedule_status_detail
 
 
 def run_doctor() -> List[Tuple[str, bool, str]]:
@@ -107,6 +109,9 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
         if blocked:
             detail += "; automatic recovery is active while the gateway runs"
         checks.append(("Companion inbox", not blocked, detail))
+
+    scheduler = schedule_status(cfg)
+    checks.append(("Scheduled jobs", scheduler["healthy"], schedule_status_detail(scheduler)))
 
     codex_home = os.getenv("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
     has_api_key = bool(os.getenv("OPENAI_API_KEY") or os.getenv("CODEX_API_KEY") or os.getenv("CODEX_ACCESS_TOKEN"))
