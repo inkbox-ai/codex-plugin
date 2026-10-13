@@ -35,6 +35,13 @@ def fence_host(run):
     pid = run['host_pid']
     if pid is None:
         return True
+    stamp = run['host_start'] or ''
+    if ':' in stamp:
+        try:
+            if stamp.split(':', 1)[0] != Path('/proc/sys/kernel/random/boot_id').read_text().strip():
+                return True
+        except OSError:
+            pass
     current = process_stamp(pid)
     if current is not None:
         if not run['host_start'] or current != run['host_start']:

@@ -243,6 +243,60 @@ def test_process_fence_never_signals_a_reused_pid(monkeypatch):
     assert signalled == []
 
 
+@pytest.mark.parametrize("original_boot,cleared", [("old-boot", True), ("current-boot", False)])
+def test_process_fence_distinguishes_reboot_from_same_boot_pid_reuse(monkeypatch, original_boot, cleared):
+    signalled = []
+    read_text = scheduler_module.Path.read_text
+
+    def read_boot(path, *args, **kwargs):
+        if str(path) == "/proc/sys/kernel/random/boot_id":
+            return "current-boot\n"
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(scheduler_module.Path, "read_text", read_boot)
+    monkeypatch.setattr(scheduler_module, "process_stamp", lambda pid: "current-boot:999")
+    monkeypatch.setattr(scheduler_module.os, "killpg", lambda *args: signalled.append(args))
+    assert scheduler_module.fence_host({"host_pid": 123456, "host_start": f"{original_boot}:111"}) is cleared
+    assert signalled == []
+
+
+def test_restart_after_reboot_clears_old_host_but_requires_explicit_retry(environment, monkeypatch):
+    async def scenario():
+        cfg, store, clock = environment
+        job = add_job(store, clock, catch_up=True)
+        clock.value += 60
+        run = store.claim(now=clock())
+        store.mark_running(run["id"], "before-reboot-thread", host_pid=123456, host_start="old-boot:111")
+        signalled = []
+        read_text = scheduler_module.Path.read_text
+
+        def read_boot(path, *args, **kwargs):
+            if str(path) == "/proc/sys/kernel/random/boot_id":
+                return "current-boot\n"
+            return read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(scheduler_module.Path, "read_text", read_boot)
+        monkeypatch.setattr(scheduler_module, "process_stamp", lambda pid: "current-boot:999")
+        monkeypatch.setattr(scheduler_module.os, "killpg", lambda *args: signalled.append(args))
+        clients = ClientFactory()
+        scheduler = Scheduler(cfg, store=store, client_factory=clients, clock=clock)
+        try:
+            clock.value += 300
+            await scheduler.start()
+            await scheduler.tick()
+            previous = next(item for item in store.runs(job["id"]) if item["id"] == run["id"])
+            assert previous["status"] == "uncertain"
+            assert previous["host_pid"] is None
+            assert clients.clients == []
+            assert signalled == []
+            retry = store.recover(run["id"], action="retry", acknowledge_duplicate_risk=True, now=clock())
+            assert retry["status"] == "pending"
+        finally:
+            await scheduler.close()
+
+    asyncio.run(scenario())
+
+
 def test_disable_prevents_new_submissions_until_enabled(environment):
     async def scenario():
         cfg, store, clock = environment

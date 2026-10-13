@@ -1,11 +1,15 @@
 """Scheduled execution through the real local Codex host, with an offline model."""
 
 import asyncio
+import ctypes
 import json
 import os
 import shutil
 import signal
+import subprocess
+import sys
 import threading
+from pathlib import Path
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 
@@ -198,3 +202,130 @@ def test_real_host_killed_inflight_is_not_replayed_after_restart(offline_host):
                 await worker.close()
 
     asyncio.run(scenario())
+
+
+@pytest.fixture
+def adopt_test_orphans():
+    """Reap only the test host's process group after its worker is killed."""
+    if sys.platform != "linux":
+        pytest.skip("requires Linux child-subreaper support")
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    assert libc.prctl(37, ctypes.byref(previous), 0, 0, 0) == 0
+    assert libc.prctl(36, 1, 0, 0, 0) == 0
+    try:
+        yield
+    finally:
+        assert libc.prctl(36, previous.value, 0, 0, 0) == 0
+
+
+def _reap_test_group(group_id):
+    while True:
+        try:
+            pid, _ = os.waitpid(-group_id, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
+
+def test_killed_scheduler_worker_releases_lock_and_recovers_real_orphan_host(
+    offline_host, adopt_test_orphans,
+):
+    cfg, path, requests, state = offline_host
+    state.block = True
+    with ScheduleStore(path) as store:
+        job = store.create(
+            name="Worker outage report",
+            prompt="Return a short status report. smoke-aabbcc33",
+            schedule={"kind": "interval", "seconds": 60},
+            catch_up=True,
+            now=START,
+        )
+    program = """
+import asyncio
+import sys
+from pathlib import Path
+from inkbox_codex.config import BridgeConfig
+from inkbox_codex.scheduler import Scheduler
+from inkbox_codex.schedules import ScheduleStore
+
+async def main():
+    cfg = BridgeConfig(identity="scheduler-contract-agent", api_key="", base_url=sys.argv[2],
+                      project_dir=sys.argv[3], codex_bin=sys.argv[4], codex_model="mock-model",
+                      codex_sandbox="read-only", codex_approval_policy="never", codex_turn_timeout_s=60)
+    with ScheduleStore(Path(sys.argv[1])) as store:
+        scheduler = Scheduler(cfg, store=store, clock=lambda: float(sys.argv[5]))
+        await scheduler.start()
+        await asyncio.Event().wait()
+
+asyncio.run(main())
+"""
+    worker_process = subprocess.Popen(
+        [sys.executable, "-c", program, str(path), cfg.base_url, cfg.project_dir, CODEX_BIN, str(START + 60)],
+        cwd=Path(__file__).resolve().parents[2],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    host_pid = None
+
+    async def scenario():
+        nonlocal host_pid
+        received = await asyncio.to_thread(state.received.wait, 20)
+        assert received, "The worker's real Codex child did not submit a model request"
+        with ScheduleStore(path) as store:
+            run = next(run for run in store.runs(job["id"]) if run["status"] == "running")
+            host_pid = run["host_pid"]
+            assert host_pid and host_pid != worker_process.pid
+            assert os.getpgid(host_pid) == host_pid
+            assert store.get(job["id"])["thread_id"]
+
+            # Kill the plugin worker itself, leaving its isolated host group to recovery.
+            worker_process.kill()
+            await asyncio.to_thread(worker_process.wait, 10)
+            assert worker_process.returncode == -signal.SIGKILL
+            previous = next(item for item in store.runs(job["id"]) if item["id"] == run["id"])
+            assert previous["status"] == "running", "The killed worker cannot finalize its receipt"
+
+            clock = START + 6 * 60 + 31
+            restarted = Scheduler(cfg, store=store, clock=lambda: clock)
+            try:
+                # This also proves no child retained the dead worker's exclusive lock.
+                await asyncio.wait_for(restarted.start(), timeout=10)
+                async with asyncio.timeout(10):
+                    while True:
+                        _reap_test_group(host_pid)
+                        await restarted.tick()
+                        if not store.orphaned_hosts():
+                            break
+                        await asyncio.sleep(0.02)
+                previous = next(item for item in store.runs(job["id"]) if item["id"] == run["id"])
+                assert previous["status"] == "uncertain"
+                assert previous["host_pid"] is None
+                assert restarted.active is None
+                assert len(requests) == 1
+                _reap_test_group(host_pid)
+                with pytest.raises(ProcessLookupError):
+                    os.killpg(host_pid, 0)
+                state.release.set()
+                await restarted.tick()
+                assert len(requests) == 1
+                assert sum(item["count"] for item in store.runs(job["id"]) if item["status"] == "missed") == 5
+            finally:
+                await restarted.close()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        state.release.set()
+        if worker_process.poll() is None:
+            worker_process.kill()
+        worker_process.communicate(timeout=10)
+        if host_pid:
+            # Captured from this test's durable receipt; never signal unrelated groups.
+            try:
+                os.killpg(host_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _reap_test_group(host_pid)
