@@ -101,7 +101,7 @@ jobs:
   # Exercise Slack initialization against the same released SDK floor.
   slack-companion-sdk:
     runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -167,7 +167,7 @@ jobs:
   # host, using the same supported SDK floor as the other verification lanes.
   companion-sdk:
     runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6

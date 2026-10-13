@@ -26,6 +26,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from tests.live.sms_diagnostics import SmsTrace
+
 # This suite owns the call transport and media path; natural-language routing is
 # exercised separately by test_cross_channel.py. Name the required action here so
 # model phrasing variance cannot prevent the telephony smoke test from starting.
@@ -34,7 +36,7 @@ import pytest
 _CALL_ME_REQUEST = "Use the inkbox_place_call tool now to call my phone number from this SMS."
 
 
-def _call_me_text(*, hosted: bool = False) -> str:
+def _call_me_text(*, hosted: bool = False, reference: str | None = None) -> str:
     """An explicit call action with a fresh body for every send."""
     request = _CALL_ME_REQUEST
     if hosted:
@@ -45,7 +47,7 @@ def _call_me_text(*, hosted: bool = False) -> str:
         )
     else:
         request += " Do not reply by text."
-    return f"{request} (ref {uuid.uuid4().hex[:6]})"
+    return f"{request} (ref {reference or uuid.uuid4().hex[:6]})"
 
 
 REMOTE_KEY = os.environ.get("REMOTE_INKBOX_API_KEY")
@@ -104,6 +106,7 @@ def _wait_for_fresh_call_pair(
     not_before: datetime,
     deadline: float,
     label: str,
+    diagnostic=None,
 ):
     """Return one stable driver/AUT pair created for the current request."""
     stable_ids = None
@@ -142,8 +145,9 @@ def _wait_for_fresh_call_pair(
             stable_ids = None
             stable_since = None
         time.sleep(POLL_EVERY_S)
+    detail = f"; {diagnostic()}" if diagnostic is not None else ""
     pytest.fail(
-        f"{label} did not produce exactly one stable call pair within {TIMEOUT_S:.0f}s (driver={_call_summary(last_driver)}; AUT={_call_summary(last_aut)})"
+        f"{label} did not produce exactly one stable call pair within {TIMEOUT_S:.0f}s (driver={_call_summary(last_driver)}; AUT={_call_summary(last_aut)}){detail}"
     )
 
 
@@ -604,7 +608,9 @@ def test_outbound_call_realtime():
     """Driver texts 'call me'; the agent places a realtime-powered call and replies."""
     st = _driver_state()
     remote, aut = _client(REMOTE_KEY), _client(AUT_KEY)
-    aut_phone = _aut_phone(aut)
+    aut_numbers = aut.phone_numbers.list()
+    assert aut_numbers, "AUT identity has no phone number"
+    aut_phone = aut_numbers[0].number
     tail = _digits(aut_phone)[-10:]
     driver_tail = _digits(st["number"])[-10:]
 
@@ -629,7 +635,15 @@ def test_outbound_call_realtime():
     before_driver = {call.id for call in _inbound_from_aut()}
     before_aut = {call.id for call in _outbound_from_aut()}
     not_before = datetime.now(UTC) - timedelta(seconds=10)
-    remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
+    trace = SmsTrace(
+        remote, aut, st["number_id"], aut_numbers[0].id, st["number"], aut_phone,
+        expect_response=False,
+    )
+    reference = uuid.uuid4().hex[:6]
+    receipt = remote.texts.send(
+        st["number_id"], to=aut_phone, text=_call_me_text(reference=reference),
+    )
+    trace.sent(receipt, reference)
 
     aut_call = None
     try:
@@ -643,6 +657,7 @@ def test_outbound_call_realtime():
             not_before=not_before,
             deadline=deadline,
             label="outbound realtime voice test",
+            diagnostic=trace.summary,
         )
         persisted = aut.calls.get(aut_call.id)
         assert _voicemail_detection_value(persisted) == "disabled"
@@ -725,7 +740,15 @@ def test_outbound_call_voice_ai_and_post_call_completion():
         scenario_deadline - HOSTED_POST_CALL_SETTLEMENT_S - HOSTED_DUPLICATE_GRACE_S - POLL_EVERY_S
     )
     not_before = datetime.now(UTC) - timedelta(seconds=10)
-    remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text(hosted=True))
+    trace = SmsTrace(
+        remote, aut, st["number_id"], aut_number_id, st["number"], aut_phone,
+        expect_response=False,
+    )
+    reference = uuid.uuid4().hex[:6]
+    receipt = remote.texts.send(
+        st["number_id"], to=aut_phone, text=_call_me_text(hosted=True, reference=reference),
+    )
+    trace.sent(receipt, reference)
 
     aut_call = None
     try:
@@ -737,6 +760,7 @@ def test_outbound_call_voice_ai_and_post_call_completion():
             not_before=not_before,
             deadline=pre_hangup_deadline,
             label="hosted voice test",
+            diagnostic=trace.summary,
         )
         mode = str(
             getattr(
