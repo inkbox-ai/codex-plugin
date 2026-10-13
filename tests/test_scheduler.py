@@ -200,6 +200,7 @@ def test_scheduled_process_has_no_inherited_conversation_or_delivery_target(envi
             assert process_env["INKBOX_SCHEDULE_RUN_ID"] == store.runs(job["id"])[0]["id"]
             assert options["mcp_server_config"]["env"]["INKBOX_CODEX_CHAT_ID"] == ""
             assert options["mcp_server_config"]["env"]["INKBOX_SCHEDULE_JOB_ID"] == job["id"]
+            assert options["mcp_server_config"]["env"]["INKBOX_SCHEDULE_RUN_ID"] == store.runs(job["id"])[0]["id"]
             assert options["isolate_process_group"] is True
             assert clients.clients[0].cfg.codex_sandbox == cfg.codex_sandbox
             assert clients.clients[0].cfg.codex_approval_policy == cfg.codex_approval_policy

@@ -90,6 +90,46 @@ async def run_due(worker):
     await asyncio.wait_for(asyncio.shield(worker.active), timeout=40)
 
 
+def test_real_host_forwards_run_ownership_to_mcp_child(offline_host, monkeypatch):
+    from inkbox_codex import scheduler as scheduler_module
+
+    cfg, path, _, _ = offline_host
+    marker = path.with_suffix('.mcp-environment.json')
+    build_config = scheduler_module.build_inkbox_mcp_server_config
+
+    def recorded_mcp(config):
+        server, names = build_config(config)
+        server['args'] = ['-c', f'''
+import json, os, runpy
+from pathlib import Path
+Path({str(marker)!r}).write_text(json.dumps({{
+    'run_id': os.getenv('INKBOX_SCHEDULE_RUN_ID'),
+    'job_id': os.getenv('INKBOX_SCHEDULE_JOB_ID'),
+    'chat_id': os.getenv('INKBOX_CODEX_CHAT_ID'),
+}}))
+runpy.run_module('inkbox_codex.mcp_stdio', run_name='__main__')
+''']
+        return server, names
+
+    monkeypatch.setattr(scheduler_module, 'build_inkbox_mcp_server_config', recorded_mcp)
+
+    async def scenario():
+        with ScheduleStore(path) as store:
+            job = store.create('Ownership propagation', 'Write a short report.',
+                               {'kind': 'interval', 'seconds': 60}, now=START)
+            worker = Scheduler(cfg, store=store, clock=lambda: START + 60)
+            try:
+                await run_due(worker)
+                run = store.runs(job['id'])[0]
+                assert run['status'] == 'succeeded', run
+                observed = json.loads(marker.read_text())
+                assert observed == {'run_id': run['id'], 'job_id': job['id'], 'chat_id': ''}
+            finally:
+                await worker.close()
+
+    asyncio.run(scenario())
+
+
 def test_real_host_persists_session_and_catches_up_outage_once(offline_host):
     cfg, path, requests, _ = offline_host
     clock = [START]

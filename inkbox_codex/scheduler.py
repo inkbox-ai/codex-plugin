@@ -219,7 +219,8 @@ class Scheduler:
             env['INKBOX_SCHEDULE_JOB_ID'] = job['id']
             env['INKBOX_SCHEDULE_RUN_ID'] = run['id']
             server['env'] = {**server['env'], 'INKBOX_CODEX_CHAT_ID': '',
-                             'INKBOX_SCHEDULE_JOB_ID': job['id']}
+                             'INKBOX_SCHEDULE_JOB_ID': job['id'],
+                             'INKBOX_SCHEDULE_RUN_ID': run['id']}
             instructions = (
                 'You are running a saved scheduled task. Use only this job’s dedicated session; '
                 'there is no incoming message or implicit reply recipient. The saved prompt defines '
