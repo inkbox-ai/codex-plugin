@@ -685,6 +685,11 @@ inkbox-codex schedule add --name "Morning summary" \
 inkbox-codex schedule add --name "Hourly check" --every 3600 \
   --prompt-file ./hourly-check.txt --catch-up
 
+# Every 30 minutes for three hours: one job, six due times, no immediate run.
+inkbox-codex schedule add --name "Afternoon checks" --every 1800 \
+  --duration-seconds 10800 --max-runs 6 \
+  --prompt "Check the project's progress and save a summary."
+
 # One execution: use a future date and an explicit UTC offset.
 inkbox-codex schedule add --name "Reminder" --once '2030-01-02T09:00:00+00:00' \
   --prompt "Summarize today's open tasks."
@@ -748,6 +753,46 @@ Resuming a paused interval or cron job starts from the current time: intentional
 paused occurrences are not replayed. Re-enabling the whole scheduler accounts for
 downtime according to each job's catch-up setting. Run history timestamps are Unix
 seconds.
+
+### Bounded recurring jobs
+
+Set `--duration-seconds` or `--end-at '2030-01-02T12:00:00+00:00'` to stop a
+recurring job automatically. A duration is converted once, when saved, into a
+fixed `end_at`; restarting the gateway, pausing, or resuming never extends it.
+The last due time is inclusive: a 30-minute interval with a three-hour duration
+has six due times, starting after 30 minutes. A job with no due time inside its
+window is rejected. Cron bounds use absolute instants, independently of the
+cron timezone.
+
+The normal 30-second dispatch grace also applies to the final due time. After
+`end_at + 30 seconds`, no new execution can start, including previously queued
+work, automatic/manual catch-up, retries, and `run-now`. Already-started work
+may finish. Downtime records only occurrences inside the window; catch-up may
+combine them while the window remains open, but does not send late work after
+the deadline. Pauses do not extend the window or replay paused occurrences.
+
+`--max-runs N` independently limits lifetime execution starts. The limit counts
+successful, failed, uncertain, manual, retry, and catch-up attempts alike. A
+coalesced catch-up counts as one execution; missed ticks and cancelled queued
+work do not consume it. This is an attempt limit, not a guarantee of N successful
+external actions. When both bounds are set, whichever is reached first stops
+the job. Claims and counting are atomic and persist across restarts.
+
+`list` and `show` include `end_at` (Unix seconds), `max_runs`, `run_count`,
+`remaining_runs`, and `stop_reason` (`end_at` or `max_runs` once stopped).
+Stopped jobs remain saved, disabled, and readable with their history intact.
+To deliberately permit further work, extend a limit or clear it with
+`schedule update JOB_ID --no-end-at --no-max-runs --enabled`. Counts never reset;
+resuming or extending an exhausted time window restarts recurring timing from
+the current time. Changing limits while
+an execution is active is refused, just like changing its prompt or schedule.
+For an uncertain execution, limits may be extended or cleared first so that
+explicit recovery remains possible; changing limits does not resolve or retry it.
+
+The corresponding `inkbox_schedule_add` and `inkbox_schedule_update` fields are
+`duration_seconds`, `end_at` (ISO 8601 with UTC offset), and `max_runs`; omitted
+update fields are unchanged and `null` clears `end_at` or `max_runs`. Do not pass
+both `duration_seconds` and `end_at`.
 
 If the process stops during execution, the run is marked `uncertain`, rather than
 automatically repeated. Inspect any effects already performed before deciding

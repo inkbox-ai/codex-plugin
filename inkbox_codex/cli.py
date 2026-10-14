@@ -121,6 +121,14 @@ def _schedule_parser(sub) -> None:
         timing.add_argument("--every", type=int, help="interval in seconds (minimum 60)")
         timing.add_argument("--cron", help="five-field cron expression")
         item.add_argument("--timezone", help="IANA timezone for --cron (default UTC)")
+        ending = item.add_mutually_exclusive_group()
+        ending.add_argument("--end-at", help="inclusive last due time (ISO 8601 with UTC offset)")
+        ending.add_argument("--duration-seconds", type=int, help="set a fixed end time this many seconds after saving")
+        count = item.add_mutually_exclusive_group()
+        count.add_argument("--max-runs", type=int, help="lifetime execution-start limit, including manual runs and retries")
+        if command == "update":
+            ending.add_argument("--no-end-at", action="store_true", help="remove the end-time limit")
+            count.add_argument("--no-max-runs", action="store_true", help="remove the execution-count limit")
         item.add_argument("--catch-up", action=argparse.BooleanOptionalAction, default=None,
                           help="coalesce missed executions after downtime into one run (default off)")
         item.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=None,
@@ -166,7 +174,10 @@ def _cmd_schedule(args) -> int:
             return 0
         with ScheduleStore(schedule_path(cfg)) as store:
             if command in {"add", "update"}:
-                changes = {key: getattr(args, key) for key in ("name", "catch_up", "enabled") if getattr(args, key) is not None}
+                changes = {key: getattr(args, key) for key in ("name", "catch_up", "enabled", "end_at", "duration_seconds", "max_runs") if getattr(args, key) is not None}
+                for key in ("end_at", "max_runs"):
+                    if getattr(args, "no_" + key, False):
+                        changes[key] = None
                 prompt = args.prompt
                 if args.prompt_file is not None:
                     with Path(args.prompt_file).expanduser().open(encoding="utf-8") as source:

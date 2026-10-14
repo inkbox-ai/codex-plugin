@@ -246,3 +246,44 @@ def test_cli_resume_invalidated_timezone_returns_error_without_traceback(capsys)
     assert 'valid IANA timezone' in error['error']
     with ScheduleStore(schedule_path(read_config())) as store:
         assert store.get(job['id'])['enabled'] is False
+
+
+def test_bounded_schedule_mcp_fields_and_saved_progress(monkeypatch):
+    monkeypatch.setattr('inkbox_codex.schedules.time.time', lambda: 1000.0)
+    job = add(duration_seconds=10800, max_runs=6)
+    assert job['end_at'] == 11800 and job['remaining_runs'] == 6
+    updated, error = call('update', job_id=job['id'], end_at='2030-01-02T12:00:00Z', max_runs=7)
+    assert not error and updated['max_runs'] == 7
+    assert call('list')[0][0]['end_at'] == updated['end_at']
+    cleared, error = call('update', job_id=job['id'], end_at=None, max_runs=None)
+    assert not error and cleared['end_at'] is None and cleared['max_runs'] is None
+    _, error = call('update', job_id=job['id'], duration_seconds=10800, end_at=None)
+    assert error
+    for name in ('inkbox_schedule_add', 'inkbox_schedule_update'):
+        schema = next(t['inputSchema'] for t in schedule_tools.SCHEDULE_TOOLS if t['name'] == name)
+        assert {'end_at', 'duration_seconds', 'max_runs'} <= schema['properties'].keys()
+        assert schema['properties']['max_runs']['minimum'] == 1
+
+
+def test_cli_bounded_schedule_and_clearing_limits(capsys, monkeypatch):
+    monkeypatch.setattr('inkbox_codex.schedules.time.time', lambda: 1000.0)
+    code, job = run_cli(capsys, 'add', '--name', 'Progress', '--every', '1800',
+                        '--duration-seconds', '10800', '--max-runs', '6', '--prompt', 'Save progress.')
+    assert code == 0 and job['end_at'] == 11800 and job['remaining_runs'] == 6
+    code, changed = run_cli(capsys, 'update', job['id'], '--end-at', '2030-01-02T12:00:00Z', '--max-runs', '8')
+    assert code == 0 and changed['max_runs'] == 8
+    code, changed = run_cli(capsys, 'update', job['id'], '--no-end-at', '--no-max-runs')
+    assert code == 0 and changed['end_at'] is None and changed['remaining_runs'] is None
+    code, error = run_cli(capsys, 'update', job['id'], '--max-runs', '0')
+    assert code == 1 and 'max_runs' in error['error']
+
+
+def test_bounded_tools_keep_owner_and_scheduled_mutation_checks(monkeypatch):
+    monkeypatch.setenv('INKBOX_CODEX_CHAT_ID', 'contact:one')
+    job = add(max_runs=6)
+    monkeypatch.setenv('INKBOX_CODEX_CHAT_ID', 'contact:two')
+    result, error = call('update', job_id=job['id'], max_runs=None)
+    assert error and result['error'] == 'Schedule not found'
+    monkeypatch.setenv('INKBOX_SCHEDULE_JOB_ID', job['id'])
+    result, error = call('update', job_id=job['id'], duration_seconds=10800)
+    assert error and 'cannot create or change schedules' in result['error']
