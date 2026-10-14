@@ -133,6 +133,8 @@ def _schedule_parser(sub) -> None:
                           help="coalesce missed executions after downtime into one run (default off)")
         item.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=None,
                           help="enable future scheduled executions (default on)")
+        item.add_argument("--decision-required", action=argparse.BooleanOptionalAction, default=None,
+                          help="require every execution to explicitly decide continue or stop (default off)")
     for command in ("show", "pause", "resume", "delete", "run-now", "catch-up"):
         commands.add_parser(command).add_argument("job_id")
     commands.add_parser("reset-session", help="start future executions with a fresh session (local administrator only)").add_argument("job_id")
@@ -147,12 +149,14 @@ def _schedule_parser(sub) -> None:
     commands.add_parser("status", help="show scheduler state")
     commands.add_parser("enable", help="enable scheduled execution globally")
     commands.add_parser("disable", help="disable scheduled execution globally without deleting jobs")
+    decision = commands.add_parser("decide", help="record a continuation decision for the current scheduled execution only")
+    decision.add_argument("--decision", choices=("continue", "stop"), required=True)
 
 
 def _cmd_schedule(args) -> int:
     import sqlite3
     from pathlib import Path
-    from .schedule_tools import check_schedule_mutation, schedule_owner, schedule_status
+    from .schedule_tools import check_schedule_mutation, current_decision_run, schedule_owner, schedule_status
     from .schedules import ScheduleStore, schedule_path
 
     daemon._maybe_load_env_file()
@@ -163,7 +167,9 @@ def _cmd_schedule(args) -> int:
         command = args.schedule_command
         owner = schedule_owner()
         current_job = (os.getenv("INKBOX_SCHEDULE_JOB_ID") or "").strip()
-        if command not in {"list", "show", "runs", "status"}:
+        if command == 'decide':
+            decision_job, decision_run = current_decision_run()
+        elif command not in {"list", "show", "runs", "status"}:
             check_schedule_mutation()
         if (owner is not None or current_job) and command in {"enable", "disable", "recover", "status", "reset-session"}:
             raise ValueError("This command is available only from the local administrator CLI.")
@@ -174,7 +180,7 @@ def _cmd_schedule(args) -> int:
             return 0
         with ScheduleStore(schedule_path(cfg)) as store:
             if command in {"add", "update"}:
-                changes = {key: getattr(args, key) for key in ("name", "catch_up", "enabled", "end_at", "duration_seconds", "max_runs") if getattr(args, key) is not None}
+                changes = {key: getattr(args, key) for key in ("name", "catch_up", "enabled", "end_at", "duration_seconds", "max_runs", "decision_required") if getattr(args, key) is not None}
                 for key in ("end_at", "max_runs"):
                     if getattr(args, "no_" + key, False):
                         changes[key] = None
@@ -208,6 +214,8 @@ def _cmd_schedule(args) -> int:
                 result = store.catch_up(args.job_id, owner=owner)
             elif command == "reset-session":
                 result = store.reset_session(args.job_id, owner=owner)
+            elif command == 'decide':
+                result = store.decide(decision_job, decision_run, args.decision)
             elif command == "runs":
                 result = store.runs(job_id=current_job or args.job_id, owner=None if current_job else owner, limit=args.limit)
             elif command == "recover":

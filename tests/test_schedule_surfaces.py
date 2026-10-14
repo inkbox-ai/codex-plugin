@@ -287,3 +287,51 @@ def test_bounded_tools_keep_owner_and_scheduled_mutation_checks(monkeypatch):
     monkeypatch.setenv('INKBOX_SCHEDULE_JOB_ID', job['id'])
     result, error = call('update', job_id=job['id'], duration_seconds=10800)
     assert error and 'cannot create or change schedules' in result['error']
+
+
+def test_mcp_decisions_bind_to_current_run_and_reject_chat_or_arbitrary_ids(monkeypatch):
+    monkeypatch.delenv('INKBOX_SCHEDULE_RUN_ID', raising=False)
+    monkeypatch.setattr('inkbox_codex.schedules.time.time', lambda: 1000.0)
+    job = add(decision_required=True)
+    assert call('decide', decision='stop')[1] is True
+    with ScheduleStore(schedule_path(read_config())) as store:
+        store.enqueue(job['id'], now=1000)
+        run = store.claim(now=1000)
+        store.mark_running(run['id'], 'decision-thread')
+    monkeypatch.setenv('INKBOX_SCHEDULE_JOB_ID', job['id'])
+    assert call('decide', decision='stop')[1] is True
+    monkeypatch.setenv('INKBOX_SCHEDULE_RUN_ID', run['id'])
+    assert call('decide', decision='stop', job_id='another-job')[1] is True
+    assert call('decide', decision='invalid')[1] is True
+    decided, error = call('decide', decision='continue')
+    assert not error and decided['decision'] == 'continue'
+    assert call('decide', decision='continue') == (decided, False)
+    assert call('update', job_id=job['id'], enabled=False)[1] is True
+    with ScheduleStore(schedule_path(read_config())) as store:
+        store.finish(run['id'], 'succeeded', now=1001)
+    assert call('decide', decision='continue')[1] is True
+
+
+def test_cli_decision_mode_and_current_run_only_command(capsys, monkeypatch):
+    monkeypatch.delenv('INKBOX_SCHEDULE_RUN_ID', raising=False)
+    monkeypatch.setattr('inkbox_codex.schedules.time.time', lambda: 1000.0)
+    code, job = run_cli(capsys, 'add', '--name', 'Progress', '--every', '60',
+                        '--decision-required', '--prompt', 'Stop once finished.')
+    assert code == 0 and job['decision_required'] is True
+    assert run_cli(capsys, 'decide', '--decision', 'stop')[0] == 1
+    with ScheduleStore(schedule_path(read_config())) as store:
+        store.enqueue(job['id'], now=1000)
+        run = store.claim(now=1000)
+        store.mark_running(run['id'], 'decision-thread')
+    monkeypatch.setenv('INKBOX_SCHEDULE_JOB_ID', job['id'])
+    monkeypatch.setenv('INKBOX_SCHEDULE_RUN_ID', run['id'])
+    code, result = run_cli(capsys, 'decide', '--decision', 'stop')
+    assert code == 0 and result['decision'] == 'stop'
+    assert run_cli(capsys, 'update', job['id'], '--no-decision-required')[0] == 1
+    with ScheduleStore(schedule_path(read_config())) as store:
+        store.finish(run['id'], 'succeeded', now=1001)
+        assert store.get(job['id'])['stop_reason'] == 'decision_stop'
+    monkeypatch.delenv('INKBOX_SCHEDULE_JOB_ID')
+    monkeypatch.delenv('INKBOX_SCHEDULE_RUN_ID')
+    code, result = run_cli(capsys, 'update', job['id'], '--no-decision-required', '--enabled')
+    assert code == 0 and result['decision_required'] is False

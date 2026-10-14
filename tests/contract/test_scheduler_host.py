@@ -543,3 +543,27 @@ def test_real_host_bounded_job_stops_without_agent_schedule_mutations(offline_ho
                 await worker.close()
 
     asyncio.run(scenario())
+
+
+def test_real_host_decision_job_pauses_when_model_only_returns_prose(offline_host):
+    cfg, path, requests, _ = offline_host
+    clock = [START + 60]
+
+    async def scenario():
+        with ScheduleStore(path) as store:
+            job = store.create('Conditional progress', 'Save a report. smoke-ddaa0011',
+                               {'kind': 'interval', 'seconds': 60},
+                               decision_required=True, now=START)
+            worker = Scheduler(cfg, store=store, clock=lambda: clock[0])
+            try:
+                await run_due(worker)
+                run = store.runs(job['id'])[0]
+                assert run['status'] == 'succeeded' and run['decision'] is None
+                assert store.get(job['id'])['stop_reason'] == 'decision_missing'
+                assert 'inkbox_schedule_decide' in json.dumps(requests[0])
+                clock[0] += 60
+                await worker.tick()
+                assert worker.active is None and len(requests) == 1
+            finally:
+                await worker.close()
+    asyncio.run(scenario())

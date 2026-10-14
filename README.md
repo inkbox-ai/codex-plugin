@@ -794,6 +794,41 @@ The corresponding `inkbox_schedule_add` and `inkbox_schedule_update` fields are
 update fields are unchanged and `null` clears `end_at` or `max_runs`. Do not pass
 both `duration_seconds` and `end_at`.
 
+### Decision-bounded recurrence
+
+For tasks such as monitoring work until it finishes, set `decision_required=true`
+(CLI: `--decision-required`) and describe the completion condition in the prompt:
+
+```bash
+inkbox-codex schedule add --name "Progress monitor" --every 300 \
+  --decision-required --duration-seconds 10800 --max-runs 36 \
+  --prompt "Check whether the project work is complete and save a summary. Continue only while work remains; stop once finished."
+```
+
+Each execution evaluates that condition and calls `inkbox_schedule_decide` with
+`{"decision":"continue"}` or `{"decision":"stop"}` before finishing. The same
+action is available inside the scheduled execution as
+`inkbox-codex schedule decide --decision continue` (or `stop`). It accepts no job
+or run ID: the current execution context identifies the only job it may affect.
+This is not permission to create jobs or edit other schedules. Normal chat/local
+administration continues to use `update`, `pause`, and `resume`.
+
+`continue` retains the existing interval/cron cadence only when the execution
+finishes successfully. `stop` disables future work immediately; the current
+execution may finish its report or explicitly requested delivery. The decision
+is stored in the execution's history. Repeating the same decision is idempotent;
+a conflicting decision or a decision from a finished/stale execution is rejected.
+Plain text such as "keep monitoring" is not treated as a decision.
+
+A successful run with no decision pauses with `stop_reason=decision_missing`.
+A failed or interrupted execution pauses with `decision_incomplete`, even if it
+recorded `continue` before failing. A recorded `stop` survives failures/restarts
+as `decision_stop`. Inspect the result before explicitly resuming or recovering;
+retries require a fresh decision. End-time and run-count bounds still win, and
+`continue` cannot undo a manual pause. Catch-up remains opt-in and coalesces missed
+occurrences into one execution requiring one decision. The default is unchanged:
+jobs without `decision_required` continue according to their schedule.
+
 If the process stops during execution, the run is marked `uncertain`, rather than
 automatically repeated. Inspect any effects already performed before deciding
 whether to dismiss it or explicitly retry (which can repeat those effects):
@@ -850,8 +885,9 @@ once startup succeeds, subject to their catch-up and recovery settings.
 
 Global scheduler controls, session resets, and uncertain-run recovery are local
 CLI operations. In chat, schedule tools manage the current conversation's jobs.
-The scheduling tool and CLI interfaces reject schedule mutations from scheduled
-turns. Tasks retain the configured Codex host permissions; scheduling does not
+The scheduling tool and CLI interfaces reject general schedule mutations from
+scheduled turns; the sole exception is recording the current execution's decision
+for its own decision-required job. Tasks retain the configured Codex host permissions; scheduling does not
 change those permissions.
 
 ## Voice
@@ -1016,7 +1052,7 @@ without TOTP must have it configured before the agent can generate codes.
 
 The agent reaches you (or third parties) through an in-process MCP server:
 
-- `inkbox_schedule_add` · `inkbox_schedule_list` · `inkbox_schedule_update` · `inkbox_schedule_delete` · `inkbox_schedule_run_now` · `inkbox_schedule_history` · `inkbox_schedule_catch_up` — persistent local jobs, dedicated sessions, and missed-run history. See [Scheduled jobs](#scheduled-jobs).
+- `inkbox_schedule_add` · `inkbox_schedule_list` · `inkbox_schedule_update` · `inkbox_schedule_delete` · `inkbox_schedule_run_now` · `inkbox_schedule_history` · `inkbox_schedule_catch_up` · `inkbox_schedule_decide` — persistent local jobs, time/run/decision bounds, dedicated sessions, and missed-run history. See [Scheduled jobs](#scheduled-jobs).
 - `inkbox_whoami` — its own identity: handle, mailbox, iMessage status, and its two calling lines (dedicated number vs shared iMessage line).
 - `inkbox_place_call` — place an outbound voice call over either line (`origination`: `dedicated_number` / `shared_imessage_number`) — see [Two calling lines](#two-calling-lines).
 - `inkbox_list_calls` · `inkbox_get_call_transcript` — browse call history and transcripts.

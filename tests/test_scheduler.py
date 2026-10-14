@@ -605,3 +605,24 @@ def test_invalidated_schedule_is_paused_without_stalling_other_jobs(environment,
     assert 'edit the schedule' in failed[0]['error']
     store.materialize(clock())
     assert len(store.runs(broken['id'])) == 1
+
+
+@pytest.mark.parametrize('error', [None, RuntimeError('Run interrupted')])
+def test_decision_required_worker_pauses_without_successful_decision(environment, error):
+    async def scenario():
+        cfg, store, clock = environment
+        job = add_job(store, clock, decision_required=True)
+        clients = ClientFactory()
+        clients.run_error = error
+        worker = Scheduler(cfg, store=store, client_factory=clients, clock=clock)
+        try:
+            clock.value += 60
+            await settle(worker)
+            assert store.get(job['id'])['stop_reason'] == ('decision_incomplete' if error else 'decision_missing')
+            assert 'inkbox_schedule_decide' in clients.clients[0].options['developer_instructions']
+            clock.value += 60
+            await settle(worker)
+            assert len(clients.clients) == 1
+        finally:
+            await worker.close()
+    asyncio.run(scenario())
