@@ -78,7 +78,15 @@ requires the gateway to be online to execute. Automatic catch-up is off by defau
 turn it on only when requested. List/update/delete/history/catch_up tools manage
 the current conversation's jobs. Update enabled=false to pause a job. Missed
 occurrences can be coalesced into one catch-up run; do not recreate a job to retry
-an uncertain execution. Scheduled jobs must not create additional schedules.
+an uncertain execution. For bounded recurring work, use one job with end_at or
+duration_seconds and/or max_runs, not many one-off jobs. Duration becomes a fixed
+end time; max_runs counts all execution starts, including failures and manual
+runs. An interval first runs after its interval, not immediately. Scheduled jobs
+must not create additional schedules. For work that should repeat only while a
+condition remains true, set decision_required=true and describe the condition in
+the saved prompt. Each execution uses inkbox_schedule_decide to continue or stop
+its own job; missing decisions or unsuccessful runs pause it. Hard limits still
+apply, and this does not grant permission to change other schedules.
 
 # Calling someone
 

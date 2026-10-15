@@ -94,6 +94,29 @@ def _text(value, name, maximum):
     return value
 
 
+def validate_bounds(changes, now):
+    """Resolve durations once, never when a job resumes or the gateway restarts."""
+    result = {key: changes[key] for key in ('end_at', 'max_runs') if key in changes}
+    if 'duration_seconds' in changes:
+        if 'end_at' in changes:
+            raise ValueError('Choose end_at or duration_seconds, not both')
+        duration = changes['duration_seconds']
+        if isinstance(duration, bool) or not isinstance(duration, int) or not 1 <= duration <= 31536000:
+            raise ValueError('duration_seconds must be an integer between 1 and 31536000')
+        result['end_at'] = now + duration
+    elif result.get('end_at') is not None:
+        try:
+            result['end_at'] = timestamp(datetime.fromisoformat(result['end_at'].replace('Z', '+00:00')))
+        except (TypeError, AttributeError, ValueError, OverflowError):
+            raise ValueError('end_at requires an ISO date and time with an explicit UTC offset') from None
+        if result['end_at'] <= now:
+            raise ValueError('end_at must be in the future')
+    maximum = result.get('max_runs')
+    if maximum is not None and (isinstance(maximum, bool) or not isinstance(maximum, int) or not 1 <= maximum <= 2147483647):
+        raise ValueError('max_runs must be an integer between 1 and 2147483647')
+    return result
+
+
 class ScheduleStore:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -140,8 +163,18 @@ class ScheduleStore:
             columns = {row['name'] for row in self.db.execute('PRAGMA table_info(runs)')}
             if 'current_due' not in columns:
                 self.db.execute('ALTER TABLE runs ADD COLUMN current_due REAL')
-            if self.db.execute('PRAGMA user_version').fetchone()[0] < 2:
-                self.db.execute('PRAGMA user_version=2')
+            if 'decision' not in columns:
+                self.db.execute('ALTER TABLE runs ADD COLUMN decision TEXT')
+            columns = {row['name'] for row in self.db.execute('PRAGMA table_info(jobs)')}
+            for name, definition in (('end_at', 'REAL'), ('max_runs', 'INTEGER'),
+                                     ('run_count', 'INTEGER NOT NULL DEFAULT 0'), ('stop_reason', 'TEXT'),
+                                     ('decision_required', 'INTEGER NOT NULL DEFAULT 0')):
+                if name not in columns:
+                    self.db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {definition}')
+                    if name == 'run_count':
+                        self.db.execute('UPDATE jobs SET run_count=(SELECT COUNT(*) FROM runs WHERE job_id=jobs.id AND started_at IS NOT NULL)')
+            if self.db.execute('PRAGMA user_version').fetchone()[0] < 4:
+                self.db.execute('PRAGMA user_version=4')
 
     def __enter__(self):
         return self
@@ -166,8 +199,9 @@ class ScheduleStore:
     def _job(row):
         value = dict(row)
         value['schedule'] = json.loads(value['schedule'])
-        for field in ('enabled', 'catch_up', 'deleted'):
+        for field in ('enabled', 'catch_up', 'deleted', 'decision_required'):
             value[field] = bool(value[field])
+        value['remaining_runs'] = None if value['max_runs'] is None else max(0, value['max_runs'] - value['run_count'])
         return value
 
     def get(self, job_id, owner=None):
@@ -176,16 +210,25 @@ class ScheduleStore:
             raise ValueError('Schedule not found')
         return self._job(row)
 
-    def create(self, name, prompt, schedule, catch_up=False, enabled=True, owner='', now=None):
+    def create(self, name, prompt, schedule, catch_up=False, enabled=True, owner='', now=None,
+               decision_required=False, **bounds):
         now = timestamp(now)
+        if bounds.keys() - {'end_at', 'duration_seconds', 'max_runs'}:
+            raise ValueError('Unexpected schedule settings')
+        bounds = validate_bounds(bounds, now)
         name, prompt = _text(name, 'Name', 200), _text(prompt, 'Prompt', 64000)
-        if not isinstance(catch_up, bool) or not isinstance(enabled, bool) or not isinstance(owner, str):
+        if (not isinstance(catch_up, bool) or not isinstance(enabled, bool)
+                or not isinstance(decision_required, bool) or not isinstance(owner, str)):
             raise ValueError('Invalid schedule settings')
         schedule, due = validate_schedule(schedule, now)
+        if bounds.get('end_at') is not None and due > bounds['end_at']:
+            raise ValueError('The schedule has no occurrence on or before end_at')
         job_id = uuid.uuid4().hex
         with self._transaction():
-            self.db.execute('INSERT INTO jobs(id,name,prompt,schedule,catch_up,enabled,owner,next_run,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
-                            (job_id, name, prompt, json.dumps(schedule), catch_up, enabled, owner, due, now, now))
+            self.db.execute('INSERT INTO jobs(id,name,prompt,schedule,catch_up,enabled,owner,next_run,created_at,updated_at,decision_required) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                            (job_id, name, prompt, json.dumps(schedule), catch_up, enabled, owner, due, now, now, decision_required))
+            if bounds:
+                self.db.execute('UPDATE jobs SET '+','.join(key+'=?' for key in bounds)+' WHERE id=?', (*bounds.values(), job_id))
         return self.get(job_id)
 
     def list_jobs(self, owner=None, include_deleted=False):
@@ -198,28 +241,33 @@ class ScheduleStore:
 
     def update(self, job_id, owner=None, now=None, **changes):
         now = timestamp(now)
-        if not changes or changes.keys() - {'name', 'prompt', 'schedule', 'catch_up', 'enabled'}:
-            raise ValueError('Choose name, prompt, schedule, catch_up, or enabled to update')
+        if not changes or changes.keys() - {'name', 'prompt', 'schedule', 'catch_up', 'enabled', 'end_at', 'duration_seconds', 'max_runs', 'decision_required'}:
+            raise ValueError('Choose name, prompt, schedule, catch_up, enabled, or schedule limits to update')
+        bounds = validate_bounds(changes, now)
+        changes.pop('duration_seconds', None)
+        changes.update(bounds)
         for key in ('name', 'prompt'):
             if key in changes:
                 _text(changes[key], key, 200 if key == 'name' else 64000)
-        for key in ('enabled', 'catch_up'):
+        for key in ('enabled', 'catch_up', 'decision_required'):
             if key in changes and not isinstance(changes[key], bool):
                 raise ValueError(f'{key} must be a boolean')
         if 'schedule' in changes:
             validated, due = validate_schedule(changes['schedule'], now)
             changes.update(schedule=json.dumps(validated), next_run=due)
         changes['updated_at'] = now
-        edits_task = bool(changes.keys() & {'prompt', 'schedule'})
+        edits_task = bool(changes.keys() & {'prompt', 'schedule', 'decision_required'})
+        edits_limits = bool(bounds)
         pauses = changes.get('enabled') is False
         while True:
             incomplete = False
             with self._transaction():
                 job = self.get(job_id, owner)
                 active = self._active(job_id)
-                if active and active['status'] != 'pending' and edits_task:
-                    raise ValueError('Resolve the active execution before changing its prompt or schedule')
-                if job['enabled'] and (pauses or edits_task):
+                if (active and active['status'] != 'pending' and (edits_task or edits_limits)
+                        and (active['status'] != 'uncertain' or edits_task)):
+                    raise ValueError('Resolve the active execution before changing its prompt, schedule, or limits')
+                if job['enabled'] and (pauses or edits_task or edits_limits):
                     calculated = self._materialize_safely(job, now)
                     if not calculated and 'schedule' in changes:
                         # Replacing the invalid schedule repairs an otherwise enabled job.
@@ -227,7 +275,10 @@ class ScheduleStore:
                     incomplete = calculated and job['next_run'] is not None and job['next_run'] <= now
                     active = self._active(job_id)
                 if not incomplete:
-                    if 'schedule' not in changes and changes.get('enabled') and not job['enabled']:
+                    restarts = changes.get('enabled') and not job['enabled']
+                    extends_window = ('end_at' in bounds and job['next_run'] is None and job['enabled']
+                                      and (bounds['end_at'] is None or job['end_at'] is None or bounds['end_at'] > job['end_at']))
+                    if 'schedule' not in changes and (restarts or extends_window):
                         s = job['schedule']
                         if s['kind'] == 'interval':
                             changes['next_run'] = now + s['seconds']
@@ -236,6 +287,15 @@ class ScheduleStore:
                         elif job['next_run'] is not None and job['next_run'] <= now:
                             self._insert_run(job, 'missed', 'paused', job['next_run'], job['next_run'], 1, now)
                             changes['next_run'] = None
+                    updated = {**job, **changes}
+                    if changes.get('enabled'):
+                        reason = self._limit_reason(updated, now)
+                        if reason:
+                            raise ValueError('Extend or clear the '+reason+' limit before resuming')
+                        changes['stop_reason'] = None
+                    if ('schedule' in changes or bounds or changes.get('enabled')) and updated['enabled']:
+                        if updated['end_at'] is not None and updated['next_run'] is not None and updated['next_run'] > updated['end_at']:
+                            raise ValueError('The schedule has no occurrence on or before end_at')
                     cancel_catchup = changes.get('catch_up') is False and active and active['source'] == 'auto_catch_up'
                     if active and active['status'] == 'pending' and (pauses or edits_task or cancel_catchup):
                         self.db.execute("UPDATE runs SET status='cancelled',finished_at=?,error='Schedule changed before execution' WHERE id=?", (now, active['id']))
@@ -243,6 +303,10 @@ class ScheduleStore:
                             self._restore_current_occurrence(job, active, now)
                         self.db.execute("UPDATE runs SET catchup_run_id=NULL WHERE status='missed' AND catchup_run_id=?", (active['id'],))
                     self.db.execute('UPDATE jobs SET '+','.join(key+'=?' for key in changes)+' WHERE id=?', (*changes.values(), job_id))
+                    updated = self.get(job_id)
+                    reason = self._limit_reason(updated, now)
+                    if reason:
+                        self._stop_job(updated, reason, now)
             if not incomplete:
                 return self.get(job_id, owner)
             # Commit each bounded batch before allowing another writer to proceed.
@@ -298,6 +362,28 @@ class ScheduleStore:
             raise ValueError('Execution not found')
         return dict(row)
 
+    @staticmethod
+    def _limit_reason(job, now):
+        if job['max_runs'] is not None and job['run_count'] >= job['max_runs']:
+            return 'max_runs'
+        # Keep the normal dispatch grace so a tick just after the final due time
+        # can start it. No queued or catch-up execution survives this deadline.
+        if job['end_at'] is not None and now > job['end_at'] + GRACE_SECONDS:
+            return 'end_at'
+        return None
+
+    def _stop_job(self, job, reason, now):
+        self.db.execute('UPDATE jobs SET enabled=0,next_run=NULL,stop_reason=? WHERE id=?', (reason, job['id']))
+        self.db.execute("UPDATE runs SET catchup_run_id=NULL WHERE status='missed' AND catchup_run_id IN (SELECT id FROM runs WHERE job_id=? AND status='pending')", (job['id'],))
+        self.db.execute("UPDATE runs SET status='cancelled',finished_at=?,error=? WHERE job_id=? AND status='pending'",
+                        (now, 'Schedule stopped before execution ('+reason+')', job['id']))
+        job.update(enabled=False, next_run=None, stop_reason=reason)
+
+    def _require_budget(self, job, now):
+        reason = self._limit_reason(job, now)
+        if reason:
+            raise ValueError('Schedule reached its '+reason+' limit; extend or clear it before requesting another execution')
+
     def _coalesce(self, job, now, automatic=True):
         active = self._active(job['id'])
         if active and not (active['status'] == 'pending' and active['source'] in {'catch_up', 'auto_catch_up', 'schedule'}):
@@ -318,6 +404,9 @@ class ScheduleStore:
         return run_id
 
     def _materialize_job(self, job, now):
+        if self._limit_reason(job, now) == 'max_runs':
+            self._stop_job(job, 'max_runs', now)
+            return
         active = self._active(job['id'])
         if active and active['status'] == 'pending' and active['source'] == 'schedule' and active['last_due'] < now - GRACE_SECONDS:
             heartbeat = self.db.execute('SELECT heartbeat FROM settings WHERE id=1').fetchone()[0]
@@ -325,20 +414,26 @@ class ScheduleStore:
                 self.db.execute("UPDATE runs SET status='missed',error='Execution missed its start window while scheduler was unavailable' WHERE id=?", (active['id'],))
                 active = None
         due, schedule = job['next_run'], job['schedule']
-        if due is not None and due <= now:
+        horizon = min(now, job['end_at']) if job['end_at'] is not None else now
+        if due is not None and due > horizon and job['end_at'] is not None and due > job['end_at']:
+            self.db.execute('UPDATE jobs SET next_run=NULL WHERE id=?', (job['id'],))
+            job['next_run'] = due = None
+        if due is not None and due <= horizon:
             first = last = due
             count = 1
             if schedule['kind'] == 'interval':
-                count = int((now - due) // schedule['seconds']) + 1
+                count = int((horizon - due) // schedule['seconds']) + 1
                 last = due + (count - 1) * schedule['seconds']
                 next_due = due + count * schedule['seconds']
             elif schedule['kind'] == 'once':
                 next_due = None
             else:
                 next_due = next_cron(schedule, last)
-                while next_due <= now and count < CRON_BATCH_SIZE:
+                while next_due <= horizon and count < CRON_BATCH_SIZE:
                     last, count = next_due, count + 1
                     next_due = next_cron(schedule, last)
+            if next_due is not None and job['end_at'] is not None and next_due > job['end_at']:
+                next_due = None
             caught_up = next_due is None or next_due > now
             on_time = caught_up and last >= now - GRACE_SECONDS and not active
             missed_count = count - int(on_time)
@@ -358,7 +453,9 @@ class ScheduleStore:
                     self.db.execute('UPDATE runs SET last_due=?,current_due=?,count=count+1 WHERE id=?', (last, last, catchup_id))
                 else:
                     self._insert_run(job, 'pending', 'schedule', last, last, 1, now)
-        if job['catch_up'] and (job['next_run'] is None or job['next_run'] > now):
+        if self._limit_reason(job, now) and job['next_run'] is None:
+            self._stop_job(job, 'end_at', now)
+        elif job['catch_up'] and (job['next_run'] is None or job['next_run'] > now):
             self._coalesce(job, now)
 
     def _materialize_safely(self, job, now):
@@ -391,6 +488,7 @@ class ScheduleStore:
         now = timestamp(now)
         with self._transaction():
             job = self.get(job_id, owner)
+            self._require_budget(job, now)
             if not job['enabled'] or self._active(job_id):
                 raise ValueError('Enable the job and resolve its active execution first')
             run_id = self._insert_run(job, 'pending', 'manual', now, now, 1, now)
@@ -401,6 +499,7 @@ class ScheduleStore:
         while True:
             with self._transaction():
                 job = self.get(job_id, owner)
+                self._require_budget(job, now)
                 if not job['enabled']:
                     raise ValueError('Resume the job before catching up')
                 active = self._active(job_id)
@@ -426,14 +525,20 @@ class ScheduleStore:
         with self._transaction():
             if not self.db.execute('SELECT enabled FROM settings WHERE id=1').fetchone()[0]:
                 return None
-            row = self.db.execute("""SELECT r.id FROM runs r JOIN jobs j ON j.id=r.job_id
+            row = self.db.execute("""SELECT r.id,r.job_id FROM runs r JOIN jobs j ON j.id=r.job_id
                 WHERE r.status='pending' AND j.enabled=1 AND j.deleted=0
+                AND (j.end_at IS NULL OR j.end_at+? >= ?)
+                AND (j.max_runs IS NULL OR j.run_count<j.max_runs)
                 AND (r.source!='auto_catch_up' OR j.next_run IS NULL OR j.next_run>?)
                 AND NOT EXISTS(SELECT 1 FROM runs h WHERE h.job_id=j.id AND h.host_pid IS NOT NULL)
-                ORDER BY r.created_at,r.rowid LIMIT 1""", (now,)).fetchone()
+                ORDER BY r.created_at,r.rowid LIMIT 1""", (GRACE_SECONDS, now, now)).fetchone()
             if row is None:
                 return None
             self.db.execute("UPDATE runs SET status='starting',started_at=? WHERE id=?", (now, row['id']))
+            self.db.execute('UPDATE jobs SET run_count=run_count+1 WHERE id=?', (row['job_id'],))
+            job = self.get(row['job_id'])
+            if self._limit_reason(job, now) == 'max_runs':
+                self._stop_job(job, 'max_runs', now)
         return self._run(row['id'])
 
     def mark_running(self, run_id, thread_id, host_pid=None, host_start=None):
@@ -461,17 +566,54 @@ class ScheduleStore:
     def finish(self, run_id, status, result='', error='', now=None):
         if status not in {'succeeded', 'failed', 'uncertain'}:
             raise ValueError('Invalid execution outcome')
+        now = timestamp(now)
         with self._transaction():
             run = self._run(run_id)
             if run['status'] not in {'starting', 'running'}:
                 raise ValueError('Execution is not active')
             self.db.execute('UPDATE runs SET status=?,result=?,error=?,finished_at=? WHERE id=?',
-                            (status, result[:256000], error[:2000], timestamp(now), run_id))
+                            (status, result[:256000], error[:2000], now, run_id))
+            self._apply_decision(self.get(run['job_id']), run, status, now)
         return self._run(run_id)
 
     def recover_interrupted(self, now=None):
+        now = timestamp(now)
         with self._transaction():
-            self.db.execute("UPDATE runs SET status='uncertain',finished_at=?,error='Gateway stopped before execution outcome was recorded; inspect before retrying' WHERE status IN ('starting','running')", (timestamp(now),))
+            interrupted = self.db.execute("SELECT * FROM runs WHERE status IN ('starting','running')").fetchall()
+            self.db.execute("UPDATE runs SET status='uncertain',finished_at=?,error='Gateway stopped before execution outcome was recorded; inspect before retrying' WHERE status IN ('starting','running')", (now,))
+            for run in interrupted:
+                self._apply_decision(self.get(run['job_id']), run, 'uncertain', now)
+
+    def decide(self, job_id, run_id, decision, now=None):
+        """Persist an explicit recurrence decision for this job's active run."""
+        if decision not in ('continue', 'stop'):
+            raise ValueError('decision must be continue or stop')
+        now = timestamp(now)
+        with self._transaction():
+            job = self.get(job_id)
+            run = self._run(run_id)
+            if run['job_id'] != job_id or run['status'] != 'running' or not job['decision_required']:
+                raise ValueError('Decisions require the current running execution of a decision-required job')
+            if run['decision'] is not None and run['decision'] != decision:
+                raise ValueError('This execution already recorded a different decision')
+            self.db.execute('UPDATE runs SET decision=? WHERE id=?', (decision, run_id))
+            if decision == 'stop':
+                self._stop_job(job, self._limit_reason(job, now) or 'decision_stop', now)
+        return self._run(run_id)
+
+    def _apply_decision(self, job, run, status, now):
+        if not job['decision_required']:
+            return
+        reason = self._limit_reason(job, now)
+        if not reason:
+            if run['decision'] == 'stop':
+                reason = 'decision_stop'
+            elif status != 'succeeded':
+                reason = 'decision_incomplete'
+            elif run['decision'] != 'continue':
+                reason = 'decision_missing'
+        if reason:
+            self._stop_job(job, reason, now)
 
     def recover(self, run_id, action='retry', acknowledge_duplicate_risk=False, owner=None, now=None):
         now = timestamp(now)
@@ -484,6 +626,8 @@ class ScheduleStore:
                 raise ValueError('Wait for the gateway to stop the previous execution process before recovery')
             if action == 'retry' and not acknowledge_duplicate_risk:
                 raise ValueError('Retry requires acknowledging possible duplicate side effects')
+            if action == 'retry':
+                self._require_budget(job, now)
             if action == 'retry' and not job['enabled']:
                 raise ValueError('Resume the job before retrying')
             self.db.execute('UPDATE runs SET status=? WHERE id=?', ('retried' if action == 'retry' else 'dismissed', run_id))

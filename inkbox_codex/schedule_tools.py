@@ -26,16 +26,21 @@ _FIELDS = {
     "schedule": SCHEDULE_SCHEMA,
     "catch_up": {"type": "boolean", "description": "Coalesce missed executions after downtime into one run. Default false; skipped runs remain in history."},
     "enabled": {"type": "boolean", "description": "Whether future scheduled executions are enabled. Default true."},
+    "decision_required": {"type": "boolean", "description": "Opt in to decision-bounded recurrence. Each run must call inkbox_schedule_decide with continue or stop. Missing decisions or unsuccessful executions pause the job; default false."},
+    "end_at": {"type": ["string", "null"], "description": "Inclusive last due time, ISO 8601 with UTC offset. Starts stop after the normal 30-second dispatch grace; running work may finish. Null clears the limit. Cannot combine with duration_seconds."},
+    "duration_seconds": {"type": "integer", "minimum": 1, "maximum": 31536000, "description": "Set end_at once to this many seconds after saving. Does not reset on restart/resume. For every 30 minutes for three hours, use interval seconds=1800 and duration_seconds=10800."},
+    "max_runs": {"type": ["integer", "null"], "minimum": 1, "maximum": 2147483647, "description": "Lifetime execution-start limit, including manual, retry and catch-up attempts, regardless of outcome. Missed ticks do not count; one coalesced execution counts once. Null clears the limit."},
 }
 _ID = {"job_id": {"type": "string", "minLength": 1}}
 SCHEDULE_TOOLS = [
     {"name": "inkbox_schedule_add", "description": "Save a persistent local scheduled job with its own prompt and session. Runs while the gateway is online; no messages are sent automatically. Only claim success after this tool returns the saved job.", "inputSchema": _schema(_FIELDS, ("name", "prompt", "schedule"))},
-    {"name": "inkbox_schedule_list", "description": "List scheduled jobs belonging to this conversation, including next due times; use history to inspect missed executions.", "inputSchema": _schema({})},
+    {"name": "inkbox_schedule_list", "description": "List this conversation's jobs, next due times, end_at, max_runs, run_count, remaining_runs and stop_reason; use history to inspect outcomes and missed executions. Saved times are Unix seconds.", "inputSchema": _schema({})},
     {"name": "inkbox_schedule_update", "description": "Edit an existing job; enabled=false pauses it and catch_up controls automatic catch-up after downtime. Omitted fields are unchanged.", "inputSchema": _schema({**_ID, **_FIELDS}, ("job_id",))},
     {"name": "inkbox_schedule_delete", "description": "Delete a scheduled job and cancel future executions. Does not undo work already started.", "inputSchema": _schema(_ID, ("job_id",))},
     {"name": "inkbox_schedule_run_now", "description": "Queue one immediate execution of a job. This does not mean execution completed. The gateway must be running and scheduling enabled.", "inputSchema": _schema(_ID, ("job_id",))},
     {"name": "inkbox_schedule_history", "description": "Read execution history, missed counts, results and errors for this conversation's jobs. Times are Unix seconds.", "inputSchema": _schema({**_ID, "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}})},
     {"name": "inkbox_schedule_catch_up", "description": "Queue one catch-up run covering tracked missed executions for a job, even when automatic catch-up is off. Does not replay every missed tick.", "inputSchema": _schema(_ID, ("job_id",))},
+    {"name": "inkbox_schedule_decide", "description": "During a decision-required scheduled run only, record whether this same job should continue or stop. Continue takes effect only after successful completion and cannot override time/run limits. Stop cancels future work, not the current run. Identical repeats are safe; conflicting decisions are rejected. No job ID or other schedule changes are accepted.", "inputSchema": _schema({"decision": {"type": "string", "enum": ["continue", "stop"]}}, ("decision",))},
 ]
 SCHEDULE_TOOL_NAMES = frozenset(tool["name"] for tool in SCHEDULE_TOOLS)
 _READ_ONLY = {"inkbox_schedule_list", "inkbox_schedule_history"}
@@ -49,6 +54,14 @@ def schedule_owner() -> str | None:
 def check_schedule_mutation() -> None:
     if os.getenv("INKBOX_SCHEDULE_JOB_ID"):
         raise ValueError("Scheduled jobs cannot create or change schedules; use the original conversation or local CLI.")
+
+
+def current_decision_run() -> tuple[str, str]:
+    job_id = (os.getenv('INKBOX_SCHEDULE_JOB_ID') or '').strip()
+    run_id = (os.getenv('INKBOX_SCHEDULE_RUN_ID') or '').strip()
+    if not job_id or not run_id:
+        raise ValueError('Only the current scheduled execution can record its continuation decision')
+    return job_id, run_id
 
 
 def dispatch_schedule_tool(name: str, args: dict[str, Any], *, identity: str = "") -> Any:
@@ -65,13 +78,17 @@ def dispatch_schedule_tool(name: str, args: dict[str, Any], *, identity: str = "
         raise ValueError("job_id must be a nonempty string")
     if "limit" in args and (isinstance(args["limit"], bool) or not isinstance(args["limit"], int) or not 1 <= args["limit"] <= 200):
         raise ValueError("limit must be an integer between 1 and 200")
-    if name not in _READ_ONLY:
+    if name == 'inkbox_schedule_decide':
+        decision_job, decision_run = current_decision_run()
+    elif name not in _READ_ONLY:
         check_schedule_mutation()
     cfg = read_config({"identity": identity} if identity else None)
     if not cfg.identity:
         raise ValueError("Set INKBOX_IDENTITY before managing scheduled jobs.")
     owner = schedule_owner()
     with ScheduleStore(schedule_path(cfg)) as store:
+        if name == 'inkbox_schedule_decide':
+            return store.decide(decision_job, decision_run, args['decision'])
         current_job = (os.getenv("INKBOX_SCHEDULE_JOB_ID") or "").strip()
         if current_job:
             if name == "inkbox_schedule_list":

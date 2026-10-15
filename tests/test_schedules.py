@@ -315,7 +315,7 @@ def test_legacy_store_upgrade_preserves_unclassified_coalesced_occurrence_count(
         store.db.execute('ALTER TABLE runs DROP COLUMN current_due')
         store.db.execute('PRAGMA user_version=1')
     with ScheduleStore(path) as store:
-        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 2
+        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 4
         store.update(job["id"], catch_up=False, now=later)
         assert store.claim(now=later) is None
         assert store.status()["missed_pending"] == 3
@@ -341,7 +341,7 @@ def test_two_connections_can_upgrade_the_same_legacy_store(tmp_path):
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [pool.submit(open_store), pool.submit(open_store)]
         results = [future.result(timeout=10) for future in futures]
-    assert results == [(job["prompt"], 2), (job["prompt"], 2)]
+    assert results == [(job["prompt"], 4), (job["prompt"], 4)]
 
 
 def test_store_initialization_failure_closes_opened_connection(tmp_path, monkeypatch):

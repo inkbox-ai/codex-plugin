@@ -230,6 +230,16 @@ class Scheduler:
                 'If a required action needs approval, explain that it was not performed. '
                 'The current saved task supersedes conflicting instructions in previous runs.'
             )
+            if job['decision_required']:
+                instructions += (
+                    ' This job requires a continuation decision. After evaluating the saved task, '
+                    'call inkbox_schedule_decide with decision="continue" only if another run is '
+                    'needed, or decision="stop" when finished. Record one decision before ending '
+                    'this run; ordinary prose is not a decision. Continue requires successful '
+                    'completion and never overrides time/run limits. Missing decisions or failures '
+                    'pause the job. This tool affects only your current job; do not create another '
+                    'schedule or use general schedule mutations.'
+                )
             def process_started(pid):
                 host = {'id': run['id'], 'host_pid': pid, 'host_start': process_stamp(pid)}
                 self._unrecorded_hosts[run['id']] = host

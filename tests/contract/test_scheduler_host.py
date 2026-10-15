@@ -507,3 +507,63 @@ asyncio.run(main())
             except ProcessLookupError:
                 pass
             _reap_test_group(host_pid)
+
+
+def test_real_host_bounded_job_stops_without_agent_schedule_mutations(offline_host):
+    cfg, path, requests, _ = offline_host
+    clock = [START]
+
+    async def scenario():
+        with ScheduleStore(path) as store:
+            job = store.create('Bounded progress', 'Return a short report. smoke-ccdd0011',
+                               {'kind': 'interval', 'seconds': 60},
+                               duration_seconds=120, max_runs=2, now=clock[0])
+        for number in (1, 2):
+            # Reopen the durable store and host for each execution.
+            clock[0] = START + number * 60 + 1
+            with ScheduleStore(path) as store:
+                worker = Scheduler(cfg, store=store, clock=lambda: clock[0])
+                try:
+                    await run_due(worker)
+                    assert store.runs(job['id'])[0]['status'] == 'succeeded'
+                    assert store.get(job['id'])['run_count'] == number
+                finally:
+                    await worker.close()
+        assert len(requests) == 2
+        clock[0] = START + 180
+        with ScheduleStore(path) as store:
+            worker = Scheduler(cfg, store=store, clock=lambda: clock[0])
+            try:
+                await worker.tick()
+                assert worker.active is None
+                assert len(requests) == 2
+                assert store.get(job['id'])['stop_reason'] == 'max_runs'
+                assert store.get(job['id'])['enabled'] is False
+            finally:
+                await worker.close()
+
+    asyncio.run(scenario())
+
+
+def test_real_host_decision_job_pauses_when_model_only_returns_prose(offline_host):
+    cfg, path, requests, _ = offline_host
+    clock = [START + 60]
+
+    async def scenario():
+        with ScheduleStore(path) as store:
+            job = store.create('Conditional progress', 'Save a report. smoke-ddaa0011',
+                               {'kind': 'interval', 'seconds': 60},
+                               decision_required=True, now=START)
+            worker = Scheduler(cfg, store=store, clock=lambda: clock[0])
+            try:
+                await run_due(worker)
+                run = store.runs(job['id'])[0]
+                assert run['status'] == 'succeeded' and run['decision'] is None
+                assert store.get(job['id'])['stop_reason'] == 'decision_missing'
+                assert 'inkbox_schedule_decide' in json.dumps(requests[0])
+                clock[0] += 60
+                await worker.tick()
+                assert worker.active is None and len(requests) == 1
+            finally:
+                await worker.close()
+    asyncio.run(scenario())
