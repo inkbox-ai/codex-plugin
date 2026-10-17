@@ -173,6 +173,14 @@ def test_channel_prompt_mentions_identity_and_dir():
     assert "vCard export/import" in text
 
 
+def test_channel_prompt_describes_single_message_delivery():
+    text = " ".join(build_channel_prompt(project_dir="/srv/app").split())
+
+    assert "whole reply is delivered as a single message" in text
+    assert "blank lines do not split it" in text
+    assert "each block is delivered as its own bubble" not in text
+
+
 def test_strip_markdown():
     raw = "**Done!** Ran `npm test`:\n```\nall green\n```\nSee [docs](https://x.y)."
     flat = strip_markdown(raw)
