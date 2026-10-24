@@ -110,7 +110,10 @@ def test_off_preserves_old_sdk_request_and_result():
     result, payload = call(identity, conversation_id="conversation-1", text="hello")
     assert not result.get("isError")
     assert received == [{"conversation_id": "conversation-1", "text": "hello"}]
-    assert payload == {"sent": True, "id": "outbound-1"}
+    assert payload["sent"] is True
+    assert payload["id"] == "outbound-1"
+    assert payload["delivery_final"] is False
+    assert "do not resend" in payload["note"]
 
 
 @pytest.mark.parametrize("extra", [
@@ -131,7 +134,7 @@ def test_native_send_preserves_exact_target_policy_and_key(monkeypatch):
     identity.result = Message(reply_to_message_id="source-1", thread_id="native-thread", thread_root_message_id="root")
     result, payload = call(identity, conversation_id="conversation-1", text="answer", idempotency_key="stable-output-key")
     assert not result.get("isError")
-    assert identity.reads == [("message", "source-1"), ("thread", "source-1", 1, None)]
+    assert identity.reads == [("message", "source-1"), ("thread", "source-1", 1, None), ("message", "outbound-1")]
     assert identity.sent == [{
         "conversation_id": "conversation-1", "text": "answer", "reply_to_message_id": "source-1",
         "plain_reply_fallback": True, "idempotency_key": "stable-output-key",
