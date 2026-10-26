@@ -44,7 +44,7 @@ def sdk(monkeypatch, tmp_path):
     monkeypatch.setenv("INKBOX_BASE_URL", "https://example.com")
     monkeypatch.delenv("INKBOX_CODEX_CHAT_ID", raising=False)
     monkeypatch.setattr(sdk_config, "_CONFIG_PATH", tmp_path / "unused-sdk-config")
-    state = NS(requests=[], status=201, calls=[], identity_enabled=False)
+    state = NS(requests=[], status=201, calls=[], identity_enabled=False, limits_status=200)
 
     def handle(request):
         assert request.url.host == "example.com"
@@ -53,6 +53,8 @@ def sdk(monkeypatch, tmp_path):
         if path == "/api/v1/identities/agent":
             return httpx.Response(200, json={"id": IDENTITY, "organization_id": "org_example", "agent_handle": "agent",
                 "whatsapp_enabled": state.identity_enabled, "created_at": NOW, "updated_at": NOW})
+        if path == "/api/v1/whatsapp/limits":
+            return httpx.Response(state.limits_status, json={"agent_identity_id": IDENTITY, "cycle_start": NOW, "limits": {"synthetic": 123}, "usage": {"synthetic": 7}})
         if path == "/api/v1/identities/agent/channel-status":
             return httpx.Response(200, json={"whatsapp": {"enabled": True, "number": "+15550000001", "status": "ready"}})
         if request.method == "POST" and path == "/api/v1/whatsapp/messages":
@@ -250,3 +252,12 @@ def test_early_delivery_callback_survives_accepted_response_correlation(sdk):
     route = store.lookup_outbound(OUTBOUND)
     assert route["status"] == "delivered" and route["delivery_state"] == "delivered"
     assert route["chat_id"] == "contact" and "unknown_route" not in route
+
+
+def test_status_includes_independent_limits_without_breaking_older_api(sdk):
+    status = result(asyncio.run(call_inkbox_tool(sdk.client, "agent", "inkbox_get_whatsapp_status", {})))
+    assert status["limits"]["limits"] == {"synthetic": 123}
+    assert status["limits"]["usage"] == {"synthetic": 7}
+    sdk.limits_status = 404
+    status = result(asyncio.run(call_inkbox_tool(sdk.client, "agent", "inkbox_get_whatsapp_status", {})))
+    assert status["enabled"] and "limits" not in status

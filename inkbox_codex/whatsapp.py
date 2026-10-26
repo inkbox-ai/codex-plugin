@@ -286,6 +286,14 @@ def run_tool(client, identity_handle, name, args):
             sender_kind="whatsapp_identity", sender_id=identity.id,
             operation="whatsapp.send", idempotency_key=args["idempotency_key"],
         ))}
+    if operation == "get_whatsapp_status":
+        status = _json_safe(require_method(identity, operation)(**args))
+        try:
+            limits = _json_safe(require_method(identity, "get_whatsapp_limits")())
+        except Exception:
+            # A not-yet-available limits endpoint must not hide channel readiness/history.
+            return status
+        return {**status, "limits": limits} if isinstance(status, dict) else status
     if operation == "send_whatsapp":
         recipient, conversation = args.get("to"), args.get("conversation_id")
         if bool(recipient) == bool(conversation) or (recipient is not None and not isinstance(recipient, str)):
