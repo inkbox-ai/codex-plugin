@@ -45,7 +45,8 @@ def sdk(monkeypatch, tmp_path):
     monkeypatch.setenv("INKBOX_BASE_URL", "https://example.com")
     monkeypatch.delenv("INKBOX_CODEX_CHAT_ID", raising=False)
     monkeypatch.setattr(sdk_config, "_CONFIG_PATH", tmp_path / "unused-sdk-config")
-    state = NS(requests=[], status=201, calls=[], identity_enabled=False, limits_status=200)
+    state = NS(requests=[], status=201, calls=[], identity_enabled=False, limits_status=200,
+               failure_detail={"error": "whatsapp_send_pending"})
 
     def handle(request):
         assert request.url.host == "example.com"
@@ -61,7 +62,7 @@ def sdk(monkeypatch, tmp_path):
         if request.method == "POST" and path == "/api/v1/whatsapp/messages":
             state.calls.append(request)
             if state.status != 201:
-                return httpx.Response(state.status, json={"detail": {"error": "whatsapp_send_pending"}})
+                return httpx.Response(state.status, json={"detail": state.failure_detail})
             return httpx.Response(201, json={"message": message(id=OUTBOUND, direction="outbound", status="queued")})
         if path == "/api/v1/message-sends/lookup":
             return httpx.Response(200, json={"message_id": OUTBOUND})
@@ -264,7 +265,7 @@ def test_status_includes_independent_limits_without_breaking_older_api(sdk):
     assert status["enabled"] and "limits" not in status
 
 
-@pytest.mark.parametrize("selector", [{"conversation_id": CONVERSATION}, {"to": "+15550000002"}])
+@pytest.mark.parametrize("selector", [{"conversation_id": CONVERSATION}, {"to": "+15550000002"}, {"to": " +1 (555) 000-0002 "}])
 def test_uncertain_source_tool_send_fences_final_and_survives_recovery(sdk, monkeypatch, selector):
     async def run():
         gw = bridge(sdk)
@@ -301,7 +302,8 @@ def test_uncertain_source_tool_send_fences_final_and_survives_recovery(sdk, monk
     asyncio.run(run())
 
 
-def test_known_rejected_source_send_can_retry_the_original_key(sdk, monkeypatch):
+@pytest.mark.parametrize("selector", [{"conversation_id": CONVERSATION}, {"to": "+15550000002"}, {"to": " +1 (555) 000-0002 "}])
+def test_known_rejected_source_send_can_retry_the_original_key(sdk, monkeypatch, selector):
     async def run():
         gw = bridge(sdk)
         meta = {"channel": "whatsapp", "conversation_id": CONVERSATION, "sender": "+15550000002",
@@ -309,7 +311,8 @@ def test_known_rejected_source_send_can_retry_the_original_key(sdk, monkeypatch)
         await gw._imessage_turn_state("contact", "admitted", meta, "Question")
         await gw._imessage_turn_state("contact", "started", meta)
         monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")
-        args = {"conversation_id": CONVERSATION, "text": "Hello", "idempotency_key": "original-key"}
+        args = {**selector, "text": "Hello", "idempotency_key": "original-key"}
+        sdk.failure_detail = {"error": "whatsapp_daily_limit_exceeded"}
         sdk.status = 429
         assert (await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", args))["isError"]
         rejected_attempts = len(sdk.calls)
@@ -319,6 +322,43 @@ def test_known_rejected_source_send_can_retry_the_original_key(sdk, monkeypatch)
         assert {call.headers["Idempotency-Key"] for call in sdk.calls} == {"original-key"}
         assert await gw._imessage_turn_state("contact", "result", meta, "Hello") is True
         assert gw._channel_store("whatsapp").summary()["done"] == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("status", [403, 422, 429])
+def test_unrecognized_send_rejection_keeps_the_original_attempt_fenced(sdk, monkeypatch, status):
+    async def run():
+        gw = bridge(sdk)
+        meta = {"channel": "whatsapp", "conversation_id": CONVERSATION, "sender": "+15550000002", "message_id": MESSAGE}
+        await gw._imessage_turn_state("contact", "admitted", meta, "Question")
+        await gw._imessage_turn_state("contact", "started", meta)
+        monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")
+        sdk.status = status
+        failed = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", {"conversation_id": CONVERSATION, "text": "Hello"})
+        assert failed["isError"]
+        assert await gw._imessage_turn_state("contact", "result", meta, "Hello") is True
+        assert gw._channel_store("whatsapp").summary()["uncertain"] == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_explicit_other_recipient_keeps_the_ordinary_origin_reply(sdk, monkeypatch, uncertain):
+    async def run():
+        gw = bridge(sdk)
+        meta = {"channel": "whatsapp", "conversation_id": CONVERSATION, "sender": "+15550000002", "message_id": MESSAGE}
+        await gw._imessage_turn_state("contact", "admitted", meta, "Question")
+        await gw._imessage_turn_state("contact", "started", meta)
+        monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")
+        sdk.status = 409 if uncertain else 201
+        await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", {"to": "+15550000003", "text": "Hello"})
+        assert await gw._imessage_turn_state("contact", "result", meta, "Hello") is False
+        sdk.status = 201
+        await gw.send_to_contact("contact", "Hello", "whatsapp", {**meta, "imessage_final_reply": True})
+        assert len(sdk.calls) == 2
+        assert json.loads(sdk.calls[0].content)["to"] == "+15550000003"
+        assert json.loads(sdk.calls[1].content)["conversation_id"] == CONVERSATION
 
     asyncio.run(run())
 

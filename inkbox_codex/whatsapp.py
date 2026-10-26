@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import re
 from pathlib import Path
 import uuid
 from datetime import datetime, timezone
@@ -14,6 +15,19 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 EVENTS = ["whatsapp.received", "whatsapp.sent", "whatsapp.delivered", "whatsapp.delivery_failed", "whatsapp.delivery_unconfirmed"]
+_REJECTED_SEND_CODES = {
+    402: {"whatsapp_cycle_limit_exceeded"},
+    403: {"whatsapp_not_eligible", "whatsapp_access_required", "whatsapp_contact_not_allowed", "whatsapp_media_source_not_allowed"},
+    413: {"whatsapp_media_too_large"},
+    422: {"whatsapp_groups_not_supported", "whatsapp_invalid_recipient", "whatsapp_text_too_long", "whatsapp_unanswered_followup_limit", "whatsapp_opening_message_too_long", "whatsapp_reply_required_for_media", "whatsapp_reply_required_for_links", "whatsapp_reply_required_for_phone_numbers"},
+    429: {"whatsapp_daily_limit_exceeded", "whatsapp_unanswered_message_limit", "whatsapp_conversation_rate_limited", "whatsapp_new_contact_rate_limited", "whatsapp_new_contact_spacing", "whatsapp_follow_up_rate_limited"},
+}
+
+
+def known_send_rejection(error):
+    detail = getattr(error, "detail", None)
+    code = detail.get("error") if isinstance(detail, dict) else None
+    return isinstance(code, str) and code in _REJECTED_SEND_CODES.get(getattr(error, "status_code", None), set())
 
 def field(value: Any, name: str, default=None):
     return (
@@ -314,8 +328,12 @@ def run_tool(client, identity_handle, name, args):
         if text is not None and (not isinstance(text, str) or len(text) > 4000):
             raise ValueError("WhatsApp text must be at most 4000 characters")
         source_route = (owner or {}).get("route_meta") or {}
+        normalized_recipient = re.sub(r"[\s().-]", "", recipient or "")
         context = owner if owner and source_route.get("channel") == "whatsapp" and (
-            owner.get("conversation_id") == conversation or recipient == source_route.get("sender")
+            owner.get("conversation_id") == conversation or (
+                re.fullmatch(r"\+[1-9]\d{6,14}", normalized_recipient)
+                and normalized_recipient == source_route.get("sender")
+            )
         ) else None
         key = args.get("idempotency_key")
         if not key:
@@ -337,7 +355,7 @@ def run_tool(client, identity_handle, name, args):
         try:
             sent = method(**kwargs)
         except Exception as exc:
-            if context and getattr(exc, "status_code", None) in {400, 402, 403, 413, 422, 429}:
+            if context and known_send_rejection(exc):
                 checkpoint_whatsapp_tool_send(context, key, state="rejected", text=text, media_id=args.get("media_id"))
             raise
         if context:
