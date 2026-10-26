@@ -28,6 +28,8 @@ def test_real_host_resolves_candidate_and_reads_dynamic_whatsapp_capability(tmp_
                          "whatsapp_enabled": False, "created_at": NOW, "updated_at": NOW}
             elif self.path == "/api/v1/identities/agent/channel-status":
                 value = {"whatsapp": {"enabled": True, "number": "+15550000001", "status": "ready"}}
+            elif self.path == f"/api/v1/whatsapp/limits?agent_identity_id={IDENTITY}":
+                value = {"agent_identity_id": IDENTITY, "cycle_start": NOW, "limits": {"synthetic": 123}, "usage": {"synthetic": 7}}
             else:
                 self.send_error(404)
                 return
@@ -65,7 +67,9 @@ def test_real_host_resolves_candidate_and_reads_dynamic_whatsapp_capability(tmp_
             assert not response.get("isError"), response
             result = json.loads(response["content"][0]["text"])
             assert result["enabled"] and result["status"] == "ready"
-            assert requests == ["/api/v1/identities/agent", "/api/v1/identities/agent/channel-status"]
+            assert result["limits"]["limits"] == {"synthetic": 123}
+            assert requests == ["/api/v1/identities/agent", "/api/v1/identities/agent/channel-status",
+                                f"/api/v1/whatsapp/limits?agent_identity_id={IDENTITY}"]
         finally:
             await host.disconnect()
     try:
