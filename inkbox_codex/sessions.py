@@ -633,6 +633,7 @@ class ContactSession:
         meta = deepcopy(meta or {})
         tracked = self._threaded_imessage(mode) and not meta.get("companion") and not meta.get("reaction")
         if tracked:
+            meta["channel"] = mode
             meta = self._imessage_meta(meta, str(meta.get("raw_text", text)))
             admitted = await self._imessage_state("admitted", meta, text)
             if admitted is False:
@@ -666,6 +667,12 @@ class ContactSession:
             return False
         is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
         pending_reply = self.pending is not None and not self.pending.future.done()
+        active_mode, active_meta = self._reply_route(self._current_turn)
+        same_origin = (mode == active_mode and meta.get("sender") == active_meta.get("sender")
+                       and meta.get("conversation_id") == active_meta.get("conversation_id"))
+        foreign_whatsapp = (mode == "whatsapp" or active_mode == "whatsapp") and not same_origin
+        if foreign_whatsapp:
+            pending_reply = False
         if is_group and pending_reply:
             pending_reply = (
                 not meta.get("reaction")
@@ -736,7 +743,7 @@ class ContactSession:
             await self._report_health()
             return False
 
-        if (not pending_reply and self._approval_waiters
+        if (not foreign_whatsapp and not pending_reply and self._approval_waiters
                 and (not is_group or meta.get("sender") == self._reply_route(self._current_turn)[1].get("sender"))):
             if parse_permission_reply(raw_text) is not None:
                 if consumed_meta is not None:
@@ -790,7 +797,7 @@ class ContactSession:
         return True
 
     def _threaded_imessage(self, mode: Optional[str]) -> bool:
-        return mode == "imessage" and getattr(self.cfg, "imessage_threaded_replies", False)
+        return mode == "whatsapp" or (mode == "imessage" and getattr(self.cfg, "imessage_threaded_replies", False))
 
     def _threaded_turn(self, turn: _Turn) -> bool:
         return bool(self._threaded_imessage(turn.reply_mode)
@@ -836,7 +843,7 @@ class ContactSession:
         # explicit reply establishes a thread boundary for burst collection.
         reply_context = self._imessage_reply_context(meta)
         return tuple(meta.get(key) for key in (
-            "sender", "conversation_id", "conversation_kind", "sender_access",
+            "channel", "sender", "conversation_id", "conversation_kind", "sender_access",
             "companion_scope_id", "companion_activation_id", "identity_id",
         )) + (reply_context,)
 
@@ -846,7 +853,7 @@ class ContactSession:
             self._flush_imessage_burst()
         loop = asyncio.get_running_loop()
         if self._imessage_burst is None:
-            self._imessage_burst = _Turn(text="", reply_mode="imessage", reply_meta=deepcopy(meta))
+            self._imessage_burst = _Turn(text="", reply_mode=meta.get("channel") or "imessage", reply_meta=deepcopy(meta))
             self._imessage_burst_parts = [text]
             self._imessage_burst_key = key
             self._imessage_burst_started = loop.time()
@@ -859,7 +866,7 @@ class ContactSession:
             if first_id:
                 route["imessage_reply_target"] = first_id
         turn = self._imessage_burst
-        turn.text = frame_inbound("imessage", turn.reply_meta, "\n\n".join(self._imessage_burst_parts))
+        turn.text = frame_inbound(turn.reply_mode, turn.reply_meta, "\n\n".join(self._imessage_burst_parts))
         if self._imessage_burst_task is not None:
             self._imessage_burst_task.cancel()
         if meta.get("attachments") or meta.get("reaction"):

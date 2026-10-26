@@ -3,6 +3,7 @@ covers the dedicated number AND the shared iMessage line), with the
 number-scoped update only as a legacy-SDK fallback."""
 
 import types
+from inkbox_codex.whatsapp import EVENTS as WHATSAPP_EVENTS
 
 from inkbox_codex import gateway as gateway_mod
 from inkbox_codex.config import BridgeConfig, VoiceStack
@@ -188,10 +189,12 @@ def test_a2a_imessage_and_call_use_channel_coherent_subscriptions():
 
     assert [created["event_types"] for created in subscriptions.created] == [
         gateway_mod.A2A_EVENTS,
+        WHATSAPP_EVENTS,
         gateway_mod.IMESSAGE_EVENTS,
         gateway_mod.CALL_EVENTS,
     ]
     assert [created["url"] for created in subscriptions.created] == [
+        "https://agent.inkboxwire.com/webhook",
         "https://agent.inkboxwire.com/webhook",
         "https://agent.inkboxwire.com/webhook",
         "https://agent.inkboxwire.com/webhook",
@@ -215,6 +218,11 @@ def test_imessage_reconcile_preserves_existing_a2a_channel_subscription():
         {
             "agent_identity_id": "identity-1",
             "url": "https://agent.inkboxwire.com/webhook",
+            "event_types": WHATSAPP_EVENTS,
+        },
+        {
+            "agent_identity_id": "identity-1",
+            "url": "https://agent.inkboxwire.com/webhook",
             "event_types": gateway_mod.IMESSAGE_EVENTS,
         },
         {
@@ -232,4 +240,4 @@ def test_a2a_only_subscription_is_skipped_on_older_api():
         subscriptions=subscriptions,
     )
 
-    assert subscriptions.created == []
+    assert subscriptions.created == [{"agent_identity_id": "identity-1", "url": "https://agent.inkboxwire.com/webhook", "event_types": WHATSAPP_EVENTS}]

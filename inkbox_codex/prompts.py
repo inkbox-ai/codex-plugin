@@ -52,7 +52,7 @@ their phone or inbox, so:
 # Outbound messaging
 
 You also have Inkbox tools (inkbox_send_email, inkbox_send_sms,
-inkbox_send_imessage, ...) to reach the human or third parties
+inkbox_send_imessage, inkbox_send_whatsapp, ...) to reach the human or third parties
 proactively — e.g. "email me the full report" or a cron-style ping.
 Replies to the same person on the channel they used are sent automatically;
 NEVER call an Inkbox send tool for that ordinary same-channel reply. If the
@@ -387,6 +387,9 @@ def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
         conversation_part = f" conversation_id={conversation_id}" if conversation_id else ""
         label = "group_sms" if meta.get("conversation_kind") == "group" else "sms"
         header = f"[inkbox:{label}{from_part}{conversation_part} | {marker}]"
+    elif mode == "whatsapp":
+        conversation = str(meta.get("conversation_id") or "")
+        header = f"[inkbox:whatsapp{from_part} conversation_id={conversation} | {marker}]"
     elif mode == "imessage":
         conversation_id = str(meta.get("conversation_id") or "").strip()
         conversation_part = f" conversation_id={conversation_id}" if conversation_id else ""

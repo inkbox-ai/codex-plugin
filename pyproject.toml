@@ -1,14 +1,14 @@
 [project]
 name = "codex-plugin"
 version = "0.2.24"
-description = "Inkbox bridge for Codex — talk to your coding agent over email, SMS, iMessage, and voice"
+description = "Inkbox bridge for Codex — talk to your coding agent over email, SMS, iMessage, WhatsApp, and voice"
 requires-python = ">=3.11"
 dependencies = [
   "aiohttp>=3.9",
   "croniter>=6.2,<7",
   "tzdata>=2025.1",
   "audioop-lts>=0.2.1; python_version >= '3.13'",
-  "inkbox>=0.7.15,<1.0.0",
+  "inkbox>=0.7.21,<1.0.0",
   "segno>=1.5",  # terminal QR codes for the iMessage connect step
 ]
 

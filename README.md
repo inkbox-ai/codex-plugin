@@ -10,7 +10,7 @@
 </p>
 
 <p>
-  <code>Email</code> · <code>Calls</code> · <code>SMS / MMS</code> · <code>iMessage</code> · <code>Tunnel</code>
+  <code>Email</code> · <code>Calls</code> · <code>SMS / MMS</code> · <code>iMessage</code> · <code>WhatsApp</code> · <code>Tunnel</code>
 </p>
 
 <br clear="left">
@@ -1110,3 +1110,14 @@ resamples to and from the realtime session's 24 kHz PCM format, preserving audio
 across WebSocket frame boundaries. Older call streams that advertise 8 kHz μ-law
 (or omit their audio descriptor) remain supported. Call audio quality also depends
 on the remote connection. Hosted voice and managed speech modes are unchanged.
+
+
+## Dedicated WhatsApp
+
+WhatsApp supports one-to-one conversations for approved agents with a dedicated iMessage number. Request access in the console. Once access is available, an already running bridge can receive WhatsApp messages without a new local toggle or restart.
+
+Normal final answers reply to the original WhatsApp conversation automatically. The tools support fresh channel status, direct sends, conversation/message reads, one attachment upload, renewed attachment access, local read state and lookup of an accepted send by its original request key. A send accepts text up to4000 characters and one owned attachment ID (upload limit20MiB). Sending is not delivery confirmation; delivery notifications do not start a new model turn or automatically resend.
+
+After an uncertain send, preserve its `idempotency_key` and `media_id`. Use `inkbox_lookup_whatsapp_send`, then `inkbox_get_whatsapp_message` to inspect the original result; do not upload again or choose a new key to recover it. WhatsApp has no group, quoted-reply, typing, reaction, voice or remote-read-receipt behavior in this integration. Local `inkbox_mark_whatsapp_read` only updates visible history.
+
+This change requires Inkbox SDK0.7.21. The draft's CI builds and installs the real SDK candidate from an immutable public source revision, including inside the actual Codex MCP subprocess. Normal registry installation remains dependent on the corresponding SDK release; this does not publish packages.
