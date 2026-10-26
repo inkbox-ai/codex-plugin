@@ -303,7 +303,8 @@ def test_uncertain_source_tool_send_fences_final_and_survives_recovery(sdk, monk
 
 
 @pytest.mark.parametrize("selector", [{"conversation_id": CONVERSATION}, {"to": "+15550000002"}, {"to": " +1 (555) 000-0002 "}])
-def test_known_rejected_source_send_can_retry_the_original_key(sdk, monkeypatch, selector):
+@pytest.mark.parametrize("status,code", [(429, "whatsapp_daily_limit_exceeded"), (422, "whatsapp_reply_required_for_email_addresses")])
+def test_known_rejected_source_send_can_retry_the_original_key(sdk, monkeypatch, selector, status, code):
     async def run():
         gw = bridge(sdk)
         meta = {"channel": "whatsapp", "conversation_id": CONVERSATION, "sender": "+15550000002",
@@ -312,9 +313,11 @@ def test_known_rejected_source_send_can_retry_the_original_key(sdk, monkeypatch,
         await gw._imessage_turn_state("contact", "started", meta)
         monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")
         args = {**selector, "text": "Hello", "idempotency_key": "original-key"}
-        sdk.failure_detail = {"error": "whatsapp_daily_limit_exceeded"}
-        sdk.status = 429
-        assert (await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", args))["isError"]
+        sdk.failure_detail = {"error": code}
+        sdk.status = status
+        failure = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", args)
+        assert failure["isError"]
+        assert json.loads(failure["content"][0]["text"])["error_code"] == code
         rejected_attempts = len(sdk.calls)
         sdk.status = 201
         result(await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", args))
