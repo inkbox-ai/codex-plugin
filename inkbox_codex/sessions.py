@@ -667,12 +667,15 @@ class ContactSession:
             return False
         is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
         pending_reply = self.pending is not None and not self.pending.future.done()
-        active_mode, active_meta = self._reply_route(self._current_turn)
+        active_mode, active_meta = self._pending_reply_route or self._reply_route(self._current_turn)
         same_origin = (mode == active_mode and meta.get("sender") == active_meta.get("sender")
                        and meta.get("conversation_id") == active_meta.get("conversation_id"))
         foreign_whatsapp = (mode == "whatsapp" or active_mode == "whatsapp") and not same_origin
         if foreign_whatsapp:
             pending_reply = False
+            global_control = command in {"reset", "resume"} or (command == "stop" and not self._threaded_imessage(mode))
+            if global_control and (self._current_turn is not None or self.pending is not None):
+                return False
         if is_group and pending_reply:
             pending_reply = (
                 not meta.get("reaction")
@@ -1048,11 +1051,17 @@ class ContactSession:
         await self._reply("Stopped." if had_work else "Nothing to stop — I'm idle.")
 
     async def _stop_imessage(self, meta: Dict[str, Any]) -> None:
-        """Stop this iMessage conversation without cancelling another channel."""
+        """Stop only the originating native messaging conversation."""
+        mode = meta.get("channel") or "imessage"
+
+        def same_source(route: Dict[str, Any]) -> bool:
+            return (route.get("conversation_id") == meta.get("conversation_id")
+                    and (mode != "whatsapp" or route.get("sender") == meta.get("sender")))
+
         def owns(turn: Optional[_Turn]) -> bool:
             return bool(
-                turn is not None and turn.future is None and turn.reply_mode == "imessage"
-                and (turn.reply_meta or {}).get("conversation_id") == meta.get("conversation_id")
+                turn is not None and turn.future is None and turn.reply_mode == mode
+                and same_source(turn.reply_meta or {})
             )
 
         dropped = []
@@ -1067,10 +1076,12 @@ class ContactSession:
         running = owns(self._current_turn)
         parked = bool(
             self.pending is not None and self._current_turn is None and self._pending_reply_route
-            and self._pending_reply_route[0] == "imessage"
-            and self._pending_reply_route[1].get("conversation_id") == meta.get("conversation_id")
+            and self._pending_reply_route[0] == mode
+            and same_source(self._pending_reply_route[1])
         )
         if running or parked:
+            if running and mode == "whatsapp":
+                await self._imessage_state("stopping", self._current_turn.reply_meta or {})
             await self._cancel_pending_turn()
         for turn in dropped:
             if self._threaded_turn(turn):

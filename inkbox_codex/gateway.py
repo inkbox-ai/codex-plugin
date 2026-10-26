@@ -1444,6 +1444,14 @@ class InkboxGateway:
             context = read_turn_context(chat_id)
             owned = context and context.get("nonce") == meta.get("imessage_context_nonce")
             sent = (context or {}).get("sent_outputs", []) if owned else []
+            attempts = (context or {}).get("whatsapp_tool_sends", {}) if owned else {}
+            unconfirmed = any(attempt["state"] == "sending" for attempt in attempts.values())
+            if unconfirmed:
+                meta["whatsapp_tool_sends"] = attempts
+                meta["whatsapp_send_unconfirmed"] = True
+                if ordinary:
+                    store.mark(meta, "uncertain", chat_id=chat_id)
+                return True
             duplicate = bool(text and any(
                 output.get("text") in {text, strip_markdown(text)}
                 and output.get("target") in context.get("admitted_source_ids", [])
@@ -1455,9 +1463,9 @@ class InkboxGateway:
                 else:
                     store.mark(meta, "reply_pending", reply=text, chat_id=chat_id)
             return duplicate
-        if state in {"done", "cancelled", "uncertain"}:
-            if ordinary:
-                store.mark(meta, state, chat_id=chat_id)
+        if state in {"stopping", "done", "cancelled", "uncertain"}:
+            if ordinary and state != "stopping":
+                store.mark(meta, "uncertain" if meta.get("whatsapp_send_unconfirmed") else state, chat_id=chat_id)
             # A control message can finish while another turn is still using
             # its tools. Never remove that other turn's source allowlist.
             context = read_turn_context(chat_id)

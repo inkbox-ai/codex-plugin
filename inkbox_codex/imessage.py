@@ -325,6 +325,31 @@ def validate_tool_target(context: dict[str, Any], conversation_id: str | None, t
         raise ValueError("The iMessage reply target must be an admitted message in the active turn")
 
 
+def checkpoint_whatsapp_tool_send(
+    context: dict[str, Any], idempotency_key: str, *, state: str,
+    text: str | None = None, media_id: str | None = None,
+) -> None:
+    """Retain original-key evidence before a source-owned send can be accepted."""
+    path = imessage_turn_context_path(context["chat_id"])
+    with _context_lock(path):
+        current = _active_context(context)
+        sends = current.setdefault("whatsapp_tool_sends", {})
+        pending = next(((key, send) for key, send in sends.items() if send["state"] == "sending"), None)
+        if state == "sending" and pending:
+            error = ValueError("An earlier WhatsApp send is unconfirmed; use its original key for read-only lookup")
+            error.idempotency_key = pending[0]
+            error.whatsapp_media_id = pending[1].get("media_id")
+            raise error
+        sends[idempotency_key] = {"state": state, "text": text, "media_id": media_id}
+        meta = {**current["route_meta"], "whatsapp_tool_sends": sends}
+        store = IMessageState(
+            SimpleNamespace(identity=current["identity"], base_url=current["base_url"]),
+            channel="whatsapp",
+        )
+        store.mark(meta, "running", chat_id=current["chat_id"])
+        _write_context(path, current)
+
+
 def record_accepted_tool_send(
     context: dict[str, Any], message: Any, idempotency_key: str,
     text: str | None = None, target: str | None = None,

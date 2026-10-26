@@ -2,6 +2,7 @@
 
 import asyncio
 from copy import deepcopy
+from datetime import datetime, timezone
 import json
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, Mock
@@ -13,7 +14,7 @@ from inkbox import Inkbox, _config as sdk_config
 
 from inkbox_codex.config import BridgeConfig
 from inkbox_codex.gateway import InkboxGateway
-from inkbox_codex.imessage import IMessageState, read_turn_context
+from inkbox_codex.imessage import IMessageState, clear_turn_context, read_turn_context
 from inkbox_codex.tools import call_inkbox_tool, mcp_tool_list
 from inkbox_codex.whatsapp import receive, record_status
 
@@ -261,3 +262,210 @@ def test_status_includes_independent_limits_without_breaking_older_api(sdk):
     sdk.limits_status = 404
     status = result(asyncio.run(call_inkbox_tool(sdk.client, "agent", "inkbox_get_whatsapp_status", {})))
     assert status["enabled"] and "limits" not in status
+
+
+@pytest.mark.parametrize("selector", [{"conversation_id": CONVERSATION}, {"to": "+15550000002"}])
+def test_uncertain_source_tool_send_fences_final_and_survives_recovery(sdk, monkeypatch, selector):
+    async def run():
+        gw = bridge(sdk)
+        meta = {"channel": "whatsapp", "conversation_id": CONVERSATION, "sender": "+15550000002",
+                "message_id": MESSAGE, "imessage_event_ids": ["original-event"]}
+        await gw._imessage_turn_state("contact", "admitted", meta, "Question")
+        await gw._imessage_turn_state("contact", "started", meta)
+        monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")
+        sdk.status = 409
+        failed = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", {
+            **selector, "text": "Hello", "media_id": MEDIA,
+        })
+        assert failed["isError"]
+        key = json.loads(failed["content"][0]["text"])["idempotency_key"]
+        blocked = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", {
+            "conversation_id": CONVERSATION, "text": "Changed answer", "idempotency_key": "new-unattempted-key",
+        })
+        details = json.loads(blocked["content"][0]["text"])
+        assert details["idempotency_key"] == key and details["media_id"] == MEDIA
+        assert len(sdk.calls) == 1
+        assert await gw._imessage_turn_state("contact", "result", meta, "Hello") is True
+        await gw._imessage_turn_state("contact", "done", meta)
+        store = gw._channel_store("whatsapp")
+        assert store.summary()["uncertain"] == 1
+        with store._db() as db:
+            saved = json.loads(db.execute("SELECT meta FROM receipts").fetchone()["meta"])
+        assert saved["whatsapp_tool_sends"][key]["media_id"] == MEDIA
+        gw.sessions = NS(get=Mock())
+        sdk.status = 201
+        await gw._recover_imessage_inputs()
+        gw.sessions.get.assert_not_called()
+        assert len(sdk.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_known_rejected_source_send_can_retry_the_original_key(sdk, monkeypatch):
+    async def run():
+        gw = bridge(sdk)
+        meta = {"channel": "whatsapp", "conversation_id": CONVERSATION, "sender": "+15550000002",
+                "message_id": MESSAGE}
+        await gw._imessage_turn_state("contact", "admitted", meta, "Question")
+        await gw._imessage_turn_state("contact", "started", meta)
+        monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")
+        args = {"conversation_id": CONVERSATION, "text": "Hello", "idempotency_key": "original-key"}
+        sdk.status = 429
+        assert (await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", args))["isError"]
+        rejected_attempts = len(sdk.calls)
+        sdk.status = 201
+        result(await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", args))
+        assert len(sdk.calls) == rejected_attempts + 1
+        assert {call.headers["Idempotency-Key"] for call in sdk.calls} == {"original-key"}
+        assert await gw._imessage_turn_state("contact", "result", meta, "Hello") is True
+        assert gw._channel_store("whatsapp").summary()["done"] == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ["send", "upload"])
+def test_source_revoked_during_identity_resolution_cannot_send_or_upload(sdk, monkeypatch, tmp_path, operation):
+    async def run():
+        gw = bridge(sdk)
+        meta = {"channel": "whatsapp", "conversation_id": CONVERSATION, "sender": "+15550000002",
+                "message_id": MESSAGE}
+        await gw._imessage_turn_state("contact", "admitted", meta, "Question")
+        await gw._imessage_turn_state("contact", "started", meta)
+        monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")
+        original = sdk.client.get_identity
+
+        def changed(handle):
+            clear_turn_context("contact")
+            return original(handle)
+
+        monkeypatch.setattr(sdk.client, "get_identity", changed)
+        file = tmp_path / "attachment.txt"
+        file.write_text("attachment")
+        name, args = (("inkbox_send_whatsapp", {"to": "+15550000003", "text": "Explicit outreach"})
+                      if operation == "send" else ("inkbox_upload_whatsapp_media", {"media_path": str(file)}))
+        failed = await call_inkbox_tool(sdk.client, "agent", name, args)
+        assert failed["isError"]
+        assert not [request for request in sdk.requests if request.method == "POST"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("observed", ["2026-01-01T00:00:01Z", "2026-01-01T01:00:01+01:00", None, "invalid"])
+def test_old_or_invalid_status_cannot_regress_an_accepted_sdk_observation(sdk, observed):
+    gw = bridge(sdk)
+    store = gw._channel_store("whatsapp")
+    store.record_outbound(NS(id=OUTBOUND, status="delivered", delivery_state="delivered",
+                            updated_at=datetime(2026, 1, 1, 0, 0, 2, tzinfo=timezone.utc)),
+                          {"channel": "whatsapp"}, "contact")
+    record_status(gw, {"event_type": "whatsapp.sent", "data": {"message": message(
+        id=OUTBOUND, direction="outbound", status="sent", delivery_state="pending", updated_at=observed)}})
+    saved = store.lookup_outbound(OUTBOUND)
+    assert saved["status"] == "delivered" and saved["delivery_state"] == "delivered"
+
+
+def test_whatsapp_stop_interrupts_own_running_work_without_imessage_flag(tmp_path, monkeypatch):
+    from tests.test_imessage_sessions import make_session, source
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+
+    async def run():
+        session, sent, _ = make_session(enabled=False)
+        session._client.gate = asyncio.Event()
+        await session.handle_inbound("Long running work", "whatsapp", source(1))
+        session._flush_imessage_burst()
+        await session._client.started.wait()
+        await session.handle_inbound("/stop", "whatsapp", source(2, raw_text="/stop"))
+        await session._worker
+        assert session._client.interrupts == 1
+        assert [text for text, _, _ in sent] == ["Stopped."]
+
+    asyncio.run(run())
+
+
+def test_whatsapp_stop_drops_own_queue_and_burst_but_preserves_other_work(tmp_path, monkeypatch):
+    from tests.test_imessage_sessions import make_session, source
+    from inkbox_codex.sessions import _Turn
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+
+    async def run():
+        session, sent, states = make_session(enabled=False)
+        other = _Turn(text="Other work", reply_mode="sms", reply_meta=source(9))
+        session._current_turn = other
+        session._turn_active = True
+        session._worker = asyncio.create_task(asyncio.Event().wait())
+        try:
+            await session.handle_inbound("First", "whatsapp", source(1))
+            session._flush_imessage_burst()
+            await session.handle_inbound("Second", "whatsapp", source(2))
+            await session.handle_inbound("/stop", "whatsapp", source(3, raw_text="/stop"))
+            assert session._imessage_burst is None and session._queue.empty()
+            assert session._client.interrupts == 0 and session._current_turn is other
+            assert sent[-1][0] == "Stopped."
+            assert {meta["message_id"] for state, meta, _ in states if state == "cancelled"} == {"message-1", "message-2"}
+        finally:
+            session._worker.cancel()
+            await asyncio.gather(session._worker, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_whatsapp_stop_cancels_its_parked_question(tmp_path, monkeypatch):
+    from tests.test_imessage_sessions import make_session, source
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+
+    async def run():
+        session, sent, _ = make_session(enabled=False)
+        session.mode, session.reply_meta = "whatsapp", source(1, channel="whatsapp")
+        question = asyncio.create_task(session._escalate("resume", "Choose a conversation"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert session.pending is not None
+        await session.handle_inbound("/stop", "whatsapp", source(2, raw_text="/stop"))
+        assert await question is None
+        assert sent[-1][0] == "Stopped."
+
+    asyncio.run(run())
+
+
+def test_whatsapp_stop_retires_tool_authority_before_waiting_for_interrupt(sdk, monkeypatch):
+    from tests.test_imessage_sessions import make_session, source
+
+    async def run():
+        gw = bridge(sdk)
+        session, _, _ = make_session(enabled=False, hook=gw._imessage_turn_state)
+        client = session._client
+        client.gate = asyncio.Event()
+        await session.handle_inbound("Long running work", "whatsapp", source(1))
+        session._flush_imessage_burst()
+        await client.started.wait()
+        assert read_turn_context(session.chat_id) is not None
+
+        async def interrupted():
+            assert read_turn_context(session.chat_id) is None
+            client.gate.set()
+
+        monkeypatch.setattr(client, "interrupt", interrupted)
+        await session.handle_inbound("/stop", "whatsapp", source(2, raw_text="/stop"))
+        await session._worker
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("command", ["/stop", "/clear", "/resume"])
+def test_foreign_channel_cannot_control_active_whatsapp_work(tmp_path, monkeypatch, command):
+    from tests.test_imessage_sessions import make_session, source
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+
+    async def run():
+        session, sent, _ = make_session(enabled=False)
+        client = session._client
+        client.gate = asyncio.Event()
+        await session.handle_inbound("Long running work", "whatsapp", source(1))
+        session._flush_imessage_burst()
+        await client.started.wait()
+        await session.handle_inbound(command, "sms", source(2, raw_text=command))
+        assert client.interrupts == 0 and not session._worker.done()
+        assert not sent
+        client.gate.set()
+        await session._worker
+
+    asyncio.run(run())

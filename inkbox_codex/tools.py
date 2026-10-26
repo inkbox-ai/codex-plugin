@@ -1478,7 +1478,8 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
     except Exception as exc:
         fields = _tool_exception_fields(exc)
         if name == "inkbox_send_whatsapp" and args.get("idempotency_key"):
-            fields.update(idempotency_key=args["idempotency_key"], media_id=args.get("media_id"))
+            fields.update(idempotency_key=getattr(exc, "idempotency_key", None) or args["idempotency_key"],
+                          media_id=getattr(exc, "whatsapp_media_id", args.get("media_id")))
         if hosted_sms_context is not None:
             _settle_hosted_sms_context(
                 hosted_sms_context,

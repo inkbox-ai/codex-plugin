@@ -9,6 +9,7 @@ import logging
 import mimetypes
 from pathlib import Path
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,15 @@ def require_method(identity, name):
     if not callable(method):
         raise RuntimeError("WhatsApp requires Inkbox SDK 0.7.21 or newer")
     return method
+
+
+def observation_time(value):
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+
 
 async def receive(gateway, envelope):
     from aiohttp import web
@@ -160,11 +170,12 @@ def record_status(gateway, envelope):
                 "unknown_route": True,
             }
         )
-        observed = str(message.get("updated_at") or "")
-        if route.get("updated_at") and observed and observed < route["updated_at"]:
+        observed = observation_time(message.get("updated_at"))
+        previous = observation_time(route.get("updated_at"))
+        if observed is None or (previous is not None and observed < previous):
             return
         route.update({"status": message.get("status"), "delivery_state": message.get("delivery_state"),
-                      "updated_at": observed})
+                      "updated_at": message["updated_at"]})
         db.execute(
             "INSERT OR REPLACE INTO outbound(message_id,route) VALUES(?,?)",
             (str(message["id"]), json.dumps(route)),
@@ -279,6 +290,7 @@ def run_tool(client, identity_handle, name, args):
     from .tools import _imessage_active_context, _json_safe
 
     operation = OPERATIONS[name]
+    owner = _imessage_active_context(identity_handle)
     identity = client.get_identity(identity_handle)
     if operation == "lookup_whatsapp_send":
         require_method(identity, "get_whatsapp_status")
@@ -301,10 +313,10 @@ def run_tool(client, identity_handle, name, args):
         text = args.get("text")
         if text is not None and (not isinstance(text, str) or len(text) > 4000):
             raise ValueError("WhatsApp text must be at most 4000 characters")
-        context = _imessage_active_context(identity_handle)
-        if context and ((context.get("route_meta") or {}).get("channel") != "whatsapp"
-                        or context.get("conversation_id") != conversation):
-            context = None
+        source_route = (owner or {}).get("route_meta") or {}
+        context = owner if owner and source_route.get("channel") == "whatsapp" and (
+            owner.get("conversation_id") == conversation or recipient == source_route.get("sender")
+        ) else None
         key = args.get("idempotency_key")
         if not key:
             key = "codex-wa-" + (hashlib.sha256(json.dumps([
@@ -315,16 +327,26 @@ def run_tool(client, identity_handle, name, args):
         kwargs["conversation_id" if conversation else "to"] = conversation or recipient
         if args.get("media_id"):
             kwargs["media_ids"] = [args["media_id"]]
-        if context:
+        method = require_method(identity, operation)
+        if owner and (owner.get("route_meta") or {}).get("channel") == "whatsapp":
             from .imessage import validate_tool_target
-            validate_tool_target(context, conversation, None)
-        sent = require_method(identity, operation)(**kwargs)
+            validate_tool_target(owner, owner["conversation_id"], None)
+        if context:
+            from .imessage import checkpoint_whatsapp_tool_send
+            checkpoint_whatsapp_tool_send(context, key, state="sending", text=text, media_id=args.get("media_id"))
+        try:
+            sent = method(**kwargs)
+        except Exception as exc:
+            if context and getattr(exc, "status_code", None) in {400, 402, 403, 413, 422, 429}:
+                checkpoint_whatsapp_tool_send(context, key, state="rejected", text=text, media_id=args.get("media_id"))
+            raise
         if context:
             from .imessage import record_accepted_tool_send, record_tool_send
             target = next(iter(context.get("admitted_source_ids") or []), None)
             try:
                 record_accepted_tool_send(context, sent, key, text=text, target=target)
                 record_tool_send(context, sent, key, text=text, target=target)
+                checkpoint_whatsapp_tool_send(context, key, state="accepted", text=text, media_id=args.get("media_id"))
             except Exception:
                 logger.warning("WhatsApp accepted; local tracking needs recovery. Do not resend.")
         result = _json_safe(sent)
@@ -337,6 +359,9 @@ def run_tool(client, identity_handle, name, args):
             content = stream.read(20 * 1024 * 1024 + 1)
         if len(content) > 20 * 1024 * 1024:
             raise ValueError("WhatsApp media must be at most 20 MiB")
+        if owner and (owner.get("route_meta") or {}).get("channel") == "whatsapp":
+            from .imessage import validate_tool_target
+            validate_tool_target(owner, owner["conversation_id"], None)
         return require_method(identity, operation)(content=content, filename=path.name,
             content_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream")
     return require_method(identity, operation)(**args)
