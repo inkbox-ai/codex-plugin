@@ -16,7 +16,6 @@ from typing import Any
 logger = logging.getLogger(__name__)
 EVENTS = ["whatsapp.received", "whatsapp.sent", "whatsapp.delivered", "whatsapp.delivery_failed", "whatsapp.delivery_unconfirmed"]
 _REJECTED_SEND_CODES = {
-    402: {"whatsapp_cycle_limit_exceeded"},
     403: {"whatsapp_not_eligible", "whatsapp_access_required", "whatsapp_contact_not_allowed", "whatsapp_media_source_not_allowed"},
     413: {"whatsapp_media_too_large"},
     422: {"whatsapp_groups_not_supported", "whatsapp_invalid_recipient", "whatsapp_text_too_long", "whatsapp_unanswered_followup_limit", "whatsapp_opening_message_too_long", "whatsapp_reply_required_for_media", "whatsapp_reply_required_for_links", "whatsapp_reply_required_for_phone_numbers", "whatsapp_reply_required_for_email_addresses"},

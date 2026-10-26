@@ -56,7 +56,7 @@ def sdk(monkeypatch, tmp_path):
             return httpx.Response(200, json={"id": IDENTITY, "organization_id": "org_example", "agent_handle": "agent",
                 "whatsapp_enabled": state.identity_enabled, "created_at": NOW, "updated_at": NOW})
         if path == "/api/v1/whatsapp/limits":
-            return httpx.Response(state.limits_status, json={"agent_identity_id": IDENTITY, "cycle_start": NOW, "limits": {"synthetic": 123}, "usage": {"synthetic": 7}})
+            return httpx.Response(state.limits_status, json={"agent_identity_id": IDENTITY, "limits": {"synthetic": 123}, "usage": {"whatsapp.texts_per_agent_identity_per_24h": 7}})
         if path == "/api/v1/identities/agent/channel-status":
             return httpx.Response(200, json={"whatsapp": {"enabled": True, "number": "+15550000001", "status": "ready"}})
         if request.method == "POST" and path == "/api/v1/whatsapp/messages":
@@ -258,8 +258,9 @@ def test_early_delivery_callback_survives_accepted_response_correlation(sdk):
 
 def test_status_includes_independent_limits_without_breaking_older_api(sdk):
     status = result(asyncio.run(call_inkbox_tool(sdk.client, "agent", "inkbox_get_whatsapp_status", {})))
+    assert set(status["limits"]) == {"agent_identity_id", "limits", "usage"}
     assert status["limits"]["limits"] == {"synthetic": 123}
-    assert status["limits"]["usage"] == {"synthetic": 7}
+    assert status["limits"]["usage"] == {"whatsapp.texts_per_agent_identity_per_24h": 7}
     sdk.limits_status = 404
     status = result(asyncio.run(call_inkbox_tool(sdk.client, "agent", "inkbox_get_whatsapp_status", {})))
     assert status["enabled"] and "limits" not in status
@@ -329,8 +330,8 @@ def test_known_rejected_source_send_can_retry_the_original_key(sdk, monkeypatch,
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("status", [403, 422, 429])
-def test_unrecognized_send_rejection_keeps_the_original_attempt_fenced(sdk, monkeypatch, status):
+@pytest.mark.parametrize("status,code", [(403, "whatsapp_unrecognized_policy"), (422, "whatsapp_unrecognized_policy"), (429, "whatsapp_unrecognized_policy"), (402, "whatsapp_cycle_limit_exceeded")])
+def test_unrecognized_send_rejection_keeps_the_original_attempt_fenced(sdk, monkeypatch, status, code):
     async def run():
         gw = bridge(sdk)
         meta = {"channel": "whatsapp", "conversation_id": CONVERSATION, "sender": "+15550000002", "message_id": MESSAGE}
@@ -338,6 +339,7 @@ def test_unrecognized_send_rejection_keeps_the_original_attempt_fenced(sdk, monk
         await gw._imessage_turn_state("contact", "started", meta)
         monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")
         sdk.status = status
+        sdk.failure_detail = {"error": code}
         failed = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", {"conversation_id": CONVERSATION, "text": "Hello"})
         assert failed["isError"]
         assert await gw._imessage_turn_state("contact", "result", meta, "Hello") is True
