@@ -292,15 +292,17 @@ Replies remain deduplicated by the stable event ID, not the selected category.
   requesting sender can answer a pending group-thread approval.
 - Messages are limited to 12,000 characters per send. The bridge rejects longer
   replies before sending; it does not split or automatically retry them.
-- Six tools list workspaces, list conversations, read messages/threads, search
-  retained text, send explicitly requested messages, and inspect send outcomes.
+- Slack tools list workspaces and conversations, read messages/threads, search
+  retained text, inspect/download files, upload local files, send explicitly requested
+  messages, and inspect send or upload outcomes.
   Ordinary final replies are sent automatically; do not send them again by tool.
 - Unconfirmed sends are logged with their action ID when available, never
   automatically resent. Reuse the exact idempotency key when retrying an explicit
   send. Webhook duplicate suppression follows the gateway's existing bounded,
   in-memory behavior.
-- Attachments are exposed as metadata in this first version. File transfer and
-  arbitrary reaction tools are not included.
+- Incoming attachments are downloaded locally, and voice memos are transcribed
+  when a voice API key is configured. See attachment behavior below. Arbitrary
+  reaction tools are not included.
 
 `INKBOX_ALLOWED_USERS` accepts Slack user IDs or workspace-qualified `T_ID:U_ID`
 entries. An empty list admits all human senders whose events reach the identity.
@@ -393,6 +395,8 @@ then exercise an approval and `/status`. Replies should stay in the right thread
 unrelated channels and bot messages should remain quiet. The preflight does not
 send messages. Live delivery can only be verified after connecting the workspace
 and starting the harness.
+
+Incoming Slack attachments are downloaded automatically (up to four files per message, 10 MiB each). The agent receives local paths and explicit per-file outcomes; unavailable files do not discard the message. Use `inkbox_slack_get_file` to inspect an accessible file and `inkbox_slack_download_file` to retrieve additional files. Downloads use the configured identity’s access and are saved under `INKBOX_CODEX_MEDIA_DIR` (default `~/.inkbox-codex/media`). Voice memos are transcribed before the message reaches Codex when `INKBOX_REALTIME_API_KEY` (or its existing fallback `OPENAI_API_KEY`) is configured. This sends the audio to the transcription API using that credential, independently of the selected live-call voice stack. Without a key, or if transcription fails, the audio file remains available and the agent receives an explicit notice rather than a guessed transcript.
 
 Local attachments use `inkbox_slack_upload_file`: provide a regular local file (1 byte–10 MiB), the original Slack destination and `source_event_id` from the request metadata, and a stable idempotency key. The tool reads relative paths from the original project directory and reports the upload operation. A local path in a reply is not an uploaded file. Unknown outcomes are retained without blind resends; inspect a returned operation with `inkbox_slack_get_operation`. A lost response retains a source-scoped idempotency key for read-only inspection when the SDK supports `get_operation_by_key`; SDK 0.7.15 cannot inspect a missing operation ID, and retains that unresolved receipt without resending.
 

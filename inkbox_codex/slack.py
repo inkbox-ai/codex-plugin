@@ -160,6 +160,9 @@ def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] |
     }
     if "sender_access" in data:
         meta["sender_access"] = data["sender_access"]
+    if isinstance(files, list):
+        meta["slack_files"] = [{key: file[key] for key in ("id", "name", "mimetype", "size") if key in file}
+                               for file in files if isinstance(file, dict)]
     # Sender context never changes workspace/thread isolation or approval ownership.
     sender_context = {}
     if isinstance(data.get("contact_id"), str):
@@ -249,6 +252,10 @@ _CONNECTION = {"connection_id": _STRING}
 _CONVERSATION = {**_CONNECTION, "conversation_id": _STRING}
 _PAGE = {"cursor": _STRING, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}
 SLACK_TOOLS = [
+    _tool("get_file", "Read accessible Slack attachment metadata.",
+          {**_CONNECTION, "file_id": _STRING}, ["connection_id", "file_id"]),
+    _tool("download_file", "Download an accessible Slack attachment (up to 10 MiB) to a local file for inspection. Returns a local path, not file bytes.",
+          {**_CONNECTION, "file_id": _STRING}, ["connection_id", "file_id"]),
     _tool("list_connections", "List this identity's Slack workspace connections.", {}, []),
     _tool("list_conversations", "List accessible Slack conversations; follow next_cursor.",
           {**_CONNECTION, **_PAGE}, ["connection_id"]),
@@ -301,6 +308,9 @@ def run_tool(client: Any, identity_handle: str, name: str, args: dict, *, upload
         owned = resource.list_connections(identity.id).connections
         if not any(str(item.id) == connection for item in owned):
             raise ValueError("Slack connection does not belong to this identity")
+    if name == "inkbox_slack_download_file":
+        from .slack_media import download_file
+        return download_file(resource, connection, args["file_id"])
     if name == "inkbox_slack_upload_file":
         if upload_context is None:
             raise ValueError("A source-bound active Slack request is required for uploads")

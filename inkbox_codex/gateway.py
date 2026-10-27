@@ -3939,6 +3939,8 @@ class InkboxGateway:
         if self._dedup_begin(event_key):
             return web.json_response({"ok": True, "deduped": True})
         try:
+            from .slack_media import with_attachments
+            body = await with_attachments(self._inkbox, body, meta, cfg=self.cfg)
             await self.sessions.get(chat_id).handle_inbound(body, "slack", meta)
         except BaseException:
             self._dedup_rollback(event_key)
