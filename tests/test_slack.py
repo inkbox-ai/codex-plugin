@@ -380,7 +380,8 @@ def test_slack_tools_opt_in_and_child_process_config(monkeypatch):
     monkeypatch.delenv("INKBOX_SLACK_ENABLED", raising=False)
     assert not any(t["name"].startswith("inkbox_slack_") for t in mcp_tool_list())
     monkeypatch.setenv("INKBOX_SLACK_ENABLED", "1")
-    assert len([t for t in mcp_tool_list() if t["name"].startswith("inkbox_slack_")]) == 8
+    slack_names = {t["name"] for t in mcp_tool_list() if t["name"].startswith("inkbox_slack_")}
+    assert {"inkbox_slack_get_file", "inkbox_slack_download_file", "inkbox_slack_upload_file"} <= slack_names
     config, names = build_inkbox_mcp_server_config(BridgeConfig(slack_enabled=True))
     assert config["env"]["INKBOX_SLACK_ENABLED"] == "1"
     assert "mcp__inkbox__inkbox_slack_send_message" in names

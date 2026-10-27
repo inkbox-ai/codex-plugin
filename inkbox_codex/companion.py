@@ -806,6 +806,9 @@ class Receiver:
             raise CompanionError("Companion reply lost its group conversation")
 
     async def submit(self, event, text, meta, *, trigger=None, source_ids=None):
+        if event.channel == "slack" and (trigger is None or trigger["id"] == event.source_id):
+            from .slack_media import with_attachments
+            text = await with_attachments(self.client, text, meta, cfg=self.cfg)
         meta = {**meta, "companion_receipt_token": uuid4().hex}
         session_key = event.session_key(self.namespace)
         session = self.sessions.get(session_key)

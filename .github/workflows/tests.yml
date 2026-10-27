@@ -60,6 +60,8 @@ jobs:
           assert callable(SlackResource.list_provisioning_workspaces)
           assert callable(SlackResource.set_processing_status)
           assert callable(SlackResource.remove_reaction)
+          assert callable(SlackResource.get_file)
+          assert callable(SlackResource.download_file)
           assert callable(SlackResource.upload_file)
           assert callable(SlackResource.get_operation)
           assert "scope" in inspect.signature(WebhookSubscriptionsResource.list).parameters
@@ -68,7 +70,7 @@ jobs:
         run: >-
           pytest -q tests/test_setup_slack.py tests/test_setup_wizard.py
           tests/test_prompts.py tests/test_slack.py tests/test_slack_activity.py tests/test_slack_harness.py
-          tests/test_slack_attachments.py tests/test_slack_progress.py tests/test_slack_streams.py
+          tests/test_slack_attachments.py tests/test_slack_inbound_files.py tests/test_slack_progress.py tests/test_slack_streams.py
           tests/test_tools.py::test_coding_agent_tool_tier_is_registered
 
   # Exercise optional native replies against the shared released SDK floor.
