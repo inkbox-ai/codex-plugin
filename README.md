@@ -292,15 +292,17 @@ Replies remain deduplicated by the stable event ID, not the selected category.
   requesting sender can answer a pending group-thread approval.
 - Messages are limited to 12,000 characters per send. The bridge rejects longer
   replies before sending; it does not split or automatically retry them.
-- Six tools list workspaces, list conversations, read messages/threads, search
-  retained text, send explicitly requested messages, and inspect send outcomes.
+- Slack tools list workspaces and conversations, read messages/threads, search
+  retained text, inspect/download files, upload local files, send explicitly requested
+  messages, and inspect send or upload outcomes.
   Ordinary final replies are sent automatically; do not send them again by tool.
 - Unconfirmed sends are logged with their action ID when available, never
   automatically resent. Reuse the exact idempotency key when retrying an explicit
   send. Webhook duplicate suppression follows the gateway's existing bounded,
   in-memory behavior.
-- Attachments are exposed as metadata in this first version. File transfer and
-  arbitrary reaction tools are not included.
+- Incoming attachments are downloaded locally, and voice memos are transcribed
+  when a voice API key is configured. See attachment behavior below. Arbitrary
+  reaction tools are not included.
 
 `INKBOX_ALLOWED_USERS` accepts Slack user IDs or workspace-qualified `T_ID:U_ID`
 entries. An empty list admits all human senders whose events reach the identity.
