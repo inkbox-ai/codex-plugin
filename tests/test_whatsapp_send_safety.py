@@ -12,10 +12,10 @@ from uuid import UUID
 
 import pytest
 
-from inkbox_codex.imessage import IMessageState, read_turn_context
+from inkbox_codex.imessage import IMessageState, clear_turn_context, read_turn_context
 from inkbox_codex.tools import call_inkbox_tool
 from inkbox_codex.whatsapp import record_status, run_tool, WhatsAppReplyRejected
-from tests.test_whatsapp import sdk, bridge, message, result, CONVERSATION, MESSAGE, IDENTITY, OUTBOUND, NOW
+from tests.test_whatsapp import sdk, bridge, message, result, CONVERSATION, MESSAGE, IDENTITY, MEDIA, OUTBOUND, NOW
 
 
 def source(**extra):
@@ -137,6 +137,98 @@ def test_group_outputs_and_approval_prompts_check_current_members(sdk, final):
         with pytest.raises(PermissionError):
             await gw.send_to_contact("group", "Approve?", "whatsapp", meta)
         assert not sdk.calls
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("selector", ["conversation", "recipients"])
+@pytest.mark.parametrize("attachment", [False, True])
+@pytest.mark.parametrize("change", ["unchanged", "joined", "read-failed", "cancelled", "retired", "uncertain"])
+def test_source_group_tool_rechecks_members_before_checkpoint(sdk, monkeypatch, selector, attachment, change):
+    from inkbox_codex import turn_authority as authority
+    from tests.test_whatsapp_autoquote import admitted_source
+
+    async def scenario():
+        gw = bridge(sdk)
+        members = ["+15550000002", "+15550000003"]
+        gw.cfg.allow_all_users = False
+        gw.cfg.allowed_users = members
+        monkeypatch.setenv("INKBOX_ALLOW_ALL_USERS", "false")
+        monkeypatch.setenv("INKBOX_ALLOWED_USERS", ",".join(members))
+        meta = await admitted_source(gw, is_group=True, participants=list(members))
+        await gw._imessage_turn_state("group", "admitted", meta, "Question")
+        await gw._imessage_turn_state("group", "started", meta)
+        monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "group")
+        before = read_turn_context("group")
+        if change == "retired":
+            host = authority.new_host("group", gw.cfg)
+            monkeypatch.setenv(authority.HOST_ENV, host)
+            token = authority.begin("group", gw.cfg, host, "whatsapp", before["nonce"])
+        store = gw._channel_store("whatsapp")
+
+        def persisted_meta():
+            with store._db() as db:
+                return json.loads(db.execute("SELECT meta FROM receipts").fetchone()["meta"])
+
+        durable_before = persisted_meta()
+        reads = []
+
+        def reading():
+            assert read_turn_context("group") == before
+            assert persisted_meta() == durable_before
+            assert not sdk.calls
+            reads.append(True)
+            if change == "cancelled":
+                clear_turn_context("group")
+            elif change == "retired":
+                authority.retire(token)
+
+        sdk.on_conversation_read = reading
+        # Membership changes only after the original A/B request is admitted.
+        if change == "joined":
+            sdk.conversation["participants"].append("+15550000004")
+        elif change == "read-failed":
+            sdk.conversation_status = 503
+        elif change == "uncertain":
+            sdk.status = 409
+        args = ({"conversation_id": CONVERSATION} if selector == "conversation"
+                else {"to": list(reversed(members))})
+        args.update({"media_id": MEDIA} if attachment else {"text": "Answer"})
+        value = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", args)
+        if change == "unchanged":
+            sent = result(value)
+            assert len(sdk.calls) == 1
+            assert sdk.calls[0].headers["Idempotency-Key"] == sent["idempotency_key"]
+            payload = json.loads(sdk.calls[0].content)
+            assert payload.get("media_ids") == ([MEDIA] if attachment else None)
+            assert payload.get("reply_to_message_id") == (MESSAGE if selector == "conversation" else None)
+            context = read_turn_context("group")
+            assert context["whatsapp_tool_sends"][sent["idempotency_key"]]["state"] == "accepted"
+            assert await gw._imessage_turn_state("group", "result", meta, "Different automatic answer") is True
+            assert store.summary()["done"] == 1 and len(sdk.calls) == 1
+        elif change == "uncertain":
+            assert value.get("isError"), value
+            error = json.loads(value["content"][0]["text"])
+            key = error["idempotency_key"]
+            assert len(sdk.calls) == 1 and sdk.calls[0].headers["Idempotency-Key"] == key
+            assert error["media_id"] == (MEDIA if attachment else None)
+            assert read_turn_context("group")["whatsapp_tool_sends"][key]["state"] == "sending"
+            sdk.on_conversation_read = lambda: None
+            retry = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", {
+                **args, "idempotency_key": "replacement-key"})
+            assert retry.get("isError"), retry
+            assert json.loads(retry["content"][0]["text"])["idempotency_key"] == key
+            found = result(await call_inkbox_tool(sdk.client, "agent", "inkbox_lookup_whatsapp_send", {
+                "idempotency_key": key}))
+            assert found["message_id"] == OUTBOUND
+            assert sdk.requests[-1].headers["Idempotency-Key"] == key
+            assert await gw._imessage_turn_state("group", "result", meta, "Different automatic answer") is True
+            assert store.summary()["uncertain"] == 1 and len(sdk.calls) == 1
+        else:
+            assert value.get("isError"), value
+            assert not sdk.calls
+            assert persisted_meta() == durable_before
+            assert read_turn_context("group") == (None if change == "cancelled" else before)
+        assert reads == [True]
     asyncio.run(scenario())
 
 

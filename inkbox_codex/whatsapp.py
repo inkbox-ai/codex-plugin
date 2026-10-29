@@ -77,7 +77,11 @@ def observation_time(value):
 
 def route_allowed(gateway, meta):
     """Apply the same local participant rule to fresh and retained input."""
-    if not gateway._sender_allowed(str(meta.get("sender") or "")):
+    return _route_allowed(gateway._sender_allowed, meta)
+
+
+def _route_allowed(sender_allowed, meta):
+    if not sender_allowed(str(meta.get("sender") or "")):
         return False
     if meta.get("conversation_kind") != "group":
         return True
@@ -85,7 +89,7 @@ def route_allowed(gateway, meta):
     return (isinstance(participants, list) and bool(participants)
             and meta.get("sender") in participants
             and all(isinstance(number, str) and re.fullmatch(r"\+[1-9]\d{6,14}", number)
-                    and gateway._sender_allowed(number) for number in participants))
+                    and sender_allowed(number) for number in participants))
 
 
 async def current_route_allowed(gateway, meta):
@@ -94,13 +98,17 @@ async def current_route_allowed(gateway, meta):
     if (meta.get("conversation_kind") != "group" or gateway.cfg.allow_all_users
             or not gateway.cfg.allowed_users):
         return True
-    conversation = await asyncio.to_thread(
-        require_method(gateway._identity, "get_whatsapp_conversation"), meta["conversation_id"])
+    return await asyncio.to_thread(
+        _current_group_allowed, gateway._identity, meta, gateway._sender_allowed)
+
+
+def _current_group_allowed(identity, meta, sender_allowed):
+    conversation = require_method(identity, "get_whatsapp_conversation")(meta["conversation_id"])
     return (_same_uuid(field(conversation, "id"), meta["conversation_id"])
-            and str(field(conversation, "agent_identity_id")) == str(gateway._identity.id)
+            and str(field(conversation, "agent_identity_id")) == str(identity.id)
             and field(conversation, "is_group") is True
             and not field(conversation, "unresolved_participant_count", 0)
-            and route_allowed(gateway, {**meta, "participants": field(conversation, "participants")}))
+            and _route_allowed(sender_allowed, {**meta, "participants": field(conversation, "participants")}))
 
 
 async def receive(gateway, envelope):
@@ -466,9 +474,20 @@ def run_tool(client, identity_handle, name, args):
         if media_id:
             kwargs["media_ids"] = [media_id]
         method = require_method(identity, operation)
+        route = (context or {}).get("route_meta") or {}
+        if route.get("conversation_kind") == "group":
+            cfg = read_config()
+            if not cfg.allow_all_users and cfg.allowed_users:
+                def sender_allowed(number):
+                    return number in cfg.allowed_users
+                if (not _route_allowed(sender_allowed, route)
+                        or not _current_group_allowed(identity, route, sender_allowed)):
+                    raise PermissionError("WhatsApp conversation participants are not allowed")
+        # Membership reads can outlive the source that authorized this send.
         if owner and (owner.get("route_meta") or {}).get("channel") == "whatsapp":
             from .imessage import validate_tool_target
             validate_tool_target(owner, owner["conversation_id"], None)
+        validate(origin)
         if context:
             from .imessage import checkpoint_whatsapp_tool_send
             checkpoint_whatsapp_tool_send(context, key, state="sending", text=text, media_id=args.get("media_id"), quote_target=reply_target)

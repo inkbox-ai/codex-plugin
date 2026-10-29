@@ -45,7 +45,11 @@ def sdk(monkeypatch, tmp_path):
     monkeypatch.delenv("INKBOX_CODEX_CHAT_ID", raising=False)
     monkeypatch.setattr(sdk_config, "_CONFIG_PATH", tmp_path / "unused-sdk-config")
     state = NS(requests=[], status=201, calls=[], identity_enabled=False, limits_status=200,
-               failure_detail={"error": "whatsapp_send_pending"})
+               failure_detail={"error": "whatsapp_send_pending"},
+               conversation_status=200, on_conversation_read=lambda: None)
+    state.conversation = {"id": CONVERSATION, "agent_identity_id": IDENTITY,
+        "local_number": "+15550000001", "remote_number": None, "is_group": True,
+        "participants": ["+15550000002", "+15550000003"], "created_at": NOW, "updated_at": NOW}
 
     def handle(request):
         assert request.url.host == "example.com"
@@ -58,6 +62,9 @@ def sdk(monkeypatch, tmp_path):
             return httpx.Response(state.limits_status, json={"agent_identity_id": IDENTITY, "limits": {"synthetic": 123}, "usage": {"whatsapp.texts_per_agent_identity_per_24h": 7}})
         if path == "/api/v1/identities/agent/channel-status":
             return httpx.Response(200, json={"whatsapp": {"enabled": True, "number": "+15550000001", "status": "ready"}})
+        if path == f"/api/v1/whatsapp/conversations/{CONVERSATION}":
+            state.on_conversation_read()
+            return httpx.Response(state.conversation_status, json=state.conversation)
         if path == "/api/v1/whatsapp/conversations":
             groups = request.url.params.get("include_groups") == "true"
             return httpx.Response(200, json=[{
