@@ -241,3 +241,15 @@ def test_a2a_only_subscription_is_skipped_on_older_api():
     )
 
     assert subscriptions.created == [{"agent_identity_id": "identity-1", "url": "https://agent.inkboxwire.com/webhook", "event_types": WHATSAPP_EVENTS}]
+
+
+def test_old_api_without_reactions_still_registers_direct_whatsapp_callbacks():
+    class OlderAPI(_FakeSubscriptions):
+        def create(self, **kwargs):
+            if "whatsapp.reaction_received" in kwargs["event_types"]:
+                raise ValueError("Unknown WhatsApp event type")
+            return super().create(**kwargs)
+    subscriptions = OlderAPI()
+    _patched_gateway(_Identity(phone=False, imessage=False), subscriptions=subscriptions)
+    assert any(row["event_types"] == WHATSAPP_EVENTS[:5] for row in subscriptions.created)
+    assert not any("whatsapp.reaction_received" in row["event_types"] for row in subscriptions.created)

@@ -17,7 +17,7 @@ from tests.test_whatsapp import IDENTITY, NOW
 
 @pytest.mark.skipif(shutil.which("codex") is None, reason="needs the codex CLI on PATH")
 def test_real_host_resolves_candidate_and_reads_dynamic_whatsapp_capability(tmp_path, monkeypatch):
-    assert version("inkbox") == "0.7.21"
+    assert version("inkbox") == "0.7.24"
     requests = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -54,7 +54,7 @@ def test_real_host_resolves_candidate_and_reads_dynamic_whatsapp_capability(tmp_
     server, names = build_inkbox_mcp_server_config(cfg)
     assert "mcp__inkbox__inkbox_get_whatsapp_status" in names
     wrapper = tmp_path / "checked_mcp.py"
-    wrapper.write_text("from importlib.metadata import version\nfrom inkbox.agent_identity import AgentIdentity\nassert version('inkbox') == '0.7.21'\nassert callable(AgentIdentity.send_whatsapp)\nimport runpy\nrunpy.run_module('inkbox_codex.mcp_stdio', run_name='__main__')\n")
+    wrapper.write_text("from importlib.metadata import version\nfrom inkbox.agent_identity import AgentIdentity\nassert version('inkbox') == '0.7.24'\nassert callable(AgentIdentity.send_whatsapp)\nimport runpy\nrunpy.run_module('inkbox_codex.mcp_stdio', run_name='__main__')\n")
     server["args"] = [str(wrapper)]
 
     async def scenario():

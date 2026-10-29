@@ -1,7 +1,6 @@
 """Dedicated WhatsApp routing and sends use the real candidate SDK offline."""
 
 import asyncio
-from copy import deepcopy
 from datetime import datetime, timezone
 import json
 from types import SimpleNamespace as NS
@@ -93,8 +92,8 @@ def result(value):
     return json.loads(value["content"][0]["text"])
 
 
-def test_all_ten_tools_exist_without_a_cached_enablement_flag(sdk):
-    assert len([tool for tool in mcp_tool_list() if "whatsapp" in tool["name"]]) == 10
+def test_all_fifteen_tools_exist_without_a_cached_enablement_flag(sdk):
+    assert len([tool for tool in mcp_tool_list() if "whatsapp" in tool["name"]]) == 15
     status = result(asyncio.run(call_inkbox_tool(sdk.client, "agent", "inkbox_get_whatsapp_status", {})))
     assert status["enabled"] and status["status"] == "ready"
     sent = result(asyncio.run(call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", {"conversation_id": CONVERSATION, "text": "Hello"})))
@@ -145,7 +144,7 @@ def test_inbound_validates_owner_and_group_before_model_wake_and_renews_media(sd
         assert gw._with_media.call_args.args[1][0]["url"] == media()["url"]
         await receive(gw, payload)
         inbound.assert_awaited_once()
-        for changes in ({"agent_identity_id": str(UUID(int=99))}, {"is_group": True}, {"sender_number": "+15550000001"}):
+        for changes in ({"agent_identity_id": str(UUID(int=99))}, {"is_group": True, "participants": ["+15550000003"]}, {"sender_number": "+15550000001"}):
             rejected = {"id": "different", "data": {"message": message(**changes)}}
             await receive(gw, rejected)
             inbound.assert_awaited_once()
@@ -167,8 +166,8 @@ def test_plain_reply_is_durable_without_native_imessage_flag_and_status_never_wa
         await gw.send_to_contact("contact", "Saved answer", "whatsapp", {**meta, "imessage_final_reply": True})
         assert sdk.calls[-1].headers["Idempotency-Key"] == key
         gw.sessions = NS(get=Mock())
-        record_status(gw, {"data": {"message": message(id=OUTBOUND, direction="outbound", status="delivered", delivery_state="delivered", updated_at="2026-01-01T00:00:02+00:00")}})
-        record_status(gw, {"data": {"message": message(id=OUTBOUND, direction="outbound", status="sent", delivery_state="pending", updated_at=NOW)}})
+        record_status(gw, {"event_type": "whatsapp.delivered", "data": {"message": message(id=OUTBOUND, direction="outbound", status="delivered", delivery_state="delivered", updated_at="2026-01-01T00:00:02+00:00")}})
+        record_status(gw, {"event_type": "whatsapp.delivered", "data": {"message": message(id=OUTBOUND, direction="outbound", status="sent", delivery_state="pending", updated_at=NOW)}})
         assert gw._channel_store("whatsapp").lookup_outbound(OUTBOUND)["delivery_state"] == "delivered"
         gw.sessions.get.assert_not_called()
         assert gw._channel_store("whatsapp").summary()["done"] == 1
@@ -248,7 +247,7 @@ def test_pending_whatsapp_permission_cannot_be_answered_over_another_channel(tmp
 
 def test_early_delivery_callback_survives_accepted_response_correlation(sdk):
     gw = bridge(sdk)
-    record_status(gw, {"data": {"message": message(id=OUTBOUND, direction="outbound", status="delivered", delivery_state="delivered", updated_at=NOW)}})
+    record_status(gw, {"event_type": "whatsapp.delivered", "data": {"message": message(id=OUTBOUND, direction="outbound", status="delivered", delivery_state="delivered", updated_at=NOW)}})
     store = gw._channel_store("whatsapp")
     store.record_outbound({"id": OUTBOUND, "status": "queued", "delivery_state": "pending"}, {"channel": "whatsapp"}, "contact")
     route = store.lookup_outbound(OUTBOUND)

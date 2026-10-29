@@ -217,6 +217,8 @@ def test_coding_agent_tool_tier_is_registered():
         "inkbox_send_whatsapp", "inkbox_list_whatsapp_conversations", "inkbox_get_whatsapp_conversation",
         "inkbox_list_whatsapp_messages", "inkbox_get_whatsapp_message", "inkbox_upload_whatsapp_media",
         "inkbox_get_whatsapp_media", "inkbox_mark_whatsapp_read", "inkbox_get_whatsapp_status", "inkbox_lookup_whatsapp_send",
+        "inkbox_get_whatsapp_thread", "inkbox_get_whatsapp_conversation_thread", "inkbox_react_whatsapp",
+        "inkbox_get_whatsapp_reaction", "inkbox_unreact_whatsapp",
     })
     assert names == expected
 

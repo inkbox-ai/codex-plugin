@@ -665,7 +665,7 @@ class ContactSession:
             self.mode, self.reply_meta = mode, meta
             await self._stop_turn()
             return False
-        is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
+        is_group = mode in {"sms", "imessage", "slack", "whatsapp"} and meta.get("conversation_kind") == "group"
         pending_reply = self.pending is not None and not self.pending.future.done()
         active_mode, active_meta = self._pending_reply_route or self._reply_route(self._current_turn)
         same_origin = (mode == active_mode and meta.get("sender") == active_meta.get("sender")
@@ -723,6 +723,13 @@ class ContactSession:
         )
         if command and consumed_meta is not None:
             await self._imessage_state("consumed", consumed_meta, raw_text)
+        if mode == "whatsapp" and command in {"reset", "resume"}:
+            parked = [*list(self._queue._queue)]
+            parked += [self._imessage_burst]
+            if any(turn is not None and turn.reply_mode == "whatsapp" and
+                   any((turn.reply_meta or {}).get(key) != meta.get(key) for key in ("conversation_id", "sender"))
+                   for turn in parked):
+                return False
         if command == "reset":
             await self._reset_session()
             return False

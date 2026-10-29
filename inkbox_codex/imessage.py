@@ -18,7 +18,7 @@ from typing import Any, Iterator
 _STATES = {"pending", "running", "reply_pending", "sending", "done", "cancelled", "uncertain", "failed"}
 _TERMINAL = {"done", "cancelled"}
 _ROUTE_FIELDS = {
-    "whatsapp_idempotency_key", "channel", "conversation_id", "conversation_kind", "sender", "to", "message_id", "source_message_id",
+    "participants", "reaction", "whatsapp_reply_target", "whatsapp_idempotency_key", "channel", "conversation_id", "conversation_kind", "sender", "to", "message_id", "source_message_id",
     "reply_to_message_id", "thread_id", "thread_root_message_id",
     "imessage_event_id", "imessage_event_ids", "imessage_sources", "imessage_reply_target",
     "companion", "companion_scope_id", "companion_activation_id", "companion_sequence",

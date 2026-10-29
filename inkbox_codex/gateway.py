@@ -1338,7 +1338,12 @@ class InkboxGateway:
         except Exception as exc:
             if not unsupported(exc):
                 raise
-            logger.warning("WhatsApp subscriptions are not supported by this API yet")
+            try:
+                _reconcile({"agent_identity_id": identity.id}, WHATSAPP_EVENTS[:5])
+            except Exception as legacy_error:
+                if not unsupported(legacy_error):
+                    raise
+                logger.warning("WhatsApp subscriptions are not supported by this API yet")
         if getattr(identity, "imessage_enabled", False):
             _reconcile({"agent_identity_id": identity.id}, IMESSAGE_EVENTS)
         # The SDK and API require each subscription to contain one event
@@ -2108,6 +2113,9 @@ class InkboxGateway:
             return await self._on_mail_received(envelope)
         if event_type == "text.received":
             return await self._on_text_received(envelope)
+        if event_type == "whatsapp.reaction_received":
+            from .whatsapp_v2 import receive_reaction
+            return await receive_reaction(self, envelope)
         if event_type == "whatsapp.received":
             from .whatsapp import receive
             return await receive(self, envelope)
