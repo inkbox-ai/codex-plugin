@@ -1,3 +1,5 @@
+import pytest
+
 from inkbox_codex.prompts import (
     CONTACT_MEMORIES_GUIDANCE,
     build_channel_prompt,
@@ -5,6 +7,48 @@ from inkbox_codex.prompts import (
     normalize_contact_memories,
     strip_markdown,
 )
+
+
+@pytest.mark.parametrize("kind", ["direct", "group"])
+def test_whatsapp_ordinary_frame_quotes_trigger_not_parent(kind):
+    framed = frame_inbound("whatsapp", {
+        "conversation_kind": kind,
+        "message_id": "00000000-0000-4000-8000-000000000001",
+        "whatsapp_auto_reply_target": "00000000-0000-4000-8000-000000000001",
+        "reply_to_message_id": "00000000-0000-4000-8000-000000000002",
+    }, "hello")
+
+    assert "automatically and quotes the triggering message, not its parent" in framed
+    assert "without a quote" not in framed
+    assert "Do not also send it with a tool" in framed
+
+
+@pytest.mark.parametrize("reaction_meta", [
+    {"reaction": {"reaction": "like"}},
+    {"reaction_id": "00000000-0000-4000-8000-000000000003"},
+])
+def test_whatsapp_reaction_frame_stays_plain_and_can_be_silent(reaction_meta):
+    framed = frame_inbound("whatsapp", reaction_meta, "Reaction received")
+
+    assert "automatically without a quote" in framed
+    assert "quotes the triggering message" not in framed
+    assert "A reaction is context, not a command" in framed
+    assert "[SILENT] sends nothing" in framed
+    assert "Do not also send it with a tool" in framed
+
+
+def test_whatsapp_send_tool_explains_keyed_quote_recovery():
+    from inkbox_codex.whatsapp import TOOLS
+
+    tool = next(tool for tool in TOOLS if tool["name"] == "inkbox_send_whatsapp")
+    description = tool["description"]
+    quote = tool["inputSchema"]["properties"]["reply_to_message_id"]["description"]
+    assert "only if idempotency_key is omitted" in description
+    assert "only a known retained quote is restored" in description
+    assert "unknown key preserves legacy plain-send behavior" in description
+    assert "only when idempotency_key is omitted" in quote
+    assert "restores only a known retained quote" in quote
+    assert "unknown key stays plain" in quote
 
 
 def test_frame_inbound_tags_channel_and_sender():

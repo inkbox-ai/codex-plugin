@@ -277,10 +277,10 @@ def _specifications():
         ),
         (
             "inkbox_send_whatsapp",
-            "Send a requested direct or dedicated-line group WhatsApp message, automatically quoting the active ordinary source when sending to its conversation. An explicit quote can select another visible message in that conversation. Your normal final response already replies automatically. Use one recipient or conversation; text and one owned media ID are optional individually. Preserve the returned request key and media ID after uncertainty; never retry as a new message.",
+            "Send a requested direct or dedicated-line group WhatsApp message, automatically quoting the active ordinary source when sending to its conversation only if idempotency_key is omitted. With an explicit key and no explicit quote, only a known retained quote is restored; an unknown key preserves legacy plain-send behavior. An explicit quote can select another visible message in that conversation. Your normal final response already replies automatically. Use one recipient or conversation; text and one owned media ID are optional individually. Preserve the returned request key and media ID after uncertainty; never retry as a new message.",
             {
                 "to": {"anyOf": [string("One E.164 recipient"), {"type": "array", "items": string("E.164 group participant"), "minItems": 1, "maxItems": 8, "uniqueItems": True}], "description": "One number, or 2-8 unique numbers for a new group. Existing groups use conversation_id."},
-                "reply_to_message_id": string("Optional visible message ID to quote; defaults to the active ordinary source for its conversation"),
+                "reply_to_message_id": string("Optional visible message ID to quote; defaults to the active ordinary source for its conversation only when idempotency_key is omitted. With an explicit key, omission restores only a known retained quote; an unknown key stays plain"),
                 "group_name": {**string("Creation hint for a new group; not a rename"), "minLength": 1, "maxLength": 100},
                 "conversation_id": string(
                     "Existing conversation; mutually exclusive with to"
