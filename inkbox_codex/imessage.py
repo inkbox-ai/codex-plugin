@@ -330,6 +330,7 @@ def validate_tool_target(context: dict[str, Any], conversation_id: str | None, t
 def checkpoint_whatsapp_tool_send(
     context: dict[str, Any], idempotency_key: str, *, state: str,
     text: str | None = None, media_id: str | None = None, quote_target: str | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> None:
     """Retain original-key evidence before a source-owned send can be accepted."""
     path = imessage_turn_context_path(context["chat_id"])
@@ -349,7 +350,17 @@ def checkpoint_whatsapp_tool_send(
                 error = ValueError("A quoted WhatsApp send is not confirmed or uses this key; do not replace it with a plain message")
                 error.idempotency_key = next(reversed(quoted), None)
                 raise error
-        sends[idempotency_key] = {"state": state, "text": text, "media_id": media_id, "quote_target": quote_target}
+        intent = {"text": text, "media_id": media_id, "quote_target": quote_target}
+        previous = sends.get(idempotency_key)
+        if previous and (any(previous.get(name) != value for name, value in intent.items())
+                         or ("payload" in previous and previous["payload"] != payload)):
+            error = ValueError("A retained WhatsApp request key must keep its original message")
+            error.idempotency_key = idempotency_key
+            error.whatsapp_media_id = previous.get("media_id")
+            raise error
+        sends[idempotency_key] = {"state": state, **intent}
+        if payload is not None:
+            sends[idempotency_key]["payload"] = payload
         if quote_target:
             current["whatsapp_explicit_quote_attempted"] = True
         meta = {**current["route_meta"], "whatsapp_tool_sends": sends,

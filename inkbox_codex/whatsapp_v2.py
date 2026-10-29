@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 from uuid import UUID
+from weakref import WeakValueDictionary
 
 V2_OPERATIONS = frozenset({"get_whatsapp_thread", "get_whatsapp_conversation_thread", "send_whatsapp_reaction", "get_whatsapp_reaction", "remove_whatsapp_reaction"})
 REACTIONS = ["love", "like", "dislike", "laugh", "emphasize", "question", "eyes"]
@@ -171,7 +172,19 @@ async def receive_reaction(gateway: Any, envelope: dict[str, Any]) -> Any:
             "contact": contact, "agent_identity": None, "contact_memories": [],
             "reply_to_message_id": field(target, "reply_to_message_id"), "thread_id": field(target, "thread_id"),
             "thread_root_message_id": field(target, "thread_root_message_id"), "whatsapp_reply_target": target_id}
-        await gateway.sessions.get(chat_id).handle_inbound(body, "whatsapp", meta)
+        # Keep the final receipt read and admission ordered for this actor/target.
+        locks = getattr(gateway, "_whatsapp_reaction_locks", None)
+        if locks is None:
+            locks = gateway._whatsapp_reaction_locks = WeakValueDictionary()
+        lock_key = (str(gateway._identity.id), conversation, target_id, actor)
+        lock = locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            current = await asyncio.to_thread(require_method(gateway._identity, "get_whatsapp_reaction"), reaction_id)
+            if any(str(field(current, name)) != str(reaction.get(name)) for name in
+                   ("id", "target_message_id", "conversation_id", "agent_identity_id", "direction", "remote_number", "revision", "status")):
+                gateway._dedup_commit(receipt)
+                return web.json_response({"ok": True, "ignored": "superseded-reaction"})
+            await gateway.sessions.get(chat_id).handle_inbound(body, "whatsapp", meta)
     except BaseException as error:
         gateway._dedup_rollback(receipt)
         if getattr(error, "status_code", None) in {403, 404}:

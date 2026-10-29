@@ -129,6 +129,102 @@ def test_cancelled_turn_cannot_write_a_reaction(channel):
     assert len(channel.requests) == before
 
 
+def test_removal_overtaking_contact_read_discards_older_applied_context(channel):
+    async def scenario():
+        paused, resume = asyncio.Event(), asyncio.Event()
+        calls = 0
+
+        async def contact(**_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                paused.set()
+                await resume.wait()
+
+        channel.gateway._resolve_contact_full = contact
+        applied = {"data": {"reaction": deepcopy(channel.reaction)}}
+        older = asyncio.create_task(receive_reaction(channel.gateway, applied))
+        try:
+            await asyncio.wait_for(paused.wait(), 2)
+            channel.reaction.update(revision=3, status="removed")
+            removed = {"data": {"reaction": deepcopy(channel.reaction)}}
+            await asyncio.wait_for(receive_reaction(channel.gateway, removed), 2)
+            assert channel.inbound.await_count == 1
+            resume.set()
+            response = await asyncio.wait_for(older, 2)
+            assert json.loads(response.body)["ignored"] == "superseded-reaction"
+            await receive_reaction(channel.gateway, applied)
+            await receive_reaction(channel.gateway, removed)
+            channel.inbound.assert_awaited_once()
+            body, _, meta = channel.inbound.call_args.args
+            assert '"status": "removed"' in body and meta["reaction_revision"] == 3
+        finally:
+            resume.set()
+            await older
+
+    asyncio.run(scenario())
+
+
+def test_reaction_admission_cannot_be_overtaken_while_it_awaits(channel):
+    async def scenario():
+        paused, resume, resolved = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        admitted = []
+
+        async def inbound(_body, _mode, meta):
+            if meta["reaction_revision"] == 2:
+                paused.set()
+                await resume.wait()
+            admitted.append(meta["reaction_revision"])
+
+        async def contact(**_kwargs):
+            if channel.reaction["revision"] == 3:
+                resolved.set()
+
+        channel.inbound.side_effect = inbound
+        channel.gateway._resolve_contact_full = contact
+        older = asyncio.create_task(receive_reaction(channel.gateway, {"data": {"reaction": deepcopy(channel.reaction)}}))
+        newer = None
+        try:
+            await asyncio.wait_for(paused.wait(), 2)
+            channel.reaction.update(revision=3, status="removed")
+            newer = asyncio.create_task(receive_reaction(channel.gateway, {"data": {"reaction": deepcopy(channel.reaction)}}))
+            await asyncio.wait_for(resolved.wait(), 2)
+            resume.set()
+            await asyncio.wait_for(asyncio.gather(older, newer), 2)
+            assert admitted == [2, 3]
+        finally:
+            resume.set()
+            await asyncio.gather(*(task for task in (older, newer) if task))
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_reaction_admission_releases_lock_and_receipt_for_retry(channel):
+    async def scenario():
+        paused = asyncio.Event()
+
+        async def inbound(*_args):
+            paused.set()
+            await asyncio.Event().wait()
+
+        event = {"data": {"reaction": deepcopy(channel.reaction)}}
+        channel.inbound.side_effect = inbound
+        attempt = asyncio.create_task(receive_reaction(channel.gateway, event))
+        try:
+            await asyncio.wait_for(paused.wait(), 2)
+        finally:
+            attempt.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await attempt
+        channel.inbound.reset_mock(side_effect=True)
+        await asyncio.wait_for(receive_reaction(channel.gateway, event), 2)
+        await receive_reaction(channel.gateway, event)
+        channel.inbound.assert_awaited_once()
+        assert not channel.gateway._whatsapp_reaction_locks
+
+    asyncio.run(scenario())
+
+
 def test_group_stop_cancels_only_original_author_queued_work(monkeypatch, tmp_path):
     from inkbox_codex.sessions import _Turn
     from tests.test_sessions import make_session

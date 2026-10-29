@@ -142,8 +142,9 @@ def test_group_outputs_and_approval_prompts_check_current_members(sdk, final):
 
 @pytest.mark.parametrize("selector", ["conversation", "recipients"])
 @pytest.mark.parametrize("attachment", [False, True])
+@pytest.mark.parametrize("supplied_key", [None, "legacy-plain-key"])
 @pytest.mark.parametrize("change", ["unchanged", "joined", "read-failed", "cancelled", "retired", "uncertain"])
-def test_source_group_tool_rechecks_members_before_checkpoint(sdk, monkeypatch, selector, attachment, change):
+def test_source_group_tool_rechecks_members_before_checkpoint(sdk, monkeypatch, selector, attachment, supplied_key, change):
     from inkbox_codex import turn_authority as authority
     from tests.test_whatsapp_autoquote import admitted_source
 
@@ -193,6 +194,8 @@ def test_source_group_tool_rechecks_members_before_checkpoint(sdk, monkeypatch, 
         args = ({"conversation_id": CONVERSATION} if selector == "conversation"
                 else {"to": list(reversed(members))})
         args.update({"media_id": MEDIA} if attachment else {"text": "Answer"})
+        if supplied_key:
+            args["idempotency_key"] = supplied_key
         value = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", args)
         if change == "unchanged":
             sent = result(value)
@@ -200,7 +203,9 @@ def test_source_group_tool_rechecks_members_before_checkpoint(sdk, monkeypatch, 
             assert sdk.calls[0].headers["Idempotency-Key"] == sent["idempotency_key"]
             payload = json.loads(sdk.calls[0].content)
             assert payload.get("media_ids") == ([MEDIA] if attachment else None)
-            assert payload.get("reply_to_message_id") == (MESSAGE if selector == "conversation" else None)
+            assert payload.get("reply_to_message_id") == (MESSAGE if selector == "conversation" and not supplied_key else None)
+            if supplied_key:
+                assert sent["idempotency_key"] == supplied_key
             context = read_turn_context("group")
             assert context["whatsapp_tool_sends"][sent["idempotency_key"]]["state"] == "accepted"
             assert await gw._imessage_turn_state("group", "result", meta, "Different automatic answer") is True
@@ -228,7 +233,34 @@ def test_source_group_tool_rechecks_members_before_checkpoint(sdk, monkeypatch, 
             assert not sdk.calls
             assert persisted_meta() == durable_before
             assert read_turn_context("group") == (None if change == "cancelled" else before)
-        assert reads == [True]
+            error = json.loads(value["content"][0]["text"])
+            if change == "read-failed":
+                sdk.conversation_status = 200
+                retry_args = dict(args)
+                if error.get("idempotency_key"):
+                    retry_args["idempotency_key"] = error["idempotency_key"]
+                sent = result(await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", retry_args))
+                assert len(sdk.calls) == 1
+                payload = json.loads(sdk.calls[0].content)
+                expected = {key: val for key, val in args.items() if key not in {"media_id", "idempotency_key"}}
+                if selector == "recipients":
+                    expected["to"] = sorted(members)
+                if attachment:
+                    expected["media_ids"] = [MEDIA]
+                if selector == "conversation" and not supplied_key:
+                    expected["reply_to_message_id"] = MESSAGE
+                assert payload == expected
+                assert sdk.calls[0].headers["Idempotency-Key"] == sent["idempotency_key"]
+                if supplied_key:
+                    assert sent["idempotency_key"] == supplied_key
+                assert read_turn_context("group")["whatsapp_tool_sends"][sent["idempotency_key"]]["state"] == "accepted"
+                assert await gw._imessage_turn_state("group", "result", meta, "Different automatic answer") is True
+                assert store.summary()["done"] == 1 and len(sdk.calls) == 1
+            if supplied_key:
+                assert error["idempotency_key"] == supplied_key
+            else:
+                assert "idempotency_key" not in error
+        assert reads == [True] * (2 if change == "read-failed" else 1)
     asyncio.run(scenario())
 
 

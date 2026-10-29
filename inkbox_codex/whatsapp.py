@@ -448,6 +448,8 @@ def run_tool(client, identity_handle, name, args):
         return {**status, "limits": limits} if isinstance(status, dict) else status
     if operation == "send_whatsapp":
         context = owner if _source_bound(owner, recipient, conversation) else None
+        if owner and key in (owner.get("whatsapp_tool_sends") or {}) and context is None:
+            raise ValueError("A retained WhatsApp request key must keep its original message")
         if context and conversation and reply_target is None:
             if key is None:
                 reply_target = auto_reply_kwargs(context.get("route_meta") or {}).get("reply_to_message_id")
@@ -464,7 +466,6 @@ def run_tool(client, identity_handle, name, args):
                 context["nonce"], conversation, text, args.get("media_id"),
                 *([recipient, reply_target, group_name] if reply_target or group_name or isinstance(recipient, list) else []),
             ], sort_keys=True).encode()).hexdigest() if context else uuid.uuid4().hex)
-            args["idempotency_key"] = key
         kwargs = {"text": text, "idempotency_key": key}
         if reply_target is not None:
             kwargs["reply_to_message_id"] = reply_target
@@ -490,13 +491,14 @@ def run_tool(client, identity_handle, name, args):
         validate(origin)
         if context:
             from .imessage import checkpoint_whatsapp_tool_send
-            checkpoint_whatsapp_tool_send(context, key, state="sending", text=text, media_id=args.get("media_id"), quote_target=reply_target)
+            checkpoint_whatsapp_tool_send(context, key, state="sending", text=text, media_id=args.get("media_id"), quote_target=reply_target, payload=kwargs)
         validate(origin)
+        args["idempotency_key"] = key
         try:
             sent = method(**kwargs)
         except Exception as exc:
             if context and known_send_rejection(exc):
-                checkpoint_whatsapp_tool_send(context, key, state="rejected", text=text, media_id=args.get("media_id"), quote_target=reply_target)
+                checkpoint_whatsapp_tool_send(context, key, state="rejected", text=text, media_id=args.get("media_id"), quote_target=reply_target, payload=kwargs)
             raise
         if context:
             from .imessage import record_accepted_tool_send, record_tool_send
@@ -504,7 +506,7 @@ def run_tool(client, identity_handle, name, args):
             try:
                 record_accepted_tool_send(context, sent, key, text=text, target=target)
                 record_tool_send(context, sent, key, text=text, target=target)
-                checkpoint_whatsapp_tool_send(context, key, state="accepted", text=text, media_id=args.get("media_id"), quote_target=reply_target)
+                checkpoint_whatsapp_tool_send(context, key, state="accepted", text=text, media_id=args.get("media_id"), quote_target=reply_target, payload=kwargs)
             except Exception:
                 logger.warning("WhatsApp accepted; local tracking needs recovery. Do not resend.")
         result = _json_safe(sent)

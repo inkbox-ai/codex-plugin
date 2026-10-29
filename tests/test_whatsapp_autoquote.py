@@ -9,12 +9,12 @@ from uuid import UUID
 
 import pytest
 
-from inkbox_codex.imessage import clear_turn_context
+from inkbox_codex.imessage import clear_turn_context, read_turn_context
 from inkbox_codex.tools import call_inkbox_tool
 from inkbox_codex.whatsapp import auto_reply_kwargs, receive, run_tool
 from inkbox_codex.whatsapp_v2 import receive_reaction
 from tests.test_imessage_sessions import make_session, finish_burst
-from tests.test_whatsapp import sdk, bridge, message, CONVERSATION, MESSAGE, IDENTITY, OUTBOUND
+from tests.test_whatsapp import sdk, bridge, message, CONVERSATION, MESSAGE, IDENTITY, OUTBOUND, MEDIA
 from tests.test_whatsapp_send_safety import source
 from tests.test_whatsapp_v2 import channel
 
@@ -273,6 +273,115 @@ def test_known_quoted_key_cannot_change_message_on_retry(sdk, monkeypatch):
         with pytest.raises(ValueError, match="original message"):
             run_tool(sdk.client, "agent", "inkbox_send_whatsapp", {**args, "text": "Changed answer"})
         assert len(sdk.calls) == first_count
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", [
+    {"text": "Changed answer"}, {"media_id": OUTBOUND}, {"media_id": None},
+    {"reply_to_message_id": OUTBOUND}, {"conversation_id": OUTBOUND},
+])
+def test_explicit_quote_retry_preserves_entire_retained_request(sdk, monkeypatch, change):
+    async def scenario():
+        gw = bridge(sdk)
+        meta = await admitted_source(gw)
+        await gw._imessage_turn_state("contact", "admitted", meta, "Question")
+        await gw._imessage_turn_state("contact", "started", meta)
+        monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")
+        args = {"conversation_id": CONVERSATION, "text": "Original answer", "media_id": MEDIA,
+                "reply_to_message_id": MESSAGE, "idempotency_key": "retained-quote"}
+        sdk.status, sdk.failure_detail = 429, {"error": "whatsapp_daily_limit_exceeded"}
+        first = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", dict(args))
+        assert first["isError"]
+        before = read_turn_context("contact")
+        store = gw._channel_store("whatsapp")
+        with store._db() as db:
+            durable_before = db.execute("SELECT meta FROM receipts").fetchall()
+        assert before["whatsapp_tool_sends"]["retained-quote"]["state"] == "rejected"
+        count = len(sdk.calls)
+        sdk.status = 201
+        with pytest.raises(ValueError, match="original message"):
+            run_tool(sdk.client, "agent", "inkbox_send_whatsapp", {**args, **change})
+        assert len(sdk.calls) == count
+        assert read_turn_context("contact") == before
+        with store._db() as db:
+            assert db.execute("SELECT meta FROM receipts").fetchall() == durable_before
+        # A mismatch must not poison a later exact retry or allocate another key.
+        sent = run_tool(sdk.client, "agent", "inkbox_send_whatsapp", dict(args))
+        assert sent["idempotency_key"] == "retained-quote"
+        assert len(sdk.calls) == count + 1
+        assert len({call.content for call in sdk.calls}) == 1
+        assert {call.headers["Idempotency-Key"] for call in sdk.calls} == {"retained-quote"}
+        assert read_turn_context("contact")["whatsapp_tool_sends"]["retained-quote"]["state"] == "accepted"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("quoted", [False, True])
+def test_legacy_checkpoint_replays_original_payload_and_key(sdk, monkeypatch, quoted):
+    from inkbox_codex.imessage import _write_context, imessage_turn_context_path
+
+    async def scenario():
+        gw = bridge(sdk)
+        meta = await admitted_source(gw)
+        await gw._imessage_turn_state("contact", "admitted", meta, "Question")
+        await gw._imessage_turn_state("contact", "started", meta)
+        monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")
+        args = {"conversation_id": CONVERSATION, "text": "Original answer", "media_id": MEDIA,
+                "idempotency_key": "legacy-request"}
+        if quoted:
+            args["reply_to_message_id"] = MESSAGE
+        sdk.status, sdk.failure_detail = 429, {"error": "whatsapp_daily_limit_exceeded"}
+        first = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", dict(args))
+        assert first["isError"]
+        context = read_turn_context("contact")
+        context["whatsapp_tool_sends"]["legacy-request"].pop("payload")
+        _write_context(imessage_turn_context_path("contact"), context)
+        before = len(sdk.calls)
+        sdk.status = 201
+        with pytest.raises(ValueError, match="original message"):
+            run_tool(sdk.client, "agent", "inkbox_send_whatsapp", {
+                **args, "reply_to_message_id": OUTBOUND})
+        with pytest.raises(ValueError, match="original message"):
+            run_tool(sdk.client, "agent", "inkbox_send_whatsapp", {
+                **args, "conversation_id": OUTBOUND})
+        assert len(sdk.calls) == before and read_turn_context("contact") == context
+        replay = {key: value for key, value in args.items() if key != "reply_to_message_id"}
+        sent = run_tool(sdk.client, "agent", "inkbox_send_whatsapp", replay)
+        assert sent["idempotency_key"] == "legacy-request"
+        assert len(sdk.calls) == before + 1
+        assert len({call.content for call in sdk.calls}) == 1
+        assert {call.headers["Idempotency-Key"] for call in sdk.calls} == {"legacy-request"}
+        assert ("reply_to_message_id" in json.loads(sdk.calls[-1].content)) is quoted
+
+    asyncio.run(scenario())
+
+
+def test_stale_tool_context_cannot_overwrite_checkpoint(sdk, monkeypatch):
+    from inkbox_codex import tools
+
+    async def scenario():
+        gw = bridge(sdk)
+        meta = await admitted_source(gw)
+        await gw._imessage_turn_state("contact", "admitted", meta, "Question")
+        await gw._imessage_turn_state("contact", "started", meta)
+        monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")
+        stale = read_turn_context("contact")
+        args = {"conversation_id": CONVERSATION, "text": "Original answer",
+                "reply_to_message_id": MESSAGE, "idempotency_key": "same-key"}
+        sdk.status, sdk.failure_detail = 429, {"error": "whatsapp_daily_limit_exceeded"}
+        rejected = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", dict(args))
+        assert rejected["isError"]
+        retained = read_turn_context("contact")
+        count = len(sdk.calls)
+        monkeypatch.setattr(tools, "_imessage_active_context", lambda _: stale)
+        sdk.status = 201
+        with pytest.raises(ValueError, match="original message"):
+            run_tool(sdk.client, "agent", "inkbox_send_whatsapp", {**args, "text": "Different answer"})
+        assert len(sdk.calls) == count and read_turn_context("contact") == retained
+        run_tool(sdk.client, "agent", "inkbox_send_whatsapp", dict(args))
+        assert len(sdk.calls) == count + 1
+        assert len({call.content for call in sdk.calls}) == 1
+
     asyncio.run(scenario())
 
 
