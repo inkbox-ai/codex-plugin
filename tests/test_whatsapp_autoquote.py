@@ -138,7 +138,7 @@ def test_tool_autoquote_respects_explicit_destination(sdk, monkeypatch, selector
             expected["reply_to_message_id"] = MESSAGE
         assert body == expected
         suppressed = await gw._imessage_turn_state("contact", "result", meta, "Different final")
-        assert suppressed is (selector in {"source", "group-recipients"})
+        assert suppressed is (selector == "source")
     asyncio.run(scenario())
 
 
@@ -346,6 +346,14 @@ def test_legacy_checkpoint_replays_original_payload_and_key(sdk, monkeypatch, qu
                 **args, "conversation_id": OUTBOUND})
         assert len(sdk.calls) == before and read_turn_context("contact") == context
         replay = {key: value for key, value in args.items() if key != "reply_to_message_id"}
+        if not quoted:
+            # Without a quote, opaque keys cannot distinguish recipients from
+            # conversation_id. Even a matching conversation is only a guess.
+            with pytest.raises(ValueError, match="read-only lookup") as failure:
+                run_tool(sdk.client, "agent", "inkbox_send_whatsapp", replay)
+            assert failure.value.idempotency_key == "legacy-request"
+            assert len(sdk.calls) == before and read_turn_context("contact") == context
+            return
         sent = run_tool(sdk.client, "agent", "inkbox_send_whatsapp", replay)
         assert sent["idempotency_key"] == "legacy-request"
         assert len(sdk.calls) == before + 1

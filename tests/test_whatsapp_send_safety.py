@@ -140,7 +140,7 @@ def test_group_outputs_and_approval_prompts_check_current_members(sdk, final):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("selector", ["conversation", "recipients"])
+@pytest.mark.parametrize("selector", ["conversation", "legacy-recipients"])
 @pytest.mark.parametrize("attachment", [False, True])
 @pytest.mark.parametrize("supplied_key", [None, "legacy-plain-key"])
 @pytest.mark.parametrize("change", ["unchanged", "joined", "read-failed", "cancelled", "retired", "uncertain"])
@@ -159,6 +159,18 @@ def test_source_group_tool_rechecks_members_before_checkpoint(sdk, monkeypatch, 
         await gw._imessage_turn_state("group", "admitted", meta, "Question")
         await gw._imessage_turn_state("group", "started", meta)
         monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "group")
+        if selector == "legacy-recipients":
+            from inkbox_codex.imessage import checkpoint_whatsapp_tool_send
+            context = read_turn_context("group")
+            text, media_id = (None, MEDIA) if attachment else ("Answer", None)
+            key = supplied_key or "codex-wa-" + hashlib.sha256(json.dumps([
+                context["nonce"], None, text, media_id, sorted(members), None, None,
+            ], sort_keys=True).encode()).hexdigest()
+            payload = {"to": sorted(members), "text": text, "idempotency_key": key}
+            if attachment:
+                payload["media_ids"] = [MEDIA]
+            checkpoint_whatsapp_tool_send(context, key, state="rejected", text=text,
+                                          media_id=media_id, payload=payload)
         before = read_turn_context("group")
         if change == "retired":
             host = authority.new_host("group", gw.cfg)
@@ -208,8 +220,8 @@ def test_source_group_tool_rechecks_members_before_checkpoint(sdk, monkeypatch, 
                 assert sent["idempotency_key"] == supplied_key
             context = read_turn_context("group")
             assert context["whatsapp_tool_sends"][sent["idempotency_key"]]["state"] == "accepted"
-            assert await gw._imessage_turn_state("group", "result", meta, "Different automatic answer") is True
-            assert store.summary()["done"] == 1 and len(sdk.calls) == 1
+            assert await gw._imessage_turn_state("group", "result", meta, "Different automatic answer") is (selector == "conversation")
+            assert store.summary()["done" if selector == "conversation" else "reply_pending"] == 1 and len(sdk.calls) == 1
         elif change == "uncertain":
             assert value.get("isError"), value
             error = json.loads(value["content"][0]["text"])
@@ -251,7 +263,7 @@ def test_source_group_tool_rechecks_members_before_checkpoint(sdk, monkeypatch, 
                 assert len(sdk.calls) == 1
                 payload = json.loads(sdk.calls[0].content)
                 expected = {key: val for key, val in args.items() if key not in {"media_id", "idempotency_key"}}
-                if selector == "recipients":
+                if selector == "legacy-recipients":
                     expected["to"] = sorted(members)
                 if attachment:
                     expected["media_ids"] = [MEDIA]
@@ -262,8 +274,8 @@ def test_source_group_tool_rechecks_members_before_checkpoint(sdk, monkeypatch, 
                 if supplied_key:
                     assert sent["idempotency_key"] == supplied_key
                 assert read_turn_context("group")["whatsapp_tool_sends"][sent["idempotency_key"]]["state"] == "accepted"
-                assert await gw._imessage_turn_state("group", "result", meta, "Different automatic answer") is True
-                assert store.summary()["done"] == 1 and len(sdk.calls) == 1
+                assert await gw._imessage_turn_state("group", "result", meta, "Different automatic answer") is (selector == "conversation")
+                assert store.summary()["done" if selector == "conversation" else "reply_pending"] == 1 and len(sdk.calls) == 1
             if supplied_key:
                 assert error["idempotency_key"] == supplied_key
             else:
@@ -300,8 +312,8 @@ def test_equivalent_source_selectors_fence_a_different_automatic_answer(sdk, mon
         meta = source(**({"conversation_kind": "group", "participants": ["+15550000002", "+15550000003"]} if kind == "group" else {}))
         if kind == "canonical":
             meta["conversation_id"] = native_id
-        selector = {"conversation_id": str(UUID(native_id))} if kind == "canonical" else {
-            "to": ["+15550000003", "+15550000002"] if kind == "group" else ["+15550000002"]}
+        selector = ({"conversation_id": str(UUID(native_id))} if kind == "canonical" else
+                    {"conversation_id": CONVERSATION} if kind == "group" else {"to": ["+15550000002"]})
         await gw._imessage_turn_state("contact", "admitted", meta, "Question")
         await gw._imessage_turn_state("contact", "started", meta)
         monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")

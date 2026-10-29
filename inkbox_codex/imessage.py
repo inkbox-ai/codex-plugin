@@ -352,6 +352,10 @@ def checkpoint_whatsapp_tool_send(
                 raise error
         intent = {"text": text, "media_id": media_id, "quote_target": quote_target}
         previous = sends.get(idempotency_key)
+        if previous and previous.get("payload") is None and state == "sending":
+            from .whatsapp import _legacy_payload_matches, _legacy_recovery_error
+            if not _legacy_payload_matches(current, idempotency_key, previous, payload):
+                raise _legacy_recovery_error(idempotency_key, previous)
         if previous and (any(previous.get(name) != value for name, value in intent.items())
                          or ("payload" in previous and previous["payload"] != payload)):
             error = ValueError("A retained WhatsApp request key must keep its original message")

@@ -1450,6 +1450,12 @@ class InkboxGateway:
             owned = context and context.get("nonce") == meta.get("imessage_context_nonce")
             sent = (context or {}).get("sent_outputs", []) if owned else []
             attempts = (context or {}).get("whatsapp_tool_sends", {}) if owned else {}
+            if meta.get("channel") == "whatsapp":
+                from .whatsapp import group_creation_send
+                group_keys = {key for key, attempt in attempts.items() if group_creation_send(attempt)}
+                sent = [output for output in sent if output.get("idempotency_key") not in group_keys]
+            else:
+                group_keys = set()
             unconfirmed = any(attempt["state"] == "sending" for attempt in attempts.values())
             quoted = bool((owned and context.get("whatsapp_explicit_quote_attempted")) or meta.get("whatsapp_explicit_quote_attempted"))
             if quoted:
@@ -1465,7 +1471,7 @@ class InkboxGateway:
                     store.mark(meta, "done", chat_id=chat_id)
                 return True
             duplicate = bool(meta.get("channel") == "whatsapp" and any(
-                attempt["state"] == "accepted" for attempt in attempts.values()
+                attempt["state"] == "accepted" for key, attempt in attempts.items() if key not in group_keys
             )) or bool(text and any(
                 output.get("text") in {text, strip_markdown(text)}
                 and output.get("target") in context.get("admitted_source_ids", [])
