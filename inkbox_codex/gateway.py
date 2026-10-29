@@ -992,7 +992,11 @@ class InkboxGateway:
         # OUTBOUND_FAILURE_MAX_ATTEMPTS. Reset on inbound / delivered / TTL.
         self._outbound_failure_state: Dict[str, Dict[str, float]] = {}
         state_root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
-        self._a2a_registry_path = state_root / "a2a_tasks.json"
+        # Preserve the existing registry location unless this profile explicitly
+        # selects a separate one; changing the home must not replay prior tasks.
+        self._a2a_registry_path = Path(os.getenv("INKBOX_CODEX_A2A_REGISTRY_PATH") or (
+            Path.home() / ".inkbox-codex" / "a2a_tasks.json"
+        ))
         self._a2a_jobs: Dict[str, set[asyncio.Task[Any]]] = {}
         self._a2a_progress_jobs: Dict[str, Tuple[str, asyncio.Task[Any]]] = {}
         self._a2a_progress_stop_events: Dict[str, asyncio.Event] = {}

@@ -1025,6 +1025,7 @@ without TOTP must have it configured before the agent can generate codes.
 | `INKBOX_CONTACT_MEMORIES_ENABLED` | no | `true` | Add memories supplied with the matched webhook contact as background context. |
 | `INKBOX_BASE_URL` | no | SDK default | Override the Inkbox API base URL. |
 | `INKBOX_PUBLIC_URL` | no | - | Public bridge URL. Omit to use an Inkbox tunnel. |
+| `INKBOX_CODEX_A2A_REGISTRY_PATH` | no | `~/.inkbox-codex/a2a_tasks.json` | A2A recovery and deduplication file. Existing profiles retain this location even with a custom `INKBOX_CODEX_HOME`. Use a separate path for a new isolated profile; changing an active profile's path requires preserving its existing file. |
 | `INKBOX_TUNNEL_NAME` | no | identity handle | Tunnel name override. |
 | `INKBOX_ALLOWED_USERS` | no | - | Local allowlist (emails / E.164 numbers). Usually leave empty and use Inkbox contact rules. |
 | `INKBOX_ALLOW_ALL_USERS` | no | `false` | Allow all senders admitted by Inkbox contact rules. |
