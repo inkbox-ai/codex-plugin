@@ -19,6 +19,7 @@ MEMBERS = ["+15550000002", "+15550000003"]
 
 
 async def start(sdk, monkeypatch):
+    sdk.response_conversation = OUTBOUND
     gw = bridge(sdk)
     meta = await admitted_source(gw, is_group=True, participants=list(MEMBERS))
     await gw._imessage_turn_state("contact", "admitted", meta, "Question")
@@ -46,7 +47,7 @@ def test_only_exact_source_conversation_owns_reply(sdk, monkeypatch, selector):
             expected["reply_to_message_id"] = MESSAGE
         assert json.loads(sdk.calls[0].content) == expected
         context = read_turn_context("contact")
-        assert bool(context.get("whatsapp_tool_sends")) is (selector == "source")
+        assert bool(context.get("whatsapp_tool_sends")) is (selector != "other-group")
         assert bool(context["sent_outputs"]) is (selector == "source")
         suppressed = await gw._imessage_turn_state("contact", "result", meta, "Answer")
         assert suppressed is (selector == "source")
@@ -70,7 +71,7 @@ def test_new_group_checks_explicit_recipients_not_source_membership(sdk, monkeyp
             "to": MEMBERS, "text": "New discussion", "group_name": "Project"})
         assert bool(value.get("isError")) is not allowed
         assert len(sdk.calls) == int(allowed)
-        assert not read_turn_context("contact").get("whatsapp_tool_sends")
+        assert bool(read_turn_context("contact").get("whatsapp_tool_sends")) is allowed
     asyncio.run(scenario())
 
 
@@ -102,7 +103,7 @@ def test_completed_unrelated_outreach_is_not_payload_deduplicated(sdk, monkeypat
         assert len(sdk.calls) == 2
         assert sdk.calls[0].content == sdk.calls[1].content
         assert sdk.calls[0].headers["Idempotency-Key"] != sdk.calls[1].headers["Idempotency-Key"]
-        assert not read_turn_context("contact").get("whatsapp_tool_sends")
+        assert bool(read_turn_context("contact").get("whatsapp_tool_sends")) is isinstance(selector, list)
         assert await gw._imessage_turn_state("contact", "result", meta, "Hello") is False
     asyncio.run(scenario())
 
@@ -238,4 +239,35 @@ def test_retained_group_intent_keeps_bytes_key_and_uncertainty(
             should_reuse = retry_key in {"original", "omitted"}
             assert (sdk.calls[-1].headers["Idempotency-Key"] == key) is should_reuse
             assert await gw._imessage_turn_state("contact", "result", meta, "Group message") is False
+    asyncio.run(scenario())
+
+@pytest.mark.parametrize("retry_key", ["omitted", "replacement"])
+def test_new_group_uncertainty_is_retained_before_any_retry(sdk, monkeypatch, retry_key):
+    async def scenario():
+        gw, meta = await start(sdk, monkeypatch)
+        args = {"to": ["+15550000004", "+15550000005"], "text": "Hello"}
+        sdk.status = 409
+        first = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", dict(args))
+        assert first.get("isError")
+        key = sdk.calls[0].headers["Idempotency-Key"]
+        context = read_turn_context("contact")
+        assert context["whatsapp_tool_sends"][key]["state"] == "sending"
+        sdk.status = 201
+        retry = {**args, **({"idempotency_key": "replacement"} if retry_key == "replacement" else {})}
+        value = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", retry)
+        assert value.get("isError"), value
+        assert json.loads(value["content"][0]["text"])["idempotency_key"] == key
+        assert len(sdk.calls) == 1 and not read_turn_context("contact")["sent_outputs"]
+    asyncio.run(scenario())
+
+
+def test_confirmed_recipient_send_to_source_conversation_suppresses_duplicate(sdk, monkeypatch):
+    async def scenario():
+        gw, meta = await start(sdk, monkeypatch)
+        sdk.response_conversation = CONVERSATION
+        whatsapp.run_tool(sdk.client, "agent", "inkbox_send_whatsapp", {"to": MEMBERS, "text": "Answer"})
+        assert await gw._imessage_turn_state("contact", "result", meta, "Answer") is True
+        assert len(sdk.calls) == 1
+        # Keep the caller's selector; a roster alone must never pick between groups.
+        assert json.loads(sdk.calls[0].content) == {"to": MEMBERS, "text": "Answer"}
     asyncio.run(scenario())

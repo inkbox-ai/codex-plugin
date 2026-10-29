@@ -239,3 +239,18 @@ def test_explicit_full_payload_key_still_identifies_its_own_group_request(sdk, m
         assert sdk.calls[0].headers["Idempotency-Key"] == "complete-original-key"
         assert read_turn_context("contact")["whatsapp_tool_sends"]["opaque-original-key"] == before
     asyncio.run(scenario())
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_proven_legacy_selector_is_not_blocked_by_another_rejected_selector(sdk, monkeypatch, explicit):
+    async def scenario():
+        gw, args = await legacy(sdk, monkeypatch, True, "rejected", {"conversation_id": CONVERSATION}, generated=True)
+        context = read_turn_context("contact")
+        sibling_key = "codex-wa-" + hashlib.sha256(json.dumps([context["nonce"], None, "Answer", MEDIA, MEMBERS, None, None], sort_keys=True).encode()).hexdigest()
+        checkpoint_whatsapp_tool_send(context, sibling_key, state="rejected", text="Answer", media_id=MEDIA)
+        key = args["idempotency_key"]
+        if not explicit: args.pop("idempotency_key")
+        value = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", args)
+        assert result(value)["idempotency_key"] == key
+        assert len(sdk.calls) == 1
+        assert json.loads(sdk.calls[0].content) == {"conversation_id": CONVERSATION, "text": "Answer", "media_ids": [MEDIA]}
+    asyncio.run(scenario())

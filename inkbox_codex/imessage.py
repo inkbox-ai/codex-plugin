@@ -330,7 +330,7 @@ def validate_tool_target(context: dict[str, Any], conversation_id: str | None, t
 def checkpoint_whatsapp_tool_send(
     context: dict[str, Any], idempotency_key: str, *, state: str,
     text: str | None = None, media_id: str | None = None, quote_target: str | None = None,
-    payload: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None, independent_group: bool = False, source_reply: bool = False,
 ) -> None:
     """Retain original-key evidence before a source-owned send can be accepted."""
     path = imessage_turn_context_path(context["chat_id"])
@@ -365,6 +365,9 @@ def checkpoint_whatsapp_tool_send(
         sends[idempotency_key] = {"state": state, **intent}
         if payload is not None:
             sends[idempotency_key]["payload"] = payload
+        for name, value in (("independent_group", independent_group), ("source_reply", source_reply)):
+            if value or (previous or {}).get(name):
+                sends[idempotency_key][name] = True
         if quote_target:
             current["whatsapp_explicit_quote_attempted"] = True
         meta = {**current["route_meta"], "whatsapp_tool_sends": sends,

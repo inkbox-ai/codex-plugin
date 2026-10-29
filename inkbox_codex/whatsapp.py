@@ -414,7 +414,8 @@ def _source_bound(owner, recipient, conversation):
 def group_creation_send(send):
     payload = send.get("payload") or {}
     recipients = payload.get("to")
-    return isinstance(recipients, list) and len(recipients) > 1 and not payload.get("conversation_id")
+    return (isinstance(recipients, list) and len(recipients) > 1
+            and not payload.get("conversation_id") and not send.get("source_reply"))
 
 
 def _legacy_payload_matches(owner, key, previous, payload):
@@ -468,8 +469,11 @@ def _retained_legacy_key(owner, payload, key):
     sends = owner.get("whatsapp_tool_sends") or {}
     if (sends.get(key) or {}).get("payload") is not None:
         return key
+    matches, unproven = [], []
     for saved_key, previous in sends.items():
         if previous.get("payload") is not None:
+            continue
+        if key in sends and saved_key != key:
             continue
         saved_media = previous.get("media_id")
         if saved_media:
@@ -487,9 +491,15 @@ def _retained_legacy_key(owner, payload, key):
         if saved_key == key and previous.get("quote_target") and "reply_to_message_id" not in candidate:
             candidate["reply_to_message_id"] = previous["quote_target"]
         if not _legacy_payload_matches(owner, saved_key, previous, candidate):
-            raise _legacy_recovery_error(saved_key, previous)
-        if saved_key == key or (key is None and previous.get("state") in {"accepted", "rejected"}):
-            key = saved_key
+            unproven.append((saved_key, previous))
+        elif saved_key == key or (key is None and previous.get("state") in {"accepted", "rejected"}):
+            matches.append(saved_key)
+    if len(matches) == 1:
+        return matches[0]
+    if unproven:
+        raise _legacy_recovery_error(*unproven[0])
+    if len(matches) > 1:
+        raise ValueError("Multiple retained WhatsApp requests match; use the original idempotency_key")
     return key
 
 
@@ -519,7 +529,8 @@ def _retained_group_key(owner, payload, key, legacy_key):
             raise error
         if not matches:
             continue
-        if saved_key == key or (key is None and previous.get("state") in {"accepted", "rejected"}):
+        if saved_key == key or (key is None and previous.get("state") in {"accepted", "rejected"}
+                                and not previous.get("independent_group")):
             retained_key = saved_key
     return retained_key
 
@@ -572,7 +583,9 @@ def run_tool(client, identity_handle, name, args):
             key = _retained_legacy_key(owner, legacy_payload, key)
         context = owner if _source_bound(owner, recipient, conversation) else None
         source_context = context
-        if owner and isinstance(recipient, list) and len(recipient) > 1 and context is None:
+        independent_group = False
+        if (owner and (owner.get("route_meta") or {}).get("channel") == "whatsapp"
+                and isinstance(recipient, list) and len(recipient) > 1 and context is None):
             payload = {"to": recipient, "text": text}
             if media_id:
                 payload["media_ids"] = [media_id]
@@ -584,6 +597,11 @@ def run_tool(client, identity_handle, name, args):
             retained_key = _retained_group_key(owner, payload, key, legacy_key)
             if retained_key:
                 context, key = owner, retained_key
+                independent_group = bool((owner.get("whatsapp_tool_sends") or {}).get(key, {}).get("independent_group"))
+            else:
+                context = owner
+                independent_group = True
+                key = key or "codex-wa-" + uuid.uuid4().hex
         if owner and key in (owner.get("whatsapp_tool_sends") or {}) and context is None:
             raise ValueError("A retained WhatsApp request key must keep its original message")
         if context and conversation and reply_target is None:
@@ -616,6 +634,8 @@ def run_tool(client, identity_handle, name, args):
                 and cfg.allowed_users and any(number not in cfg.allowed_users for number in recipient)):
             raise PermissionError("WhatsApp conversation participants are not allowed")
         route = (context or {}).get("route_meta") or {}
+        if independent_group:
+            route = {}
         if route.get("conversation_kind") == "group":
             if not cfg.allow_all_users and cfg.allowed_users:
                 def sender_allowed(number):
@@ -630,7 +650,7 @@ def run_tool(client, identity_handle, name, args):
         validate(origin)
         if context:
             from .imessage import checkpoint_whatsapp_tool_send
-            checkpoint_whatsapp_tool_send(context, key, state="sending", text=text, media_id=args.get("media_id"), quote_target=reply_target, payload=kwargs)
+            checkpoint_whatsapp_tool_send(context, key, independent_group=independent_group, state="sending", text=text, media_id=args.get("media_id"), quote_target=reply_target, payload=kwargs)
         validate(origin)
         args["idempotency_key"] = key
         try:
@@ -641,12 +661,14 @@ def run_tool(client, identity_handle, name, args):
             raise
         if context:
             from .imessage import record_accepted_tool_send, record_tool_send
+            confirmed_source = bool(not source_context and isinstance(recipient, list)
+                and _same_uuid(getattr(sent, "conversation_id", None), owner.get("conversation_id")))
             target = next(iter(context.get("admitted_source_ids") or []), None)
             try:
-                if source_context:
+                if source_context or confirmed_source:
                     record_accepted_tool_send(context, sent, key, text=text, target=target)
                     record_tool_send(context, sent, key, text=text, target=target)
-                checkpoint_whatsapp_tool_send(context, key, state="accepted", text=text, media_id=args.get("media_id"), quote_target=reply_target, payload=kwargs)
+                checkpoint_whatsapp_tool_send(context, key, source_reply=confirmed_source, state="accepted", text=text, media_id=args.get("media_id"), quote_target=reply_target, payload=kwargs)
             except Exception:
                 logger.warning("WhatsApp accepted; local tracking needs recovery. Do not resend.")
         result = _json_safe(sent)

@@ -78,7 +78,8 @@ def sdk(monkeypatch, tmp_path):
             state.calls.append(request)
             if state.status != 201:
                 return httpx.Response(state.status, json={"detail": state.failure_detail})
-            return httpx.Response(201, json={"message": message(id=OUTBOUND, direction="outbound", status="queued")})
+            return httpx.Response(201, json={"message": message(id=OUTBOUND, direction="outbound", status="queued",
+                conversation_id=getattr(state, "response_conversation", CONVERSATION))})
         if path == "/api/v1/message-sends/lookup":
             return httpx.Response(200, json={"message_id": OUTBOUND})
         if path == f"/api/v1/whatsapp/media/{MEDIA}":

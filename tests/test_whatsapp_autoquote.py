@@ -138,7 +138,8 @@ def test_tool_autoquote_respects_explicit_destination(sdk, monkeypatch, selector
             expected["reply_to_message_id"] = MESSAGE
         assert body == expected
         suppressed = await gw._imessage_turn_state("contact", "result", meta, "Different final")
-        assert suppressed is (selector == "source")
+        # The accepted message proves the recipient-selected destination is this source.
+        assert suppressed is (selector in {"source", "group-recipients"})
     asyncio.run(scenario())
 
 

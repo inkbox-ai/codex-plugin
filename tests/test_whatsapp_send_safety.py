@@ -220,8 +220,8 @@ def test_source_group_tool_rechecks_members_before_checkpoint(sdk, monkeypatch, 
                 assert sent["idempotency_key"] == supplied_key
             context = read_turn_context("group")
             assert context["whatsapp_tool_sends"][sent["idempotency_key"]]["state"] == "accepted"
-            assert await gw._imessage_turn_state("group", "result", meta, "Different automatic answer") is (selector == "conversation")
-            assert store.summary()["done" if selector == "conversation" else "reply_pending"] == 1 and len(sdk.calls) == 1
+            assert await gw._imessage_turn_state("group", "result", meta, "Different automatic answer") is True
+            assert store.summary()["done"] == 1 and len(sdk.calls) == 1
         elif change == "uncertain":
             assert value.get("isError"), value
             error = json.loads(value["content"][0]["text"])
@@ -274,8 +274,8 @@ def test_source_group_tool_rechecks_members_before_checkpoint(sdk, monkeypatch, 
                 if supplied_key:
                     assert sent["idempotency_key"] == supplied_key
                 assert read_turn_context("group")["whatsapp_tool_sends"][sent["idempotency_key"]]["state"] == "accepted"
-                assert await gw._imessage_turn_state("group", "result", meta, "Different automatic answer") is (selector == "conversation")
-                assert store.summary()["done" if selector == "conversation" else "reply_pending"] == 1 and len(sdk.calls) == 1
+                assert await gw._imessage_turn_state("group", "result", meta, "Different automatic answer") is True
+                assert store.summary()["done"] == 1 and len(sdk.calls) == 1
             if supplied_key:
                 assert error["idempotency_key"] == supplied_key
             else:
