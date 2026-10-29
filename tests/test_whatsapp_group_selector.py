@@ -271,3 +271,29 @@ def test_confirmed_recipient_send_to_source_conversation_suppresses_duplicate(sd
         # Keep the caller's selector; a roster alone must never pick between groups.
         assert json.loads(sdk.calls[0].content) == {"to": MEMBERS, "text": "Answer"}
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("selector", ["recovered-group", "other-contact"])
+@pytest.mark.parametrize("new_key", [False, True])
+def test_uncertain_group_cannot_escape_through_an_unowned_selector(sdk, monkeypatch, selector, new_key):
+    async def scenario():
+        gw, meta = await start(sdk, monkeypatch)
+        sdk.status = 409
+        first = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", {
+            "to": MEMBERS, "text": "Hello", "idempotency_key": "original-group"})
+        assert first.get("isError") and len(sdk.calls) == 1
+        lookup = await call_inkbox_tool(sdk.client, "agent", "inkbox_lookup_whatsapp_send", {
+            "idempotency_key": "original-group"})
+        assert not lookup.get("isError")
+        sdk.status = 201
+        retained = read_turn_context("contact")
+        args = {"text": "Hello", **({"conversation_id": OUTBOUND} if selector == "recovered-group"
+                                   else {"to": "+15550000004"})}
+        if new_key:
+            args["idempotency_key"] = "replacement"
+        value = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", args)
+        assert value.get("isError"), value
+        assert json.loads(value["content"][0]["text"])["idempotency_key"] == "original-group"
+        assert len(sdk.calls) == 1 and read_turn_context("contact") == retained
+        assert await gw._imessage_turn_state("contact", "result", meta, "Hello") is True
+    asyncio.run(scenario())

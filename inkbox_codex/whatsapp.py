@@ -647,6 +647,15 @@ def run_tool(client, identity_handle, name, args):
         if owner and (owner.get("route_meta") or {}).get("channel") == "whatsapp":
             from .imessage import validate_tool_target
             validate_tool_target(owner, owner["conversation_id"], None)
+            if context is None:
+                current = _active_context(owner)
+                pending = next(((saved_key, send) for saved_key, send in
+                    (current.get("whatsapp_tool_sends") or {}).items() if send.get("state") == "sending"), None)
+                if pending:
+                    error = ValueError("An earlier WhatsApp send is unconfirmed; use its original key for read-only lookup")
+                    error.idempotency_key = pending[0]
+                    error.whatsapp_media_id = pending[1].get("media_id")
+                    raise error
         validate(origin)
         if context:
             from .imessage import checkpoint_whatsapp_tool_send
