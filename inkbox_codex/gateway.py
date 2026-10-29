@@ -923,7 +923,7 @@ def _codex_health(cfg: Optional[BridgeConfig] = None) -> str:
 
 
 def _tunnel_state_dir() -> Path:
-    root = Path.home() / ".inkbox-codex" / "tunnel"
+    root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex")) / "tunnel"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -991,9 +991,8 @@ class InkboxGateway:
         # delivery-failure loop can stop waking the agent after
         # OUTBOUND_FAILURE_MAX_ATTEMPTS. Reset on inbound / delivered / TTL.
         self._outbound_failure_state: Dict[str, Dict[str, float]] = {}
-        self._a2a_registry_path = (
-            Path.home() / ".inkbox-codex" / "a2a_tasks.json"
-        )
+        state_root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
+        self._a2a_registry_path = state_root / "a2a_tasks.json"
         self._a2a_jobs: Dict[str, set[asyncio.Task[Any]]] = {}
         self._a2a_progress_jobs: Dict[str, Tuple[str, asyncio.Task[Any]]] = {}
         self._a2a_progress_stop_events: Dict[str, asyncio.Event] = {}
@@ -1002,7 +1001,6 @@ class InkboxGateway:
         self._a2a_ingest_lock = asyncio.Lock()
         self._a2a_closing = False
         self._a2a_identifiers: Dict[str, List[str]] = {}
-        state_root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
         self._hosted_call_registry_path = state_root / "hosted_call_completions.json"
         self._hosted_call_registry_owner = uuid.uuid4().hex
         self._hosted_call_jobs: Dict[str, asyncio.Task[Any]] = {}
