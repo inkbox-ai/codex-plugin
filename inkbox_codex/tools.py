@@ -1477,9 +1477,11 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
         return _tool_result(result)
     except Exception as exc:
         fields = _tool_exception_fields(exc)
-        if name == "inkbox_send_whatsapp" and args.get("idempotency_key"):
-            fields.update(idempotency_key=getattr(exc, "idempotency_key", None) or args["idempotency_key"],
-                          media_id=getattr(exc, "whatsapp_media_id", args.get("media_id")))
+        if name == "inkbox_send_whatsapp":
+            recovery_key = getattr(exc, "idempotency_key", None) or args.get("idempotency_key")
+            if recovery_key:
+                fields.update(idempotency_key=recovery_key,
+                              media_id=getattr(exc, "whatsapp_media_id", args.get("media_id")))
         if name in {"inkbox_react_whatsapp", "inkbox_unreact_whatsapp"} and args.get("idempotency_key"):
             fields.update(idempotency_key=args["idempotency_key"], reaction_id=args.get("reaction_id"),
                 target_message_id=args.get("message_id"), recovery="Preserve this operation and key. Recover only by replaying the same operation/key or reading its original reaction receipt; never create a replacement key.")

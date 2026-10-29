@@ -218,10 +218,18 @@ def test_source_group_tool_rechecks_members_before_checkpoint(sdk, monkeypatch, 
             assert error["media_id"] == (MEDIA if attachment else None)
             assert read_turn_context("group")["whatsapp_tool_sends"][key]["state"] == "sending"
             sdk.on_conversation_read = lambda: None
-            retry = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", {
-                **args, "idempotency_key": "replacement-key"})
-            assert retry.get("isError"), retry
-            assert json.loads(retry["content"][0]["text"])["idempotency_key"] == key
+            retained = read_turn_context("group")
+            for retry_key in ("replacement-key", None):
+                retry_args = {name: value for name, value in args.items() if name != "idempotency_key"}
+                if retry_key is not None:
+                    retry_args["idempotency_key"] = retry_key
+                retry = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", retry_args)
+                assert retry.get("isError"), retry
+                recovered = json.loads(retry["content"][0]["text"])
+                assert recovered["idempotency_key"] == key
+                assert recovered["media_id"] == (MEDIA if attachment else None)
+                assert read_turn_context("group") == retained
+                assert len(sdk.calls) == 1
             found = result(await call_inkbox_tool(sdk.client, "agent", "inkbox_lookup_whatsapp_send", {
                 "idempotency_key": key}))
             assert found["message_id"] == OUTBOUND
