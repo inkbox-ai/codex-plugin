@@ -17,9 +17,11 @@ try:
     from . import __version__
     from .config import inkbox_client_kwargs
     from .tools import call_inkbox_tool, mcp_tool_list
+    from .turn_authority import mcp_request
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import inkbox_client_kwargs
     from tools import call_inkbox_tool, mcp_tool_list
+    from inkbox_codex.turn_authority import mcp_request
 
     from inkbox_codex import __version__
 
@@ -79,7 +81,8 @@ class InkboxMcpServer:
             name = str(params.get("name") or "")
             args = params.get("arguments") or {}
             client = None if name.startswith("inkbox_schedule_") else self._inkbox()
-            result = await call_inkbox_tool(client, self.identity, name, args)
+            with mcp_request(params.get("_meta")):
+                result = await call_inkbox_tool(client, self.identity, name, args)
             return _response(message_id, result)
 
         return _error(message_id, -32601, f"method not found: {method}")

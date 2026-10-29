@@ -62,8 +62,6 @@ def channel(monkeypatch, tmp_path):
     state.gateway._resolve_contact_full = AsyncMock(return_value=None)
     state.gateway._with_media = AsyncMock(side_effect=lambda text, *_args, **_kwargs: text)
     yield state
-    for store in state.gateway._channel_stores.values():
-        store.close()
     state.client.close()
 
 

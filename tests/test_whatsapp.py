@@ -513,3 +513,29 @@ def test_foreign_channel_cannot_control_active_whatsapp_work(tmp_path, monkeypat
         await session._worker
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("status", [201, 409, 429])
+def test_explicit_quote_fence_survives_different_final_text_rejection_and_lookup(sdk, monkeypatch, status):
+    async def run():
+        gw = bridge(sdk)
+        meta = {"channel": "whatsapp", "conversation_id": CONVERSATION, "sender": "+15550000002",
+                "message_id": MESSAGE, "imessage_event_ids": ["quote-source"]}
+        await gw._imessage_turn_state("contact", "admitted", meta, "Question")
+        await gw._imessage_turn_state("contact", "started", meta)
+        monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")
+        sdk.status = status
+        if status == 429:
+            sdk.failure_detail = {"error": "whatsapp_daily_limit_exceeded"}
+        args = {"conversation_id": CONVERSATION, "reply_to_message_id": MESSAGE, "text": "Answer\n", "idempotency_key": "quote-attempt"}
+        await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", args)
+        attempted_calls = len(sdk.calls)
+        assert attempted_calls >= 1 and all(request.headers["Idempotency-Key"] == "quote-attempt" for request in sdk.calls)
+        assert read_turn_context("contact")["whatsapp_explicit_quote_attempted"] is True
+        await call_inkbox_tool(sdk.client, "agent", "inkbox_lookup_whatsapp_send", {"idempotency_key": "quote-attempt"})
+        assert await gw._imessage_turn_state("contact", "result", meta, "Different final answer") is True
+        assert meta["whatsapp_explicit_quote_attempted"] is True
+        with pytest.raises(ValueError, match="explicit quoted reply"):
+            await gw.send_to_contact("contact", "Different final answer", "whatsapp", {**meta, "imessage_final_reply": True})
+        assert len(sdk.calls) == attempted_calls
+    asyncio.run(run())

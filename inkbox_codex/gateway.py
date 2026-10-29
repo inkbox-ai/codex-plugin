@@ -1021,7 +1021,7 @@ class InkboxGateway:
         if not AIOHTTP_AVAILABLE:
             raise RuntimeError("aiohttp is not installed; run: pip install aiohttp")
         if not INKBOX_AVAILABLE:
-            raise RuntimeError("inkbox SDK is not installed; run: uv pip install 'inkbox>=0.7.15,<1.0.0'")
+            raise RuntimeError("inkbox SDK is not installed; run: uv pip install 'inkbox>=0.7.24,<1.0.0'")
         if not self.cfg.api_key or not self.cfg.identity:
             raise RuntimeError("INKBOX_API_KEY and INKBOX_IDENTITY must be set (see README)")
         if self.cfg.voice_stack_invalid_value:
@@ -1451,13 +1451,22 @@ class InkboxGateway:
             sent = (context or {}).get("sent_outputs", []) if owned else []
             attempts = (context or {}).get("whatsapp_tool_sends", {}) if owned else {}
             unconfirmed = any(attempt["state"] == "sending" for attempt in attempts.values())
+            quoted = bool((owned and context.get("whatsapp_explicit_quote_attempted")) or meta.get("whatsapp_explicit_quote_attempted"))
+            if quoted:
+                meta["whatsapp_explicit_quote_attempted"] = True
             if unconfirmed:
                 meta["whatsapp_tool_sends"] = attempts
                 meta["whatsapp_send_unconfirmed"] = True
                 if ordinary:
                     store.mark(meta, "uncertain", chat_id=chat_id)
                 return True
-            duplicate = bool(text and any(
+            if quoted:
+                if ordinary:
+                    store.mark(meta, "done", chat_id=chat_id)
+                return True
+            duplicate = bool(meta.get("channel") == "whatsapp" and any(
+                attempt["state"] == "accepted" for attempt in attempts.values()
+            )) or bool(text and any(
                 output.get("text") in {text, strip_markdown(text)}
                 and output.get("target") in context.get("admitted_source_ids", [])
                 for output in sent
@@ -1478,6 +1487,17 @@ class InkboxGateway:
                 clear_turn_context(chat_id)
 
     async def _recover_imessage_inputs(self):
+        from .whatsapp import current_route_allowed, WhatsAppReplyRejected, REPLY_REJECTED_NOTICE
+
+        async def allowed_route(mode, meta):
+            if mode != "whatsapp":
+                return self._sender_allowed(str(meta.get("sender") or ""))
+            try:
+                return await current_route_allowed(self, meta)
+            except Exception:
+                logger.warning("Messaging recovery is waiting for current conversation participants")
+                return None
+
         for mode, enabled in (("whatsapp", True), ("imessage", self.cfg.imessage_threaded_replies)):
             if not enabled:
                 continue
@@ -1485,17 +1505,32 @@ class InkboxGateway:
             pending = store.replay_pending()
             for item in store.pending_replies():
                 meta, chat_id = item["meta"], item["chat_id"]
-                if not self._sender_allowed(str(meta.get("sender") or "")):
+                allowed = await allowed_route(mode, meta)
+                if allowed is None:
+                    continue
+                if not allowed:
                     store.mark(meta, "cancelled", chat_id=chat_id)
                     continue
                 try:
                     await self.send_to_contact(chat_id, item["reply"], mode, {**meta, "imessage_final_reply": True})
+                except WhatsAppReplyRejected:
+                    # This is a new notification, not another attempt at the saved answer.
+                    try:
+                        await self.send_to_contact(chat_id, REPLY_REJECTED_NOTICE, mode, {
+                            **meta, "imessage_final_reply": False, "final_reply": False,
+                            "whatsapp_idempotency_key": None,
+                        })
+                    except Exception:
+                        logger.warning("The reply-length notification could not be delivered; not retrying")
                 except Exception:
                     store.mark(meta, "uncertain", chat_id=chat_id)
                     logger.warning("Retained a messaging reply after a delivery error; check receipt state before retrying")
             for item in pending:
                 meta = item["meta"]
-                if not self._sender_allowed(str(meta.get("sender") or "")):
+                allowed = await allowed_route(mode, meta)
+                if allowed is None:
+                    continue
+                if not allowed:
                     store.mark(meta, "cancelled", chat_id=item["chat_id"])
                     continue
                 meta["_imessage_replay"] = True

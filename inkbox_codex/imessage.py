@@ -18,7 +18,8 @@ from typing import Any, Iterator
 _STATES = {"pending", "running", "reply_pending", "sending", "done", "cancelled", "uncertain", "failed"}
 _TERMINAL = {"done", "cancelled"}
 _ROUTE_FIELDS = {
-    "participants", "reaction", "whatsapp_reply_target", "whatsapp_idempotency_key", "channel", "conversation_id", "conversation_kind", "sender", "to", "message_id", "source_message_id",
+    "whatsapp_auto_reply_target",
+    "participants", "reaction", "reaction_id", "reaction_revision", "source_event_id", "whatsapp_explicit_quote_attempted", "whatsapp_reply_target", "whatsapp_idempotency_key", "channel", "conversation_id", "conversation_kind", "sender", "to", "message_id", "source_message_id",
     "reply_to_message_id", "thread_id", "thread_root_message_id",
     "imessage_event_id", "imessage_event_ids", "imessage_sources", "imessage_reply_target",
     "companion", "companion_scope_id", "companion_activation_id", "companion_sequence",
@@ -165,7 +166,8 @@ class IMessageState:
             # Serialize batch selection and updates across the gateway and tool processes.
             db.execute("BEGIN IMMEDIATE")
             rows = [db.execute("SELECT * FROM receipts WHERE event_id=?", (event_id,)).fetchone() for event_id in ids]
-            rows = [row for row in rows if row is not None and row["state"] not in _TERMINAL]
+            terminal = _TERMINAL | {"failed"} if self.channel == "whatsapp" else _TERMINAL
+            rows = [row for row in rows if row is not None and row["state"] not in terminal]
             if chat_id is not None:
                 rows = [row for row in rows if row["chat_id"] == chat_id]
             anchor = next((row["batch_anchor"] for row in rows if row["batch_anchor"]), ids[0])
@@ -327,7 +329,7 @@ def validate_tool_target(context: dict[str, Any], conversation_id: str | None, t
 
 def checkpoint_whatsapp_tool_send(
     context: dict[str, Any], idempotency_key: str, *, state: str,
-    text: str | None = None, media_id: str | None = None,
+    text: str | None = None, media_id: str | None = None, quote_target: str | None = None,
 ) -> None:
     """Retain original-key evidence before a source-owned send can be accepted."""
     path = imessage_turn_context_path(context["chat_id"])
@@ -340,8 +342,18 @@ def checkpoint_whatsapp_tool_send(
             error.idempotency_key = pending[0]
             error.whatsapp_media_id = pending[1].get("media_id")
             raise error
-        sends[idempotency_key] = {"state": state, "text": text, "media_id": media_id}
-        meta = {**current["route_meta"], "whatsapp_tool_sends": sends}
+        if state == "sending" and not quote_target and current.get("whatsapp_explicit_quote_attempted"):
+            quoted = {key: send for key, send in sends.items() if send.get("quote_target")}
+            if (not quoted or idempotency_key in quoted
+                    or any(send.get("state") != "accepted" for send in quoted.values())):
+                error = ValueError("A quoted WhatsApp send is not confirmed or uses this key; do not replace it with a plain message")
+                error.idempotency_key = next(reversed(quoted), None)
+                raise error
+        sends[idempotency_key] = {"state": state, "text": text, "media_id": media_id, "quote_target": quote_target}
+        if quote_target:
+            current["whatsapp_explicit_quote_attempted"] = True
+        meta = {**current["route_meta"], "whatsapp_tool_sends": sends,
+            "whatsapp_explicit_quote_attempted": current.get("whatsapp_explicit_quote_attempted", False)}
         store = IMessageState(
             SimpleNamespace(identity=current["identity"], base_url=current["base_url"]),
             channel="whatsapp",

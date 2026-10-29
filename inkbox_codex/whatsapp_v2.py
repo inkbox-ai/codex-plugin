@@ -89,7 +89,7 @@ def send_selector(args: dict[str, Any]) -> tuple[str | list[str] | None, str | N
             if not isinstance(value, str):
                 raise ValueError("Recipients must be E.164 phone numbers")
             number = re.sub(r"[\s().-]", "", value)
-            if re.fullmatch(r"\+[1-9]\d{6,14}", number) is None:
+            if re.fullmatch(r"\+[1-9][0-9]{6,14}", number) is None:
                 raise ValueError("Recipients must be E.164 phone numbers")
             numbers.append(number)
         if len(numbers) != len(set(numbers)):
