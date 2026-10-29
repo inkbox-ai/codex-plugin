@@ -24,6 +24,11 @@ IDENTITY = "00000000-0000-4000-8000-000000000001"
 CONNECTION = "00000000-0000-4000-8000-000000000002"
 
 
+@pytest.fixture(autouse=True)
+def isolated_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+
+
 def event(**overrides):
     result = {"id": "evt_1", "event_type": "slack.mention_received", "data": {
         "identity_id": IDENTITY, "connection_id": CONNECTION, "workspace_id": "T_TEST",

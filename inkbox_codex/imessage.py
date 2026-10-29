@@ -18,7 +18,8 @@ from typing import Any, Iterator
 _STATES = {"pending", "running", "reply_pending", "sending", "done", "cancelled", "uncertain", "failed"}
 _TERMINAL = {"done", "cancelled"}
 _ROUTE_FIELDS = {
-    "conversation_id", "conversation_kind", "sender", "to", "message_id", "source_message_id",
+    "whatsapp_auto_reply_target",
+    "participants", "reaction", "reaction_id", "reaction_revision", "source_event_id", "whatsapp_explicit_quote_attempted", "whatsapp_reply_target", "whatsapp_idempotency_key", "channel", "conversation_id", "conversation_kind", "sender", "to", "message_id", "source_message_id",
     "reply_to_message_id", "thread_id", "thread_root_message_id",
     "imessage_event_id", "imessage_event_ids", "imessage_sources", "imessage_reply_target",
     "companion", "companion_scope_id", "companion_activation_id", "companion_sequence",
@@ -86,9 +87,12 @@ def _outbound(message: Any) -> dict[str, Any]:
 class IMessageState:
     """One identity/environment's admitted work, with no automatic uncertain replay."""
 
-    def __init__(self, cfg: Any):
+    def __init__(self, cfg: Any, channel: str = "imessage"):
+        self.channel = channel
+        if channel not in {"imessage", "whatsapp"}:
+            raise ValueError("Unsupported messaging channel")
         scope = _json([str(cfg.base_url or "").rstrip("/"), str(cfg.identity)])
-        self.path = _private_dir("imessage_state") / f"{hashlib.sha256(scope.encode()).hexdigest()}.sqlite3"
+        self.path = _private_dir(f"{channel}_state") / f"{hashlib.sha256(scope.encode()).hexdigest()}.sqlite3"
         fd = os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600)
         os.close(fd)
         self.path.chmod(0o600)
@@ -115,7 +119,7 @@ class IMessageState:
             db.close()
 
     def admit(self, chat_id: str, text: str, meta: dict[str, Any]) -> bool:
-        event_id = meta.get("imessage_event_id") or meta.get("message_id")
+        event_id = next(iter(_event_ids(meta)), None)
         if not event_id:
             raise ValueError("An iMessage receipt requires a stable event or message ID")
         with self._db() as db:
@@ -162,7 +166,8 @@ class IMessageState:
             # Serialize batch selection and updates across the gateway and tool processes.
             db.execute("BEGIN IMMEDIATE")
             rows = [db.execute("SELECT * FROM receipts WHERE event_id=?", (event_id,)).fetchone() for event_id in ids]
-            rows = [row for row in rows if row is not None and row["state"] not in _TERMINAL]
+            terminal = _TERMINAL | {"failed"} if self.channel == "whatsapp" else _TERMINAL
+            rows = [row for row in rows if row is not None and row["state"] not in terminal]
             if chat_id is not None:
                 rows = [row for row in rows if row["chat_id"] == chat_id]
             anchor = next((row["batch_anchor"] for row in rows if row["batch_anchor"]), ids[0])
@@ -178,6 +183,12 @@ class IMessageState:
 
     def record_outbound(self, message: Any, meta: dict[str, Any], chat_id: str) -> None:
         sent = _outbound(message)
+        if self.channel == "whatsapp":
+            from .whatsapp import field
+            for name in ("delivery_state", "updated_at"):
+                value = field(message, name)
+                if value is not None:
+                    sent[name] = str(value)
         if not sent["id"]:
             return
         route = {"chat_id": chat_id, "meta": meta, "message_id": sent.pop("id"), **sent}
@@ -189,7 +200,10 @@ class IMessageState:
             elif json.loads(row["route"]).get("unknown_route"):
                 # Delivery callbacks can win the race with the accepted-send
                 # response. Fill its missing route without undoing that failure.
-                route["status"] = json.loads(row["route"])["status"]
+                previous = json.loads(row["route"])
+                route["status"] = previous["status"]
+                if self.channel == "whatsapp":
+                    route.update({key: previous[key] for key in ("delivery_state", "updated_at") if key in previous})
                 db.execute("UPDATE outbound SET route=? WHERE message_id=?", (_json(route), route["message_id"]))
 
     def lookup_outbound(self, message_id: str) -> dict[str, Any] | None:
@@ -313,6 +327,59 @@ def validate_tool_target(context: dict[str, Any], conversation_id: str | None, t
         raise ValueError("The iMessage reply target must be an admitted message in the active turn")
 
 
+def checkpoint_whatsapp_tool_send(
+    context: dict[str, Any], idempotency_key: str, *, state: str,
+    text: str | None = None, media_id: str | None = None, quote_target: str | None = None,
+    payload: dict[str, Any] | None = None, independent_group: bool = False, source_reply: bool = False,
+) -> None:
+    """Retain original-key evidence before a source-owned send can be accepted."""
+    path = imessage_turn_context_path(context["chat_id"])
+    with _context_lock(path):
+        current = _active_context(context)
+        sends = current.setdefault("whatsapp_tool_sends", {})
+        pending = next(((key, send) for key, send in sends.items() if send["state"] == "sending"), None)
+        if state == "sending" and pending:
+            error = ValueError("An earlier WhatsApp send is unconfirmed; use its original key for read-only lookup")
+            error.idempotency_key = pending[0]
+            error.whatsapp_media_id = pending[1].get("media_id")
+            raise error
+        if state == "sending" and not quote_target and current.get("whatsapp_explicit_quote_attempted"):
+            quoted = {key: send for key, send in sends.items() if send.get("quote_target")}
+            if (not quoted or idempotency_key in quoted
+                    or any(send.get("state") != "accepted" for send in quoted.values())):
+                error = ValueError("A quoted WhatsApp send is not confirmed or uses this key; do not replace it with a plain message")
+                error.idempotency_key = next(reversed(quoted), None)
+                raise error
+        intent = {"text": text, "media_id": media_id, "quote_target": quote_target}
+        previous = sends.get(idempotency_key)
+        if previous and previous.get("payload") is None and state == "sending":
+            from .whatsapp import _legacy_payload_matches, _legacy_recovery_error
+            if not _legacy_payload_matches(current, idempotency_key, previous, payload):
+                raise _legacy_recovery_error(idempotency_key, previous)
+        if previous and (any(previous.get(name) != value for name, value in intent.items())
+                         or ("payload" in previous and previous["payload"] != payload)):
+            error = ValueError("A retained WhatsApp request key must keep its original message")
+            error.idempotency_key = idempotency_key
+            error.whatsapp_media_id = previous.get("media_id")
+            raise error
+        sends[idempotency_key] = {"state": state, **intent}
+        if payload is not None:
+            sends[idempotency_key]["payload"] = payload
+        for name, value in (("independent_group", independent_group), ("source_reply", source_reply)):
+            if value or (previous or {}).get(name):
+                sends[idempotency_key][name] = True
+        if quote_target:
+            current["whatsapp_explicit_quote_attempted"] = True
+        meta = {**current["route_meta"], "whatsapp_tool_sends": sends,
+            "whatsapp_explicit_quote_attempted": current.get("whatsapp_explicit_quote_attempted", False)}
+        store = IMessageState(
+            SimpleNamespace(identity=current["identity"], base_url=current["base_url"]),
+            channel="whatsapp",
+        )
+        store.mark(meta, "running", chat_id=current["chat_id"])
+        _write_context(path, current)
+
+
 def record_accepted_tool_send(
     context: dict[str, Any], message: Any, idempotency_key: str,
     text: str | None = None, target: str | None = None,
@@ -325,7 +392,8 @@ def record_accepted_tool_send(
     """
     route_meta = {**context["route_meta"], "imessage_reply_target": target,
                   "imessage_idempotency_key": idempotency_key}
-    state = IMessageState(SimpleNamespace(identity=context["identity"], base_url=context["base_url"]))
+    state = IMessageState(SimpleNamespace(identity=context["identity"], base_url=context["base_url"]),
+                          channel=context.get("route_meta", {}).get("channel") or "imessage")
     state.record_outbound(message, route_meta, context["chat_id"])
 
 

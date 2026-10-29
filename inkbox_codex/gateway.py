@@ -923,7 +923,7 @@ def _codex_health(cfg: Optional[BridgeConfig] = None) -> str:
 
 
 def _tunnel_state_dir() -> Path:
-    root = Path.home() / ".inkbox-codex" / "tunnel"
+    root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex")) / "tunnel"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -968,6 +968,7 @@ class InkboxGateway:
         self._scheduler_start_task = None
         self._scheduler_start_error = None
         self._imessage_state = None
+        self._channel_stores = {}
         self._codex_ready: Optional[bool] = None
         self._codex_readiness_detail = "startup has not been checked"
         self._codex_checked_at: Optional[float] = None
@@ -990,9 +991,12 @@ class InkboxGateway:
         # delivery-failure loop can stop waking the agent after
         # OUTBOUND_FAILURE_MAX_ATTEMPTS. Reset on inbound / delivered / TTL.
         self._outbound_failure_state: Dict[str, Dict[str, float]] = {}
-        self._a2a_registry_path = (
+        state_root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
+        # Preserve the existing registry location unless this profile explicitly
+        # selects a separate one; changing the home must not replay prior tasks.
+        self._a2a_registry_path = Path(os.getenv("INKBOX_CODEX_A2A_REGISTRY_PATH") or (
             Path.home() / ".inkbox-codex" / "a2a_tasks.json"
-        )
+        ))
         self._a2a_jobs: Dict[str, set[asyncio.Task[Any]]] = {}
         self._a2a_progress_jobs: Dict[str, Tuple[str, asyncio.Task[Any]]] = {}
         self._a2a_progress_stop_events: Dict[str, asyncio.Event] = {}
@@ -1001,7 +1005,6 @@ class InkboxGateway:
         self._a2a_ingest_lock = asyncio.Lock()
         self._a2a_closing = False
         self._a2a_identifiers: Dict[str, List[str]] = {}
-        state_root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
         self._hosted_call_registry_path = state_root / "hosted_call_completions.json"
         self._hosted_call_registry_owner = uuid.uuid4().hex
         self._hosted_call_jobs: Dict[str, asyncio.Task[Any]] = {}
@@ -1020,7 +1023,7 @@ class InkboxGateway:
         if not AIOHTTP_AVAILABLE:
             raise RuntimeError("aiohttp is not installed; run: pip install aiohttp")
         if not INKBOX_AVAILABLE:
-            raise RuntimeError("inkbox SDK is not installed; run: uv pip install 'inkbox>=0.7.15,<1.0.0'")
+            raise RuntimeError("inkbox SDK is not installed; run: uv pip install 'inkbox>=0.7.24,<1.0.0'")
         if not self.cfg.api_key or not self.cfg.identity:
             raise RuntimeError("INKBOX_API_KEY and INKBOX_IDENTITY must be set (see README)")
         if self.cfg.voice_stack_invalid_value:
@@ -1092,7 +1095,7 @@ class InkboxGateway:
             on_send_failure=self._note_sync_send_failure,
             turn_activity_fn=self._slack_activity.notify if self._slack_activity else None,
             turn_progress_fn=self._slack_activity.progress if self._slack_activity else None,
-            imessage_turn_fn=self._imessage_turn_state if self.cfg.imessage_threaded_replies else None,
+            imessage_turn_fn=self._imessage_turn_state,
         )
         receiver = self._companion()  # Acquire the existing single-gateway inbox lock first.
         if self._slack_activity is not None:
@@ -1100,8 +1103,7 @@ class InkboxGateway:
         clear_identity_turn_contexts(self.cfg)
         from .slack_turns import retire
         retire(self.cfg)
-        if self.cfg.imessage_threaded_replies:
-            await self._recover_imessage_inputs()
+        await self._recover_imessage_inputs()
         receiver.recover()
         await asyncio.to_thread(self._patch_identity_objects)
         await self._catch_up_a2a_tasks()
@@ -1332,6 +1334,18 @@ class InkboxGateway:
                 "[bridge] Inkbox API does not support A2A webhook events yet; "
                 "continuing without A2A delivery until the backend is upgraded"
             )
+        from .whatsapp import EVENTS as WHATSAPP_EVENTS, unsupported
+        try:
+            _reconcile({"agent_identity_id": identity.id}, WHATSAPP_EVENTS)
+        except Exception as exc:
+            if not unsupported(exc):
+                raise
+            try:
+                _reconcile({"agent_identity_id": identity.id}, WHATSAPP_EVENTS[:5])
+            except Exception as legacy_error:
+                if not unsupported(legacy_error):
+                    raise
+                logger.warning("WhatsApp subscriptions are not supported by this API yet")
         if getattr(identity, "imessage_enabled", False):
             _reconcile({"agent_identity_id": identity.id}, IMESSAGE_EVENTS)
         # The SDK and API require each subscription to contain one event
@@ -1398,6 +1412,16 @@ class InkboxGateway:
     # Inbound: webhooks
     # ------------------------------------------------------------------
 
+    def _channel_store(self, mode):
+        if mode == "imessage":
+            return self._threaded_imessage_state()
+        stores = getattr(self, "_channel_stores", None)
+        if stores is None:
+            stores = self._channel_stores = {}
+        if mode not in stores:
+            stores[mode] = IMessageState(self.cfg, channel=mode)
+        return stores[mode]
+
     def _threaded_imessage_state(self) -> IMessageState:
         if self._imessage_state is None:
             self._imessage_state = IMessageState(self.cfg)
@@ -1405,7 +1429,7 @@ class InkboxGateway:
 
     async def _imessage_turn_state(self, chat_id, state, meta, text=None):
         """Checkpoint ordinary inputs; Companion retains its own receipt owner."""
-        store = self._threaded_imessage_state()
+        store = self._channel_store(meta.get("channel") or "imessage")
         ordinary = not meta.get("companion")
         if state == "admitted":
             # Only recovery sets this local marker; inbound metadata is built
@@ -1427,7 +1451,30 @@ class InkboxGateway:
             context = read_turn_context(chat_id)
             owned = context and context.get("nonce") == meta.get("imessage_context_nonce")
             sent = (context or {}).get("sent_outputs", []) if owned else []
-            duplicate = bool(text and any(
+            attempts = (context or {}).get("whatsapp_tool_sends", {}) if owned else {}
+            if meta.get("channel") == "whatsapp":
+                from .whatsapp import group_creation_send
+                group_keys = {key for key, attempt in attempts.items() if group_creation_send(attempt)}
+                sent = [output for output in sent if output.get("idempotency_key") not in group_keys]
+            else:
+                group_keys = set()
+            unconfirmed = any(attempt["state"] == "sending" for attempt in attempts.values())
+            quoted = bool((owned and context.get("whatsapp_explicit_quote_attempted")) or meta.get("whatsapp_explicit_quote_attempted"))
+            if quoted:
+                meta["whatsapp_explicit_quote_attempted"] = True
+            if unconfirmed:
+                meta["whatsapp_tool_sends"] = attempts
+                meta["whatsapp_send_unconfirmed"] = True
+                if ordinary:
+                    store.mark(meta, "uncertain", chat_id=chat_id)
+                return True
+            if quoted:
+                if ordinary:
+                    store.mark(meta, "done", chat_id=chat_id)
+                return True
+            duplicate = bool(meta.get("channel") == "whatsapp" and any(
+                attempt["state"] == "accepted" for key, attempt in attempts.items() if key not in group_keys
+            )) or bool(text and any(
                 output.get("text") in {text, strip_markdown(text)}
                 and output.get("target") in context.get("admitted_source_ids", [])
                 for output in sent
@@ -1438,9 +1485,9 @@ class InkboxGateway:
                 else:
                     store.mark(meta, "reply_pending", reply=text, chat_id=chat_id)
             return duplicate
-        if state in {"done", "cancelled", "uncertain"}:
-            if ordinary:
-                store.mark(meta, state, chat_id=chat_id)
+        if state in {"stopping", "done", "cancelled", "uncertain"}:
+            if ordinary and state != "stopping":
+                store.mark(meta, "uncertain" if meta.get("whatsapp_send_unconfirmed") else state, chat_id=chat_id)
             # A control message can finish while another turn is still using
             # its tools. Never remove that other turn's source allowlist.
             context = read_turn_context(chat_id)
@@ -1448,26 +1495,54 @@ class InkboxGateway:
                 clear_turn_context(chat_id)
 
     async def _recover_imessage_inputs(self):
-        store = self._threaded_imessage_state()
-        pending = store.replay_pending()  # running/sending become uncertain
-        for item in store.pending_replies():
-            meta, chat_id = item["meta"], item["chat_id"]
-            if not self._sender_allowed(str(meta.get("sender") or "")):
-                store.mark(meta, "cancelled", chat_id=chat_id)
-                continue
+        from .whatsapp import current_route_allowed, WhatsAppReplyRejected, REPLY_REJECTED_NOTICE
+
+        async def allowed_route(mode, meta):
+            if mode != "whatsapp":
+                return self._sender_allowed(str(meta.get("sender") or ""))
             try:
-                await self.send_to_contact(chat_id, item["reply"], "imessage", {**meta, "imessage_final_reply": True})
+                return await current_route_allowed(self, meta)
             except Exception:
-                # No automatic retry after crossing the send checkpoint.
-                store.mark(meta, "uncertain", chat_id=chat_id)
-                logger.warning("[bridge] retained an iMessage reply after a delivery error; check receipt state before retrying")
-        for item in pending:
-            meta = item["meta"]
-            if not self._sender_allowed(str(meta.get("sender") or "")):
-                store.mark(meta, "cancelled", chat_id=item["chat_id"])
+                logger.warning("Messaging recovery is waiting for current conversation participants")
+                return None
+
+        for mode, enabled in (("whatsapp", True), ("imessage", self.cfg.imessage_threaded_replies)):
+            if not enabled:
                 continue
-            meta["_imessage_replay"] = True
-            await self.sessions.get(item["chat_id"]).handle_inbound(item["text"], "imessage", meta)
+            store = self._channel_store(mode)
+            pending = store.replay_pending()
+            for item in store.pending_replies():
+                meta, chat_id = item["meta"], item["chat_id"]
+                allowed = await allowed_route(mode, meta)
+                if allowed is None:
+                    continue
+                if not allowed:
+                    store.mark(meta, "cancelled", chat_id=chat_id)
+                    continue
+                try:
+                    await self.send_to_contact(chat_id, item["reply"], mode, {**meta, "imessage_final_reply": True})
+                except WhatsAppReplyRejected:
+                    # This is a new notification, not another attempt at the saved answer.
+                    try:
+                        await self.send_to_contact(chat_id, REPLY_REJECTED_NOTICE, mode, {
+                            **meta, "imessage_final_reply": False, "final_reply": False,
+                            "whatsapp_idempotency_key": None,
+                        })
+                    except Exception:
+                        logger.warning("The reply-length notification could not be delivered; not retrying")
+                except Exception:
+                    store.mark(meta, "uncertain", chat_id=chat_id)
+                    logger.warning("Retained a messaging reply after a delivery error; check receipt state before retrying")
+            for item in pending:
+                meta = item["meta"]
+                allowed = await allowed_route(mode, meta)
+                if allowed is None:
+                    continue
+                if not allowed:
+                    store.mark(meta, "cancelled", chat_id=item["chat_id"])
+                    continue
+                meta["_imessage_replay"] = True
+                await self.sessions.get(item["chat_id"]).handle_inbound(item["text"], mode, meta)
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         return web.json_response({"ok": True, "identity": self.cfg.identity, **await self._readiness()})
@@ -1923,7 +1998,7 @@ class InkboxGateway:
             bool: True for a recognised Inkbox event shape.
         """
         if event_type and event_type.startswith(
-            ("message.", "text.", "imessage.", "a2a.", "call.", "slack.")
+            ("message.", "text.", "imessage.", "whatsapp.", "a2a.", "call.", "slack.")
         ):
             return True
         explicit_call_id = envelope.get("call_id") or envelope.get("callId")
@@ -1992,6 +2067,15 @@ class InkboxGateway:
             # downstream reader assumes a dict.
             self._dedup_rollback(request_id)
             return web.Response(status=400, text="invalid json")
+
+        if str(envelope.get("event_type") or "").startswith("whatsapp."):
+            if source != "inkbox" or not provider.verify(
+                body=body, headers=dict(request.headers), url=str(request.url),
+                secret=self._provider_secret("inkbox"),
+            ):
+                return web.Response(status=401, text="WhatsApp requires a valid Inkbox signature")
+            if envelope.get("companion") is not None:
+                return web.Response(status=422, text="Unsupported WhatsApp message")
 
         if envelope.get("companion") is not None:
             # Context grants require a verified Inkbox signature even when the
@@ -2072,6 +2156,16 @@ class InkboxGateway:
             return await self._on_mail_received(envelope)
         if event_type == "text.received":
             return await self._on_text_received(envelope)
+        if event_type == "whatsapp.reaction_received":
+            from .whatsapp_v2 import receive_reaction
+            return await receive_reaction(self, envelope)
+        if event_type == "whatsapp.received":
+            from .whatsapp import receive
+            return await receive(self, envelope)
+        if event_type.startswith("whatsapp."):
+            from .whatsapp import record_status
+            record_status(self, envelope)
+            return web.json_response({"ok": True})
         if event_type == "imessage.received":
             return await self._on_imessage_received(envelope)
         if event_type == "imessage.reaction_received":
@@ -5110,6 +5204,9 @@ class InkboxGateway:
             if meta.get("companion"):
                 self._companion().reply_sending(meta)
             await asyncio.to_thread(identity.send_text, **kwargs)
+        elif mode == "whatsapp":
+            from .whatsapp import send_reply
+            await send_reply(self, chat_id, content, meta)
         elif mode == "imessage":
             text = strip_markdown(content)
             if len(text) > IMESSAGE_MAX_LENGTH:

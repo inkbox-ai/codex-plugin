@@ -33,7 +33,10 @@ jobs:
 
       # Live helper regressions exercise the SDK's real pagination offline.
       - name: Install test deps
-        run: uv pip install --system pytest httpx aiohttp segno "croniter>=6.2,<7" "tzdata>=2025.1" "inkbox==0.7.15" "audioop-lts>=0.2.1; python_version >= '3.13'"
+        run: uv pip install --system -e . pytest httpx aiohttp segno "croniter>=6.2,<7" "tzdata>=2025.1" "$(bash tests/ci/candidate_sdk.sh)" "audioop-lts>=0.2.1; python_version >= '3.13'"
+
+      - name: Verify candidate SDK in MCP interpreter
+        run: python tests/ci/assert_candidate_sdk.py
 
       - name: Run unit tests
         run: pytest -q
@@ -48,9 +51,12 @@ jobs:
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v8.1.0
-      - name: Install bridge and released SDK
+      - name: Install bridge and candidate SDK
         run: >-
-          uv pip install --system -e . pytest httpx "inkbox==0.7.15"
+          uv pip install --system -e . pytest httpx "$(bash tests/ci/candidate_sdk.sh)"
+      - name: Verify candidate SDK in MCP interpreter
+        run: python tests/ci/assert_candidate_sdk.py
+
       - name: Require provisioning-workspace and identity-subscription support
         run: |
           python - <<'PY'
@@ -82,10 +88,13 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Install bridge and released native-reply SDK
+      - name: Install bridge and candidate native-reply SDK
         run: >-
           pip install -e . pytest httpx
-          "inkbox==0.7.15"
+          "$(bash tests/ci/candidate_sdk.sh)"
+      - name: Verify candidate SDK in MCP interpreter
+        run: python tests/ci/assert_candidate_sdk.py
+
       - name: Require native reply support
         run: |
           python - <<'PY'
@@ -113,10 +122,13 @@ jobs:
         with:
           node-version: "22"
       - uses: astral-sh/setup-uv@v8.1.0
-      - name: Install bridge and released Slack-aware SDK
+      - name: Install bridge and candidate Slack-aware SDK
         run: >-
           uv pip install --system -e . pytest httpx
-          "inkbox==0.7.15"
+          "$(bash tests/ci/candidate_sdk.sh)"
+      - name: Verify candidate SDK in MCP interpreter
+        run: python tests/ci/assert_candidate_sdk.py
+
       - name: Require Slack initialization support (do not silently skip)
         run: python -c "from inkbox_codex.slack_companion import require_sdk_support; require_sdk_support()"
       - name: Install Codex (freshest main prerelease)
@@ -154,13 +166,16 @@ jobs:
       - name: Install bridge + test deps
         run: |
           uv pip install --system \
-            "inkbox==0.7.15" \
+            "$(bash tests/ci/candidate_sdk.sh)" \
             -e . pytest
 
       # @alpha is the prerelease channel cut from codex main near-daily — the
       # freshest main build available without compiling the host from source.
       - name: Install Codex (freshest main prerelease)
         run: bash "$GITHUB_WORKSPACE/tests/ci/install_codex.sh"
+
+      - name: Verify candidate SDK in MCP interpreter
+        run: python tests/ci/assert_candidate_sdk.py
 
       - name: Contract tests vs real Codex
         run: pytest tests/contract -v
@@ -179,10 +194,13 @@ jobs:
         with:
           node-version: "22"
       - uses: astral-sh/setup-uv@v8.1.0
-      - name: Install released SDK and test dependencies
+      - name: Install candidate SDK and test dependencies
         run: >-
           uv pip install --system -e . pytest httpx
-          "inkbox==0.7.15"
+          "$(bash tests/ci/candidate_sdk.sh)"
+      - name: Verify candidate SDK in MCP interpreter
+        run: python tests/ci/assert_candidate_sdk.py
+
       - name: Verify helper is present (do not silently skip its tests)
         run: python -c "from inkbox.companion import CompanionResource; assert callable(CompanionResource.load_initialization)"
       - name: Install Codex (freshest main prerelease)

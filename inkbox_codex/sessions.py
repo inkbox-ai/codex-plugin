@@ -415,6 +415,8 @@ class ContactSession:
         self._interaction_lock = asyncio.Lock()
         self._interaction_generation = 0
         self._approval_waiters = 0
+        self._host_epoch = None
+        self._source_authority = None
         self.always_allowed: set[str] = set()
 
         self._client: Optional[CodexAppServerClient] = None
@@ -428,6 +430,7 @@ class ContactSession:
         self._interrupting = False    # a new message asked us to abort it
         self._slack_context = None
         self._current_turn: Optional[_Turn] = None  # the turn the worker is running
+        self._delivering_turn: Optional[_Turn] = None
         self._imessage_burst: Optional[_Turn] = None
         self._imessage_burst_parts: list[str] = []
         self._imessage_burst_key: Optional[tuple] = None
@@ -572,6 +575,8 @@ class ContactSession:
                 logger.warning("Slack tool context cleanup was not saved")
 
     async def _cancel_pending_turn(self) -> None:
+        from .turn_authority import retire
+        retire(self._source_authority)
         self._cancel_interactions()
         self._retire_slack_context()
         if self._current_turn is not None or self._turn_active:
@@ -631,8 +636,10 @@ class ContactSession:
     async def handle_inbound(self, text: str, mode: str, meta: Dict[str, Any]) -> None:
         """Admit source-aware input before it can be buffered or consumed."""
         meta = deepcopy(meta or {})
-        tracked = self._threaded_imessage(mode) and not meta.get("companion") and not meta.get("reaction")
+        tracked = (self._threaded_imessage(mode) and not meta.get("companion")
+                   and (mode == "whatsapp" or not meta.get("reaction")))
         if tracked:
+            meta["channel"] = mode
             meta = self._imessage_meta(meta, str(meta.get("raw_text", text)))
             admitted = await self._imessage_state("admitted", meta, text)
             if admitted is False:
@@ -659,13 +666,25 @@ class ContactSession:
         """
         meta = dict(meta or {})
         raw_text = str(meta.get("raw_text", text))
-        command = _control_command(raw_text)
+        command = None if meta.get("reaction") else _control_command(raw_text)
         if mode == "slack" and meta.get("slack_native_stop") and command == "stop":
             self.mode, self.reply_meta = mode, meta
             await self._stop_turn()
             return False
-        is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
-        pending_reply = self.pending is not None and not self.pending.future.done()
+        is_group = mode in {"sms", "imessage", "slack", "whatsapp"} and meta.get("conversation_kind") == "group"
+        pending_reply = (self.pending is not None and not self.pending.future.done()
+                         and not meta.get("reaction"))
+        active_mode, active_meta = self._pending_reply_route or self._reply_route(
+            self._current_turn or self._delivering_turn
+        )
+        same_origin = (mode == active_mode and meta.get("sender") == active_meta.get("sender")
+                       and meta.get("conversation_id") == active_meta.get("conversation_id"))
+        foreign_whatsapp = (mode == "whatsapp" or active_mode == "whatsapp") and not same_origin
+        if foreign_whatsapp:
+            pending_reply = False
+        global_control = command in {"reset", "resume"} or (command == "stop" and not self._threaded_imessage(mode))
+        if global_control and self._foreign_whatsapp_work(mode, meta):
+            return False
         if is_group and pending_reply:
             pending_reply = (
                 not meta.get("reaction")
@@ -736,7 +755,7 @@ class ContactSession:
             await self._report_health()
             return False
 
-        if (not pending_reply and self._approval_waiters
+        if (not meta.get("reaction") and not foreign_whatsapp and not pending_reply and self._approval_waiters
                 and (not is_group or meta.get("sender") == self._reply_route(self._current_turn)[1].get("sender"))):
             if parse_permission_reply(raw_text) is not None:
                 if consumed_meta is not None:
@@ -789,13 +808,25 @@ class ContactSession:
             self._worker = asyncio.create_task(self._drain())
         return True
 
+    def _foreign_whatsapp_work(self, mode: str, meta: Dict[str, Any]) -> bool:
+        """Shared-session controls cannot discard another WhatsApp origin's work."""
+        turns = [self._current_turn, self._delivering_turn, self._imessage_burst, *self._queue._queue]
+        routes = [self._reply_route(turn) for turn in turns if turn is not None]
+        if self.pending is not None and self._pending_reply_route is not None:
+            routes.append(self._pending_reply_route)
+        return any(
+            (mode == "whatsapp" or route_mode == "whatsapp")
+            and (mode != route_mode or any(route.get(key) != meta.get(key) for key in ("conversation_id", "sender")))
+            for route_mode, route in routes
+        )
+
     def _threaded_imessage(self, mode: Optional[str]) -> bool:
-        return mode == "imessage" and getattr(self.cfg, "imessage_threaded_replies", False)
+        return mode == "whatsapp" or (mode == "imessage" and getattr(self.cfg, "imessage_threaded_replies", False))
 
     def _threaded_turn(self, turn: _Turn) -> bool:
         return bool(self._threaded_imessage(turn.reply_mode)
                     and (turn.reply_meta or {}).get("imessage_threaded_replies")
-                    and not (turn.reply_meta or {}).get("reaction"))
+                    and (turn.reply_mode == "whatsapp" or not (turn.reply_meta or {}).get("reaction")))
 
     @staticmethod
     def _imessage_meta(meta: Dict[str, Any], text: str) -> Dict[str, Any]:
@@ -836,7 +867,7 @@ class ContactSession:
         # explicit reply establishes a thread boundary for burst collection.
         reply_context = self._imessage_reply_context(meta)
         return tuple(meta.get(key) for key in (
-            "sender", "conversation_id", "conversation_kind", "sender_access",
+            "channel", "sender", "conversation_id", "conversation_kind", "sender_access",
             "companion_scope_id", "companion_activation_id", "identity_id",
         )) + (reply_context,)
 
@@ -846,7 +877,7 @@ class ContactSession:
             self._flush_imessage_burst()
         loop = asyncio.get_running_loop()
         if self._imessage_burst is None:
-            self._imessage_burst = _Turn(text="", reply_mode="imessage", reply_meta=deepcopy(meta))
+            self._imessage_burst = _Turn(text="", reply_mode=meta.get("channel") or "imessage", reply_meta=deepcopy(meta))
             self._imessage_burst_parts = [text]
             self._imessage_burst_key = key
             self._imessage_burst_started = loop.time()
@@ -859,7 +890,7 @@ class ContactSession:
             if first_id:
                 route["imessage_reply_target"] = first_id
         turn = self._imessage_burst
-        turn.text = frame_inbound("imessage", turn.reply_meta, "\n\n".join(self._imessage_burst_parts))
+        turn.text = frame_inbound(turn.reply_mode, turn.reply_meta, "\n\n".join(self._imessage_burst_parts))
         if self._imessage_burst_task is not None:
             self._imessage_burst_task.cancel()
         if meta.get("attachments") or meta.get("reaction"):
@@ -1041,11 +1072,17 @@ class ContactSession:
         await self._reply("Stopped." if had_work else "Nothing to stop — I'm idle.")
 
     async def _stop_imessage(self, meta: Dict[str, Any]) -> None:
-        """Stop this iMessage conversation without cancelling another channel."""
+        """Stop only the originating native messaging conversation."""
+        mode = meta.get("channel") or "imessage"
+
+        def same_source(route: Dict[str, Any]) -> bool:
+            return (route.get("conversation_id") == meta.get("conversation_id")
+                    and (mode != "whatsapp" or route.get("sender") == meta.get("sender")))
+
         def owns(turn: Optional[_Turn]) -> bool:
             return bool(
-                turn is not None and turn.future is None and turn.reply_mode == "imessage"
-                and (turn.reply_meta or {}).get("conversation_id") == meta.get("conversation_id")
+                turn is not None and turn.future is None and turn.reply_mode == mode
+                and same_source(turn.reply_meta or {})
             )
 
         dropped = []
@@ -1060,17 +1097,22 @@ class ContactSession:
         running = owns(self._current_turn)
         parked = bool(
             self.pending is not None and self._current_turn is None and self._pending_reply_route
-            and self._pending_reply_route[0] == "imessage"
-            and self._pending_reply_route[1].get("conversation_id") == meta.get("conversation_id")
+            and self._pending_reply_route[0] == mode
+            and same_source(self._pending_reply_route[1])
         )
         if running or parked:
+            if running and mode == "whatsapp":
+                await self._imessage_state("stopping", self._current_turn.reply_meta or {})
             await self._cancel_pending_turn()
         for turn in dropped:
             if self._threaded_turn(turn):
                 await self._imessage_state("cancelled", turn.reply_meta or {})
             if turn.completion is not None and not turn.completion.done():
                 turn.completion.set_result(None)
-        await self._reply("Stopped." if running or parked or dropped else "Nothing to stop — I'm idle.")
+        idle = ("No pending work from you to stop in this conversation." if mode == "whatsapp"
+                else "Nothing to stop — I'm idle.")
+        await self._reply("Stopped." if running or parked or dropped else idle,
+                          turn=_Turn(text="", reply_mode=mode, reply_meta=meta))
 
     async def _abort_in_flight(self) -> None:
         """Cancel whatever the session is currently doing: a parked
@@ -1266,6 +1308,13 @@ class ContactSession:
                 # wait_for may schedule this coroutine after a Stop was handled.
                 if self._interrupting:
                     return CodexTurnResult(text="", mcp_tool_calls=(), aborted=True) if turn.capture_tools else ""
+                from .turn_authority import begin, bind, new_host
+                if self._host_epoch is None:
+                    self._host_epoch = new_host(self.chat_id, self.cfg)
+                source = begin(self.chat_id, self.cfg, self._host_epoch, turn.reply_mode or "background",
+                               (turn.reply_meta or {}).get("imessage_context_nonce"))
+                self._source_authority = source
+                client.turn_started = lambda thread_id, turn_id: bind(source, thread_id, turn_id)
                 run = client.run_detailed if turn.capture_tools else client.run
                 options = {"activity_handler": turn.activity_handler} if turn.activity_handler is not None else {}
                 return await run(turn.text, **options)
@@ -1310,6 +1359,9 @@ class ContactSession:
                 return
             raise
         finally:
+            from .turn_authority import retire
+            retire(self._source_authority)
+            self._source_authority = None
             self._retire_slack_context()
             self._slack_context = None
             self._cancel_interactions()
@@ -1328,13 +1380,13 @@ class ContactSession:
             if hosted_sms_context_path is not None:
                 hosted_sms_context_path.unlink(missing_ok=True)
             self._turn_active = False
-            self._current_turn = None
             if typing_task is not None:
                 typing_task.cancel()
                 try:
                     await typing_task
                 except asyncio.CancelledError:
                     pass
+            self._current_turn = None
 
         # Route the result. Capture turns hand the text back to their waiter and
         # never auto-reply (the caller speaks/queues/swallows it). Normal turns
@@ -1362,7 +1414,11 @@ class ContactSession:
                 turn.completion.set_result(reply)
             return
         if reply:
-            await self._deliver_reply(turn, reply)
+            self._delivering_turn = turn
+            try:
+                await self._deliver_reply(turn, reply)
+            finally:
+                self._delivering_turn = None
 
     async def _deliver_reply(self, turn: _Turn, reply: str) -> None:
         """Send a normal turn's reply, recovering once if the send is rejected.
@@ -1392,6 +1448,21 @@ class ContactSession:
             await self._reply(reply, turn=delivery_turn)
         except Exception as exc:
             turn.delivery_failed = True
+            if turn.reply_mode == "whatsapp":
+                from .whatsapp import REPLY_REJECTED_NOTICE, WhatsAppReplyRejected
+                if isinstance(exc, WhatsAppReplyRejected):
+                    logger.warning("WhatsApp answer was not sent: %s", exc)
+                    notice_meta = dict(turn.reply_meta or {})
+                    for key in ("imessage_final_reply", "final_reply", "whatsapp_idempotency_key"):
+                        notice_meta.pop(key, None)
+                    try:
+                        await self._reply(
+                            REPLY_REJECTED_NOTICE,
+                            turn=replace(turn, reply_meta=notice_meta),
+                        )
+                    except Exception:
+                        logger.warning("The WhatsApp length-limit notice could not be delivered; not retrying")
+                    return
             if self._threaded_turn(turn):
                 # The send may already be accepted. Keep its route and outcome
                 # rather than asking another turn to resend it differently.
@@ -1531,13 +1602,16 @@ class ContactSession:
                       else "email, SMS, iMessage, and voice calls"),
             imessage_threaded_replies=getattr(self.cfg, "imessage_threaded_replies", False),
         )
+        from .turn_authority import HOST_ENV, new_host
+        self._host_epoch = new_host(self.chat_id, self.cfg)
+        self.mcp_server_config["env"] = {**self.mcp_server_config.get("env", {}), HOST_ENV: self._host_epoch}
         client = CodexAppServerClient(
             self.cfg,
             developer_instructions=developer_instructions,
             mcp_server_config=self.mcp_server_config,
             approval_handler=self._handle_codex_request,
             # Shell-invoked local commands use the same conversation as MCP.
-            process_env={**os.environ, "INKBOX_CODEX_CHAT_ID": self.chat_id},
+            process_env={**os.environ, "INKBOX_CODEX_CHAT_ID": self.chat_id, HOST_ENV: self._host_epoch},
         )
         # Capture what we resumed from before it's overwritten with the new
         # thread id below — otherwise the log claims every session resumed.
@@ -1574,6 +1648,8 @@ class ContactSession:
         Returns:
             None
         """
+        from .turn_authority import retire
+        retire(self._source_authority)
         if self._client is None:
             return
         timeout = max(0.0, float(self.cfg.codex_interrupt_timeout_s or 0.0))
@@ -1737,6 +1813,11 @@ class ContactSession:
         await self.send_fn(self.chat_id, text, *self._reply_route(turn))
 
     async def close(self, *, shutting_down: bool = False) -> None:
+        from .turn_authority import retire, retire_host
+        retire(self._source_authority)
+        if self._host_epoch is not None:
+            retire_host(self.chat_id, self._host_epoch)
+        self._host_epoch = None
         self._retire_slack_context()
         if shutting_down:
             self._shutting_down = True
