@@ -286,7 +286,8 @@ def _specifications():
         (
             "inkbox_list_whatsapp_conversations",
             "List WhatsApp conversations with local unread counts.",
-            {"limit": integer, "offset": {"type": "integer", "minimum": 0}},
+            {"limit": integer, "offset": {"type": "integer", "minimum": 0},
+             "include_groups": {"type": "boolean", "description": "Include group conversations; defaults to false"}},
             [],
             "list_whatsapp_conversations",
         ),

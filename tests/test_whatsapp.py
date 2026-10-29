@@ -58,6 +58,15 @@ def sdk(monkeypatch, tmp_path):
             return httpx.Response(state.limits_status, json={"agent_identity_id": IDENTITY, "limits": {"synthetic": 123}, "usage": {"whatsapp.texts_per_agent_identity_per_24h": 7}})
         if path == "/api/v1/identities/agent/channel-status":
             return httpx.Response(200, json={"whatsapp": {"enabled": True, "number": "+15550000001", "status": "ready"}})
+        if path == "/api/v1/whatsapp/conversations":
+            groups = request.url.params.get("include_groups") == "true"
+            return httpx.Response(200, json=[{
+                "id": CONVERSATION, "agent_identity_id": IDENTITY,
+                "local_number": "+15550000001", "remote_number": None,
+                "participants": [f"+15550000{n:03d}" for n in range(2, 11)],
+                "is_group": True, "created_at": NOW, "updated_at": NOW,
+                "latest_has_media": False, "unread_count": 1, "total_count": 1,
+            }] if groups else [])
         if request.method == "POST" and path == "/api/v1/whatsapp/messages":
             state.calls.append(request)
             if state.status != 201:

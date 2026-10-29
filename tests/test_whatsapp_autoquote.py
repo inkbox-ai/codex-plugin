@@ -299,3 +299,18 @@ def test_plain_send_cannot_reuse_quoted_key_or_bypass_legacy_fence(sdk, monkeypa
                 "to": "+15550000002", "text": "Plain answer", "idempotency_key": "quote-key"})
         assert len(sdk.calls) == before
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("include", [None, True])
+def test_registered_list_tool_can_discover_existing_large_groups(sdk, include):
+    from inkbox_codex.tools import mcp_tool_list
+    tool = next(t for t in mcp_tool_list() if t["name"] == "inkbox_list_whatsapp_conversations")
+    assert tool["inputSchema"]["properties"]["include_groups"]["type"] == "boolean"
+    result = asyncio.run(call_inkbox_tool(sdk.client, "agent", tool["name"],
+                                        {} if include is None else {"include_groups": include}))
+    assert not result.get("isError"), result
+    assert sdk.requests[-1].url.params["include_groups"] == ("true" if include else "false")
+    rows = json.loads(result["content"][0]["text"])
+    assert len(rows) == (1 if include else 0)
+    if include:
+        assert rows[0]["is_group"] and len(rows[0]["participants"]) == 9
