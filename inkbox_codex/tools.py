@@ -1621,6 +1621,8 @@ def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]
         "INKBOX_API_KEY": cfg.api_key,
         "INKBOX_IDENTITY": cfg.identity,
         "INKBOX_BASE_URL": cfg.base_url,
+        "INKBOX_ALLOWED_USERS": ",".join(cfg.allowed_users),
+        "INKBOX_ALLOW_ALL_USERS": "1" if cfg.allow_all_users else "0",
         "CODEX_PROJECT_DIR": str(Path(cfg.project_dir or os.getcwd()).expanduser().resolve()),
         "INKBOX_SLACK_ENABLED": "1" if cfg.slack_enabled else "0",
         "INKBOX_IMESSAGE_THREADED_REPLIES": "1" if cfg.imessage_threaded_replies else "0",

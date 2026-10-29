@@ -10,7 +10,7 @@ import pytest
 
 from inkbox_codex import whatsapp
 from inkbox_codex.imessage import read_turn_context, clear_turn_context, _write_context, imessage_turn_context_path
-from inkbox_codex.tools import call_inkbox_tool
+from inkbox_codex.tools import build_inkbox_mcp_server_config, call_inkbox_tool
 from tests.test_whatsapp import sdk, bridge, CONVERSATION, MESSAGE, OUTBOUND, MEDIA
 from tests.test_whatsapp_autoquote import admitted_source
 
@@ -26,6 +26,27 @@ async def start(sdk, monkeypatch):
     await gw._imessage_turn_state("contact", "started", meta)
     monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")
     return gw, meta
+
+
+@pytest.mark.parametrize("selector", ["new", "source"])
+@pytest.mark.parametrize("allow_all", [False, True])
+def test_gateway_allowlist_survives_mcp_environment_boundary(sdk, monkeypatch, selector, allow_all):
+    async def scenario():
+        gw, _ = await start(sdk, monkeypatch)
+        gw.cfg.allowed_users = MEMBERS[:1]
+        gw.cfg.allow_all_users = allow_all
+        server, _ = build_inkbox_mcp_server_config(gw.cfg)
+        # Model a host that forwards only the declared tool environment.
+        for key in ("INKBOX_ALLOWED_USERS", "INKBOX_ALLOW_ALL_USERS"):
+            monkeypatch.delenv(key, raising=False)
+            if key in server["env"]:
+                monkeypatch.setenv(key, server["env"][key])
+        args = {"text": "Answer", **({"to": MEMBERS} if selector == "new"
+                                    else {"conversation_id": CONVERSATION})}
+        result = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", args)
+        assert bool(result.get("isError")) is not allow_all
+        assert len(sdk.calls) == int(allow_all)
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("selector", ["new", "named-new", "source", "other-group"])
