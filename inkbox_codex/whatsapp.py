@@ -1,4 +1,4 @@
-"""Dedicated WhatsApp groups, native replies, reactions and durable receipt routing."""
+"""WhatsApp direct messages, native replies, reactions and durable receipt routing."""
 
 from __future__ import annotations
 
@@ -80,35 +80,28 @@ def route_allowed(gateway, meta):
     return _route_allowed(gateway._sender_allowed, meta)
 
 
+def unsupported_shape(value):
+    """Reject unsupported legacy routes without inferring a direct recipient."""
+    data = value if isinstance(value, dict) else vars(value)
+    for attempt in (data.get("whatsapp_tool_sends") or {}).values():
+        payload = attempt.get("payload") or {}
+        if unsupported_shape(payload) or isinstance(payload.get("to"), list) or attempt.get("independent_group"):
+            return True
+    return (bool(data.get("is_group") or data.get("isGroup"))
+            or data.get("conversation_kind") == "group"
+            or any((name.startswith("group_") or name == "groupName") and item is not None
+                   for name, item in data.items())
+            or bool(data.get("unresolved_participant_count"))
+            or any(isinstance(data.get(name), list) and len(data[name]) > 1
+                   for name in ("participants", "recipients")))
+
+
 def _route_allowed(sender_allowed, meta):
-    if not sender_allowed(str(meta.get("sender") or "")):
-        return False
-    if meta.get("conversation_kind") != "group":
-        return True
-    participants = meta.get("participants")
-    return (isinstance(participants, list) and bool(participants)
-            and meta.get("sender") in participants
-            and all(isinstance(number, str) and re.fullmatch(r"\+[1-9]\d{6,14}", number)
-                    and sender_allowed(number) for number in participants))
+    return not unsupported_shape(meta) and sender_allowed(str(meta.get("sender") or ""))
 
 
 async def current_route_allowed(gateway, meta):
-    if not route_allowed(gateway, meta):
-        return False
-    if (meta.get("conversation_kind") != "group" or gateway.cfg.allow_all_users
-            or not gateway.cfg.allowed_users):
-        return True
-    return await asyncio.to_thread(
-        _current_group_allowed, gateway._identity, meta, gateway._sender_allowed)
-
-
-def _current_group_allowed(identity, meta, sender_allowed):
-    conversation = require_method(identity, "get_whatsapp_conversation")(meta["conversation_id"])
-    return (_same_uuid(field(conversation, "id"), meta["conversation_id"])
-            and str(field(conversation, "agent_identity_id")) == str(identity.id)
-            and field(conversation, "is_group") is True
-            and not field(conversation, "unresolved_participant_count", 0)
-            and _route_allowed(sender_allowed, {**meta, "participants": field(conversation, "participants")}))
+    return route_allowed(gateway, meta)
 
 
 async def receive(gateway, envelope):
@@ -122,22 +115,22 @@ async def receive(gateway, envelope):
     sender = str(message.get("sender_number") or "")
     identity = gateway._identity
     participants = message.get("participants") or []
-    is_group = message.get("is_group") is True
     if (
-        not message_id
+        unsupported_shape(message)
+        or not message_id
         or not event_id
         or not conversation
         or message.get("direction") != "inbound"
         or not isinstance(participants, list)
         or not participants
-        or any(not isinstance(number, str) or re.fullmatch(r"\+[1-9]\d{6,14}", number) is None for number in participants)
+        or any(not isinstance(number, str) or re.fullmatch(r"\+[1-9][0-9]{6,14}", number) is None for number in participants)
         or sender not in participants
-        or (not is_group and (len(participants) != 1 or sender != message.get("remote_number")))
+        or len(participants) != 1 or sender != message.get("remote_number")
         or sender == message.get("local_number")
         or str(message.get("agent_identity_id") or "") != str(identity.id)
     ):
         return web.json_response({"ok": True, "ignored": "unsupported-message"})
-    if not gateway._sender_allowed(sender) or (is_group and any(not gateway._sender_allowed(number) for number in participants)):
+    if not gateway._sender_allowed(sender):
         return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
     text = str(message.get("content") or "")
     media = message.get("media") or []
@@ -176,7 +169,7 @@ async def receive(gateway, envelope):
             resolved_id=gateway._contact_id(contact),
         )
         memories = gateway._webhook_contact_memories(payload_contact)
-        chat_id = gateway._thread_key("whatsapp", conversation) if is_group else gateway._chat_key(
+        chat_id = gateway._chat_key(
             data,
             sender,
             gateway._thread_key("whatsapp", conversation),
@@ -194,14 +187,14 @@ async def receive(gateway, envelope):
             "sender": sender,
             "contact": contact,
             "agent_identity": None
-            if contact or is_group
+            if contact
             else gateway._single_agent_identity(
                 gateway._webhook_list(
                     data, "agent_identities", "agentIdentities", "identity_agents"
                 )
             ),
             "contact_memories": memories,
-            "conversation_kind": "group" if is_group else "direct",
+            "conversation_kind": "direct",
             "participants": participants,
             "reply_to_message_id": message.get("reply_to_message_id"),
             "thread_id": message.get("thread_id"),
@@ -277,11 +270,10 @@ def _specifications():
         ),
         (
             "inkbox_send_whatsapp",
-            "Send a requested direct or dedicated-line group WhatsApp message, automatically quoting the active ordinary source when sending to its conversation only if idempotency_key is omitted. With an explicit key and no explicit quote, only a known retained quote is restored; an unknown key preserves legacy plain-send behavior. An explicit quote can select another visible message in that conversation. Your normal final response already replies automatically. Use one recipient or conversation; text and one owned media ID are optional individually. Preserve the returned request key and media ID after uncertainty; never retry as a new message.",
+            "Send a requested direct WhatsApp message, automatically quoting the active ordinary source when sending to its conversation only if idempotency_key is omitted. With an explicit key and no explicit quote, only a known retained quote is restored; an unknown key preserves legacy plain-send behavior. An explicit quote can select another visible message in that conversation. Your normal final response already replies automatically. Use one recipient or conversation; text and one owned media ID are optional individually. Preserve the returned request key and media ID after uncertainty; never retry as a new message.",
             {
-                "to": {"anyOf": [string("One E.164 recipient"), {"type": "array", "items": string("E.164 group participant"), "minItems": 1, "maxItems": 8, "uniqueItems": True}], "description": "One number, or 2-8 unique numbers for a new group. Existing groups use conversation_id."},
+                "to": {**string("One E.164 recipient; arrays are not supported"), "pattern": r"^\+[1-9][0-9]{6,14}$"},
                 "reply_to_message_id": string("Optional visible message ID to quote; defaults to the active ordinary source for its conversation only when idempotency_key is omitted. With an explicit key, omission restores only a known retained quote; an unknown key stays plain"),
-                "group_name": {**string("Creation hint for a new group; not a rename"), "minLength": 1, "maxLength": 100},
                 "conversation_id": string(
                     "Existing conversation; mutually exclusive with to"
                 ),
@@ -294,8 +286,7 @@ def _specifications():
         (
             "inkbox_list_whatsapp_conversations",
             "List WhatsApp conversations with local unread counts.",
-            {"limit": integer, "offset": {"type": "integer", "minimum": 0},
-             "include_groups": {"type": "boolean", "description": "Include group conversations; defaults to false"}},
+            {"limit": integer, "offset": {"type": "integer", "minimum": 0}},
             [],
             "list_whatsapp_conversations",
         ),
@@ -363,7 +354,7 @@ next(tool for tool in TOOLS if tool["name"] == "inkbox_send_whatsapp")["inputSch
 
 
 def _send_arguments(args):
-    recipient, conversation, reply_target, group_name = send_selector(args)
+    recipient, conversation, reply_target = send_selector(args)
     text = args.get("text")
     if text is not None and (not isinstance(text, str) or len(text) > 4000):
         raise ValueError("WhatsApp text must be at most 4000 characters")
@@ -378,7 +369,7 @@ def _send_arguments(args):
     if key is not None and (not isinstance(key, str) or not key.strip() or len(key) > 255
                             or not key.isascii() or not key.isprintable()):
         raise ValueError("idempotency_key must contain 1–255 printable ASCII characters")
-    return recipient, conversation, reply_target, group_name, text, media_id, key
+    return recipient, conversation, reply_target, text, media_id, key
 
 
 def _same_uuid(left, right):
@@ -405,22 +396,14 @@ def _source_bound(owner, recipient, conversation):
         return False
     if conversation:
         return _same_uuid(owner.get("conversation_id"), conversation)
-    recipients = recipient if isinstance(recipient, list) else [recipient]
     if route.get("conversation_kind") == "group":
         return False
-    return recipients == [route.get("sender")]
-
-
-def group_creation_send(send):
-    payload = send.get("payload") or {}
-    recipients = payload.get("to")
-    return (isinstance(recipients, list) and len(recipients) > 1
-            and not payload.get("conversation_id") and not send.get("source_reply"))
+    return recipient == route.get("sender")
 
 
 def _legacy_payload_matches(owner, key, previous, payload):
     """Prove a missing selector from the quote contract or exact historical hash."""
-    if not payload:
+    if not payload or unsupported_shape(owner.get("route_meta") or {}) or isinstance(payload.get("to"), list) or unsupported_shape(payload):
         return False
     payload = {k: v for k, v in payload.items() if k != "idempotency_key"}
     expected = {"text": previous.get("text")}
@@ -434,22 +417,17 @@ def _legacy_payload_matches(owner, key, previous, payload):
         return payload == {**expected, "conversation_id": owner["conversation_id"],
                            "reply_to_message_id": quote}
     recipient, conversation = payload.get("to"), payload.get("conversation_id")
-    group_name = payload.get("group_name")
     expected["conversation_id" if conversation else "to"] = conversation or recipient
-    if group_name is not None:
-        expected["group_name"] = group_name
     if payload != expected:
         return False
     if conversation and conversation != owner.get("conversation_id"):
         return False
-    if not conversation and not isinstance(recipient, list):
+    if not conversation:
         # The old scalar-recipient hash omitted `to`; source ownership supplies
         # that value only for a direct sender, never for a group or other peer.
         if not _source_bound(owner, recipient, None):
             return False
     material = [owner["nonce"], conversation, previous.get("text"), media_id]
-    if group_name or isinstance(recipient, list):
-        material += [recipient, None, group_name]
     return key == "codex-wa-" + hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
 
@@ -503,38 +481,6 @@ def _retained_legacy_key(owner, payload, key):
     return key
 
 
-def _retained_group_key(owner, payload, key, legacy_key):
-    """Recover only an existing intent, never infer a conversation from members."""
-    retained_key = None
-    for saved_key, previous in (owner.get("whatsapp_tool_sends") or {}).items():
-        saved = previous.get("payload")
-        fields_match = (previous.get("text") == payload.get("text")
-                        and previous.get("media_id") == next(iter(payload.get("media_ids") or []), None)
-                        and previous.get("quote_target") is None)
-        if saved is not None:
-            matches = {k: v for k, v in saved.items() if k != "idempotency_key"} == payload
-        else:
-            # Older checkpoints lack a selector; only their exact derived key
-            # can establish which request the retained fields describe.
-            matches = saved_key == legacy_key and fields_match
-        if previous.get("state") == "sending" and (matches or (saved is None and fields_match)):
-            error = ValueError("An earlier WhatsApp send is unconfirmed; use its original key for read-only lookup")
-            error.idempotency_key = saved_key
-            error.whatsapp_media_id = previous.get("media_id")
-            raise error
-        if saved_key == key and not matches:
-            error = ValueError("A retained WhatsApp request key must keep its original message")
-            error.idempotency_key = saved_key
-            error.whatsapp_media_id = previous.get("media_id")
-            raise error
-        if not matches:
-            continue
-        if saved_key == key or (key is None and previous.get("state") in {"accepted", "rejected"}
-                                and not previous.get("independent_group")):
-            retained_key = saved_key
-    return retained_key
-
-
 def run_tool(client, identity_handle, name, args):
     """Resolve fresh capability and delegate policy to the identity-scoped SDK."""
     from .tools import _imessage_active_context, _json_safe
@@ -542,11 +488,20 @@ def run_tool(client, identity_handle, name, args):
     from .config import read_config
 
     operation = OPERATIONS[name]
+    if any(name.startswith("group_") or name in {"groupName", "is_group", "isGroup", "unresolved_participant_count", "include_groups"} for name in args):
+        raise ValueError("WhatsApp supports direct messages only")
     if operation == "send_whatsapp":
-        recipient, conversation, reply_target, group_name, text, media_id, key = _send_arguments(args)
+        recipient, conversation, reply_target, text, media_id, key = _send_arguments(args)
     mutation = operation in {"send_whatsapp", "upload_whatsapp_media", "send_whatsapp_reaction", "remove_whatsapp_reaction"}
     origin = capture(identity_handle, read_config()) if mutation else None
     owner = _imessage_active_context(identity_handle)
+    if mutation and owner:
+        route = owner.get("route_meta") or {}
+        if (route.get("channel") == "whatsapp" and unsupported_shape(route)) or unsupported_shape(owner):
+            for saved_key, previous in (owner.get("whatsapp_tool_sends") or {}).items():
+                if unsupported_shape({"whatsapp_tool_sends": {saved_key: previous}}):
+                    raise _legacy_recovery_error(saved_key, previous)
+            raise ValueError("Retained WhatsApp group routes cannot send; use read-only lookup")
     identity = client.get_identity(identity_handle)
     if operation in V2_OPERATIONS:
         def authorize_v2():
@@ -573,35 +528,16 @@ def run_tool(client, identity_handle, name, args):
         if owner:
             from .imessage import _active_context
             owner = _active_context(owner)
+            if ((owner.get("route_meta") or {}).get("channel") == "whatsapp"
+                    and unsupported_shape(owner.get("route_meta") or {})) or unsupported_shape(owner):
+                raise ValueError("Retained WhatsApp group routes cannot send; use read-only lookup")
             legacy_payload = {"text": text, "conversation_id" if conversation else "to": conversation or recipient}
             if media_id:
                 legacy_payload["media_ids"] = [media_id]
             if reply_target is not None:
                 legacy_payload["reply_to_message_id"] = reply_target
-            if group_name is not None:
-                legacy_payload["group_name"] = group_name
             key = _retained_legacy_key(owner, legacy_payload, key)
         context = owner if _source_bound(owner, recipient, conversation) else None
-        source_context = context
-        independent_group = False
-        if (owner and (owner.get("route_meta") or {}).get("channel") == "whatsapp"
-                and isinstance(recipient, list) and len(recipient) > 1 and context is None):
-            payload = {"to": recipient, "text": text}
-            if media_id:
-                payload["media_ids"] = [media_id]
-            if group_name is not None:
-                payload["group_name"] = group_name
-            legacy_key = "codex-wa-" + hashlib.sha256(json.dumps([
-                owner["nonce"], conversation, text, args.get("media_id"), recipient, reply_target, group_name,
-            ], sort_keys=True).encode()).hexdigest()
-            retained_key = _retained_group_key(owner, payload, key, legacy_key)
-            if retained_key:
-                context, key = owner, retained_key
-                independent_group = bool((owner.get("whatsapp_tool_sends") or {}).get(key, {}).get("independent_group"))
-            else:
-                context = owner
-                independent_group = True
-                key = key or "codex-wa-" + uuid.uuid4().hex
         if owner and key in (owner.get("whatsapp_tool_sends") or {}) and context is None:
             raise ValueError("A retained WhatsApp request key must keep its original message")
         if context and conversation and reply_target is None:
@@ -616,34 +552,18 @@ def run_tool(client, identity_handle, name, args):
                 # An unrecognized caller key may recover an older plain send.
                 # Only an exact retained intent can restore its quote.
         if key is None:
+            # Preserve the historical quoted-send hash, including its final null.
             key = "codex-wa-" + (hashlib.sha256(json.dumps([
                 context["nonce"], conversation, text, args.get("media_id"),
-                *([recipient, reply_target, group_name] if reply_target or group_name or isinstance(recipient, list) else []),
+                *([recipient, reply_target, None] if reply_target else []),
             ], sort_keys=True).encode()).hexdigest() if context else uuid.uuid4().hex)
         kwargs = {"text": text, "idempotency_key": key}
         if reply_target is not None:
             kwargs["reply_to_message_id"] = reply_target
-        if group_name is not None:
-            kwargs["group_name"] = group_name
         kwargs["conversation_id" if conversation else "to"] = conversation or recipient
         if media_id:
             kwargs["media_ids"] = [media_id]
         method = require_method(identity, operation)
-        cfg = read_config()
-        if (isinstance(recipient, list) and len(recipient) > 1 and not cfg.allow_all_users
-                and cfg.allowed_users and any(number not in cfg.allowed_users for number in recipient)):
-            raise PermissionError("WhatsApp conversation participants are not allowed")
-        route = (context or {}).get("route_meta") or {}
-        if independent_group:
-            route = {}
-        if route.get("conversation_kind") == "group":
-            if not cfg.allow_all_users and cfg.allowed_users:
-                def sender_allowed(number):
-                    return number in cfg.allowed_users
-                if (not _route_allowed(sender_allowed, route)
-                        or not _current_group_allowed(identity, route, sender_allowed)):
-                    raise PermissionError("WhatsApp conversation participants are not allowed")
-        # Membership reads can outlive the source that authorized this send.
         if owner and (owner.get("route_meta") or {}).get("channel") == "whatsapp":
             from .imessage import validate_tool_target
             validate_tool_target(owner, owner["conversation_id"], None)
@@ -659,7 +579,7 @@ def run_tool(client, identity_handle, name, args):
         validate(origin)
         if context:
             from .imessage import checkpoint_whatsapp_tool_send
-            checkpoint_whatsapp_tool_send(context, key, independent_group=independent_group, state="sending", text=text, media_id=args.get("media_id"), quote_target=reply_target, payload=kwargs)
+            checkpoint_whatsapp_tool_send(context, key, state="sending", text=text, media_id=args.get("media_id"), quote_target=reply_target, payload=kwargs)
         validate(origin)
         args["idempotency_key"] = key
         try:
@@ -670,14 +590,11 @@ def run_tool(client, identity_handle, name, args):
             raise
         if context:
             from .imessage import record_accepted_tool_send, record_tool_send
-            confirmed_source = bool(not source_context and isinstance(recipient, list)
-                and _same_uuid(getattr(sent, "conversation_id", None), owner.get("conversation_id")))
             target = next(iter(context.get("admitted_source_ids") or []), None)
             try:
-                if source_context or confirmed_source:
-                    record_accepted_tool_send(context, sent, key, text=text, target=target)
-                    record_tool_send(context, sent, key, text=text, target=target)
-                checkpoint_whatsapp_tool_send(context, key, source_reply=confirmed_source, state="accepted", text=text, media_id=args.get("media_id"), quote_target=reply_target, payload=kwargs)
+                record_accepted_tool_send(context, sent, key, text=text, target=target)
+                record_tool_send(context, sent, key, text=text, target=target)
+                checkpoint_whatsapp_tool_send(context, key, state="accepted", text=text, media_id=args.get("media_id"), quote_target=reply_target, payload=kwargs)
             except Exception:
                 logger.warning("WhatsApp accepted; local tracking needs recovery. Do not resend.")
         result = _json_safe(sent)

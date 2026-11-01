@@ -636,6 +636,10 @@ class ContactSession:
     async def handle_inbound(self, text: str, mode: str, meta: Dict[str, Any]) -> None:
         """Admit source-aware input before it can be buffered or consumed."""
         meta = deepcopy(meta or {})
+        if mode == "whatsapp":
+            from .whatsapp import unsupported_shape
+            if unsupported_shape(meta):
+                return
         tracked = (self._threaded_imessage(mode) and not meta.get("companion")
                    and (mode == "whatsapp" or not meta.get("reaction")))
         if tracked:
@@ -665,13 +669,17 @@ class ContactSession:
             bool: Whether the input remains owned by the turn queue.
         """
         meta = dict(meta or {})
+        if mode == "whatsapp":
+            from .whatsapp import unsupported_shape
+            if unsupported_shape(meta):
+                return False
         raw_text = str(meta.get("raw_text", text))
         command = None if meta.get("reaction") else _control_command(raw_text)
         if mode == "slack" and meta.get("slack_native_stop") and command == "stop":
             self.mode, self.reply_meta = mode, meta
             await self._stop_turn()
             return False
-        is_group = mode in {"sms", "imessage", "slack", "whatsapp"} and meta.get("conversation_kind") == "group"
+        is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
         pending_reply = (self.pending is not None and not self.pending.future.done()
                          and not meta.get("reaction"))
         active_mode, active_meta = self._pending_reply_route or self._reply_route(

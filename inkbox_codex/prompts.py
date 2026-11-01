@@ -395,7 +395,7 @@ def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
             header += "\nYour normal final response replies here automatically without a quote. A reaction is context, not a command; reply only if warranted. [SILENT] sends nothing."
         else:
             header += "\nYour normal final response replies here automatically and quotes the triggering message, not its parent."
-        header += " Keep it within 4000 characters; summarize longer results. Do not also send it with a tool. Explicit tools support groups, visible quoted replies, and reactions. WhatsApp typing, remote read receipts, and voice calls are not supported."
+        header += " Keep it within 4000 characters; summarize longer results. Do not also send it with a tool. Explicit tools support direct messages, visible quoted replies, and reactions. WhatsApp typing, remote read receipts, and voice calls are not supported."
     elif mode == "imessage":
         conversation_id = str(meta.get("conversation_id") or "").strip()
         conversation_part = f" conversation_id={conversation_id}" if conversation_id else ""

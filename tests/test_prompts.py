@@ -9,7 +9,7 @@ from inkbox_codex.prompts import (
 )
 
 
-@pytest.mark.parametrize("kind", ["direct", "group"])
+@pytest.mark.parametrize("kind", ["direct"])
 def test_whatsapp_ordinary_frame_quotes_trigger_not_parent(kind):
     framed = frame_inbound("whatsapp", {
         "conversation_kind": kind,

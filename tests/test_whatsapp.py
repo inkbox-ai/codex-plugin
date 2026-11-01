@@ -28,9 +28,9 @@ NOW = "2026-01-01T00:00:00+00:00"
 def message(**changes):
     return {"id": MESSAGE, "agent_identity_id": IDENTITY, "conversation_id": CONVERSATION,
             "direction": "inbound", "local_number": "+15550000001", "remote_number": "+15550000002",
-            "sender_number": "+15550000002", "participants": ["+15550000002"], "is_group": False,
+            "sender_number": "+15550000002", "participants": ["+15550000002"],
             "content": "Question", "media": [], "status": "received", "delivery_state": None,
-            "recipients": [], "is_read": False, "created_at": NOW, "updated_at": NOW, **changes}
+            "recipients": [{"remote_number": "+15550000002", "delivery_status": "queued", "delivery_state": "pending"}], "is_read": False, "created_at": NOW, "updated_at": NOW, **changes}
 
 
 def media():
@@ -48,8 +48,8 @@ def sdk(monkeypatch, tmp_path):
                failure_detail={"error": "whatsapp_send_pending"},
                conversation_status=200, on_conversation_read=lambda: None)
     state.conversation = {"id": CONVERSATION, "agent_identity_id": IDENTITY,
-        "local_number": "+15550000001", "remote_number": None, "is_group": True,
-        "participants": ["+15550000002", "+15550000003"], "created_at": NOW, "updated_at": NOW}
+        "local_number": "+15550000001", "remote_number": "+15550000002",
+        "participants": ["+15550000002"], "created_at": NOW, "updated_at": NOW}
 
     def handle(request):
         assert request.url.host == "example.com"
@@ -66,14 +66,7 @@ def sdk(monkeypatch, tmp_path):
             state.on_conversation_read()
             return httpx.Response(state.conversation_status, json=state.conversation)
         if path == "/api/v1/whatsapp/conversations":
-            groups = request.url.params.get("include_groups") == "true"
-            return httpx.Response(200, json=[{
-                "id": CONVERSATION, "agent_identity_id": IDENTITY,
-                "local_number": "+15550000001", "remote_number": None,
-                "participants": [f"+15550000{n:03d}" for n in range(2, 11)],
-                "is_group": True, "created_at": NOW, "updated_at": NOW,
-                "latest_has_media": False, "unread_count": 1, "total_count": 1,
-            }] if groups else [])
+            return httpx.Response(200, json=[])
         if request.method == "POST" and path == "/api/v1/whatsapp/messages":
             state.calls.append(request)
             if state.status != 201:
@@ -282,7 +275,7 @@ def test_status_includes_independent_limits_without_breaking_older_api(sdk):
     assert status["enabled"] and "limits" not in status
 
 
-@pytest.mark.parametrize("selector", [{"conversation_id": CONVERSATION}, {"to": "+15550000002"}, {"to": " +1 (555) 000-0002 "}])
+@pytest.mark.parametrize("selector", [{"conversation_id": CONVERSATION}, {"to": "+15550000002"}])
 def test_uncertain_source_tool_send_fences_final_and_survives_recovery(sdk, monkeypatch, selector):
     async def run():
         gw = bridge(sdk)
@@ -319,7 +312,7 @@ def test_uncertain_source_tool_send_fences_final_and_survives_recovery(sdk, monk
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("selector", [{"conversation_id": CONVERSATION}, {"to": "+15550000002"}, {"to": " +1 (555) 000-0002 "}])
+@pytest.mark.parametrize("selector", [{"conversation_id": CONVERSATION}, {"to": "+15550000002"}])
 @pytest.mark.parametrize("status,code", [(429, "whatsapp_daily_limit_exceeded"), (422, "whatsapp_reply_required_for_email_addresses")])
 def test_known_rejected_source_send_can_retry_the_original_key(sdk, monkeypatch, selector, status, code):
     async def run():

@@ -139,12 +139,12 @@ def test_foreign_control_during_delivery_preserves_host_and_original_route(comma
         session, sent, _ = make_session(enabled=False, send=send)
         session.resume_session_id = "existing-conversation"
         client = session._client
-        await session.handle_inbound("Request", origin, source(1, conversation_kind="group"))
+        await session.handle_inbound("Request", origin, source(1, conversation_kind="direct"))
         session._flush_imessage_burst()
         await sending.wait()
         assert session._current_turn is None and session._delivering_turn is not None
         await session.handle_inbound(command, incoming, source(
-            2, sender="+15555550124", raw_text=command, conversation_kind="group",
+            2, sender="+15555550124", raw_text=command, conversation_kind="direct",
         ))
         assert session.resume_session_id == "existing-conversation"
         assert session._client is client and session._resume_task is None
@@ -173,50 +173,6 @@ def test_foreign_control_cannot_discard_a_buffered_other_channel(command, origin
         assert session._resume_task is None and not sent
         await finish_burst(session)
         assert len(client.calls) == 1 and sent[0][1] == origin
-
-    asyncio.run(scenario())
-
-
-def test_stop_own_queued_work_while_other_author_runs_preserves_other_work_and_tombstones(channel):
-    async def scenario():
-        session = gateway_session(channel.gateway)
-        client = session._client
-        client.gate = asyncio.Event()
-        group = {"channel": "whatsapp", "conversation_id": CONVERSATION,
-                 "conversation_kind": "group", "participants": ["+15550000002", "+15550000003"]}
-        own = {**group, "sender": "+15550000002", "message_id": MESSAGE,
-               "imessage_event_id": "own-queued"}
-        other = {**group, "sender": "+15550000003", "message_id": str(UUID(int=20)),
-                 "imessage_event_id": "other-running"}
-        await session.handle_inbound("Other active task", "whatsapp", other)
-        session._flush_imessage_burst()
-        await client.started.wait()
-        await session.handle_inbound("Own queued task", "whatsapp", own)
-        session._flush_imessage_burst()
-        remaining = {**other, "message_id": str(UUID(int=21)), "imessage_event_id": "other-queued"}
-        await session.handle_inbound("Other queued task", "whatsapp", remaining)
-        session._flush_imessage_burst()
-        stop = {**own, "message_id": str(UUID(int=22)), "imessage_event_id": "stop-own",
-                "raw_text": "/stop"}
-        # Keep this author-control test independent of transport group preflights.
-        session.send_fn = AsyncMock()
-        await session.handle_inbound("/stop", "whatsapp", stop)
-        assert client.interrupts == 0 and not client.gate.is_set()
-        assert [turn.reply_meta["imessage_event_id"] for turn in session._queue._queue] == ["other-queued"]
-        assert session.send_fn.call_args.args[1] == "Stopped."
-        store = channel.gateway._channel_store("whatsapp")
-        assert store.summary()["cancelled"] == 1 and store.summary()["done"] == 1
-        before = session.send_fn.call_count
-        await session.handle_inbound("/stop", "whatsapp", stop)
-        await session.handle_inbound("Own queued task", "whatsapp", own)
-        assert session.send_fn.call_count == before
-        assert session._imessage_burst is None and session._queue.qsize() == 1
-        client.gate.set()
-        await session._worker
-        assert len(client.calls) == 2
-        assert all("Own queued task" not in text for text in client.calls)
-        assert not store.replay_pending()
-        await session.close()
 
     asyncio.run(scenario())
 
@@ -275,11 +231,11 @@ def test_foreign_clear_cannot_enter_between_model_completion_and_delivery(monkey
 
         monkeypatch.setattr(session, "_typing_loop", typing_loop)
         monkeypatch.setattr(client, "run", model)
-        await session.handle_inbound("Request", "whatsapp", source(1, conversation_kind="group"))
+        await session.handle_inbound("Request", "whatsapp", source(1, conversation_kind="direct"))
         session._flush_imessage_burst()
         await asyncio.wait_for(draining.wait(), timeout=1)
         await session.handle_inbound("/clear", "whatsapp", source(
-            2, raw_text="/clear", sender="+15555550124", conversation_kind="group",
+            2, raw_text="/clear", sender="+15555550124", conversation_kind="direct",
         ))
         assert session.resume_session_id == "existing-conversation"
         assert session._client is client and not sent
@@ -360,7 +316,6 @@ def test_reaction_explicit_send_uncertainty_fences_final_and_preserves_source_re
         await session.close()
 
     asyncio.run(scenario())
-
 
 
 def test_stop_acknowledgment_keeps_its_original_route_while_interrupt_is_held(channel, monkeypatch):

@@ -1,4 +1,4 @@
-"""Group, quote and reaction boundaries exercise the actual candidate SDK offline."""
+"""Direct-message, quote and reaction boundaries exercise the actual candidate SDK offline."""
 
 import asyncio
 import json
@@ -25,9 +25,9 @@ def channel(monkeypatch, tmp_path):
     state = NS(requests=[], reaction_status=201)
     state.message = {"id": MESSAGE, "agent_identity_id": IDENTITY, "conversation_id": CONVERSATION,
         "direction": "inbound", "local_number": "+15550000001", "remote_number": "+15550000002",
-        "sender_number": "+15550000002", "participants": ["+15550000002"], "is_group": False,
+        "sender_number": "+15550000002", "participants": ["+15550000002"],
         "content": "/stop do not replay this old text", "media": [], "status": "received", "delivery_state": None,
-        "recipients": [], "is_read": False, "is_blocked": False, "created_at": NOW, "updated_at": NOW}
+        "recipients": [{"remote_number": "+15550000002", "delivery_status": "queued", "delivery_state": "pending"}], "is_read": False, "is_blocked": False, "created_at": NOW, "updated_at": NOW}
     state.reaction = {"id": REACTION, "target_message_id": MESSAGE, "conversation_id": CONVERSATION,
         "agent_identity_id": IDENTITY, "direction": "inbound", "remote_number": "+15550000002",
         "reaction": "like", "custom_emoji": None, "emoji": "👍", "status": "applied", "revision": 2,
@@ -65,13 +65,13 @@ def channel(monkeypatch, tmp_path):
     state.client.close()
 
 
-def test_group_and_explicit_quote_use_bound_public_sdk(channel):
+def test_direct_and_explicit_quote_use_bound_public_sdk(channel):
     from inkbox_codex.whatsapp import run_tool
     def send(args):
         return run_tool(channel.client, "agent", "inkbox_send_whatsapp", args)
-    send({"to": ["+15550000003", "+15550000002"], "group_name": "Project", "text": "Hello", "idempotency_key": "group-one"})
+    send({"to": "+15550000002", "text": "Hello", "idempotency_key": "direct-one"})
     request = channel.requests[-1]
-    assert json.loads(request.content) == {"to": ["+15550000002", "+15550000003"], "group_name": "Project", "text": "Hello"}
+    assert json.loads(request.content) == {"to": "+15550000002", "text": "Hello"}
     send({"conversation_id": CONVERSATION, "reply_to_message_id": MESSAGE, "text": "Quoted", "idempotency_key": "quote-one"})
     request = channel.requests[-1]
     assert json.loads(request.content) == {"conversation_id": CONVERSATION, "reply_to_message_id": MESSAGE, "text": "Quoted"}
@@ -93,16 +93,6 @@ def test_thread_cursor_and_versioned_reaction_receipts_use_real_sdk(channel):
 def test_invalid_material_intent_is_rejected_before_write(args):
     with pytest.raises(ValueError):
         send_selector(args)
-
-
-def test_group_admission_is_conversation_scoped_and_preserves_quote_context(channel):
-    channel.message.update(is_group=True, participants=["+15550000002", "+15550000003"],
-        reply_to_message_id=OUTBOUND, thread_id=OUTBOUND, thread_root_message_id=OUTBOUND)
-    asyncio.run(receive(channel.gateway, {"id": "group-inbound", "data": {"message": channel.message}}))
-    body, mode, meta = channel.inbound.call_args.args
-    assert mode == "whatsapp" and meta["conversation_kind"] == "group"
-    assert meta["participants"] == channel.message["participants"] and meta["reply_to_message_id"] == OUTBOUND
-    assert channel.gateway.sessions.get.call_args.args[0] == channel.gateway._thread_key("whatsapp", CONVERSATION)
 
 
 @pytest.mark.parametrize("change", [{}, {"direction": "outbound"}, {"remote_number": None}, {"revision": 1}])
@@ -222,40 +212,4 @@ def test_cancelled_reaction_admission_releases_lock_and_receipt_for_retry(channe
         channel.inbound.assert_awaited_once()
         assert not channel.gateway._whatsapp_reaction_locks
 
-    asyncio.run(scenario())
-
-
-def test_group_stop_cancels_only_original_author_queued_work(monkeypatch, tmp_path):
-    from inkbox_codex.sessions import _Turn
-    from tests.test_sessions import make_session
-    monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
-    async def scenario():
-        session = make_session([])
-        own = {"channel": "whatsapp", "conversation_id": CONVERSATION, "conversation_kind": "group", "sender": "+15550000002", "message_id": MESSAGE}
-        other = {**own, "sender": "+15550000003", "message_id": OUTBOUND}
-        first = _Turn(text="Own task", reply_mode="whatsapp", reply_meta=own)
-        second = _Turn(text="Other participant task", reply_mode="whatsapp", reply_meta=other)
-        await session._queue.put(first)
-        await session._queue.put(second)
-        session.mode, session.reply_meta = "whatsapp", own
-        await session._stop_imessage(own)
-        assert list(session._queue._queue) == [second]
-        assert session._current_turn is None
-    asyncio.run(scenario())
-
-
-def test_group_reset_cannot_erase_another_author_queued_work(monkeypatch, tmp_path):
-    from inkbox_codex.sessions import _Turn
-    from tests.test_sessions import make_session
-    monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
-    async def scenario():
-        session = make_session([])
-        own = {"channel": "whatsapp", "conversation_id": CONVERSATION, "conversation_kind": "group", "sender": "+15550000002", "message_id": MESSAGE}
-        other = {**own, "sender": "+15550000003", "message_id": OUTBOUND, "raw_text": "/clear"}
-        first = _Turn(text="Queued task", reply_mode="whatsapp", reply_meta=own)
-        await session._queue.put(first)
-        session._reset_session = AsyncMock()
-        await session._handle_inbound("/clear", "whatsapp", other)
-        session._reset_session.assert_not_awaited()
-        assert list(session._queue._queue) == [first]
     asyncio.run(scenario())
