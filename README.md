@@ -1119,7 +1119,7 @@ Normal final answers reply to the original WhatsApp conversation automatically. 
 
 After an uncertain send, preserve its `idempotency_key` and `media_id`. Use `inkbox_lookup_whatsapp_send`, then `inkbox_get_whatsapp_message` to inspect the original result; do not upload again or choose a new key to recover it. Use one E.164 string to start a direct conversation; recipient arrays and comma-separated recipients are rejected. Existing direct conversations use `conversation_id`. Explicit `reply_to_message_id` quotes a visible message in that conversation. Thread reads and named/custom reactions have dedicated tools. New ordinary final replies quote the triggering message, not its quoted parent, and keep the original conversation destination. Source-conversation tool sends inherit that quote unless an explicit visible target is selected; explicit recipient or other-conversation sends keep their destination. Retained plain replies from earlier versions keep their original payload and request key. A supplied recovery key does not acquire a new automatic quote; only its retained intent restores a previous quote. Reaction-triggered replies remain plain. An explicit quoted reply is never automatically replaced by a plain response, including after a rejected or uncertain send. Reaction updates from peers are contextual signals, not new commands. Typing, voice and remote-read receipts are not supported. Local `inkbox_mark_whatsapp_read` only updates visible history.
 
-WhatsApp requires Inkbox SDK 0.7.24 or newer (below 1.0.0).
+WhatsApp requires Inkbox SDK 0.7.26 or newer (below 1.0.0). Until that release is published, use the reviewed source candidate; candidate checks do not verify a published-package install.
 
 ### WhatsApp direct-message update
 
