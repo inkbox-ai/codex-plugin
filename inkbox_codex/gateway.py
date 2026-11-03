@@ -1247,10 +1247,24 @@ class InkboxGateway:
             *,
             subscription_url: str = webhook_url,
         ) -> None:
-            existing = self._inkbox.webhooks.subscriptions.list(**owner_kw)
+            whatsapp = any(event.startswith("whatsapp.") for event in event_types)
+            lookup_kw = {**owner_kw, "scope": "identity"} if whatsapp else owner_kw
+            subscriptions = self._inkbox.webhooks.subscriptions
+            try:
+                existing = subscriptions.list(**lookup_kw)
+            except ValueError as exc:
+                if whatsapp and str(exc).startswith(
+                    "Identity-wide webhook subscriptions are not supported by this server yet."
+                ):
+                    logger.warning("WhatsApp subscriptions are not supported by this API yet")
+                    return
+                raise
             desired_families = {
                 event_type.split(".", 1)[0] for event_type in event_types
             }
+            if whatsapp and any(sub.url == subscription_url and set(event_types).issubset(sub.event_types)
+                                for sub in existing):
+                return
             for sub in existing:
                 if (
                     sub.url == subscription_url
@@ -1263,13 +1277,21 @@ class InkboxGateway:
                 if (
                     sub.url.split("?", 1)[0].endswith(DEFAULT_WEBHOOK_PATH)
                     and desired_families & existing_families
+                    and (not whatsapp or (existing_families <= desired_families
+                                          and sub.url == subscription_url))
                 ):
                     # Replace only this event channel. One identity may have
                     # separate iMessage and A2A subscriptions at the same URL.
                     self._inkbox.webhooks.subscriptions.delete(sub.id)
-            self._inkbox.webhooks.subscriptions.create(
-                url=subscription_url, event_types=event_types, **owner_kw
-            )
+            try:
+                subscriptions.create(url=subscription_url, event_types=event_types, **owner_kw)
+            except Exception as exc:
+                if whatsapp and getattr(exc, "status_code", None) == 409:
+                    # Another startup may have installed the same receiver.
+                    for sub in subscriptions.list(**lookup_kw):
+                        if sub.url == subscription_url and set(event_types).issubset(sub.event_types):
+                            return
+                raise
 
         if identity.mailbox is not None:
             _reconcile({"mailbox_id": identity.mailbox.id}, MAIL_EVENTS)
