@@ -145,9 +145,13 @@ async def receive(gateway, envelope):
             if item.get("status") == "unavailable":
                 text += "\n[WhatsApp attachment unavailable]"
                 continue
-            fresh = await asyncio.to_thread(
-                require_method(identity, "get_whatsapp_media"), item["id"]
-            )
+            try:
+                fresh = await asyncio.to_thread(
+                    require_method(identity, "get_whatsapp_media"), item["id"]
+                )
+            except Exception:
+                text += "\n[WhatsApp attachment unavailable; do not guess its contents]"
+                continue
             if field(fresh, "status") == "ready" and field(fresh, "url"):
                 refreshed.append(
                     {
@@ -158,8 +162,9 @@ async def receive(gateway, envelope):
                 )
             else:
                 text += "\n[WhatsApp attachment unavailable]"
+        image_paths = []
         body = await gateway._with_media(
-            text, refreshed, prefix=f"whatsapp-{message_id}"
+            text, refreshed, prefix=f"whatsapp-{message_id}", image_paths=image_paths
         )
         if refreshed and body == text:
             body += "\n[WhatsApp attachment could not be downloaded; its media ID remains available]"
@@ -200,8 +205,9 @@ async def receive(gateway, envelope):
             "thread_id": message.get("thread_id"),
             "thread_root_message_id": message.get("thread_root_message_id"),
             "whatsapp_reply_target": message_id,
-            "whatsapp_auto_reply_target": message_id,
             "media": bool(media),
+            "whatsapp_image_paths": image_paths,
+            "whatsapp_media_ids": [item["id"] for item in media if item.get("id")],
         }
         await gateway.sessions.get(chat_id).handle_inbound(body, "whatsapp", meta)
     except BaseException:
@@ -270,12 +276,12 @@ def _specifications():
         ),
         (
             "inkbox_send_whatsapp",
-            "Send a requested direct WhatsApp message, automatically quoting the active ordinary source when sending to its conversation only if idempotency_key is omitted. With an explicit key and no explicit quote, only a known retained quote is restored; an unknown key preserves legacy plain-send behavior. An explicit quote can select another visible message in that conversation. Your normal final response already replies automatically. Use one recipient or conversation; text and one owned media ID are optional individually. Preserve the returned request key and media ID after uncertainty; never retry as a new message.",
+            "Send a requested direct WhatsApp message. New sends are plain unless reply_to_message_id is explicit. Quote selectively to refer to an older message, distinguish requests, or identify an attachment. With an explicit recovery key, only a known retained quote is restored; an unknown key stays plain. Your normal final response already replies automatically. Use one recipient or conversation; text and one owned media ID are optional individually. Preserve the returned request key and media ID after uncertainty; never retry as a new message.",
             {
                 "to": {**string("One E.164 recipient; arrays are not supported"), "pattern": r"^\+[1-9][0-9]{6,14}$"},
-                "reply_to_message_id": string("Optional visible message ID to quote; defaults to the active ordinary source for its conversation only when idempotency_key is omitted. With an explicit key, omission restores only a known retained quote; an unknown key stays plain"),
+                "reply_to_message_id": string("Optional visible message ID to quote explicitly. Omit for a plain message. A recovery key restores only a known retained quote; an unknown key stays plain"),
                 "conversation_id": string(
-                    "Existing conversation; mutually exclusive with to"
+                    "Existing conversation; mutually exclusive with to. Omit both to reply in the active WhatsApp conversation"
                 ),
                 "text": {**string("Message text"), "maxLength": 4000},
                 "media_id": string("Owned ID returned by upload"),
@@ -380,7 +386,7 @@ def _same_uuid(left, right):
 
 
 def auto_reply_kwargs(meta):
-    """Only newly admitted ordinary sources opt in; retained plain intents stay plain."""
+    """Preserve the quote on historical saved replies; fresh input stays plain."""
     target = meta.get("whatsapp_auto_reply_target")
     if not target or meta.get("reaction") or meta.get("reaction_id"):
         return {}
@@ -488,6 +494,10 @@ def run_tool(client, identity_handle, name, args):
     from .config import read_config
 
     operation = OPERATIONS[name]
+    owner = _imessage_active_context(identity_handle)
+    if (operation == "send_whatsapp" and "to" not in args and "conversation_id" not in args
+            and owner and (owner.get("route_meta") or {}).get("channel") == "whatsapp"):
+        args["conversation_id"] = owner.get("conversation_id")
     if any(name.startswith("group_") or name in {"groupName", "is_group", "isGroup", "unresolved_participant_count", "include_groups"} for name in args):
         raise ValueError("WhatsApp supports direct messages only")
     if operation == "send_whatsapp":

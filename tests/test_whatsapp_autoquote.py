@@ -30,7 +30,7 @@ async def admitted_source(gw, **changes):
 
 
 @pytest.mark.parametrize("quoted", [False, True])
-def test_new_ordinary_final_quotes_trigger_not_parent_after_restart(sdk, quoted):
+def test_new_ordinary_final_stays_plain_after_restart(sdk, quoted):
     async def scenario():
         gw = bridge(sdk)
         changes = {}
@@ -45,10 +45,9 @@ def test_new_ordinary_final_quotes_trigger_not_parent_after_restart(sdk, quoted)
         await restarted._recover_imessage_inputs()
         assert len(sdk.calls) == 1
         assert json.loads(sdk.calls[0].content) == {
-            "conversation_id": CONVERSATION, "text": "Answer", "reply_to_message_id": MESSAGE}
+            "conversation_id": CONVERSATION, "text": "Answer"}
         expected_key = "codex-wa-" + hashlib.sha256(json.dumps([
-            gw.cfg.base_url, IDENTITY, CONVERSATION, meta["imessage_event_ids"], "Answer",
-            {"reply_to_message_id": MESSAGE}], sort_keys=True).encode()).hexdigest()
+            gw.cfg.base_url, IDENTITY, CONVERSATION, meta["imessage_event_ids"], "Answer"], sort_keys=True).encode()).hexdigest()
         assert sdk.calls[0].headers["Idempotency-Key"] == expected_key
         restarted.sessions.get.assert_not_called()
         await restarted._recover_imessage_inputs()
@@ -97,7 +96,7 @@ def test_legacy_pending_input_never_acquires_anchor_during_recovery(sdk):
     asyncio.run(scenario())
 
 
-def test_burst_anchors_first_source_in_original_conversation(sdk):
+def test_burst_stays_plain_in_original_conversation(sdk):
     async def scenario():
         gw = bridge(sdk)
         members = ["+15550000002"]
@@ -112,13 +111,13 @@ def test_burst_anchors_first_source_in_original_conversation(sdk):
         await gw.send_to_contact("contact", text, mode, meta)
         assert len(sdk.calls) == 1
         body = json.loads(sdk.calls[0].content)
-        assert body["reply_to_message_id"] == MESSAGE and body["conversation_id"] == CONVERSATION
+        assert "reply_to_message_id" not in body and body["conversation_id"] == CONVERSATION
         assert len(meta["imessage_sources"]) == 2
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("selector", ["source", "other-conversation", "recipient"])
-def test_tool_autoquote_respects_explicit_destination(sdk, monkeypatch, selector):
+def test_plain_tool_send_respects_explicit_destination(sdk, monkeypatch, selector):
     async def scenario():
         gw = bridge(sdk)
         meta = await admitted_source(gw, participants=["+15550000002"])
@@ -131,8 +130,6 @@ def test_tool_autoquote_respects_explicit_destination(sdk, monkeypatch, selector
         run_tool(sdk.client, "agent", "inkbox_send_whatsapp", {**args, "text": "Tool answer"})
         body = json.loads(sdk.calls[0].content)
         expected = {**args, "text": "Tool answer"}
-        if selector == "source":
-            expected["reply_to_message_id"] = MESSAGE
         assert body == expected
         suppressed = await gw._imessage_turn_state("contact", "result", meta, "Different final")
         assert suppressed is (selector == "source")
@@ -157,8 +154,8 @@ def test_quoted_tool_attempt_allows_only_confirmed_distinct_sends(sdk, monkeypat
         await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", args)
         first_count = len(sdk.calls)
         assert first_count >= 1
-        target = OUTBOUND if explicit else MESSAGE
-        assert all(json.loads(call.content)["reply_to_message_id"] == target for call in sdk.calls)
+        target = OUTBOUND if explicit else None
+        assert all(json.loads(call.content).get("reply_to_message_id") == target for call in sdk.calls)
         plain = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", {
             "to": "+15550000002", "text": "Additional detail", "idempotency_key": "new-key"})
         if status == 201:
@@ -176,7 +173,7 @@ def test_quoted_tool_attempt_allows_only_confirmed_distinct_sends(sdk, monkeypat
     asyncio.run(scenario())
 
 
-def test_automatic_quote_retry_keeps_same_payload_and_key_after_known_rejection(sdk, monkeypatch):
+def test_plain_retry_keeps_same_payload_and_key_after_known_rejection(sdk, monkeypatch):
     async def scenario():
         gw = bridge(sdk)
         meta = await admitted_source(gw)
@@ -192,7 +189,7 @@ def test_automatic_quote_retry_keeps_same_payload_and_key_after_known_rejection(
         assert len(sdk.calls) >= 2
         assert len({call.content for call in sdk.calls}) == 1
         assert len({call.headers["Idempotency-Key"] for call in sdk.calls}) == 1
-        assert json.loads(sdk.calls[-1].content)["reply_to_message_id"] == MESSAGE
+        assert "reply_to_message_id" not in json.loads(sdk.calls[-1].content)
     asyncio.run(scenario())
 
 
@@ -232,10 +229,11 @@ def test_unknown_recovery_key_stays_plain_even_in_new_anchored_turn(sdk, monkeyp
 
 
 @pytest.mark.parametrize("status", [409, 429])
-def test_automatic_quoted_failure_never_replays_as_plain_on_restart(sdk, status):
+def test_retained_quoted_failure_never_replays_as_plain_on_restart(sdk, status):
     async def scenario():
         gw = bridge(sdk)
         meta = await admitted_source(gw)
+        meta["whatsapp_auto_reply_target"] = MESSAGE
         store = gw._channel_store("whatsapp")
         store.admit("contact", "Question", meta)
         store.mark(meta, "reply_pending", reply="Answer")
@@ -262,7 +260,7 @@ def test_known_quoted_key_cannot_change_message_on_retry(sdk, monkeypatch):
         await gw._imessage_turn_state("contact", "admitted", meta, "Question")
         await gw._imessage_turn_state("contact", "started", meta)
         monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "contact")
-        args = {"conversation_id": CONVERSATION, "text": "Original answer"}
+        args = {"conversation_id": CONVERSATION, "text": "Original answer", "reply_to_message_id": MESSAGE}
         sdk.status, sdk.failure_detail = 429, {"error": "whatsapp_daily_limit_exceeded"}
         await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", args)
         args["idempotency_key"] = sdk.calls[-1].headers["Idempotency-Key"]

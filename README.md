@@ -207,7 +207,7 @@ before replying `DONE`.
 
 ## Slack preview
 
-Set `INKBOX_SLACK_ENABLED=true` to add Slack to the gateway. Inkbox SDK 0.7.24 or newer
+Set `INKBOX_SLACK_ENABLED=true` to add Slack to the gateway. Inkbox SDK 0.7.26 or newer
 includes the required Slack methods; the API must also support Slack. Connect a
 workspace to the same Inkbox identity to exchange messages; the receiver can
 start before installation.
@@ -328,7 +328,7 @@ verified Companion envelope. Explicit null/unknown access is ignored; older
 ordinary Slack webhooks without this field retain their existing behavior.
 
 Slack Companion requires an API environment supporting Slack initialization and
-**Python SDK 0.7.24 or newer**, the same SDK floor as the other channels.
+**Python SDK 0.7.26 or newer**, the same SDK floor as the other channels.
 No new setup wizard or permission setting is needed:
 
 ```text
@@ -492,7 +492,7 @@ and are unaffected by the Companion response setting.
   `@agent allow` or `@agent /stop`; on Slack, mention the native bot instead.
   Escalation prompts remind you of this.
 
-**SDK requirement:** The bridge requires Inkbox SDK **0.7.24 or newer** (below 1.0.0), including
+**SDK requirement:** The bridge requires Inkbox SDK **0.7.26 or newer** (below 1.0.0), including
 `client.companion.load_initialization` and `activation_messages`.
 An unsupported SDK produces an explicit webhook error; the bridge never falls
 back to submitting only the trigger.
@@ -1076,7 +1076,7 @@ Inbound A2A tasks acknowledge pickup immediately. While a task remains active,
 the worker sends a short progress update about every three minutes by default;
 these updates are visible in task history without starting a requester turn.
 
-The bridge requires Inkbox SDK 0.7.24 or newer (below 1.0.0).
+The bridge requires Inkbox SDK 0.7.26 or newer (below 1.0.0).
 
 On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 
@@ -1117,9 +1117,11 @@ WhatsApp supports direct conversations only for approved agents with a dedicated
 
 Normal final answers reply to the original WhatsApp conversation automatically. The tools support fresh channel status, direct sends, conversation/message reads, one attachment upload, renewed attachment access, local read state and lookup of an accepted send by its original request key. A send accepts text up to 4000 characters and one owned attachment ID. Check `inkbox_get_whatsapp_status` for the current attachment limit: 5 MiB by default, with a hard 20 MiB transport ceiling. Sending is not delivery confirmation; delivery notifications do not start a new model turn or automatically resend.
 
-After an uncertain send, preserve its `idempotency_key` and `media_id`. Use `inkbox_lookup_whatsapp_send`, then `inkbox_get_whatsapp_message` to inspect the original result; do not upload again or choose a new key to recover it. Use one E.164 string to start a direct conversation; recipient arrays and comma-separated recipients are rejected. Existing direct conversations use `conversation_id`. Explicit `reply_to_message_id` quotes a visible message in that conversation. Thread reads and named/custom reactions have dedicated tools. New ordinary final replies quote the triggering message, not its quoted parent, and keep the original conversation destination. Source-conversation tool sends inherit that quote unless an explicit visible target is selected; explicit recipient or other-conversation sends keep their destination. Retained plain replies from earlier versions keep their original payload and request key. A supplied recovery key does not acquire a new automatic quote; only its retained intent restores a previous quote. Reaction-triggered replies remain plain. An explicit quoted reply is never automatically replaced by a plain response, including after a rejected or uncertain send. Reaction updates from peers are contextual signals, not new commands. Typing, voice and remote-read receipts are not supported. Local `inkbox_mark_whatsapp_read` only updates visible history.
+After an uncertain send, preserve its `idempotency_key` and `media_id`. Use `inkbox_lookup_whatsapp_send`, then `inkbox_get_whatsapp_message` to inspect the original result; do not upload again or choose a new key to recover it. Use one E.164 string to start a direct conversation; recipient arrays and comma-separated recipients are rejected. Existing direct conversations use `conversation_id`. Explicit `reply_to_message_id` quotes a visible message in that conversation. Thread reads and named/custom reactions have dedicated tools. New ordinary replies and tool sends are plain chat messages. Use an explicit quote only to refer to an older message, distinguish multiple requests, or identify a specific attachment. Existing saved sends keep their original quote, payload, and request key during recovery. Reaction-triggered replies remain plain. An explicit quoted reply is never automatically replaced by a plain response, including after a rejected or uncertain send. Reaction updates from peers are contextual signals, not new commands. Typing, voice and remote-read receipts are not supported. Local `inkbox_mark_whatsapp_read` only updates visible history.
 
-WhatsApp requires Inkbox SDK 0.7.26 or newer (below 1.0.0). Until that release is published, use the reviewed source candidate; candidate checks do not verify a published-package install.
+Inbound images are attached to the native Codex turn, including photos without captions. Voice notes use the existing transcription credential when configured; unavailable transcripts are reported without guessing. Requested outgoing media uses `inkbox_upload_whatsapp_media` followed by `inkbox_send_whatsapp`; a local path in the final answer does not send a file.
+
+WhatsApp requires Inkbox SDK 0.7.26 or newer (below 1.0.0).
 
 ### WhatsApp direct-message update
 

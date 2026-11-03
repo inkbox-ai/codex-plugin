@@ -10,7 +10,7 @@ from inkbox_codex.prompts import (
 
 
 @pytest.mark.parametrize("kind", ["direct"])
-def test_whatsapp_ordinary_frame_quotes_trigger_not_parent(kind):
+def test_whatsapp_ordinary_frame_is_plain_with_selective_quotes(kind):
     framed = frame_inbound("whatsapp", {
         "conversation_kind": kind,
         "message_id": "00000000-0000-4000-8000-000000000001",
@@ -18,8 +18,8 @@ def test_whatsapp_ordinary_frame_quotes_trigger_not_parent(kind):
         "reply_to_message_id": "00000000-0000-4000-8000-000000000002",
     }, "hello")
 
-    assert "automatically and quotes the triggering message, not its parent" in framed
-    assert "without a quote" not in framed
+    assert "automatically without a quote" in framed
+    assert "explicit reply_to_message_id" in framed
     assert "Do not also send it with a tool" in framed
 
 
@@ -43,10 +43,10 @@ def test_whatsapp_send_tool_explains_keyed_quote_recovery():
     tool = next(tool for tool in TOOLS if tool["name"] == "inkbox_send_whatsapp")
     description = tool["description"]
     quote = tool["inputSchema"]["properties"]["reply_to_message_id"]["description"]
-    assert "only if idempotency_key is omitted" in description
+    assert "New sends are plain" in description
     assert "only a known retained quote is restored" in description
-    assert "unknown key preserves legacy plain-send behavior" in description
-    assert "only when idempotency_key is omitted" in quote
+    assert "unknown key stays plain" in description
+    assert "Omit for a plain message" in quote
     assert "restores only a known retained quote" in quote
     assert "unknown key stays plain" in quote
 

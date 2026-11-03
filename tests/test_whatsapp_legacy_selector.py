@@ -52,6 +52,10 @@ def test_opaque_plain_legacy_selector_never_guessed(sdk, monkeypatch, state, ret
     async def scenario():
         gw, original = await legacy(sdk, monkeypatch, state, {"conversation_id": CONVERSATION})
         before = snapshot(gw)
+        # Load the source authority before patching shared filesystem helpers.
+        # Otherwise a lazy import retains this test-only function after teardown.
+        from inkbox_codex import turn_authority
+        assert callable(turn_authority.validate)
         def no_rewrite(*args, **kwargs):
             pytest.fail("A blocked legacy retry must not rewrite its checkpoint or journal")
         monkeypatch.setattr(imessage, "_write_context", no_rewrite)

@@ -18,7 +18,7 @@ from typing import Any, Iterator
 _STATES = {"pending", "running", "reply_pending", "sending", "done", "cancelled", "uncertain", "failed"}
 _TERMINAL = {"done", "cancelled"}
 _ROUTE_FIELDS = {
-    "whatsapp_auto_reply_target",
+    "whatsapp_auto_reply_target", "whatsapp_image_paths", "whatsapp_media_ids", "media",
     "participants", "reaction", "reaction_id", "reaction_revision", "source_event_id", "whatsapp_explicit_quote_attempted", "whatsapp_reply_target", "whatsapp_idempotency_key", "channel", "conversation_id", "conversation_kind", "sender", "to", "message_id", "source_message_id",
     "reply_to_message_id", "thread_id", "thread_root_message_id",
     "imessage_event_id", "imessage_event_ids", "imessage_sources", "imessage_reply_target",
@@ -342,6 +342,12 @@ def checkpoint_whatsapp_tool_send(
             error = ValueError("An earlier WhatsApp send is unconfirmed; use its original key for read-only lookup")
             error.idempotency_key = pending[0]
             error.whatsapp_media_id = pending[1].get("media_id")
+            raise error
+        rejected = next(((key, send) for key, send in sends.items()
+                         if send.get("state") == "rejected" and key != idempotency_key), None)
+        if state == "sending" and rejected and idempotency_key not in sends:
+            error = ValueError("An earlier WhatsApp request was rejected; preserve its original key and payload")
+            error.idempotency_key = rejected[0]
             raise error
         if state == "sending" and not quote_target and current.get("whatsapp_explicit_quote_attempted"):
             quoted = {key: send for key, send in sends.items() if send.get("quote_target")}

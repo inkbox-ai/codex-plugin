@@ -31,7 +31,7 @@ jobs:
       - name: Install bridge + test deps
         run: |
           uv pip install --system \
-            "$(bash tests/ci/candidate_sdk.sh)" \
+            "inkbox==0.7.26" \
             -e . pytest
 
       # @alpha is the prerelease channel cut from codex main near-daily — the

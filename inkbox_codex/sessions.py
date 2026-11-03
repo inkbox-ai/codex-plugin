@@ -881,7 +881,7 @@ class ContactSession:
 
     def _collect_imessage(self, text: str, meta: Dict[str, Any]) -> None:
         key = self._imessage_compatible_key(meta)
-        if self._imessage_burst is not None and (key != self._imessage_burst_key or meta.get("attachments")):
+        if self._imessage_burst is not None and (key != self._imessage_burst_key or meta.get("attachments") or meta.get("media")):
             self._flush_imessage_burst()
         loop = asyncio.get_running_loop()
         if self._imessage_burst is None:
@@ -901,7 +901,7 @@ class ContactSession:
         turn.text = frame_inbound(turn.reply_mode, turn.reply_meta, "\n\n".join(self._imessage_burst_parts))
         if self._imessage_burst_task is not None:
             self._imessage_burst_task.cancel()
-        if meta.get("attachments") or meta.get("reaction"):
+        if meta.get("attachments") or meta.get("media") or meta.get("reaction"):
             self._flush_imessage_burst()
             return
         deadline = min(
@@ -1325,6 +1325,8 @@ class ContactSession:
                 client.turn_started = lambda thread_id, turn_id: bind(source, thread_id, turn_id)
                 run = client.run_detailed if turn.capture_tools else client.run
                 options = {"activity_handler": turn.activity_handler} if turn.activity_handler is not None else {}
+                if turn.reply_mode == "whatsapp" and (turn.reply_meta or {}).get("whatsapp_image_paths"):
+                    options["image_paths"] = list(turn.reply_meta["whatsapp_image_paths"])
                 return await run(turn.text, **options)
             operation = submit()
             if timeout:

@@ -237,15 +237,17 @@ class CodexAppServerClient:
         text: str,
         *,
         activity_handler: Optional[ActivityHandler] = None,
+        image_paths: Optional[list[str]] = None,
     ) -> str:
         """Run one turn in the current thread and return the final reply text."""
-        return (await self.run_detailed(text, activity_handler=activity_handler)).text
+        return (await self.run_detailed(text, activity_handler=activity_handler, image_paths=image_paths)).text
 
     async def run_detailed(
         self,
         text: str,
         *,
         activity_handler: Optional[ActivityHandler] = None,
+        image_paths: Optional[list[str]] = None,
     ) -> CodexTurnResult:
         """Run one turn and return its final reply and sanitized MCP outcomes."""
         if not self.thread_id:
@@ -254,7 +256,8 @@ class CodexAppServerClient:
 
         params = {
             "threadId": self.thread_id,
-            "input": [{"type": "text", "text": text}],
+            "input": [{"type": "text", "text": text},
+                      *({"type": "localImage", "path": path} for path in (image_paths or []))],
             "cwd": self.cfg.project_dir or None,
             "model": self.cfg.codex_model or None,
             "approvalPolicy": self.cfg.codex_approval_policy or "on-request",
