@@ -3,6 +3,7 @@ covers the dedicated number AND the shared iMessage line), with the
 number-scoped update only as a legacy-SDK fallback."""
 
 import types
+from inkbox_codex.whatsapp import EVENTS as WHATSAPP_EVENTS
 
 from inkbox_codex import gateway as gateway_mod
 from inkbox_codex.config import BridgeConfig, VoiceStack
@@ -188,10 +189,12 @@ def test_a2a_imessage_and_call_use_channel_coherent_subscriptions():
 
     assert [created["event_types"] for created in subscriptions.created] == [
         gateway_mod.A2A_EVENTS,
+        WHATSAPP_EVENTS,
         gateway_mod.IMESSAGE_EVENTS,
         gateway_mod.CALL_EVENTS,
     ]
     assert [created["url"] for created in subscriptions.created] == [
+        "https://agent.inkboxwire.com/webhook",
         "https://agent.inkboxwire.com/webhook",
         "https://agent.inkboxwire.com/webhook",
         "https://agent.inkboxwire.com/webhook",
@@ -215,6 +218,11 @@ def test_imessage_reconcile_preserves_existing_a2a_channel_subscription():
         {
             "agent_identity_id": "identity-1",
             "url": "https://agent.inkboxwire.com/webhook",
+            "event_types": WHATSAPP_EVENTS,
+        },
+        {
+            "agent_identity_id": "identity-1",
+            "url": "https://agent.inkboxwire.com/webhook",
             "event_types": gateway_mod.IMESSAGE_EVENTS,
         },
         {
@@ -232,4 +240,92 @@ def test_a2a_only_subscription_is_skipped_on_older_api():
         subscriptions=subscriptions,
     )
 
-    assert subscriptions.created == []
+    assert subscriptions.created == [{"agent_identity_id": "identity-1", "url": "https://agent.inkboxwire.com/webhook", "event_types": WHATSAPP_EVENTS}]
+
+
+def test_old_api_without_reactions_still_registers_direct_whatsapp_callbacks():
+    class OlderAPI(_FakeSubscriptions):
+        def create(self, **kwargs):
+            if "whatsapp.reaction_received" in kwargs["event_types"]:
+                raise ValueError("Unknown WhatsApp event type")
+            return super().create(**kwargs)
+    subscriptions = OlderAPI()
+    _patched_gateway(_Identity(phone=False, imessage=False), subscriptions=subscriptions)
+    assert any(row["event_types"] == WHATSAPP_EVENTS[:5] for row in subscriptions.created)
+    assert not any("whatsapp.reaction_received" in row["event_types"] for row in subscriptions.created)
+
+
+class _IdentityScopedWhatsAppSubscriptions(_FakeSubscriptions):
+    def __init__(self, rows, race=False):
+        super().__init__(rows)
+        self.lookups = []
+        self.race = race
+
+    def list(self, **kwargs):
+        if kwargs.get("scope") != "identity":
+            return []
+        self.lookups.append(kwargs)
+        if self.race and len(self.lookups) == 1:
+            return []
+        return list(self.existing)
+
+    def create(self, **kwargs):
+        if kwargs["event_types"][0].startswith("whatsapp."):
+            self.created.append(kwargs)
+            error = RuntimeError("Subscription conflict")
+            error.status_code = 409
+            raise error
+        return super().create(**kwargs)
+
+
+def test_whatsapp_scoped_lookup_adopts_mixed_receiver_and_race():
+    for race in (False, True):
+        rows = [types.SimpleNamespace(id="mixed", url="https://agent.inkboxwire.com/webhook",
+                                     event_types=[*WHATSAPP_EVENTS, "a2a.task.created"])]
+        subscriptions = _IdentityScopedWhatsAppSubscriptions(rows, race=race)
+        _patched_gateway(_Identity(phone=False), subscriptions=subscriptions)
+        assert subscriptions.deleted == []
+        assert len([row for row in subscriptions.created if row["event_types"] == WHATSAPP_EVENTS]) == int(race)
+        assert subscriptions.lookups == [{"agent_identity_id": "identity-1", "scope": "identity"}] * (1 + int(race))
+
+
+def test_whatsapp_incomplete_mixed_receiver_is_not_deleted_on_conflict():
+    import pytest
+    rows = [types.SimpleNamespace(id="mixed", url="https://agent.inkboxwire.com/webhook",
+                                 event_types=["whatsapp.sent", "a2a.task.created"])]
+    subscriptions = _IdentityScopedWhatsAppSubscriptions(rows)
+    with pytest.raises(RuntimeError, match="Subscription conflict"):
+        _patched_gateway(_Identity(phone=False), subscriptions=subscriptions)
+    assert subscriptions.deleted == []
+
+
+def test_whatsapp_unsupported_identity_scope_does_not_use_legacy_lookup():
+    class OlderAPI(_FakeSubscriptions):
+        def list(self, **kwargs):
+            if kwargs.get("scope") == "identity":
+                raise ValueError("Identity-wide webhook subscriptions are not supported by this server yet.")
+            return super().list(**kwargs)
+    subscriptions = OlderAPI()
+    _patched_gateway(_Identity(phone=False, imessage=True), subscriptions=subscriptions)
+    assert not any(row["event_types"] == WHATSAPP_EVENTS for row in subscriptions.created)
+    assert any(row["event_types"] == gateway_mod.IMESSAGE_EVENTS for row in subscriptions.created)
+
+
+def test_whatsapp_unrelated_lookup_failure_propagates():
+    import pytest
+    class BrokenAPI(_FakeSubscriptions):
+        def list(self, **kwargs):
+            if kwargs.get("scope") == "identity":
+                raise ValueError("Unexpected catalog value")
+            return []
+    with pytest.raises(ValueError, match="Unexpected catalog value"):
+        _patched_gateway(_Identity(phone=False), subscriptions=BrokenAPI())
+
+
+def test_whatsapp_foreign_receiver_is_not_deleted_on_conflict():
+    import pytest
+    rows = [types.SimpleNamespace(id="foreign", url="https://other.example/webhook", event_types=WHATSAPP_EVENTS)]
+    subscriptions = _IdentityScopedWhatsAppSubscriptions(rows)
+    with pytest.raises(RuntimeError, match="Subscription conflict"):
+        _patched_gateway(_Identity(phone=False), subscriptions=subscriptions)
+    assert subscriptions.deleted == []

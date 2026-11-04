@@ -27,6 +27,7 @@ SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 ApprovalHandler = Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
 ActivityHandler = Callable[[str, str], None]
+TurnStartedHandler = Callable[[str, str], None]
 
 
 class CodexAppServerError(RuntimeError):
@@ -131,6 +132,7 @@ class _TurnCapture:
     deltas: list[str] = field(default_factory=list)
     mcp_tool_calls: list["McpToolCallResult"] = field(default_factory=list)
     activity_handler: Optional[ActivityHandler] = None
+    turn_started: Optional[TurnStartedHandler] = None
 
 
 @dataclass(frozen=True)
@@ -172,6 +174,7 @@ class CodexAppServerClient:
         isolate_process_group: bool = False,
         process_env: Optional[Dict[str, str]] = None,
         process_started: Optional[Callable[[int], None]] = None,
+        turn_started: Optional[TurnStartedHandler] = None,
     ) -> None:
         self.cfg = cfg
         self.developer_instructions = developer_instructions
@@ -180,6 +183,7 @@ class CodexAppServerClient:
         self.tools_enabled = tools_enabled
         self._process_env = process_env
         self._process_started = process_started
+        self.turn_started = turn_started
         self._isolated_process_group = isolate_process_group and os.name == "posix"
         self._owns_process_group = os.name == "posix"
         self._process_group_id: Optional[int] = None
@@ -233,15 +237,17 @@ class CodexAppServerClient:
         text: str,
         *,
         activity_handler: Optional[ActivityHandler] = None,
+        image_paths: Optional[list[str]] = None,
     ) -> str:
         """Run one turn in the current thread and return the final reply text."""
-        return (await self.run_detailed(text, activity_handler=activity_handler)).text
+        return (await self.run_detailed(text, activity_handler=activity_handler, image_paths=image_paths)).text
 
     async def run_detailed(
         self,
         text: str,
         *,
         activity_handler: Optional[ActivityHandler] = None,
+        image_paths: Optional[list[str]] = None,
     ) -> CodexTurnResult:
         """Run one turn and return its final reply and sanitized MCP outcomes."""
         if not self.thread_id:
@@ -250,7 +256,8 @@ class CodexAppServerClient:
 
         params = {
             "threadId": self.thread_id,
-            "input": [{"type": "text", "text": text}],
+            "input": [{"type": "text", "text": text},
+                      *({"type": "localImage", "path": path} for path in (image_paths or []))],
             "cwd": self.cfg.project_dir or None,
             "model": self.cfg.codex_model or None,
             "approvalPolicy": self.cfg.codex_approval_policy or "on-request",
@@ -265,6 +272,7 @@ class CodexAppServerClient:
             turn_id="",
             future=loop.create_future(),
             activity_handler=activity_handler,
+            turn_started=self.turn_started,
         )
         try:
             await self._request("turn/start", params, turn_capture=capture)
@@ -602,6 +610,13 @@ class CodexAppServerClient:
                 capture.turn_id = turn_id
                 self._turns[turn_id] = capture
                 self._current_turn_id = turn_id
+                if capture.turn_started is not None:
+                    try:
+                        capture.turn_started(capture.thread_id, turn_id)
+                    except Exception as exc:
+                        future.set_exception(CodexAppServerError("Could not bind the submitted turn to its source"))
+                        logger.warning("Turn source binding failed: %s", type(exc).__name__)
+                        return
                 notifications = self._early_notifications.pop(turn_id, [])
             future.set_result(result)
             for notification in notifications:

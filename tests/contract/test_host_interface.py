@@ -178,7 +178,8 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def test_bridge_client_full_mock_turn(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_image", [False, True])
+def test_bridge_client_full_mock_turn(tmp_path, monkeypatch, with_image):
     """The bridge's own CodexAppServerClient completes a full turn against a
     real app-server thinking on the local mock model.
 
@@ -225,6 +226,15 @@ def test_bridge_client_full_mock_turn(tmp_path, monkeypatch):
     )
     client = CodexAppServerClient(cfg, developer_instructions="contract-test")
 
+    image = tmp_path / "input.png"
+    if with_image:
+        import struct
+        import zlib
+        def chunk(kind, data):
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        image.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+                          + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00")) + chunk(b"IEND", b""))
+
     async def _run() -> tuple[str, str, str, str]:
         try:
             thread_id = await client.connect()
@@ -233,7 +243,7 @@ def test_bridge_client_full_mock_turn(tmp_path, monkeypatch):
             await asyncio.sleep(0.1)
             assert model_requests == [], "context-only append started model generation"
             # Resuming a real turn returns its history in one JSON-RPC line.
-            await asyncio.wait_for(client.run("History seed: " + "x" * 100000), timeout=10)
+            await asyncio.wait_for(client.run("History seed: " + "x" * 100000, image_paths=[str(image)] if with_image else None), timeout=10)
         finally:
             await client.disconnect()
         # Resume the SAME thread from a fresh client — the bridge does exactly
@@ -271,6 +281,11 @@ def test_bridge_client_full_mock_turn(tmp_path, monkeypatch):
     assert resumed_id == thread_id, f"thread/resume reopened {resumed_id!r}, wanted {thread_id!r}"
     assert "REPLY_OK" in tool_free_reply
     assert len(model_requests) == 3
+    image_inputs = [part for item in model_requests[0]["input"]
+                    for part in item.get("content", []) if isinstance(part, dict) and part.get("type") == "input_image"]
+    assert bool(image_inputs) is with_image, str(model_requests[0]["input"])[-3000:]
+    if with_image:
+        assert image_inputs[0]["image_url"].startswith("data:image/png;base64,")
     assert "meeting moved to Saturday" in json.dumps(model_requests[1]["input"])
     assert model_requests[1]["tools"], "normal main turn unexpectedly lost its tools"
     assert model_requests[2]["tools"] == [], (

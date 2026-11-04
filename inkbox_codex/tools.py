@@ -943,6 +943,9 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
         return client.get_identity(identity_handle)
 
     def _run() -> Any:
+        from .whatsapp import OPERATIONS, run_tool
+        if name in OPERATIONS:
+            return run_tool(client, identity_handle, name, args)
         if name.startswith("inkbox_slack_"):
             from .slack import run_tool
 
@@ -960,6 +963,8 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 "email": getattr(mailbox, "email_address", None),
                 "phone": dedicated_number,
                 "imessage_enabled": imessage_enabled,
+                "whatsapp_enabled": bool(getattr(identity, "whatsapp_enabled", False)),
+                "whatsapp_number": getattr(identity, "whatsapp_number", None),
                 # Explicit labels so the agent describes its two lines
                 # correctly: its OWN dedicated phone line vs the SHARED
                 # iMessage line, whose number is never surfaced.
@@ -1472,6 +1477,14 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
         return _tool_result(result)
     except Exception as exc:
         fields = _tool_exception_fields(exc)
+        if name == "inkbox_send_whatsapp":
+            recovery_key = getattr(exc, "idempotency_key", None) or args.get("idempotency_key")
+            if recovery_key:
+                fields.update(idempotency_key=recovery_key,
+                              media_id=getattr(exc, "whatsapp_media_id", args.get("media_id")))
+        if name in {"inkbox_react_whatsapp", "inkbox_unreact_whatsapp"} and args.get("idempotency_key"):
+            fields.update(idempotency_key=args["idempotency_key"], reaction_id=args.get("reaction_id"),
+                target_message_id=args.get("message_id"), recovery="Preserve this operation and key. Recover only by replaying the same operation/key or reading its original reaction receipt; never create a replacement key.")
         if hosted_sms_context is not None:
             _settle_hosted_sms_context(
                 hosted_sms_context,
@@ -1585,7 +1598,8 @@ def mcp_tool_list() -> List[Dict[str, Any]]:
     from .schedule_tools import SCHEDULE_TOOLS
 
     cfg = read_config()
-    return SCHEDULE_TOOLS + (SLACK_TOOLS if cfg.slack_enabled else []) + (
+    from .whatsapp import TOOLS as WHATSAPP_TOOLS
+    return WHATSAPP_TOOLS + SCHEDULE_TOOLS + (SLACK_TOOLS if cfg.slack_enabled else []) + (
         IMESSAGE_THREAD_TOOLS if cfg.imessage_threaded_replies else []
     ) + [
         _place_call_tool_entry(cfg.voice_stack)
@@ -1607,6 +1621,8 @@ def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]
         "INKBOX_API_KEY": cfg.api_key,
         "INKBOX_IDENTITY": cfg.identity,
         "INKBOX_BASE_URL": cfg.base_url,
+        "INKBOX_ALLOWED_USERS": ",".join(cfg.allowed_users),
+        "INKBOX_ALLOW_ALL_USERS": "1" if cfg.allow_all_users else "0",
         "CODEX_PROJECT_DIR": str(Path(cfg.project_dir or os.getcwd()).expanduser().resolve()),
         "INKBOX_SLACK_ENABLED": "1" if cfg.slack_enabled else "0",
         "INKBOX_IMESSAGE_THREADED_REPLIES": "1" if cfg.imessage_threaded_replies else "0",
@@ -1633,7 +1649,9 @@ def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]
         server["default_tools_approval_mode"] = "approve"
     from .schedule_tools import SCHEDULE_TOOLS
 
-    tool_names = [f"mcp__inkbox__{spec.name}" for spec in TOOL_SPECS]
+    from .whatsapp import TOOLS as WHATSAPP_TOOLS
+    tool_names = [f"mcp__inkbox__{tool['name']}" for tool in WHATSAPP_TOOLS]
+    tool_names.extend(f"mcp__inkbox__{spec.name}" for spec in TOOL_SPECS)
     tool_names.extend(f"mcp__inkbox__{tool['name']}" for tool in SCHEDULE_TOOLS)
     if cfg.imessage_threaded_replies:
         tool_names.extend(f"mcp__inkbox__{tool['name']}" for tool in IMESSAGE_THREAD_TOOLS)
