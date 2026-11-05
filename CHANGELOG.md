@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Reduce scheduled full-stack CI to once daily at noon Pacific Time, including daylight saving time changes.
 - Pin CI host tests and live suites to Codex 0.163.0 instead of the moving alpha channel.
 - Add 14 agent-scoped tools for email reads/replies/forwarding/read state, individual SMS/iMessage reads, iMessage reactions, call inspection/activity/hangup, and send-key lookup.
 - Register WhatsApp tools only for identities with WhatsApp configured; sending restrictions remain enforced when called.

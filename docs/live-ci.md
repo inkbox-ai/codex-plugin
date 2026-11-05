@@ -6,7 +6,7 @@ All CI jobs that install Codex use exactly `0.163.0`, including host contracts a
 
 ## Full stack e2e
 
-Runs the component Actions in sequence for ready same-repository pull requests, manual dispatches, and successful canary runs on `main`. Its voice invocation includes the otherwise optional inbound scenario.
+Runs once daily at noon Pacific Time (`America/Los_Angeles`, automatically following daylight saving time), plus ready same-repository pull requests and manual dispatches. Each run starts with the canary, then runs the component Actions in sequence. Its voice invocation includes the otherwise optional inbound scenario.
 
 ### `full-stack`
 
