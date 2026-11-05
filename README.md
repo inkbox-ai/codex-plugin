@@ -207,7 +207,7 @@ before replying `DONE`.
 
 ## Slack preview
 
-Set `INKBOX_SLACK_ENABLED=true` to add Slack to the gateway. Inkbox SDK 0.7.26 or newer
+Set `INKBOX_SLACK_ENABLED=true` to add Slack to the gateway. Inkbox SDK 0.7.27 or newer
 includes the required Slack methods; the API must also support Slack. Connect a
 workspace to the same Inkbox identity to exchange messages; the receiver can
 start before installation.
@@ -328,7 +328,7 @@ verified Companion envelope. Explicit null/unknown access is ignored; older
 ordinary Slack webhooks without this field retain their existing behavior.
 
 Slack Companion requires an API environment supporting Slack initialization and
-**Python SDK 0.7.26 or newer**, the same SDK floor as the other channels.
+**Python SDK 0.7.27 or newer**, the same SDK floor as the other channels.
 No new setup wizard or permission setting is needed:
 
 ```text
@@ -492,7 +492,7 @@ and are unaffected by the Companion response setting.
   `@agent allow` or `@agent /stop`; on Slack, mention the native bot instead.
   Escalation prompts remind you of this.
 
-**SDK requirement:** The bridge requires Inkbox SDK **0.7.26 or newer** (below 1.0.0), including
+**SDK requirement:** The bridge requires Inkbox SDK **0.7.27 or newer** (below 1.0.0), including
 `client.companion.load_initialization` and `activation_messages`.
 An unsupported SDK produces an explicit webhook error; the bridge never falls
 back to submitting only the trigger.
@@ -1076,7 +1076,7 @@ Inbound A2A tasks acknowledge pickup immediately. While a task remains active,
 the worker sends a short progress update about every three minutes by default;
 these updates are visible in task history without starting a requester turn.
 
-The bridge requires Inkbox SDK 0.7.26 or newer (below 1.0.0).
+The bridge requires Inkbox SDK 0.7.27 or newer (below 1.0.0).
 
 On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 
@@ -1121,7 +1121,7 @@ After an uncertain send, preserve its `idempotency_key` and `media_id`. Use `ink
 
 Inbound images are attached to the native Codex turn, including photos without captions. Voice notes use the existing transcription credential when configured; unavailable transcripts are reported without guessing. Requested outgoing media uses `inkbox_upload_whatsapp_media` followed by `inkbox_send_whatsapp`; a local path in the final answer does not send a file.
 
-WhatsApp requires Inkbox SDK 0.7.26 or newer (below 1.0.0).
+WhatsApp requires Inkbox SDK 0.7.27 or newer (below 1.0.0).
 
 ### WhatsApp direct-message update
 

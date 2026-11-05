@@ -4,7 +4,7 @@
 
 - Ordinary WhatsApp replies are plain messages; use explicit quotes selectively. Saved sends retain their original payload and request key.
 - Captionless and consecutive WhatsApp images reach native image input; voice notes use the existing transcription credential when available.
-- Use the published Inkbox SDK 0.7.26 or newer.
+- Require the published Inkbox SDK >=0.7.27,<1.0.0 in plugin 0.2.26.
 
 - WhatsApp now supports direct messages only. `to` accepts exactly one E.164 string; arrays, formatted numbers, and comma-separated recipients are rejected.
 - Removed WhatsApp group creation, membership, routing, and group tool parameters. Unsupported inbound group messages and reactions do not start agent turns or replies.

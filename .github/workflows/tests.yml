@@ -33,7 +33,7 @@ jobs:
 
       # Live helper regressions exercise the SDK's real pagination offline.
       - name: Install test deps
-        run: uv pip install --system -e . pytest httpx aiohttp segno "croniter>=6.2,<7" "tzdata>=2025.1" "inkbox==0.7.26" "audioop-lts>=0.2.1; python_version >= '3.13'"
+        run: uv pip install --system -e . pytest httpx aiohttp segno "croniter>=6.2,<7" "tzdata>=2025.1" "inkbox==0.7.27" "audioop-lts>=0.2.1; python_version >= '3.13'"
 
       - name: Verify released SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
@@ -53,7 +53,7 @@ jobs:
       - uses: astral-sh/setup-uv@v8.1.0
       - name: Install bridge and released SDK
         run: >-
-          uv pip install --system -e . pytest httpx "inkbox==0.7.26"
+          uv pip install --system -e . pytest httpx "inkbox==0.7.27"
       - name: Verify released SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
 
@@ -91,7 +91,7 @@ jobs:
       - name: Install bridge and released native-reply SDK
         run: >-
           pip install -e . pytest httpx
-          "inkbox==0.7.26"
+          "inkbox==0.7.27"
       - name: Verify released SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
 
@@ -125,7 +125,7 @@ jobs:
       - name: Install bridge and released Slack-aware SDK
         run: >-
           uv pip install --system -e . pytest httpx
-          "inkbox==0.7.26"
+          "inkbox==0.7.27"
       - name: Verify released SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
 
@@ -166,7 +166,7 @@ jobs:
       - name: Install bridge + test deps
         run: |
           uv pip install --system \
-            "inkbox==0.7.26" \
+            "inkbox==0.7.27" \
             -e . pytest
 
       # @alpha is the prerelease channel cut from codex main near-daily — the
@@ -197,7 +197,7 @@ jobs:
       - name: Install released SDK and test dependencies
         run: >-
           uv pip install --system -e . pytest httpx
-          "inkbox==0.7.26"
+          "inkbox==0.7.27"
       - name: Verify released SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
 
