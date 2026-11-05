@@ -131,7 +131,7 @@ jobs:
 
       - name: Require Slack initialization support (do not silently skip)
         run: python -c "from inkbox_codex.slack_companion import require_sdk_support; require_sdk_support()"
-      - name: Install Codex (freshest main prerelease)
+      - name: Install pinned Codex
         run: bash "$GITHUB_WORKSPACE/tests/ci/install_codex.sh"
       - name: Slack Companion receiver, SDK wires, and real host
         run: >-
@@ -140,10 +140,7 @@ jobs:
           tests/test_slack.py tests/test_slack_activity.py tests/test_slack_harness.py
           tests/test_companion.py tests/test_companion_response_modes.py
 
-  # Contract suite against the REAL Codex host at its freshest main cut. This is
-  # the lane that catches upstream drift in the app-server protocol (a renamed
-  # method, a moved result field, a dropped notification) before it reaches a
-  # user. Same suite the canary runs on a schedule; this is the per-PR gate.
+  # Exercise the real host protocol against the same pinned release as live CI.
   contract-pr:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 15
@@ -169,9 +166,7 @@ jobs:
             "inkbox==0.7.27" \
             -e . pytest
 
-      # @alpha is the prerelease channel cut from codex main near-daily — the
-      # freshest main build available without compiling the host from source.
-      - name: Install Codex (freshest main prerelease)
+      - name: Install pinned Codex
         run: bash "$GITHUB_WORKSPACE/tests/ci/install_codex.sh"
 
       - name: Verify released SDK in MCP interpreter
@@ -203,7 +198,7 @@ jobs:
 
       - name: Verify helper is present (do not silently skip its tests)
         run: python -c "from inkbox.companion import CompanionResource; assert callable(CompanionResource.load_initialization)"
-      - name: Install Codex (freshest main prerelease)
+      - name: Install pinned Codex
         run: bash "$GITHUB_WORKSPACE/tests/ci/install_codex.sh"
       - name: Run unit and host suites including actual SDK pagination
         run: pytest -q

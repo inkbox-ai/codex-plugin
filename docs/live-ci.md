@@ -2,6 +2,8 @@
 
 These live Actions exercise the installed plugin against live Inkbox identities. Each component Action supports reusable and manual execution. Tests use current-run markers or pre-request snapshots so stale records cannot pass.
 
+All CI jobs that install Codex use exactly `0.163.0`, including host contracts and the canary. The single version pin lives in `tests/ci/install_codex.sh`; retries keep the same version and verify its matching native package and executable. CI does not follow the `alpha` or `latest` tags.
+
 ## Full stack e2e
 
 Runs the component Actions in sequence for ready same-repository pull requests, manual dispatches, and successful canary runs on `main`. Its voice invocation includes the otherwise optional inbound scenario.
