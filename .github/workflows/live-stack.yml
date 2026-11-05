@@ -2,8 +2,8 @@ name: Full stack e2e
 
 on:
   schedule:
-    - cron: "13 13 * * *"
-    - cron: "13 1 * * *"
+    - cron: "0 12 * * *"
+      timezone: "America/Los_Angeles"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:

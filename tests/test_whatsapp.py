@@ -102,8 +102,9 @@ def result(value):
     return json.loads(value["content"][0]["text"])
 
 
-def test_all_fifteen_tools_exist_without_a_cached_enablement_flag(sdk):
-    assert len([tool for tool in mcp_tool_list() if "whatsapp" in tool["name"]]) == 15
+def test_whatsapp_tools_require_configuration_but_sends_check_live_access(sdk):
+    assert not any("whatsapp" in tool["name"] for tool in mcp_tool_list())
+    assert len([tool for tool in mcp_tool_list(whatsapp_configured=True) if "whatsapp" in tool["name"]]) == 15
     status = result(asyncio.run(call_inkbox_tool(sdk.client, "agent", "inkbox_get_whatsapp_status", {})))
     assert status["enabled"] and status["status"] == "ready"
     sent = result(asyncio.run(call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", {"conversation_id": CONVERSATION, "text": "Hello"})))

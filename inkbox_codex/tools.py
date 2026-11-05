@@ -20,6 +20,7 @@ import time
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -190,6 +191,29 @@ def _str_list(desc: str = "") -> JsonSchema:
     return schema
 
 
+PAGE_FIELDS = {
+    "limit": _bounded_int(1, 100, "Maximum entries per page."),
+    "offset": {"type": "integer", "minimum": 0, "maximum": 10000},
+}
+DATE_FIELDS = {
+    "start_datetime": _str("Inclusive creation-date lower bound, ISO timestamp or YYYY-MM-DD."),
+    "end_datetime": _str("Creation-date upper bound; a bare date includes the whole day."),
+    "tz": _str("IANA timezone for dates without offsets; defaults to UTC."),
+}
+SEND_KEY = _str("Stable key for one logical send. Reuse the same key and payload after uncertainty; use inkbox_lookup_send before retrying.")
+EMAIL_BODY_FIELDS = {
+    "body": _str("Plain-text body."),
+    "body_html": _str("HTML body."),
+    "attachment_paths": _str_list("Local file paths to attach; preserve file contents on retries."),
+    "idempotency_key": SEND_KEY,
+}
+EMAIL_RECIPIENT = {
+    "oneOf": [{"type": "string", "minLength": 1},
+              {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}],
+    "description": "One recipient email address or a list of addresses.",
+}
+
+
 TOOL_SPECS: List[ToolSpec] = [
     ToolSpec(
         "inkbox_whoami",
@@ -202,12 +226,14 @@ TOOL_SPECS: List[ToolSpec] = [
         "Send an email from this agent's Inkbox mailbox. Pass attachment_paths for local files.",
         _schema(
             {
-                "to": _str("Recipient email address."),
+                "to": EMAIL_RECIPIENT,
                 "subject": _str("Email subject."),
-                "body": _str("Plain-text email body."),
-                "attachment_paths": _str_list("Local file paths to attach."),
+                **EMAIL_BODY_FIELDS,
+                "cc": _str_list("Carbon-copy addresses."),
+                "bcc": _str_list("Blind-carbon-copy addresses."),
+                "in_reply_to_message_id": _str("RFC 5322 Message-ID, not the stored UUID. Prefer inkbox_reply_email for replies."),
             },
-            ["to", "subject", "body"],
+            ["to", "subject"],
         ),
     ),
     ToolSpec(
@@ -215,12 +241,17 @@ TOOL_SPECS: List[ToolSpec] = [
         "Send an SMS/MMS from this agent's Inkbox phone number.",
         _schema(
             {
-                "to": _str("E.164 recipient number or an existing text conversation id."),
+                "to": {"oneOf": [{"type": "string", "minLength": 1},
+                    {"type": "array", "items": {"type": "string", "pattern": r"^\+[1-9][0-9]{6,14}$"},
+                     "minItems": 2, "maxItems": 8, "uniqueItems": True}],
+                    "description": "E.164 recipient, 2-8 group recipients, or legacy conversation ID. Mutually exclusive with conversation_id."},
+                "conversation_id": _str("Existing SMS/MMS conversation; mutually exclusive with to."),
                 "text": _str("Message body, max 1600 chars.", max_length=SMS_MAX_LENGTH),
-                "media_paths": _str_list("Local file paths to upload and attach."),
+                "media_paths": _str_list("Local files to upload. For retries, reuse returned media_urls instead of uploading again."),
                 "media_urls": _str_list("Already-hosted media URLs to attach."),
+                "idempotency_key": SEND_KEY,
             },
-            ["to", "text"],
+            [],
         ),
     ),
     ToolSpec(
@@ -245,8 +276,11 @@ TOOL_SPECS: List[ToolSpec] = [
                 },
                 "text": _str("Message body, max 18995 chars.", max_length=IMESSAGE_MAX_LENGTH),
                 "media_path": _str("Optional local file path to upload and attach."),
+                "media_urls": {"type": "array", "items": {"type": "string"}, "maxItems": 1,
+                    "description": "Hosted attachment URL, including the URL retained from an earlier send. Mutually exclusive with media_path."},
+                "idempotency_key": SEND_KEY,
             },
-            ["text"],
+            [],
         ),
     ),
     ToolSpec(
@@ -290,23 +324,18 @@ TOOL_SPECS: List[ToolSpec] = [
     ),
     ToolSpec(
         "inkbox_list_calls",
-        "List recent phone calls on this agent's Inkbox number, newest first.",
-        _schema(
-            {
-                "limit": _int("Maximum calls to return."),
-                "offset": _int("Pagination offset."),
-            }
-        ),
+        "List this identity's calls across dedicated and shared lines, newest first.",
+        _schema({**PAGE_FIELDS, **DATE_FIELDS}),
     ),
     ToolSpec(
         "inkbox_get_call_transcript",
-        "Fetch transcript segments for one phone call by call_id.",
+        "Fetch ordered transcript segments, preserving speaker phone numbers when known.",
         _schema({"call_id": _str("Call id from inkbox_list_calls.")}, ["call_id"]),
     ),
     ToolSpec(
         "inkbox_list_text_conversations",
         "List this agent's SMS conversations, newest first.",
-        _schema({"limit": _int("Maximum conversations to return.")}),
+        _schema({**PAGE_FIELDS, **DATE_FIELDS, "include_groups": {"type": "boolean", "default": True}}),
     ),
     ToolSpec(
         "inkbox_get_text_conversation",
@@ -314,7 +343,7 @@ TOOL_SPECS: List[ToolSpec] = [
         _schema(
             {
                 "conversation_id": _str("Text conversation id."),
-                "limit": _int("Maximum messages to return."),
+                **PAGE_FIELDS,
             },
             ["conversation_id"],
         ),
@@ -322,7 +351,7 @@ TOOL_SPECS: List[ToolSpec] = [
     ToolSpec(
         "inkbox_list_imessage_conversations",
         "List this agent's iMessage conversations, newest first.",
-        _schema({"limit": _int("Maximum conversations to return.")}),
+        _schema({**PAGE_FIELDS, **DATE_FIELDS, "include_groups": {"type": "boolean", "default": True}}),
     ),
     ToolSpec(
         "inkbox_get_imessage_conversation",
@@ -330,7 +359,8 @@ TOOL_SPECS: List[ToolSpec] = [
         _schema(
             {
                 "conversation_id": _str("iMessage conversation id."),
-                "limit": _int("Maximum messages to return."),
+                **PAGE_FIELDS,
+                **DATE_FIELDS,
             },
             ["conversation_id"],
         ),
@@ -524,6 +554,95 @@ TOOL_SPECS: List[ToolSpec] = [
 ]
 
 
+TOOL_SPECS += [
+    ToolSpec("inkbox_list_emails",
+        "List one bounded page of mailbox summaries, newest first. Query and unread filters apply within each scanned page; follow next_offset even if items is empty. Does not mark mail read or search full bodies.",
+        _schema({**PAGE_FIELDS, **DATE_FIELDS,
+            "direction": _enum(["inbound", "outbound"]),
+            "unread_only": {"type": "boolean"},
+            "query": _str("Case-insensitive substring in subject, snippet, or addresses on this page.")})),
+    ToolSpec("inkbox_get_email", "Read a full email and attachment metadata. Fetching inbound mail marks it read.",
+        _schema({"message_id": _str("Stored message UUID, not the RFC Message-ID.")}, ["message_id"])),
+    ToolSpec("inkbox_get_email_thread", "Read thread metadata and message summaries oldest first, without marking messages read. Use inkbox_get_email for full bodies.",
+        _schema({"thread_id": _str("Thread UUID.")}, ["thread_id"])),
+    ToolSpec("inkbox_reply_email", "Reply to the sender of an inbound email, or set reply_all to use the server's To/Cc recipients. Preserve the request key on retries.",
+        _schema({"message_id": _str("Stored source message UUID."),
+            "reply_all": {"type": "boolean", "default": False},
+            "subject": _str("Optional subject override."), **EMAIL_BODY_FIELDS}, ["message_id"])),
+    ToolSpec("inkbox_forward_email", "Forward a stored email to new recipients with an optional note and attachments.",
+        _schema({"message_id": _str("Stored source message UUID."), "to": EMAIL_RECIPIENT,
+            "cc": _str_list(), "bcc": _str_list(), "subject": _str("Optional subject override."),
+            "mode": _enum(["inline", "wrapped"]),
+            "include_original_attachments": {"type": "boolean", "default": True},
+            **EMAIL_BODY_FIELDS}, ["message_id", "to"])),
+    ToolSpec("inkbox_mark_emails", "Mark selected emails read or unread. Reports per-message results if an update fails.",
+        _schema({"message_ids": {"type": "array", "items": {"type": "string", "minLength": 1},
+            "minItems": 1, "maxItems": 100, "uniqueItems": True},
+            "is_read": {"type": "boolean"}}, ["message_ids", "is_read"])),
+    ToolSpec("inkbox_get_sms", "Read one SMS/MMS message, including its current delivery details.",
+        _schema({"message_id": _str("SMS/MMS message UUID.")}, ["message_id"])),
+    ToolSpec("inkbox_get_imessage", "Read one iMessage with media, native reply metadata, and live reactions.",
+        _schema({"message_id": _str("iMessage UUID.")}, ["message_id"])),
+    ToolSpec("inkbox_react_imessage", "React to a visible inbound iMessage. Use the returned target_message_id and part_index when inspecting the reaction.",
+        _schema({"message_id": _str(),
+            "reaction": _enum(["love", "like", "dislike", "laugh", "emphasize", "question", "eyes"]),
+            "part_index": {"type": "integer", "minimum": 0, "default": 0}}, ["message_id", "reaction"])),
+    ToolSpec("inkbox_remove_imessage_reaction", "Remove an iMessage reaction sent by this identity.",
+        _schema({"reaction_id": _str()}, ["reaction_id"])),
+    ToolSpec("inkbox_get_call", "Read a call's current status, action items, and transfer/conference history.",
+        _schema({"call_id": _str()}, ["call_id"])),
+    ToolSpec("inkbox_list_call_tool_activity", "Read a page of Voice AI tool activity. Unknown outcomes, incomplete observations, and unavailable payloads are not proof of success.",
+        _schema({"call_id": _str(), **PAGE_FIELDS}, ["call_id"])),
+    ToolSpec("inkbox_hangup_call", "Request an active call to end. Teardown is asynchronous; inspect the returned status or get the call again.",
+        _schema({"call_id": _str()}, ["call_id"])),
+    ToolSpec("inkbox_lookup_send", "Recover the original message ID without resending. Use the operation and key returned by the send tool, then fetch the message for current delivery status. A missing result does not authorize a new key.",
+        _schema({"operation": _enum(["mail.send", "mail.reply_all", "mail.forward", "text.send", "imessage.send"]),
+            "idempotency_key": SEND_KEY}, ["operation", "idempotency_key"])),
+]
+
+
+def _page_options(args: Dict[str, Any], *, default_limit: int = 50) -> Dict[str, Any]:
+    limit, offset = args.get("limit", default_limit), args.get("offset", 0)
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("limit must be an integer between 1 and 100")
+    if type(offset) is not int or not 0 <= offset <= 10000:
+        raise ValueError("offset must be an integer between 0 and 10000; narrow the date range for older results")
+    return {"limit": limit, "offset": offset}
+
+
+def _date_options(args: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: args[key] for key in DATE_FIELDS if key in args}
+
+
+def _email_recipients(value: Any) -> List[str]:
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, list) or not values or any(not isinstance(v, str) or not v.strip() for v in values):
+        raise ValueError("to must contain one or more email addresses")
+    return [v.strip() for v in values]
+
+
+def _send_key(args: Dict[str, Any], operation: str) -> str:
+    key = args.get("idempotency_key")
+    if key is None:
+        key = str(uuid.uuid4())
+    if not isinstance(key, str) or not key.strip() or len(key) > 128:
+        raise ValueError("idempotency_key must be a nonempty string of at most 128 characters")
+    args["idempotency_key"] = key
+    args["_send_operation"] = operation
+    return key
+
+
+def _send_result(message: Any, args: Dict[str, Any]) -> Dict[str, Any]:
+    result = {"accepted": True, "idempotency_key": args["idempotency_key"], "operation": args["_send_operation"]}
+    result.update({name: _json_safe(_imessage_value(message, name)) for name in (
+        "id", "status", "delivery_status", "conversation_id", "thread_id", "reply_to_message_id",
+        "thread_root_message_id", "recipients", "error_code", "error_detail", "sent_at", "delivered_at", "failed_at",
+    )})
+    if args.get("_send_media_urls"):
+        result["media_urls"] = args["_send_media_urls"]
+    return result
+
+
 def _json_safe(value: Any) -> Any:
     """Convert SDK dataclasses, UUIDs, datetimes, and enums into JSON-safe data."""
     if value is None or isinstance(value, (str, int, float, bool)):
@@ -595,11 +714,9 @@ def _imessage_reply_options(
     target = None
     if context is not None and context.get("conversation_id") == conversation_id:
         target = (context.get("route_meta") or {}).get("imessage_reply_target")
-    if target is None and "idempotency_key" not in args:
-        return {}
-    _require_imessage_threading(identity)
     options: Dict[str, Any] = {}
     if target is not None:
+        _require_imessage_threading(identity)
         if not isinstance(target, str) or not target.strip():
             raise ValueError("reply_to_message_id must be a nonempty message ID")
         if not conversation_id or args.get("to") is not None:
@@ -623,16 +740,6 @@ def _imessage_reply_options(
             raise ValueError("idempotency_key must be a nonempty string")
         options["idempotency_key"] = key
     return options
-
-
-def _imessage_send_result(message: Any) -> Dict[str, Any]:
-    """Return accepted-send metadata; queued state is not proof of delivery."""
-    return {
-        "sent": True,
-        **{name: _json_safe(_imessage_value(message, name)) for name in (
-            "id", "status", "conversation_id", "reply_to_message_id", "thread_id", "thread_root_message_id",
-        )},
-    }
 
 
 def _tool_result(data: Any) -> Dict[str, Any]:
@@ -673,6 +780,10 @@ def _tool_exception_fields(exc: Exception) -> Dict[str, Any]:
             fields["error_code"] = str(code)
         if rule:
             fields["rule"] = str(rule)
+    for name in ("retry_after_seconds", "upgrade_url", "limit_bytes"):
+        value = getattr(exc, name, None)
+        if value is not None:
+            fields[name] = value
     return fields
 
 
@@ -915,7 +1026,7 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
 
     if name == "inkbox_send_sms":
         text = str(args.get("text") or "")
-        target = str(args.get("to") or "").strip()
+        target = str(args.get("to") or args.get("conversation_id") or "").strip()
         hosted_sms_context, blocked = _reserve_hosted_sms_target(target)
         if blocked is not None:
             return blocked
@@ -943,6 +1054,14 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
         return client.get_identity(identity_handle)
 
     def _run() -> Any:
+        from .turn_authority import capture, validate
+
+        mutation = name in {
+            "inkbox_send_email", "inkbox_reply_email", "inkbox_forward_email", "inkbox_mark_emails",
+            "inkbox_send_sms", "inkbox_send_imessage", "inkbox_react_imessage",
+            "inkbox_remove_imessage_reaction", "inkbox_hangup_call",
+        }
+        origin = capture(identity_handle, read_config()) if mutation else None
         from .whatsapp import OPERATIONS, run_tool
         if name in OPERATIONS:
             return run_tool(client, identity_handle, name, args)
@@ -964,6 +1083,7 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 "phone": dedicated_number,
                 "imessage_enabled": imessage_enabled,
                 "whatsapp_enabled": bool(getattr(identity, "whatsapp_enabled", False)),
+                "whatsapp_configured": bool(getattr(identity, "whatsapp_configured", False)),
                 "whatsapp_number": getattr(identity, "whatsapp_number", None),
                 # Explicit labels so the agent describes its two lines
                 # correctly: its OWN dedicated phone line vs the SHARED
@@ -983,32 +1103,135 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 },
             }
 
-        if name == "inkbox_send_email":
+        if name == "inkbox_list_emails":
+            page = _page_options(args)
+            options = _date_options(args)
+            if "direction" in args:
+                if args["direction"] not in {"inbound", "outbound"}:
+                    raise ValueError("direction must be inbound or outbound")
+                options["direction"] = args["direction"]
+            rows = list(islice(_identity().iter_emails(page_size=100, **options),
+                page["offset"], page["offset"] + page["limit"] + 1))
+            has_more = len(rows) > page["limit"]
+            scanned = rows[:page["limit"]]
+            query = str(args.get("query") or "").casefold()
+            items = []
+            for row in scanned:
+                if args.get("unread_only") and _imessage_value(row, "is_read") is not False:
+                    continue
+                searchable = " ".join(str(_imessage_value(row, key) or "") for key in
+                    ("subject", "snippet", "from_address", "to_addresses", "cc_addresses"))
+                if query and query not in searchable.casefold():
+                    continue
+                items.append(row)
+            return {"items": items, "scanned": len(scanned),
+                "next_offset": page["offset"] + len(scanned) if has_more else None}
+
+        if name == "inkbox_get_email":
+            return _identity().get_message(args["message_id"])
+        if name == "inkbox_get_email_thread":
+            return _identity().get_thread(args["thread_id"])
+        if name == "inkbox_mark_emails":
+            ids = args.get("message_ids")
+            if (not isinstance(ids, list) or not 1 <= len(ids) <= 100
+                    or any(not isinstance(mid, str) or not mid.strip() for mid in ids)
+                    or len(set(ids)) != len(ids) or type(args.get("is_read")) is not bool):
+                raise ValueError("Supply 1-100 distinct message_ids and a boolean is_read")
+            identity = _identity()
+            method = identity.mark_emails_read if args["is_read"] else identity.mark_emails_unread
+            results = []
+            for mid in ids:
+                try:
+                    validate(origin)
+                    method([mid])
+                    results.append({"message_id": mid, "is_read": args["is_read"]})
+                except Exception as exc:
+                    results.append({"message_id": mid, "error": str(exc), **_tool_exception_fields(exc)})
+            return {"results": results, "complete": all("error" not in item for item in results)}
+
+        if name in {"inkbox_send_email", "inkbox_reply_email", "inkbox_forward_email"}:
+            identity = _identity()
             paths = args.get("attachment_paths") or []
             attachments = [file_to_email_attachment(str(p)) for p in paths] or None
-            msg = _identity().send_email(
-                to=[str(args["to"])],
-                subject=str(args.get("subject") or ""),
-                body_text=str(args.get("body") or ""),
-                attachments=attachments,
-            )
-            return {"sent": True, "id": str(getattr(msg, "id", "")), "attachments": len(paths)}
+            kwargs = {"body_text": args.get("body"), "body_html": args.get("body_html")}
+            if name != "inkbox_forward_email" and not any((kwargs["body_text"], kwargs["body_html"], attachments)):
+                raise ValueError("Provide body, body_html, or an attachment")
+            if "subject" in args:
+                kwargs["subject"] = args["subject"]
+            if name == "inkbox_reply_email":
+                if type(args.get("reply_all", False)) is not bool:
+                    raise ValueError("reply_all must be a boolean")
+                kwargs["attachments"] = attachments
+                if args.get("reply_all"):
+                    kwargs["idempotency_key"] = _send_key(args, "mail.reply_all")
+                    validate(origin)
+                    msg = identity.reply_all_email(args["message_id"], **kwargs)
+                else:
+                    source = identity.get_message(args["message_id"])
+                    if str(_imessage_value(source, "direction")) != "inbound":
+                        raise ValueError("Sender-only replies require an inbound message; use reply_all or send_email for sent mail")
+                    kwargs["to"] = [_imessage_value(source, "from_address")]
+                    kwargs["in_reply_to_message_id"] = _imessage_value(source, "message_id")
+                    if not kwargs["to"][0] or not kwargs["in_reply_to_message_id"]:
+                        raise ValueError("Source email lacks its sender or RFC Message-ID")
+                    subject = str(_imessage_value(source, "subject") or "")
+                    kwargs.setdefault("subject", subject if subject.lower().startswith("re:") else f"Re: {subject}")
+                    kwargs["idempotency_key"] = _send_key(args, "mail.send")
+                    validate(origin)
+                    msg = identity.send_email(**kwargs)
+            else:
+                kwargs.update({key: args[key] for key in ("cc", "bcc") if key in args})
+                kwargs["to"] = _email_recipients(args["to"])
+                if name == "inkbox_forward_email":
+                    kwargs.update({key: args[key] for key in ("mode", "include_original_attachments") if key in args})
+                    kwargs["additional_attachments"] = attachments
+                    kwargs["idempotency_key"] = _send_key(args, "mail.forward")
+                    validate(origin)
+                    msg = identity.forward_email(args["message_id"], **kwargs)
+                else:
+                    kwargs.setdefault("subject", "")
+                    kwargs["attachments"] = attachments
+                    if "in_reply_to_message_id" in args:
+                        kwargs["in_reply_to_message_id"] = args["in_reply_to_message_id"]
+                    kwargs["idempotency_key"] = _send_key(args, "mail.send")
+                    validate(origin)
+                    msg = identity.send_email(**kwargs)
+            return {**_send_result(msg, args), "attachments": len(paths)}
 
         if name == "inkbox_send_sms":
             identity = _identity()
             kwargs: Dict[str, Any] = {"text": str(args.get("text") or "")}
-            target = str(args.get("to") or "").strip()
-            if target.startswith("+"):
+            target = args.get("to")
+            conversation = args.get("conversation_id")
+            if isinstance(target, str):
+                target = target.strip()
+            if isinstance(conversation, str):
+                conversation = conversation.strip()
+            if bool(target) == bool(conversation):
+                raise ValueError("Specify exactly one of to or conversation_id")
+            if isinstance(target, list):
+                import re
+                if (not 2 <= len(target) <= 8 or any(not isinstance(v, str) or not re.fullmatch(r"\+[1-9][0-9]{6,14}", v) for v in target)
+                        or len(set(target)) != len(target)):
+                    raise ValueError("SMS groups require 2-8 distinct E.164 recipients")
                 kwargs["to"] = target
+            elif isinstance(target, str) and target.startswith("+"):
+                kwargs["to"] = target.strip()
             else:
-                kwargs["conversation_id"] = target
+                kwargs["conversation_id"] = conversation or target
             urls = [str(u) for u in (args.get("media_urls") or [])]
             for path in (args.get("media_paths") or []):
+                validate(origin)
                 urls.append(_upload_media_url(identity, str(path)))
             if urls:
                 kwargs["media_urls"] = urls
+                args["_send_media_urls"] = urls
+            if not kwargs["text"] and not urls:
+                raise ValueError("Provide text or media")
+            kwargs["idempotency_key"] = _send_key(args, "text.send")
+            validate(origin)
             msg = identity.send_text(**kwargs)
-            return {"sent": True, "id": str(getattr(msg, "id", "")), "media": len(urls)}
+            return {**_send_result(msg, args), "media": len(urls)}
 
         if name == "inkbox_send_imessage":
             text = str(args.get("text") or "")
@@ -1041,8 +1264,19 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
             else:
                 kwargs["to"] = to_list[0] if len(to_list) == 1 else to_list
             media_path = str(args.get("media_path") or "").strip()
+            if media_path and args.get("media_urls"):
+                raise ValueError("Specify media_path or media_urls, not both")
             if media_path:
+                validate(origin)
                 kwargs["media_urls"] = [_upload_media_url(identity, media_path)]
+            elif args.get("media_urls"):
+                if not isinstance(args["media_urls"], list) or len(args["media_urls"]) != 1:
+                    raise ValueError("media_urls must contain one attachment URL")
+                kwargs["media_urls"] = args["media_urls"]
+            if not text and not kwargs.get("media_urls"):
+                raise ValueError("Provide text or media")
+            if kwargs.get("media_urls"):
+                args["_send_media_urls"] = kwargs["media_urls"]
             if threaded:
                 if context is not None and context.get("conversation_id") == conversation_id:
                     from .imessage import validate_tool_target
@@ -1051,16 +1285,20 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                     kwargs.setdefault("idempotency_key", str(uuid.uuid5(
                         uuid.NAMESPACE_URL,
                         json.dumps([
-                            context["nonce"], conversation_id, text, media_path,
+                            context["nonce"], conversation_id, text, media_path or kwargs.get("media_urls") or "",
                             reply_options.get("reply_to_message_id"),
                             reply_options.get("plain_reply_fallback"),
                         ]),
                     )))
                 else:
                     context = None
+            if "idempotency_key" in kwargs:
+                args["idempotency_key"] = kwargs["idempotency_key"]
+            kwargs["idempotency_key"] = _send_key(args, "imessage.send")
+            validate(origin)
             msg = identity.send_imessage(**kwargs)
             if threaded:
-                result = _imessage_send_result(msg)
+                result = _send_result(msg, args)
                 if context is not None:
                     from .imessage import record_accepted_tool_send, record_tool_send
 
@@ -1075,7 +1313,7 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                         # The send was accepted even if a concurrent stop closed its turn.
                         result["warning"] = "Message accepted; reply correlation could not be saved. Do not resend."
                 return result
-            return {"sent": True, "id": str(getattr(msg, "id", ""))}
+            return _send_result(msg, args)
 
         if name == "inkbox_place_call":
             snake_to_number = str(args.get("to_number") or "").strip()
@@ -1195,10 +1433,16 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
             }
 
         if name == "inkbox_list_calls":
-            return _identity().list_calls(
-                limit=int(args.get("limit") or 25),
-                offset=int(args.get("offset") or 0),
-            )
+            return _identity().list_calls(**_page_options(args, default_limit=25), **_date_options(args))
+
+        if name == "inkbox_get_call":
+            return client.calls.get(args["call_id"])
+        if name == "inkbox_list_call_tool_activity":
+            return _identity().list_tool_invocations(args["call_id"], **_page_options(args))
+        if name == "inkbox_hangup_call":
+            identity = _identity()
+            validate(origin)
+            return identity.hangup_call(args["call_id"])
 
         if name == "inkbox_get_call_transcript":
             call_id = str(args.get("call_id") or "").strip()
@@ -1207,20 +1451,62 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
             return _identity().list_transcripts(call_id)
 
         if name == "inkbox_list_text_conversations":
-            return _identity().list_text_conversations(limit=int(args.get("limit") or 25))
+            return _identity().list_text_conversations(**_page_options(args, default_limit=25),
+                **_date_options(args), include_groups=args.get("include_groups", True))
 
         if name == "inkbox_get_text_conversation":
             return _identity().get_text_conversation(
-                str(args["conversation_id"]), limit=int(args.get("limit") or 50)
+                str(args["conversation_id"]), **_page_options(args)
             )
 
         if name == "inkbox_list_imessage_conversations":
-            return _identity().list_imessage_conversations(limit=int(args.get("limit") or 25))
+            return _identity().list_imessage_conversations(**_page_options(args, default_limit=25),
+                **_date_options(args), include_groups=args.get("include_groups", True))
 
         if name == "inkbox_get_imessage_conversation":
-            return _identity().get_imessage_conversation(
-                str(args["conversation_id"]), limit=int(args.get("limit") or 50)
+            return _identity().list_imessages(
+                conversation_id=str(args["conversation_id"]), **_page_options(args),
+                **_date_options(args), include_groups=True,
             )
+
+        if name == "inkbox_get_sms":
+            return _identity().get_text(args["message_id"])
+        if name == "inkbox_get_imessage":
+            return _identity().get_imessage(args["message_id"])
+        if name == "inkbox_react_imessage":
+            part = args.get("part_index", 0)
+            if type(part) is not int or part < 0:
+                raise ValueError("part_index must be a nonnegative integer")
+            if args["reaction"] not in {"love", "like", "dislike", "laugh", "emphasize", "question", "eyes"}:
+                raise ValueError("Use a supported named iMessage reaction")
+            identity = _identity()
+            validate(origin)
+            return identity.send_imessage_reaction(message_id=args["message_id"], reaction=args["reaction"], part_index=part)
+        if name == "inkbox_remove_imessage_reaction":
+            identity = _identity()
+            validate(origin)
+            identity.remove_imessage_reaction(args["reaction_id"])
+            return {"removed": args["reaction_id"]}
+        if name == "inkbox_lookup_send":
+            identity = _identity()
+            operation = args["operation"]
+            key = args["idempotency_key"]
+            if operation in {"mail.send", "mail.reply_all", "mail.forward"}:
+                if identity.mailbox is None:
+                    raise ValueError("This identity has no mailbox")
+                sender_kind, sender_id = "mailbox", identity.mailbox.id
+            elif operation in {"text.send", "imessage.send"}:
+                if operation == "text.send":
+                    if identity.phone_number is None:
+                        raise ValueError("This identity has no SMS number")
+                    sender_kind, sender_id = "phone_number", identity.phone_number.id
+                else:
+                    sender_kind, sender_id = "imessage_identity", identity.id
+            else:
+                raise ValueError("Unsupported send operation")
+            message_id = client.message_sends.lookup(sender_kind=sender_kind, sender_id=sender_id,
+                operation=operation, idempotency_key=key)
+            return {"message_id": str(message_id), "operation": operation, "idempotency_key": key}
 
         if name in {"inkbox_get_imessage_thread", "inkbox_get_imessage_conversation_thread"}:
             identity = _identity()
@@ -1470,13 +1756,46 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
 
         raise ValueError(f"unknown Inkbox tool: {name}")
 
+    response_notices = None
+
+    def _run_with_notices():
+        nonlocal client, response_notices
+        collect = getattr(type(client), "with_response_metadata", None)
+        if not callable(collect):
+            return _run()
+        run_error = None
+
+        def scoped_run(scoped):
+            nonlocal client, run_error
+            client = scoped
+            try:
+                return _run()
+            except Exception as exc:
+                run_error = exc
+                return None
+
+        response = collect(client, scoped_run)
+        response_notices = response.notices
+        if run_error is not None:
+            raise run_error
+        if response.notices:
+            return {"data": response.data, "notices": response.notices}
+        return response.data
+
     try:
-        result = await asyncio.to_thread(_run)
+        result = await asyncio.to_thread(_run_with_notices)
         if hosted_sms_context is not None:
             _settle_hosted_sms_context(hosted_sms_context, "success")
         return _tool_result(result)
     except Exception as exc:
         fields = _tool_exception_fields(exc)
+        if response_notices:
+            fields["notices"] = response_notices
+        if args.get("_send_operation"):
+            fields.update(idempotency_key=args["idempotency_key"], operation=args["_send_operation"],
+                recovery="Look up the original operation/key before retrying. Never replace the key after an uncertain outcome. Preserve the exact payload; reuse media_urls instead of uploading again.")
+            if args.get("_send_media_urls"):
+                fields["media_urls"] = args["_send_media_urls"]
         if name == "inkbox_send_whatsapp":
             recovery_key = getattr(exc, "idempotency_key", None) or args.get("idempotency_key")
             if recovery_key:
@@ -1592,14 +1911,14 @@ def _imessage_send_tool_entry(spec: ToolSpec) -> Dict[str, Any]:
     }
 
 
-def mcp_tool_list() -> List[Dict[str, Any]]:
+def mcp_tool_list(*, whatsapp_configured: bool = False) -> List[Dict[str, Any]]:
     """Return MCP ``tools/list`` entries for every Inkbox tool."""
     from .slack import SLACK_TOOLS
     from .schedule_tools import SCHEDULE_TOOLS
 
     cfg = read_config()
     from .whatsapp import TOOLS as WHATSAPP_TOOLS
-    return WHATSAPP_TOOLS + SCHEDULE_TOOLS + (SLACK_TOOLS if cfg.slack_enabled else []) + (
+    return (WHATSAPP_TOOLS if whatsapp_configured else []) + SCHEDULE_TOOLS + (SLACK_TOOLS if cfg.slack_enabled else []) + (
         IMESSAGE_THREAD_TOOLS if cfg.imessage_threaded_replies else []
     ) + [
         _place_call_tool_entry(cfg.voice_stack)
@@ -1615,7 +1934,7 @@ def mcp_tool_list() -> List[Dict[str, Any]]:
     ]
 
 
-def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]:
+def build_inkbox_mcp_server_config(cfg: Any, *, whatsapp_configured: bool = False) -> Tuple[Dict[str, Any], List[str]]:
     """Build Codex app-server config for the Inkbox stdio MCP server."""
     env = {
         "INKBOX_API_KEY": cfg.api_key,
@@ -1650,7 +1969,7 @@ def build_inkbox_mcp_server_config(cfg: Any) -> Tuple[Dict[str, Any], List[str]]
     from .schedule_tools import SCHEDULE_TOOLS
 
     from .whatsapp import TOOLS as WHATSAPP_TOOLS
-    tool_names = [f"mcp__inkbox__{tool['name']}" for tool in WHATSAPP_TOOLS]
+    tool_names = [f"mcp__inkbox__{tool['name']}" for tool in WHATSAPP_TOOLS] if whatsapp_configured else []
     tool_names.extend(f"mcp__inkbox__{spec.name}" for spec in TOOL_SPECS)
     tool_names.extend(f"mcp__inkbox__{tool['name']}" for tool in SCHEDULE_TOOLS)
     if cfg.imessage_threaded_replies:

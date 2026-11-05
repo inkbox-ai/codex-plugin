@@ -1,8 +1,6 @@
-name: Canary — plugin vs Codex main
+name: Canary - plugin vs pinned Codex
 
-# Codex main moves fast and ships a prerelease cut (@alpha) near-daily, so the
-# host can break us even when we don't push. This reusable check exercises the
-# host interface against the freshest main prerelease before full-stack suites.
+# Validate the pinned host before running the full-stack suites.
 on:
   workflow_call:
   workflow_dispatch: {}
@@ -31,15 +29,13 @@ jobs:
       - name: Install bridge + test deps
         run: |
           uv pip install --system \
-            "inkbox==0.7.26" \
+            "inkbox==0.7.27" \
             -e . pytest
 
-      # @alpha is the prerelease channel cut from codex main near-daily — the
-      # freshest main build available without compiling the host from source.
-      - name: Install Codex (freshest main prerelease)
+      - name: Install pinned Codex
         run: bash "$GITHUB_WORKSPACE/tests/ci/install_codex.sh"
 
       # Live tests self-skip without credentials; the complete live stack runs
-      # only after this latest-host canary succeeds.
+      # only after this pinned-host canary succeeds.
       - name: Full offline suite vs real Codex
         run: pytest -q

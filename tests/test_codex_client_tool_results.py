@@ -59,7 +59,12 @@ def test_normal_client_keeps_main_turn_tool_configuration():
     }
 
 
-def test_mcp_completed_item_captures_only_settlement_fields():
+@pytest.mark.parametrize("payload", [
+    {"sent": True, "id": "private-message-id"},
+    {"accepted": True, "delivery_status": "queued", "id": "private-message-id"},
+    {"data": {"accepted": True, "delivery_status": "queued", "id": "private-message-id"}, "notices": []},
+])
+def test_mcp_completed_item_captures_only_settlement_fields(payload):
     async def scenario():
         client = _client()
         loop = asyncio.get_running_loop()
@@ -79,7 +84,7 @@ def test_mcp_completed_item_captures_only_settlement_fields():
                     "result": {
                         "content": [{
                             "type": "text",
-                            "text": '{"sent":true,"id":"private-provider-id"}',
+                            "text": json.dumps(payload),
                         }],
                     },
                 },
@@ -103,7 +108,7 @@ def test_mcp_completed_item_captures_only_settlement_fields():
         assert not hasattr(call, "result")
         assert not hasattr(call, "error")
         assert "private body" not in repr(call)
-        assert "private-provider-id" not in repr(call)
+        assert "private-message-id" not in repr(call)
 
     asyncio.run(scenario())
 

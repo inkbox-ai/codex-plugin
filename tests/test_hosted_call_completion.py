@@ -201,6 +201,27 @@ def test_hosted_completion_dedupes_same_process_inflight(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_hosted_completion_keeps_connection_history_and_speaker_numbers(tmp_path, monkeypatch):
+    async def scenario():
+        session = _Session()
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        identity = types.SimpleNamespace(list_transcripts=lambda _: [
+            types.SimpleNamespace(party="remote", text="Please update the checklist.", phone_number="+15550000002"),
+            types.SimpleNamespace(party="local", text="Understood.", phone_number=None),
+        ])
+        gateway._inkbox = types.SimpleNamespace(get_identity=lambda _: identity)
+        payload = _non_sms_payload()
+        payload["data"]["call"]["connections"] = [{"kind": "conference", "status": "completed"}]
+        payload["data"]["call"]["forwardings"] = [{"status": "legacy-history"}]
+        await gateway._on_hosted_call_ended(payload)
+        await _drain(gateway)
+        prompt = session.prompts[0]
+        assert "remote (+15550000002): Please update the checklist." in prompt
+        assert "local: Understood." in prompt and "local (None)" not in prompt
+        assert '"kind": "conference"' in prompt and "legacy-history" not in prompt
+    asyncio.run(scenario())
+
+
 def test_hosted_sms_recoverable_failure_gets_one_correction(tmp_path, monkeypatch):
     async def scenario():
         session = _Session(results=[

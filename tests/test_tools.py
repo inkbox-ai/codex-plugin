@@ -214,11 +214,10 @@ def test_coding_agent_tool_tier_is_registered():
         "inkbox_schedule_catch_up", "inkbox_schedule_decide",
     })
     expected.update({
-        "inkbox_send_whatsapp", "inkbox_list_whatsapp_conversations", "inkbox_get_whatsapp_conversation",
-        "inkbox_list_whatsapp_messages", "inkbox_get_whatsapp_message", "inkbox_upload_whatsapp_media",
-        "inkbox_get_whatsapp_media", "inkbox_mark_whatsapp_read", "inkbox_get_whatsapp_status", "inkbox_lookup_whatsapp_send",
-        "inkbox_get_whatsapp_thread", "inkbox_get_whatsapp_conversation_thread", "inkbox_react_whatsapp",
-        "inkbox_get_whatsapp_reaction", "inkbox_unreact_whatsapp",
+        "inkbox_list_emails", "inkbox_get_email", "inkbox_get_email_thread", "inkbox_reply_email",
+        "inkbox_forward_email", "inkbox_mark_emails", "inkbox_get_sms", "inkbox_get_imessage",
+        "inkbox_react_imessage", "inkbox_remove_imessage_reaction", "inkbox_get_call",
+        "inkbox_list_call_tool_activity", "inkbox_hangup_call", "inkbox_lookup_send",
     })
     assert names == expected
 
@@ -542,7 +541,7 @@ def test_hosted_sms_is_exact_target_durable_and_single_use(monkeypatch):
         {"to": "+15551112222", "text": "release update"},
     )
 
-    assert first["sent"] is True
+    assert first["accepted"] is True
     assert duplicate["error_code"] == "hosted_sms_duplicate_blocked"
     assert len(client.identity.sent_texts) == 1
     assert hosted_sms_attempt_state("call-hosted-1", 1) == "success"

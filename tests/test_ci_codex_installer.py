@@ -8,7 +8,7 @@ import pytest
 
 
 INSTALLER = Path(__file__).parent / "ci" / "install_codex.sh"
-VERSION = "0.1.0-alpha.2"
+VERSION = "0.163.0"
 
 
 @pytest.fixture
@@ -33,24 +33,20 @@ mode = os.environ["INSTALL_MODE"]
 if mode == "hang":
     time.sleep(30)
 if args[0] == "view":
-    if args[1] == "@openai/codex@alpha":
+    if args[1] == "@openai/codex@{VERSION}":
         count = sum(call[1] == args[1] for call in calls)
         if mode == "metadata_failure" and count == 1:
             sys.exit(1)
-        if mode == "stable_tag":
-            print("0.1.0")
-        elif mode == "moving_tag" and count == 1:
-            print("0.1.0-alpha.1")
+        if mode == "wrong_version":
+            print("0.162.0")
         else:
             print("{VERSION}")
     else:
-        count = sum(call[0] == "view" and call[1] != "@openai/codex@alpha" for call in calls)
+        count = sum(call[0] == "view" and call[1] != "@openai/codex@{VERSION}" for call in calls)
         if mode == "missing_native" or (mode == "late_native" and count <= 5):
             sys.exit(1)
-        if mode == "moving_tag" and count == 1:
-            sys.exit(1)
         if mode == "wrong_native":
-            print("0.1.0-alpha.1-linux-x64")
+            print("0.162.0-linux-x64")
         elif mode != "empty_native":
             print(args[1].split("@")[-1])
 elif args[0] == "install":
@@ -85,6 +81,8 @@ else:
 
 
 def _assert_matching_install(calls):
+    assert all(call[1] in {f"@openai/codex@{VERSION}", f"@openai/codex@{VERSION}-linux-x64"}
+               for call in calls if call[0] == "view")
     installs = [call for call in calls if call[0] == "install"]
     assert installs
     for call in installs:
@@ -101,15 +99,15 @@ def test_waits_for_native_publication_beyond_four_attempts(install_codex):
     assert f"codex-cli {VERSION}" in result.stdout
 
 
-@pytest.mark.parametrize("mode", ["metadata_failure", "install_failure", "moving_tag"])
-def test_retries_transient_failures_and_reresolves_current_alpha(install_codex, mode):
+@pytest.mark.parametrize("mode", ["metadata_failure", "install_failure"])
+def test_retries_transient_failures_without_changing_pinned_version(install_codex, mode):
     result, calls, delays = install_codex(mode)
     assert result.returncode == 0, result.stderr
     assert delays == [15]
     _assert_matching_install(calls)
 
 
-@pytest.mark.parametrize("mode", ["missing_native", "empty_native", "wrong_native", "stable_tag"])
+@pytest.mark.parametrize("mode", ["missing_native", "empty_native", "wrong_native", "wrong_version"])
 def test_missing_or_invalid_artifacts_never_install_or_fall_back(install_codex, mode):
     result, calls, delays = install_codex(mode, CODEX_INSTALL_ATTEMPTS="3")
     assert result.returncode == 1
@@ -120,7 +118,7 @@ def test_missing_or_invalid_artifacts_never_install_or_fall_back(install_codex, 
 
 def test_stale_executable_is_not_a_successful_install(install_codex):
     result, calls, delays = install_codex(
-        CLI_VERSION="codex-cli 0.1.0-alpha.1", CODEX_INSTALL_ATTEMPTS="2",
+        CLI_VERSION="codex-cli 0.162.0", CODEX_INSTALL_ATTEMPTS="2",
     )
     assert result.returncode == 1
     assert "executable version does not match" in result.stderr

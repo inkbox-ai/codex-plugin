@@ -759,7 +759,9 @@ def _mcp_tool_call_result(item: Dict[str, Any]) -> McpToolCallResult:
     if isinstance(result, dict):
         structured = result.get("structuredContent") or result.get("structured_content")
         if isinstance(structured, dict):
-            sent = structured.get("sent") is True
+            if isinstance(structured.get("data"), dict) and "notices" in structured:
+                structured = structured["data"]
+            sent = structured.get("sent") is True or structured.get("accepted") is True
             capture_error_metadata(structured)
         content = result.get("content")
         for block in content if isinstance(content, list) else []:
@@ -771,7 +773,9 @@ def _mcp_tool_call_result(item: Dict[str, Any]) -> McpToolCallResult:
             except json.JSONDecodeError:
                 payload = None
             if isinstance(payload, dict):
-                sent = sent or payload.get("sent") is True
+                if isinstance(payload.get("data"), dict) and "notices" in payload:
+                    payload = payload["data"]
+                sent = sent or payload.get("sent") is True or payload.get("accepted") is True
                 capture_error_metadata(payload)
 
     error = item.get("error")

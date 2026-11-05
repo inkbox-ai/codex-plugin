@@ -20,14 +20,13 @@ registry() {
   within_budget npm "$@" --prefer-online --fetch-retries=0 --fetch-timeout=20000
 }
 
-install_current_alpha() {
-  local version native_version installed_version
-  version="$(registry view @openai/codex@alpha version)" || return 1
-  if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]; then
-    echo "Codex alpha metadata did not identify an alpha release" >&2
+install_pinned_codex() {
+  local version="0.163.0" published_version native_version installed_version
+  published_version="$(registry view "@openai/codex@$version" version)" || return 1
+  if [ "$published_version" != "$version" ]; then
+    echo "Codex metadata does not match pinned version $version" >&2
     return 1
   fi
-  # The alpha tag can advance before its native artifact is published.
   native_version="$(registry view "@openai/codex@$version-$platform" version)" || return 1
   if [ "$native_version" != "$version-$platform" ]; then
     echo "Codex native artifact is not ready for $version ($platform)" >&2
@@ -44,7 +43,7 @@ install_current_alpha() {
 }
 
 for ((attempt = 1; attempt <= attempts; attempt++)); do
-  if install_current_alpha; then
+  if install_pinned_codex; then
     exit 0
   fi
   remaining=$((deadline - SECONDS))
