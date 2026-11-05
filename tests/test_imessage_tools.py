@@ -104,17 +104,19 @@ def test_schema_does_not_leak_opt_in_fields_after_flag_is_disabled(monkeypatch):
     assert tools.mcp_tool_list() == before
 
 
-def test_off_preserves_old_sdk_request_and_result():
+def test_plain_send_retains_request_key_and_actual_status():
     received = []
     identity = SimpleNamespace(send_imessage=lambda **kwargs: received.append(kwargs) or Message())
     result, payload = call(identity, conversation_id="conversation-1", text="hello")
     assert not result.get("isError")
-    assert received == [{"conversation_id": "conversation-1", "text": "hello"}]
-    assert payload == {"sent": True, "id": "outbound-1"}
+    assert received == [{"conversation_id": "conversation-1", "text": "hello", "idempotency_key": payload["idempotency_key"]}]
+    assert payload["accepted"] and payload["id"] == "outbound-1"
+    assert payload["status"] == "pending" and payload["operation"] == "imessage.send"
+    assert "sent" not in payload
 
 
 @pytest.mark.parametrize("extra", [
-    {"reply_to_message_id": "source-1"}, {"plain_reply_fallback": True}, {"idempotency_key": "send-1"},
+    {"reply_to_message_id": "source-1"}, {"plain_reply_fallback": True},
 ])
 def test_off_rejects_new_arguments_instead_of_silently_flattening(extra):
     identity = Identity()
@@ -248,6 +250,19 @@ def test_later_scheduled_send_does_not_reuse_previous_trigger(monkeypatch):
     result, _ = call(identity, conversation_id="conversation-1", text="Later reminder")
     assert not result.get("isError")
     assert [message["reply_to_message_id"] for message in identity.sent] == ["source-1", None]
+
+
+def test_different_hosted_media_in_one_turn_gets_distinct_send_keys(monkeypatch):
+    enable(monkeypatch)
+    active_turn(monkeypatch)
+    identity = Identity()
+    result, first = call(identity, conversation_id="conversation-1", text="Image", media_urls=["https://example.com/first.png"])
+    assert not result.get("isError"), first
+    identity.result = Message(id="outbound-2")
+    result, second = call(identity, conversation_id="conversation-1", text="Image", media_urls=["https://example.com/second.png"])
+    assert not result.get("isError"), second
+    assert first["idempotency_key"] != second["idempotency_key"]
+    assert second["media_urls"] == ["https://example.com/second.png"]
 
 
 def test_backend_thread_capability_failure_does_not_send(monkeypatch):

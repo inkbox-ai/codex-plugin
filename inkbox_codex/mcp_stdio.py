@@ -75,7 +75,15 @@ class InkboxMcpServer:
             return _response(message_id, {})
 
         if method == "tools/list":
-            return _response(message_id, {"tools": mcp_tool_list()})
+            configured = False
+            try:
+                identity = await asyncio.wait_for(
+                    asyncio.to_thread(self._inkbox().get_identity, self.identity), timeout=5,
+                )
+                configured = getattr(identity, "whatsapp_configured", False) is True
+            except Exception:
+                print("WhatsApp capability lookup unavailable; listing core tools only.", file=sys.stderr)
+            return _response(message_id, {"tools": mcp_tool_list(whatsapp_configured=configured)})
 
         if method == "tools/call":
             name = str(params.get("name") or "")

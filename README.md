@@ -1053,16 +1053,23 @@ without TOTP must have it configured before the agent can generate codes.
 
 ## Tools exposed to Codex
 
-The agent reaches you (or third parties) through an in-process MCP server:
+The agent reaches you (or third parties) through a local stdio MCP server. It exposes 50 tools by default, plus 15 when WhatsApp is configured, 10 when Slack is enabled, and 2 when native iMessage threading is enabled (77 total).
 
 - `inkbox_schedule_add` · `inkbox_schedule_list` · `inkbox_schedule_update` · `inkbox_schedule_delete` · `inkbox_schedule_run_now` · `inkbox_schedule_history` · `inkbox_schedule_catch_up` · `inkbox_schedule_decide` — persistent local jobs, time/run/decision bounds, dedicated sessions, and missed-run history. See [Scheduled jobs](#scheduled-jobs).
 - `inkbox_whoami` — its own identity: handle, mailbox, iMessage status, and its two calling lines (dedicated number vs shared iMessage line).
 - `inkbox_place_call` — place an outbound voice call over either line (`origination`: `dedicated_number` / `shared_imessage_number`) — see [Two calling lines](#two-calling-lines).
-- `inkbox_list_calls` · `inkbox_get_call_transcript` — browse call history and transcripts.
-- `inkbox_send_email` — send email; attach local files with `attachment_paths`.
-- `inkbox_send_sms` — send SMS/MMS; attach local files with `media_paths` (or hosted `media_urls`).
-- `inkbox_send_imessage` — send into an iMessage conversation; attach a local file with `media_path`.
-- `inkbox_get_imessage_thread` · `inkbox_get_imessage_conversation_thread` — bounded native-thread pages, available only with `INKBOX_IMESSAGE_THREADED_REPLIES=true`; reply targets and fallback policy are bridge-owned, while the send tool also accepts `idempotency_key`.
+- `inkbox_list_calls` · `inkbox_get_call` · `inkbox_get_call_transcript`: read calls across both line types, connection history, action items, and speaker-attributed transcripts.
+- `inkbox_list_call_tool_activity` · `inkbox_hangup_call`: inspect Voice AI tool outcomes or request live-call teardown. Unknown activity outcomes stay unknown; hangup may return a still-active status while teardown completes.
+- `inkbox_list_emails` · `inkbox_get_email` · `inkbox_get_email_thread`: list mailbox summaries, read full messages, and inspect ordered thread summaries. Fetching an inbound message marks it read; listing and thread reads do not.
+- `inkbox_send_email`: send to one address or a list, with optional CC/BCC, plain `body`, `body_html`, and local `attachment_paths`.
+- `inkbox_reply_email` · `inkbox_forward_email`: reply to an inbound sender, set `reply_all=true` for server-resolved To/Cc recipients, or forward a stored message. These take the stored message UUID; `send_email.in_reply_to_message_id` instead takes the RFC Message-ID.
+- `inkbox_mark_emails`: mark selected messages read/unread and report individual failures.
+- `inkbox_send_sms`: send to an E.164 number, 2-8 group recipients, or an existing `conversation_id`; attach local `media_paths` or hosted `media_urls`. The legacy conversation ID in `to` remains supported.
+- `inkbox_send_imessage`: send into a conversation or to supported recipients, with optional `media_path` or one hosted `media_urls` entry.
+- `inkbox_get_sms` · `inkbox_get_imessage`: inspect an individual message and its current status, media, or reactions.
+- `inkbox_react_imessage` · `inkbox_remove_imessage_reaction`: add a named tapback or remove your own reaction. Inspect the returned target and part index, which may differ from the requested target.
+- `inkbox_get_imessage_thread` · `inkbox_get_imessage_conversation_thread`: bounded native-thread pages, available only with `INKBOX_IMESSAGE_THREADED_REPLIES=true`; reply targets and fallback policy are bridge-owned. Send idempotency works with or without this setting.
+- `inkbox_lookup_send`: recover an email/SMS/iMessage send's original ID using its operation and request key, without sending again.
 - `inkbox_list_text_conversations` · `inkbox_get_text_conversation` — browse SMS threads and history.
 - `inkbox_list_imessage_conversations` · `inkbox_get_imessage_conversation` — browse iMessage threads and history (find the `conversation_id` to send into).
 - `inkbox_lookup_contact` · `inkbox_list_contacts` · `inkbox_get_contact` — resolve and read address-book contacts (reverse-lookup by email/phone, free-text search, or full record by id).
@@ -1071,6 +1078,10 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_a2a_call` · `inkbox_a2a_check` · `inkbox_a2a_reply` — delegate work to another agent and follow its task.
 - `inkbox_list_a2a_tasks` · `inkbox_list_a2a_messages` — page and search this identity's inbound and outbound A2A history, with participant, task, context, role, state, and timestamp filters.
 - `inkbox_a2a_complete` · `inkbox_a2a_ask_caller` · `inkbox_a2a_fail` — commit the outcome of a verified inbound A2A task. These tools are rejected outside that task's isolated session.
+
+Call and conversation listings accept `limit`, `offset`, `start_datetime`, `end_datetime`, and `tz`. SMS/iMessage conversation listings include groups by default. SMS history accepts limit/offset; iMessage history also accepts date bounds. Email listing scans a bounded page of summaries and filters `unread_only` and `query` within that page. Query matches subject, snippet, and addresses, not full bodies. Follow `next_offset` even when `items` is empty. Use date bounds to narrow large mailboxes.
+
+Email/SMS/iMessage send tools return `accepted`, the actual status fields, `operation`, and `idempotency_key`; acceptance is not delivery confirmation. The former `sent: true` result is replaced. Preserve the exact key and payload after uncertainty, call `inkbox_lookup_send`, then fetch the message to inspect delivery. Sender-only replies use `mail.send`; reply-all uses `mail.reply_all`. A missing lookup result is not permission to send a replacement with a new key. When a tool uploaded media, retain its returned `media_urls` and reuse those instead of re-uploading on retry. SDK advisory notices are returned as `{data, notices}` when present; ordinary results retain their normal shape.
 
 Inbound A2A tasks acknowledge pickup immediately. While a task remains active,
 the worker sends a short progress update about every three minutes by default;
@@ -1121,7 +1132,7 @@ After an uncertain send, preserve its `idempotency_key` and `media_id`. Use `ink
 
 Inbound images are attached to the native Codex turn, including photos without captions. Voice notes use the existing transcription credential when configured; unavailable transcripts are reported without guessing. Requested outgoing media uses `inkbox_upload_whatsapp_media` followed by `inkbox_send_whatsapp`; a local path in the final answer does not send a file.
 
-WhatsApp requires Inkbox SDK 0.7.27 or newer (below 1.0.0).
+WhatsApp requires Inkbox SDK 0.7.27 or newer (below 1.0.0). Its 15 tools are registered only when the bound identity reports `whatsapp_configured=true`. This uses configuration rather than current sending permission, so configured identities with restricted sending can still inspect status and accessible history. Capability is refreshed on MCP tool discovery; reconnect the session after enabling WhatsApp if the host caches its tool list. If discovery cannot read the identity, WhatsApp tools stay hidden while other tools remain available. Each operation still checks current access through the API.
 
 ### WhatsApp direct-message update
 

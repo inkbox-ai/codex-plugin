@@ -33,7 +33,7 @@ def test_actual_host_source_metadata_and_late_cancelled_tool(tmp_path, monkeypat
                 self.send_error(404)
                 return
             self._send_json(200, {"id": IDENTITY, "organization_id": "org_example", "agent_handle": "agent",
-                "whatsapp_enabled": True, "created_at": NOW, "updated_at": NOW})
+                "whatsapp_enabled": True, "whatsapp_configured": True, "created_at": NOW, "updated_at": NOW})
 
         def do_POST(self):
             if urlsplit(self.path).path == "/api/v1/whatsapp/messages":

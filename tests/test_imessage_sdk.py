@@ -235,7 +235,9 @@ def test_real_sdk_flag_off_keeps_ordinary_tool_wire_shape(sdk, monkeypatch):
     assert not result.get("isError"), payload
     assert json.loads(posts(sdk)[0].content) == {"conversation_id": CONVERSATION_ID, "text": "Answer"}
     assert not [request for request in sdk.requests if request.url.path.endswith("/thread")]
-    assert payload == {"sent": True, "id": OUTBOUND_ID}
+    assert payload["accepted"] and payload["id"] == OUTBOUND_ID
+    assert payload["status"] == "pending" and "sent" not in payload
+    assert payload["idempotency_key"] == posts(sdk)[0].headers["Idempotency-Key"]
 
 
 def test_real_sdk_gateway_routes_and_correlates_native_queued_reply(sdk):

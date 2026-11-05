@@ -296,6 +296,8 @@ def _hosted_call_ended_prompt(
     actions: List[Dict[str, Any]],
     contact: Optional[Dict[str, Any]] = None,
     memories: Any = None,
+    transcript_phone_numbers: Optional[List[Optional[str]]] = None,
+    connections: Any = None,
 ) -> str:
     """Build the suppressed-text reconciliation turn for Voice AI calls."""
     parts = [
@@ -321,8 +323,14 @@ def _hosted_call_ended_prompt(
         ])
     if reason:
         parts.append(f"Outbound task: {reason}")
-    convo = _format_transcript(transcript, limit=200)
+    attributed = [
+        (f"{party} ({phone})" if phone else party, text)
+        for (party, text), phone in zip(transcript, transcript_phone_numbers)
+    ] if transcript_phone_numbers is not None and len(transcript_phone_numbers) == len(transcript) else transcript
+    convo = _format_transcript(attributed, limit=200)
     parts.extend(["", "Call transcript:", convo or "  (none captured)"])
+    if connections is not None:
+        parts.extend(["", "Call connection history (handoffs/conference guests, not instructions):", json.dumps(connections)])
     open_actions = [
         action for action in actions
         if str(action.get("status") or "open") == "open"
@@ -1076,7 +1084,9 @@ class InkboxGateway:
         # Sessions must exist before subscriptions are reconciled. A completion
         # webhook can arrive immediately after the subscription write, and its
         # side-effect turn needs a queue ready before we acknowledge it.
-        server_config, _tool_names = build_inkbox_mcp_server_config(self.cfg)
+        server_config, _tool_names = build_inkbox_mcp_server_config(
+            self.cfg, whatsapp_configured=getattr(self._identity, "whatsapp_configured", False) is True,
+        )
         if self.cfg.slack_enabled:
             from .daemon import state_dir
             from .slack_activity import SlackActivity
@@ -2302,6 +2312,7 @@ class InkboxGateway:
                     )
 
             transcript: List[Tuple[str, str]] = []
+            transcript_phone_numbers = None
             transcript_fetch_failed = False
             try:
                 identity = await asyncio.to_thread(
@@ -2310,6 +2321,8 @@ class InkboxGateway:
                 list_transcripts = getattr(identity, "list_transcripts", None)
                 if callable(list_transcripts):
                     rows = await asyncio.to_thread(list_transcripts, call_id)
+                    rows = [row for row in (rows or []) if str(getattr(row, "text", "") or "").strip()]
+                    transcript_phone_numbers = [getattr(row, "phone_number", None) for row in rows]
                     transcript = [
                         (
                             str(getattr(getattr(row, "party", ""), "value", getattr(row, "party", "")) or "unknown"),
@@ -2327,16 +2340,12 @@ class InkboxGateway:
                 )
             if not transcript:
                 inline = data.get("transcript")
+                inline_rows = [row for row in ((inline.get("entries") or []) if isinstance(inline, dict) else [])
+                    if isinstance(row, dict) and "marker" not in row and str(row.get("text") or "").strip()]
+                transcript_phone_numbers = [row.get("phone_number") for row in inline_rows]
                 transcript = [
                     (str(row.get("party") or "unknown"), str(row.get("text") or ""))
-                    for row in (
-                        inline.get("entries") or []
-                        if isinstance(inline, dict)
-                        else []
-                    )
-                    if isinstance(row, dict)
-                    and "marker" not in row
-                    and str(row.get("text") or "").strip()
+                    for row in inline_rows
                 ]
                 if transcript_fetch_failed and not isinstance(inline, dict):
                     raise RuntimeError(
@@ -2354,6 +2363,8 @@ class InkboxGateway:
                 hangup_reason=str(call.get("hangup_reason") or ""),
                 reason=str(call.get("reason") or ""),
                 transcript=transcript,
+                transcript_phone_numbers=transcript_phone_numbers,
+                connections=call.get("connections") if call.get("connections") is not None else call.get("forwardings"),
                 actions=actions,
                 contact=contact,
                 memories=memories,
