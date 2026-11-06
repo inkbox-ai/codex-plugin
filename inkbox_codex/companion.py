@@ -107,6 +107,19 @@ def _receipt_content(envelope: dict) -> dict:
         key: value for key, value in envelope["companion"].items()
         if key not in {"history", "history_complete", "history_next_cursor"}
     }
+    if envelope.get("event_type") == "whatsapp.received":
+        message = envelope["data"]["message"]
+        # Delivery rebuilds current roster, visibility, media URLs and receipts.
+        # Only immutable source content and scope identify a repeated delivery.
+        stable = {key: message.get(key) for key in (
+            "id", "agent_identity_id", "conversation_id", "direction", "local_number",
+            "remote_number", "sender_number", "content", "is_group", "agent_mentioned",
+            "reply_to_message_id", "thread_id", "thread_root_message_id",
+        )}
+        stable["media_ids"] = [item.get("id") for item in message.get("media") or []]
+        stable["mentions"] = [{"text": item.get("text"), "is_agent": item.get("is_agent")}
+                              for item in message.get("mentions") or []]
+        content["data"] = {"message": stable}
     if envelope.get("event_type") in SLACK_INCOMING_EVENTS:
         # Optional contact/profile presentation may refresh on a retry.
         content["data"] = {key: value for key, value in envelope["data"].items()
@@ -384,7 +397,10 @@ class Receiver:
         if envelope.get("event_type") == "whatsapp.received":
             if self.prepare_whatsapp is None:
                 raise CompanionError("WhatsApp Companion source validation is unavailable")
+            Event.parse(envelope)  # Malformed envelopes remain errors, not local-policy ignores.
             envelope = await self.prepare_whatsapp(envelope)
+            if envelope is None:
+                return False
         if envelope.get("event_type") in SLACK_INCOMING_EVENTS:
             if not self.cfg.slack_enabled:
                 return False
@@ -792,7 +808,8 @@ class Receiver:
             if initialization and context_only and source_id and source_id != event.source_id:
                 # A snapshot missing this live source is background only.
                 meta.update(source_metadata({"id": source_id, "content": ""}, event.event_id))
-                meta.update(whatsapp_mentioned=False, mentions=[], original_text=None, rendered_text="")
+                meta.update(whatsapp_mentioned=False, mentions=[], original_text=None, rendered_text="",
+                            whatsapp_body="", whatsapp_image_paths=[], whatsapp_media_ids=[], media=False)
             meta["imessage_threaded_replies"] = True
         if event.channel == "slack":
             incoming = inbound_message(event.envelope, event.envelope["data"]["identity_id"])
@@ -919,6 +936,10 @@ class Receiver:
             if any(entry["id"] == event.source_id and not same_author(event.channel, entry["author"], event.author)
                    for entry in entries):
                 raise CompanionError("Companion snapshot author does not match the received message")
+            if event.channel == "whatsapp" and event.source_id in source_ids:
+                source = event.envelope["_codex_whatsapp_source"]
+                if source.get("media"):
+                    text += "\nCurrent WhatsApp attachment context: " + source["whatsapp_body"]
             # A live-first receipt must not generate a separate historical turn.
             # If already in the snapshot, that receipt gates the combined input.
             await self.submit(event, text, self.meta(
@@ -945,11 +966,11 @@ class Receiver:
         message = event.envelope["data"]["text_message" if event.channel == "phone" else "message"]
         text = event.text
         if event.channel == "whatsapp":
-            text = event.envelope["_codex_whatsapp_source"]["rendered_text"]
+            text = event.envelope["_codex_whatsapp_source"]["whatsapp_body"]
         if event.channel == "mail":
             text = await asyncio.to_thread(self.mail_body, message)
         media = message.get("attachments") or message.get("media") or []
-        if media:
+        if media and event.channel != "whatsapp":
             text += "\nAttachment data: " + json.dumps(media)
         if len(text.encode()) > MAX_BYTES:
             raise CompanionError("Companion live input exceeds the input limit")

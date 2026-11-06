@@ -136,8 +136,11 @@ def test_companion_source_rejects_direct_or_unresolved_group(monkeypatch):
                            {"sender_number": "+19999999999"}, {"agent_identity_id": "wrong"}):
                 invalid = deepcopy(value)
                 invalid["data"]["message"].update(change)
-                with pytest.raises(CompanionError):
-                    await receiver.accept(invalid)
+                if "is_group" in change or "agent_identity_id" in change:
+                    with pytest.raises(CompanionError):
+                        await receiver.accept(invalid)
+                else:
+                    assert not await receiver.accept(invalid)
         finally:
             await receiver.close()
     asyncio.run(scenario())
@@ -374,6 +377,110 @@ def test_history_only_snapshot_does_not_label_trigger_with_absent_live_mentions(
             assert history["original_text"] is None and history["rendered_text"] == ""
             assert current["whatsapp_mentioned"] is True and current["mentions"][0]["is_agent"] is True
             assert len(sent) == 1
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", [{"participants": [PEER]}, {"unresolved_participant_count": 1}])
+def test_inadmissible_current_roster_does_not_block_next_sequence(monkeypatch, change):
+    async def scenario():
+        value = envelope()
+        receiver, _, session, _, _ = setup(value, monkeypatch)
+        stale = deepcopy(value)
+        stale["data"]["message"].update(change)
+        try:
+            assert not await receiver.accept(stale)
+            assert not receiver.inbox.scopes()
+            following = deepcopy(value)
+            following["companion"]["sequence"] = 2
+            following["id"] += "-next"
+            assert await receiver.accept(following)
+            await drained(receiver)
+            assert len(session._client.events) == 1
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
+
+
+def test_retry_ignores_current_projection_but_rejects_changed_source(monkeypatch):
+    async def scenario():
+        value = envelope()
+        receiver, _, session, _, _ = setup(value, monkeypatch)
+        try:
+            await receiver.accept(value)
+            await drained(receiver)
+            retry = deepcopy(value)
+            retry["data"]["message"].update(group_name="Renamed", participants=[SPONSOR, PEER, "+12025550999"],
+                reactions=[{"emoji": "👍"}], is_read=True, updated_at="later", status="read")
+            retry["data"]["message"]["mentions"][0]["phone_number"] = PEER
+            assert not await receiver.accept(retry)
+            await drained(receiver)
+            assert len(session._client.events) == 1
+            retry["data"]["message"]["content"] = "changed source body"
+            with pytest.raises(CompanionError, match="Conflicting"):
+                await receiver.accept(retry)
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_companion_current_media_reaches_native_host_input(monkeypatch, live):
+    async def scenario():
+        value = envelope()
+        receiver, _, session, _, gateway = setup(value, monkeypatch, response_mode="relaxed")
+        gateway._identity.get_whatsapp_media = Mock(return_value=NS(status="ready", url="https://example.test/image", content_type="image/png", size=12))
+        async def download(text, attachments, *, prefix, image_paths):
+            assert attachments[0]["url"] == "https://example.test/image"
+            image_paths.append("/tmp/companion-fixture.png")
+            return text + "\n[refreshed attachment context]"
+        gateway._with_media = download
+        seen = []
+        async def run(text, **kwargs):
+            seen.append((text, kwargs)); return "Answer"
+        session._client.run = run
+        try:
+            if live:
+                await receiver.accept(value)
+                await drained(receiver)
+                value = next_event(value, native=True)
+            value["data"]["message"].update(content="", media=[{"id": "media-owned", "url": None}])
+            assert await receiver.accept(value)
+            await drained(receiver)
+            assert seen[-1][1]["image_paths"] == ["/tmp/companion-fixture.png"]
+            assert "refreshed attachment context" in seen[-1][0]
+            gateway._identity.get_whatsapp_media.assert_called_once_with("media-owned")
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
+
+
+def test_overlong_companion_answer_sends_notice_and_unblocks_next_event(monkeypatch):
+    async def scenario():
+        value = envelope()
+        receiver, _, session, _, gateway = setup(value, monkeypatch, response_mode="relaxed")
+        gateway.cfg.base_url = "https://example.test"
+        gateway._identity.send_whatsapp = Mock(return_value=NS(id="sent"))
+        gateway._channel_store = Mock(return_value=Mock())
+        gateway._companion = lambda: receiver
+        allowed = AsyncMock(return_value=True)
+        monkeypatch.setattr(whatsapp, "current_route_allowed", allowed)
+        async def send(chat, content, mode, meta):
+            await whatsapp.send_reply(gateway, chat, content, meta)
+        session.send_fn = send
+        session._client.run = AsyncMock(side_effect=["x" * 4001, "Next answer"])
+        try:
+            await receiver.accept(value)
+            await drained(receiver)
+            assert gateway._identity.send_whatsapp.call_args.kwargs["text"] == whatsapp.REPLY_REJECTED_NOTICE
+            assert receiver.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (value["id"],)).fetchone()[0] == "done"
+            await receiver.accept(next_event(value, native=True))
+            await drained(receiver)
+            assert gateway._identity.send_whatsapp.call_count == 2
+            assert gateway._identity.send_whatsapp.call_args.kwargs["text"] == "Next answer"
+            assert allowed.await_count == 2
+            assert not receiver.inbox.scopes()
         finally:
             await receiver.close()
     asyncio.run(scenario())

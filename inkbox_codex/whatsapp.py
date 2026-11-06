@@ -189,6 +189,44 @@ async def render_mentions(gateway, text, mentions):
     return pattern.sub(lambda match: replacements[match.group("mention")] if match.group("mention") else match.group(), text), enriched
 
 
+async def with_media(gateway, message, text):
+    """Refresh owned attachments and preserve native inputs for both receive paths."""
+    media = message.get("media") or []
+    if not media:
+        return text, []
+    identity = gateway._identity
+    message_id = message["id"]
+    refreshed = []
+    for item in media:
+        if item.get("status") == "unavailable":
+            text += "\n[WhatsApp attachment unavailable]"
+            continue
+        try:
+            fresh = await asyncio.to_thread(
+                require_method(identity, "get_whatsapp_media"), item["id"]
+            )
+        except Exception:
+            text += "\n[WhatsApp attachment unavailable; do not guess its contents]"
+            continue
+        if field(fresh, "status") == "ready" and field(fresh, "url"):
+            refreshed.append(
+                {
+                    "url": field(fresh, "url"),
+                    "content_type": field(fresh, "content_type"),
+                    "size": field(fresh, "size"),
+                }
+            )
+        else:
+            text += "\n[WhatsApp attachment unavailable]"
+    image_paths = []
+    body = await gateway._with_media(
+        text, refreshed, prefix=f"whatsapp-{message_id}", image_paths=image_paths
+    )
+    if refreshed and body == text:
+        body += "\n[WhatsApp attachment could not be downloaded; its media ID remains available]"
+    return body, image_paths
+
+
 async def prepare_companion(gateway, envelope):
     """Validate signed group context without importing direct-contact memories."""
     from copy import deepcopy
@@ -198,22 +236,27 @@ async def prepare_companion(gateway, envelope):
     message = (envelope.get("data") or {}).get("message") or {}
     participants = message.get("participants") or []
     sender = message.get("sender_number")
-    if (not group_sdk_available() or not is_group(message) or unsupported_shape(message)
-            or message.get("direction") != "inbound"
+    if (not is_group(message) or message.get("direction") != "inbound"
             or str(message.get("agent_identity_id")) != str(gateway._identity.id)
-            or not isinstance(participants, list) or not participants
+            or not isinstance(participants, list)):
+        raise CompanionError("Invalid WhatsApp Companion group source")
+    if (not group_sdk_available() or unsupported_shape(message) or not participants
             or any(not isinstance(number, str) or re.fullmatch(r"\+[1-9][0-9]{6,14}", number) is None for number in participants)
             or sender not in participants or sender == message.get("local_number")):
-        raise CompanionError("Invalid WhatsApp Companion group source")
+        return None  # Current local admission can change without invalidating the signed event.
+
     raw = str(message.get("content") or "")
     rendered, mentions = await render_mentions(gateway, raw, message.get("mentions") or [])
+    body, image_paths = await with_media(gateway, message, rendered)
     meta = {**source_metadata(message, envelope.get("id")), "channel": "whatsapp",
         "is_group": True, "conversation_kind": "group", "conversation_id": message.get("conversation_id"),
         "group_name": message.get("group_name"), "remote_number": None,
         "unresolved_participant_count": 0, "participants": participants,
         "sender": sender, "mentions": mentions, "whatsapp_mentioned": message.get("agent_mentioned") is True,
         "raw_text": raw, "rendered_text": rendered, "original_text": raw if raw != rendered else None,
-        "contact": None, "contact_memories": [], "media": message.get("media") or []}
+        "contact": None, "contact_memories": [], "media": bool(message.get("media")),
+        "whatsapp_body": body, "whatsapp_image_paths": image_paths,
+        "whatsapp_media_ids": [item["id"] for item in message.get("media") or [] if item.get("id")]}
     prepared = deepcopy(envelope)
     prepared["_codex_whatsapp_source"] = meta
     return prepared
@@ -288,34 +331,7 @@ async def receive(gateway, envelope):
         mentions = message.get("mentions") if isinstance(message.get("mentions"), list) else []
         text, mentions = await render_mentions(gateway, text, mentions)
         rendered_text = text
-        refreshed = []
-        for item in media:
-            if item.get("status") == "unavailable":
-                text += "\n[WhatsApp attachment unavailable]"
-                continue
-            try:
-                fresh = await asyncio.to_thread(
-                    require_method(identity, "get_whatsapp_media"), item["id"]
-                )
-            except Exception:
-                text += "\n[WhatsApp attachment unavailable; do not guess its contents]"
-                continue
-            if field(fresh, "status") == "ready" and field(fresh, "url"):
-                refreshed.append(
-                    {
-                        "url": field(fresh, "url"),
-                        "content_type": field(fresh, "content_type"),
-                        "size": field(fresh, "size"),
-                    }
-                )
-            else:
-                text += "\n[WhatsApp attachment unavailable]"
-        image_paths = []
-        body = await gateway._with_media(
-            text, refreshed, prefix=f"whatsapp-{message_id}", image_paths=image_paths
-        )
-        if refreshed and body == text:
-            body += "\n[WhatsApp attachment could not be downloaded; its media ID remains available]"
+        body, image_paths = await with_media(gateway, message, text)
         contact = None if is_group(message) else await gateway._resolve_contact_full(kind="phone", value=sender)
         payload_contact = gateway._matched_payload_contact(
             gateway._webhook_list(data, "contacts", "contact_list"),
@@ -838,6 +854,10 @@ async def send_reply(gateway, chat_id, content, meta):
         if final:
             store.mark(meta, "done", chat_id=chat_id)
         raise ValueError("An explicit quoted reply was already attempted; inspect its original receipt instead of sending an automatic replacement")
+    if companion and meta.get("companion_reply_event_id") and (len(text) > 4000 or not text.strip()):
+        # The durable receiver must settle this deterministic rejection, not retry
+        # the same oversized answer forever. The notice keeps its receipt/key.
+        text = REPLY_REJECTED_NOTICE
     if len(text) > 4000 or not text.strip():
         if final:
             store.mark(meta, "failed", chat_id=chat_id)
