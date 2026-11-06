@@ -606,3 +606,43 @@ def test_phase_downgrade_never_retires_checkpointed_work(monkeypatch, state):
         finally:
             await receiver.close()
     asyncio.run(scenario())
+
+
+
+def test_new_signed_activation_unblocks_unsubmitted_borrowed_receipt_without_downgrade(monkeypatch):
+    async def scenario():
+        value = envelope()
+        receiver, sdk, session, _, _ = setup(value, monkeypatch)
+        try:
+            old_live = next_event(value, sender=PEER)
+            old_prepared = await receiver.prepare_whatsapp(old_live)
+            receiver.inbox.accept(Event.parse(old_prepared))
+            replacement = deepcopy(value)
+            replacement["id"] += "-replacement"
+            replacement["companion"].update(sequence=3, activation_id="20000000-0000-4000-8000-000000000088")
+            sdk.c = deepcopy(replacement["companion"])
+            assert await receiver.accept(replacement)
+            assert receiver.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (old_live["id"],)).fetchone()[0] == "done"
+            await drained(receiver)
+            assert len(session._client.events) == 1
+            assert not receiver.inbox.scopes()
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
+
+
+def test_ambiguous_activation_read_failure_does_not_retire_pending_source(monkeypatch):
+    async def scenario():
+        value = envelope()
+        receiver, sdk, _, _, _ = setup(value, monkeypatch)
+        class Unavailable(Exception):
+            status_code = 409
+        sdk.load_initialization = Mock(side_effect=Unavailable("membership evidence unavailable"))
+        try:
+            await receiver.accept(value)
+            await drained(receiver)
+            assert receiver.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (value["id"],)).fetchone()[0] == "pending"
+            assert receiver.retries
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())

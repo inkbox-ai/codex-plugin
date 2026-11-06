@@ -262,6 +262,16 @@ class Inbox:
             self.db.execute("UPDATE events SET state='uncertain' WHERE state IN ('submitting','sending')")
             self.db.execute("UPDATE activations SET state='uncertain' WHERE state='submitting'")
 
+    def retire_unsubmitted(self, event: Event) -> None:
+        """Only authoritative revocation/replacement may settle unstarted work."""
+        if self.source_submitted(event):
+            return
+        self.db.execute("""UPDATE events SET state='done'
+            WHERE event_id=? AND state IN ('pending','failed')
+            AND NOT EXISTS (SELECT 1 FROM host_receipts WHERE event_id=?)
+            AND NOT EXISTS (SELECT 1 FROM replies WHERE event_id=?)""",
+            (event.event_id, event.event_id, event.event_id))
+
     def accept(self, event: Event) -> bool:
         payload = json.dumps(event.envelope, sort_keys=True, separators=(",", ":"))
         if len(payload.encode()) > MAX_BYTES:
@@ -299,14 +309,8 @@ class Inbox:
                         downgraded = True
                 if old[0] != event.event_id or previous != incoming:
                     raise CompanionError("Conflicting Companion event ID or sequence")
-                if downgraded and not self.source_submitted(Event.parse(previous_envelope)):
-                    # The signed retry revoked this grant. Retire only work that
-                    # has never crossed a host/send checkpoint, not uncertainty.
-                    self.db.execute("""UPDATE events SET state='done'
-                        WHERE event_id=? AND state IN ('pending','failed')
-                        AND NOT EXISTS (SELECT 1 FROM host_receipts WHERE event_id=?)
-                        AND NOT EXISTS (SELECT 1 FROM replies WHERE event_id=?)""",
-                        (event.event_id, event.event_id, event.event_id))
+                if downgraded:
+                    self.retire_unsubmitted(Event.parse(previous_envelope))
                 return False
             if self.db.execute(
                 "SELECT 1 FROM events WHERE scope=? AND sequence>? AND state!='pending' LIMIT 1",
@@ -315,6 +319,16 @@ class Inbox:
                 raise CompanionError("A later Companion sequence was already submitted; reconcile this late event")
             self.db.execute("INSERT INTO events(event_id,scope,sequence,payload,received_at) VALUES(?,?,?,?,?)",
                             (event.event_id, event.scope, event.sequence, payload, time.time()))
+            if event.channel == "whatsapp" and event.activation:
+                # A higher-sequence signed grant proves an older activation was
+                # replaced. Never infer revocation from an ambiguous read error.
+                for (previous_payload,) in self.db.execute(
+                    "SELECT payload FROM events WHERE scope=? AND sequence<? AND state IN ('pending','failed')",
+                    (event.scope, event.sequence),
+                ).fetchall():
+                    previous_event = Event.parse(json.loads(previous_payload))
+                    if previous_event.activation and previous_event.activation != event.activation:
+                        self.retire_unsubmitted(previous_event)
         return True
 
     def scopes(self) -> list[str]:
