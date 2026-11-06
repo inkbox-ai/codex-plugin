@@ -325,3 +325,34 @@ def test_readable_mention_keeps_raw_gate_and_original_text_without_memories(sdk,
         assert read_turn_context("rendered")["route_meta"]["original_text"] == original
         assert read_turn_context("rendered")["route_meta"]["mentions"][0]["display_name"] == "agent"
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("agent_mentioned", [False, True])
+def test_direct_mentions_render_without_group_reply_gating(sdk, agent_mentioned):
+    async def scenario():
+        gw = bridge(sdk)
+        sender = {"id": "sender-contact", "name": "Sender"}
+        mentioned = {"name": "Alex", "notes": "do not inject mention notes", "memories": ["do not inject mention memories"]}
+        gw._resolve_contact_full = AsyncMock(side_effect=lambda **kw: sender if kw["value"] == "+15550000002" else mentioned)
+        sent = []
+        session = make_session(sent)
+        session.cfg.group_reply_mode = "mention"
+        client = session._client = Client()
+        received = []
+        async def inbound(body, mode, meta):
+            received.append(meta)
+            await session.handle_inbound(body, mode, meta)
+        gw.sessions = NS(get=Mock(return_value=NS(handle_inbound=inbound)))
+        original = "Please ask @123 about the plan"
+        await whatsapp.receive(gw, {"data": {"message": message(content=original, agent_mentioned=agent_mentioned,
+            mentions=[{"text": "@123", "phone_number": "+15550000003", "is_agent": False}])}})
+        session._flush_imessage_burst()
+        await session._worker
+        assert [event[0] for event in client.events] == ["run"] and len(sent) == 1
+        assert "Please ask @Alex about the plan" in client.events[0][1]
+        meta = received[0]
+        assert meta["conversation_kind"] == "direct" and meta["contact"] == sender
+        assert meta["raw_text"] == meta["original_text"] == original
+        assert meta["whatsapp_mentioned"] is agent_mentioned
+        assert "do not inject mention" not in json.dumps(meta) + client.events[0][1]
+    asyncio.run(scenario())

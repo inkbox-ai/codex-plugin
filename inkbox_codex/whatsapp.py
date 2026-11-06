@@ -224,8 +224,7 @@ async def receive(gateway, envelope):
     try:
         original_text = text
         mentions = message.get("mentions") if isinstance(message.get("mentions"), list) else []
-        if is_group(message):
-            text, mentions = await render_mentions(gateway, text, mentions)
+        text, mentions = await render_mentions(gateway, text, mentions)
         refreshed = []
         for item in media:
             if item.get("status") == "unavailable":
@@ -288,7 +287,7 @@ async def receive(gateway, envelope):
             "conversation_kind": "group" if is_group(message) else "direct",
             "mentions": mentions,
             "original_text": original_text if text != original_text else None,
-            "whatsapp_mentioned": is_group(message) and message.get("agent_mentioned") is True,
+            "whatsapp_mentioned": message.get("agent_mentioned") is True,
             "is_group": is_group(message),
             "group_name": message.get("group_name"),
             "remote_number": message.get("remote_number"),
