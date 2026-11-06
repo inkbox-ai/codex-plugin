@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Recognize verified native WhatsApp @mentions in group mention mode without interpreting numeric text as identity evidence. Preserve structured mentions of other participants as context, without inventing unknown phone numbers.
+- Recognize verified native WhatsApp @mentions in group mention mode without interpreting numeric text as identity evidence. Preserve structured mentions of other participants as context, without inventing unknown phone numbers. Render verified mention tokens using name-only contact lookups, with phone or unresolved fallbacks while retaining original text.
 
 - Reduce scheduled full-stack CI to once daily at noon Pacific Time, including daylight saving time changes.
 - Pin CI host tests and live suites to Codex 0.163.0 instead of the moving alpha channel.

@@ -259,9 +259,69 @@ def test_other_native_mentions_are_context_not_a_wake_signal(sdk, monkeypatch):
         session._flush_imessage_burst()
         await session._worker
         assert [event[0] for event in client.events] == ["context"] and not sent
-        assert received[0]["mentions"] == mentions
+        assert received[0]["mentions"] == [{**item, "display_name": None} for item in mentions]
         assert '"phone_number": null' in client.events[0][1]
         assert "+15550000003" in client.events[0][1]
         write_turn_context("other-mentions", gw.cfg, received[0])
-        assert read_turn_context("other-mentions")["route_meta"]["mentions"] == mentions
+        assert read_turn_context("other-mentions")["route_meta"]["mentions"] == received[0]["mentions"]
+    asyncio.run(scenario())
+
+
+
+def test_readable_mentions_use_names_only_and_exact_tokens():
+    async def scenario():
+        lookup = AsyncMock(return_value={"name": "Alex\nExample", "notes": "private note", "memories": ["private memory"]})
+        gw = NS(_resolve_contact_full=lookup)
+        mentions = [{"text": "@123", "phone_number": "+15550000003", "is_agent": False},
+                    {"text": "@1234", "phone_number": None, "is_agent": False},
+                    {"text": "@123", "phone_number": "+15550000003", "is_agent": False}]
+        original = "@123 asks @1234; @123! @12345 other@123 https://example.test/@123 www.example.test/@123 @123.example"
+        rendered, enriched = await whatsapp.render_mentions(gw, original, mentions)
+        assert rendered == "@Alex Example asks @[unresolved mention]; @Alex Example! @12345 other@123 https://example.test/@123 www.example.test/@123 @123.example"
+        assert enriched[0]["display_name"] == "Alex Example"
+        assert enriched[1]["phone_number"] is None
+        assert "private" not in json.dumps(enriched) + rendered
+        lookup.assert_awaited_once_with(kind="phone", value="+15550000003")
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("contact", [None, {"name": ""}, RuntimeError("lookup unavailable")])
+def test_readable_mentions_fall_back_to_verified_phone(contact):
+    async def scenario():
+        lookup = AsyncMock(side_effect=contact) if isinstance(contact, Exception) else AsyncMock(return_value=contact)
+        rendered, enriched = await whatsapp.render_mentions(NS(_resolve_contact_full=lookup), "Ask @123", [
+            {"text": "@123", "phone_number": "+15550000003", "is_agent": False}])
+        assert rendered == "Ask @+15550000003" and enriched[0]["display_name"] is None
+    asyncio.run(scenario())
+
+
+def test_readable_mention_keeps_raw_gate_and_original_text_without_memories(sdk, monkeypatch):
+    from inkbox_codex.imessage import read_turn_context, write_turn_context
+    async def scenario():
+        monkeypatch.setattr(whatsapp, "group_sdk_available", lambda: True)
+        gw = bridge(sdk)
+        gw._resolve_contact_full = AsyncMock(return_value={"name": "agent", "notes": "private note", "memories": ["private memory"]})
+        sent = []
+        session = make_session(sent)
+        session.cfg.group_reply_mode = "mention"
+        client = session._client = Client()
+        received = []
+        async def inbound(body, mode, meta):
+            received.append(meta)
+            await session.handle_inbound(body, mode, meta)
+        gw.sessions = NS(get=Mock(return_value=NS(handle_inbound=inbound)))
+        original = "Ask @123 about the plan"
+        mentions = [{"text": "@123", "phone_number": "+15550000003", "is_agent": False}]
+        await whatsapp.receive(gw, {"data": {"message": group(content=original, agent_mentioned=False, mentions=mentions)}})
+        session._flush_imessage_burst()
+        await session._worker
+        assert [event[0] for event in client.events] == ["context"] and not sent
+        assert "Ask @agent about the plan" in client.events[0][1]
+        meta = received[0]
+        assert meta["raw_text"] == meta["original_text"] == original
+        assert meta["contact"] is None and meta["contact_memories"] == []
+        assert "private" not in json.dumps(meta) + client.events[0][1]
+        write_turn_context("rendered", gw.cfg, meta)
+        assert read_turn_context("rendered")["route_meta"]["original_text"] == original
+        assert read_turn_context("rendered")["route_meta"]["mentions"][0]["display_name"] == "agent"
     asyncio.run(scenario())

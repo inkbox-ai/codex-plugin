@@ -149,6 +149,40 @@ async def current_route_allowed(gateway, meta):
             and all(gateway._sender_allowed(number) for number in field(current, "participants")))
 
 
+async def render_mentions(gateway, text, mentions):
+    """Render verified mention tokens using names only, without contact memories."""
+    names = {}
+    enriched = []
+    replacements = {}
+    for item in mentions:
+        if not isinstance(item, dict):
+            continue
+        phone = item.get("phone_number")
+        if not isinstance(phone, str) or re.fullmatch(r"\+[1-9][0-9]{6,14}", phone) is None:
+            phone = None
+        if phone and phone not in names:
+            try:
+                contact = await gateway._resolve_contact_full(kind="phone", value=phone)
+            except Exception:
+                contact = None
+            name = field(contact, "name") if contact else None
+            names[phone] = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", name).split())[:160] if isinstance(name, str) else ""
+        name = names.get(phone) or None
+        token = item.get("text")
+        enriched.append({"text": token if isinstance(token, str) else None, "phone_number": phone,
+                         "is_agent": item.get("is_agent") is True, "display_name": name})
+        if isinstance(token, str) and re.fullmatch(r"@[0-9]+", token):
+            replacement = "@" + (name or phone) if name or phone else "@[unresolved mention]"
+            if token in replacements and replacements[token] != replacement:
+                replacement = "@[unresolved mention]"
+            replacements[token] = replacement
+    if not replacements:
+        return text, enriched
+    tokens = "|".join(re.escape(token) for token in sorted(replacements, key=len, reverse=True))
+    pattern = re.compile(r"(?:https?://|www\.)\S+|(?<![\w@.+/-])(?P<mention>" + tokens + r")(?![\w-])(?!\.\w)", re.I)
+    return pattern.sub(lambda match: replacements[match.group("mention")] if match.group("mention") else match.group(), text), enriched
+
+
 async def receive(gateway, envelope):
     from aiohttp import web
 
@@ -188,6 +222,10 @@ async def receive(gateway, envelope):
     if gateway._dedup_begin(key):
         return web.json_response({"ok": True, "deduped": True})
     try:
+        original_text = text
+        mentions = message.get("mentions") if isinstance(message.get("mentions"), list) else []
+        if is_group(message):
+            text, mentions = await render_mentions(gateway, text, mentions)
         refreshed = []
         for item in media:
             if item.get("status") == "unavailable":
@@ -248,7 +286,8 @@ async def receive(gateway, envelope):
             ),
             "contact_memories": memories,
             "conversation_kind": "group" if is_group(message) else "direct",
-            "mentions": message.get("mentions") if isinstance(message.get("mentions"), list) else [],
+            "mentions": mentions,
+            "original_text": original_text if text != original_text else None,
             "whatsapp_mentioned": is_group(message) and message.get("agent_mentioned") is True,
             "is_group": is_group(message),
             "group_name": message.get("group_name"),
