@@ -282,7 +282,9 @@ class Inbox:
             old = self.db.execute("SELECT event_id,payload FROM events WHERE event_id=? OR (scope=? AND sequence=?)",
                                   (event.event_id, event.scope, event.sequence)).fetchone()
             if old:
-                previous = _receipt_content(json.loads(old[1]))
+                previous_envelope = json.loads(old[1])
+                previous = _receipt_content(previous_envelope)
+                downgraded = False
                 incoming = _receipt_content(event.envelope)
                 if (event.channel == "whatsapp" and event.phase == "ordinary"
                         and previous["companion"].get("phase") != "ordinary"):
@@ -294,8 +296,17 @@ class Inbox:
                                  if key != "phase"}
                     if prior_scope == new_scope:
                         incoming["companion"] = previous["companion"]
+                        downgraded = True
                 if old[0] != event.event_id or previous != incoming:
                     raise CompanionError("Conflicting Companion event ID or sequence")
+                if downgraded and not self.source_submitted(Event.parse(previous_envelope)):
+                    # The signed retry revoked this grant. Retire only work that
+                    # has never crossed a host/send checkpoint, not uncertainty.
+                    self.db.execute("""UPDATE events SET state='done'
+                        WHERE event_id=? AND state IN ('pending','failed')
+                        AND NOT EXISTS (SELECT 1 FROM host_receipts WHERE event_id=?)
+                        AND NOT EXISTS (SELECT 1 FROM replies WHERE event_id=?)""",
+                        (event.event_id, event.event_id, event.event_id))
                 return False
             if self.db.execute(
                 "SELECT 1 FROM events WHERE scope=? AND sequence>? AND state!='pending' LIMIT 1",
@@ -540,6 +551,8 @@ class Receiver:
                 # or send automatically; other conversation workers can continue.
                 row = self.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (event.event_id,)).fetchone()
                 retrying_reply = False
+                if event.channel == "whatsapp" and row[0] == "done":
+                    continue  # A signed downgrade retired unsubmitted work during preflight.
                 if row[0] in {"submitting", "sending"}:
                     self.inbox.state(event.event_id, "uncertain")
                     self.retries[scope] = asyncio.get_running_loop().call_later(min(2, RETRY_MAX_SECONDS), self.schedule, scope)
@@ -874,6 +887,10 @@ class Receiver:
                 elif event.channel == "whatsapp":
                     await self.authorize_whatsapp(event, meta)
             with self.inbox.db:
+                if event.channel == "whatsapp" and self.inbox.db.execute(
+                    "SELECT state FROM events WHERE event_id=?", (event.event_id,),
+                ).fetchone()[0] == "done":
+                    raise CompanionError("WhatsApp Companion receipt retired before submission")
                 thread_id = getattr(session._client, "thread_id", None)
                 if thread_id:
                     self.inbox.db.execute("INSERT INTO threads VALUES(?,?) ON CONFLICT(session_key) DO UPDATE SET thread_id=excluded.thread_id",
@@ -925,6 +942,8 @@ class Receiver:
             # downloads or contact lookups. Persist enrichment for restart replay.
             prepared = await self.prepare_whatsapp(event.envelope, enrich=True)
             if prepared is None:
+                return
+            if self.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (event.event_id,)).fetchone()[0] == "done":
                 return
             event.envelope.update(prepared)
             with self.inbox.db:

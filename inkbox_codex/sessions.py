@@ -492,7 +492,8 @@ class ContactSession:
         handle = (self.identity_info.get("handle") or self.cfg.identity).lstrip("@").lower()
         if meta and meta.get("channel") == "whatsapp" and handle.isdigit():
             handle = ""
-        if parts and parts[0].lower().rstrip(",:") in {"@agent", f"@{handle}"}:
+        handles = {"@agent"} | ({f"@{handle}"} if handle else set())
+        if parts and parts[0].lower().rstrip(",:") in handles:
             return parts[1] if len(parts) == 2 else ""
         return text
 

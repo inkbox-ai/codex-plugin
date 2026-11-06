@@ -406,3 +406,5 @@ def test_numeric_handle_never_treats_another_native_token_as_agent(native, expec
     assert session._companion_mentioned(meta) is expected
     assert session._companion_control_text("@123456789 allow", meta) == ("allow" if native else "@123456789 allow")
     assert session._whatsapp_mentioned("@agent hello", {**meta, "whatsapp_mentioned": False})
+    assert session._companion_control_text("@ allow", meta) == "@ allow"
+    assert session._companion_control_text("@: /stop", meta) == "@: /stop"

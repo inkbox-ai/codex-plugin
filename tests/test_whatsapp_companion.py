@@ -548,3 +548,58 @@ def test_revoked_phase_retry_acknowledges_without_replacing_saved_grant(monkeypa
         finally:
             await receiver.close()
     asyncio.run(scenario())
+
+
+
+def test_revoked_unsubmitted_grant_retires_during_enrichment_and_next_event_runs(monkeypatch):
+    async def scenario():
+        value = envelope()
+        value["data"]["message"]["media"] = [{"id": "owned"}]
+        receiver, _, session, _, gateway = setup(value, monkeypatch)
+        gateway._identity.get_whatsapp_media = Mock(return_value=NS(status="ready", url="https://example.test/photo", content_type="image/png", size=12))
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def slow(text, attachments, **kwargs):
+            entered.set(); await release.wait(); return text
+        gateway._with_media = slow
+        try:
+            assert await receiver.accept(value)
+            await entered.wait()
+            retry = deepcopy(value)
+            retry["companion"] = {key: val for key, val in retry["companion"].items()
+                if key not in {"activation_id", "history", "history_complete", "history_next_cursor", "reply_context"}}
+            retry["companion"]["phase"] = "ordinary"
+            assert not await receiver.accept(retry)
+            assert receiver.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (value["id"],)).fetchone()[0] == "done"
+            following = deepcopy(retry)
+            following["id"] += "-next"
+            following["companion"]["sequence"] = 2
+            following["data"]["message"].update(id="20000000-0000-4000-8000-000000000099", media=[])
+            assert await receiver.accept(following)
+            release.set()
+            await drained(receiver)
+            assert len(session._client.events) == 1
+            assert not receiver.inbox.scopes()
+        finally:
+            release.set(); await receiver.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("state", ["submitting", "sending", "uncertain", "reply_pending"])
+def test_phase_downgrade_never_retires_checkpointed_work(monkeypatch, state):
+    async def scenario():
+        value = envelope()
+        receiver, _, _, _, _ = setup(value, monkeypatch)
+        try:
+            prepared = await receiver.prepare_whatsapp(value)
+            receiver.inbox.accept(Event.parse(prepared))
+            receiver.inbox.state(value["id"], state)
+            retry = deepcopy(value)
+            retry["companion"] = {key: val for key, val in retry["companion"].items()
+                if key not in {"activation_id", "history", "history_complete", "history_next_cursor", "reply_context"}}
+            retry["companion"]["phase"] = "ordinary"
+            prepared = await receiver.prepare_whatsapp(retry)
+            assert not receiver.inbox.accept(Event.parse(prepared))
+            assert receiver.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (value["id"],)).fetchone()[0] == state
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
