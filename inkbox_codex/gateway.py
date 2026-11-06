@@ -3708,7 +3708,7 @@ class InkboxGateway:
         try:
             matches = await asyncio.to_thread(self._inkbox.contacts.lookup, **{kind: value})
         except Exception:
-            logger.debug("[bridge] contacts.lookup(%s=%s) failed", kind, value, exc_info=True)
+            logger.debug("[bridge] contacts.lookup failed (kind=%s)", kind)
             self._contact_cache[cache_key] = (None, now + CONTACT_CACHE_TTL_SECONDS)
             return None
         if len(matches) != 1:

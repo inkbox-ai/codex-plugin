@@ -410,3 +410,18 @@ def test_self_mention_uses_agent_handle_not_contact_nickname(sdk, monkeypatch):
         assert meta["mentions"][0]["is_agent"] is True
         gw._resolve_contact_full.assert_not_awaited()
     asyncio.run(scenario())
+
+
+
+def test_mention_lookup_failure_does_not_log_private_number(sdk, caplog):
+    async def scenario():
+        gw = bridge(sdk)
+        phone = "+15550000003"
+        gw._inkbox = NS(contacts=NS(lookup=Mock(side_effect=RuntimeError(f"lookup failed for {phone}"))))
+        with caplog.at_level("DEBUG"):
+            rendered, _ = await whatsapp.render_mentions(gw, "Ask @123", [
+                {"text": "@123", "phone_number": phone, "is_agent": False}])
+        assert rendered == "Ask @" + phone
+        assert "contacts.lookup failed" in caplog.text
+        assert phone not in caplog.text
+    asyncio.run(scenario())
