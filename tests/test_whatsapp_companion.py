@@ -412,11 +412,17 @@ def test_retry_ignores_current_projection_but_rejects_changed_source(monkeypatch
             await drained(receiver)
             retry = deepcopy(value)
             retry["data"]["message"].update(group_name="Renamed", participants=[SPONSOR, PEER, "+12025550999"],
-                reactions=[{"emoji": "👍"}], is_read=True, updated_at="later", status="read")
+                reactions=[{"emoji": "👍"}], is_read=True, updated_at="later", status="read",
+                reply_to_message_id="20000000-0000-4000-8000-000000000091",
+                thread_id="20000000-0000-4000-8000-000000000092",
+                thread_root_message_id="20000000-0000-4000-8000-000000000093")
             retry["data"]["message"]["mentions"][0]["phone_number"] = PEER
             assert not await receiver.accept(retry)
             await drained(receiver)
             assert len(session._client.events) == 1
+            stored = receiver.inbox.db.execute("SELECT payload FROM events WHERE event_id=?", (value["id"],)).fetchone()[0]
+            import json
+            assert json.loads(stored)["data"]["message"].get("reply_to_message_id") == value["data"]["message"].get("reply_to_message_id")
             retry["data"]["message"]["content"] = "changed source body"
             with pytest.raises(CompanionError, match="Conflicting"):
                 await receiver.accept(retry)
