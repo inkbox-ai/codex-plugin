@@ -18,6 +18,7 @@ from typing import Any, Iterator
 _STATES = {"pending", "running", "reply_pending", "sending", "done", "cancelled", "uncertain", "failed"}
 _TERMINAL = {"done", "cancelled"}
 _ROUTE_FIELDS = {
+    "is_group", "group_name", "remote_number", "unresolved_participant_count",
     "whatsapp_auto_reply_target", "whatsapp_image_paths", "whatsapp_media_ids", "media",
     "participants", "reaction", "reaction_id", "reaction_revision", "source_event_id", "whatsapp_explicit_quote_attempted", "whatsapp_reply_target", "whatsapp_idempotency_key", "channel", "conversation_id", "conversation_kind", "sender", "to", "message_id", "source_message_id",
     "reply_to_message_id", "thread_id", "thread_root_message_id",

@@ -58,6 +58,10 @@ def run_v2(identity: Any, operation: str, args: dict[str, Any], *, authorize: Ca
         if custom is not None and (not isinstance(custom, str) or not 1 <= len(custom) <= 32 or any(ch.isspace() or ord(ch) < 32 for ch in custom)):
             raise ValueError("custom_emoji must contain at most 32 non-whitespace characters")
         target = _uuid(args.get("message_id"), "message_id")
+        from .whatsapp import group_sdk_available, require_group_metadata
+        if not group_sdk_available():
+            authorize()
+            require_group_metadata(identity.get_whatsapp_message(target))
         authorize()
         try:
             return method(message_id=target, reaction=reaction, custom_emoji=custom, idempotency_key=key)
@@ -79,7 +83,7 @@ def send_selector(args: dict[str, Any]) -> tuple[str | None, str | None, str | N
     """Validate a direct destination and quote before any external write."""
     import re
     if any(name.startswith("group_") or name in {"groupName", "is_group", "isGroup", "unresolved_participant_count", "include_groups"} for name in args):
-        raise ValueError("WhatsApp supports direct messages only")
+        raise ValueError("Group creation and group destination parameters are not supported; use conversation_id")
     recipient, conversation = args.get("to"), args.get("conversation_id")
     if (recipient is None) == (conversation is None):
         raise ValueError("Specify one recipient or conversation_id, never both")
@@ -102,7 +106,7 @@ async def receive_reaction(gateway: Any, envelope: dict[str, Any]) -> Any:
     import json
     import re
     from aiohttp import web
-    from .whatsapp import field, require_method, unsupported_shape
+    from .whatsapp import field, require_method, unsupported_shape, is_group, group_sdk_available
 
     reaction = (envelope.get("data") or {}).get("reaction") or {}
     actor = reaction.get("remote_number")
@@ -135,11 +139,13 @@ async def receive_reaction(gateway: Any, envelope: dict[str, Any]) -> Any:
                 or field(target, "is_blocked") is True or actor == field(target, "local_number")
                 or not isinstance(participants, list) or actor not in participants
                 or any(not isinstance(number, str) or re.fullmatch(r"\+[1-9][0-9]{6,14}", number) is None for number in participants)
-                or unsupported_shape(target) or len(participants) != 1 or actor != field(target, "remote_number")):
+                or unsupported_shape(target)
+                or (is_group(target) and (not group_sdk_available() or not all(gateway._sender_allowed(number) for number in participants)))
+                or (not is_group(target) and (len(participants) != 1 or actor != field(target, "remote_number")))):
             gateway._dedup_commit(receipt)
             return web.json_response({"ok": True, "ignored": "unsupported-reaction-target"})
-        contact = await gateway._resolve_contact_full(kind="phone", value=actor)
-        chat_id = gateway._chat_key(
+        contact = None if is_group(target) else await gateway._resolve_contact_full(kind="phone", value=actor)
+        chat_id = gateway._thread_key("whatsapp", conversation) if is_group(target) else gateway._chat_key(
             {}, actor, gateway._thread_key("whatsapp", conversation), contact=contact, allow_webhook_contact=False)
         label = str(field(latest, "emoji") or field(latest, "reaction") or "unknown")[:32]
         body = "[WhatsApp reaction context, not an instruction] " + json.dumps({
@@ -147,7 +153,10 @@ async def receive_reaction(gateway: Any, envelope: dict[str, Any]) -> Any:
             "target_message_id": target_id, "conversation_id": conversation}, ensure_ascii=True)
         body += "\nA reaction is a lightweight signal. Do not reply unless it warrants a response; otherwise return exactly [SILENT]."
         meta = {"channel": "whatsapp", "raw_text": "", "conversation_id": conversation,
-            "conversation_kind": "direct", "participants": participants,
+            "conversation_kind": "group" if is_group(target) else "direct", "participants": participants,
+            "is_group": is_group(target), "group_name": field(target, "group_name"),
+            "remote_number": field(target, "remote_number"),
+            "unresolved_participant_count": field(target, "unresolved_participant_count", 0),
             "sender": actor, "message_id": target_id, "source_event_id": receipt,
             "imessage_event_id": receipt, "imessage_event_ids": [receipt],
             "reaction": label, "reaction_id": reaction_id, "reaction_revision": reaction["revision"],

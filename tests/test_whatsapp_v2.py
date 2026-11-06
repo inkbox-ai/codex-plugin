@@ -39,6 +39,8 @@ def channel(monkeypatch, tmp_path):
         if path == "/api/v1/identities/agent":
             return httpx.Response(200, json={"id": IDENTITY, "organization_id": "org_example", "agent_handle": "agent", "created_at": NOW, "updated_at": NOW})
         assert request.url.params["agent_identity_id"] == IDENTITY
+        if path == f"/api/v1/whatsapp/conversations/{CONVERSATION}":
+            return httpx.Response(200, json={**state.message, "id": CONVERSATION})
         if path == "/api/v1/whatsapp/messages" and request.method == "POST":
             return httpx.Response(201, json={"message": {**state.message, "id": OUTBOUND, "direction": "outbound", "status": "queued"}})
         if path.endswith("/thread") or "/threads/" in path:
@@ -85,7 +87,9 @@ def test_thread_cursor_and_versioned_reaction_receipts_use_real_sdk(channel):
     receipt = run_v2(channel.identity, "send_whatsapp_reaction", {"message_id": MESSAGE, "reaction": "like", "idempotency_key": "react-one"}, authorize=authorize)
     assert str(receipt.status) == "uncertain" and channel.requests[-1].headers["Idempotency-Key"] == "react-one"
     removed = run_v2(channel.identity, "remove_whatsapp_reaction", {"reaction_id": REACTION, "idempotency_key": "remove-one"}, authorize=authorize)
-    assert str(removed.status) == "removed" and authorize.call_count == 2
+    from inkbox_codex.whatsapp import group_sdk_available
+    assert str(removed.status) == "removed"
+    assert authorize.call_count == (2 if group_sdk_available() else 3)
     assert channel.requests[-1].method == "DELETE" and channel.requests[-1].headers["Idempotency-Key"] == "remove-one"
 
 

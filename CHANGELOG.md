@@ -14,7 +14,8 @@
 - Captionless and consecutive WhatsApp images reach native image input; voice notes use the existing transcription credential when available.
 - Require the published Inkbox SDK >=0.7.27,<1.0.0 in plugin 0.2.26.
 
-- WhatsApp now supports direct messages only. `to` accepts exactly one E.164 string; arrays, formatted numbers, and comma-separated recipients are rejected.
-- Removed WhatsApp group creation, membership, routing, and group tool parameters. Unsupported inbound group messages and reactions do not start agent turns or replies.
+- WhatsApp supports direct messages and existing inbound group conversations. `to` accepts exactly one E.164 string; arrays, formatted numbers, and comma-separated recipients are rejected.
+- Group conversations have isolated sessions and support Automatic or Mention required mode, media, quoted replies, and reactions. Group names are display metadata; replies use conversation IDs. Group creation and membership changes remain unsupported.
+- Group routing requires an SDK that preserves group metadata (0.7.29 or newer); older supported SDKs retain direct-message functionality and report when group metadata is unavailable.
 - Retained group send intents cannot be converted to direct messages. Their original request keys remain available for read-only receipt lookup.
 - Direct-message quoted replies, threads, reactions, media, and idempotent recovery remain supported. Other channels' group support is unchanged.

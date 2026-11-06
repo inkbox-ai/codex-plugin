@@ -32,7 +32,7 @@ def test_schema_and_scalar_wire_contract(sdk):
     response = result(asyncio.run(call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", {"to": "+15550000002", "text": "Hello"})))
     assert json.loads(sdk.calls[0].content) == {"to": "+15550000002", "text": "Hello"}
     assert len(response["participants"]) == len(response["recipients"]) == 1
-    assert "is_group" not in response
+    assert response.get("is_group", False) is False
 
 
 @pytest.mark.parametrize("shape", [{"is_group": True}, {"isGroup": True},
@@ -126,7 +126,7 @@ def test_other_channel_group_context_does_not_block_explicit_direct_send(sdk, mo
 def test_removed_arguments_rejected_even_without_schema_validation(sdk, name):
     from inkbox_codex.whatsapp_v2 import send_selector
     args = {"to": "+15550000002", "text": "Hello", name: None}
-    with pytest.raises(ValueError, match="direct messages only"):
+    with pytest.raises(ValueError, match="Group creation"):
         send_selector(args)
     value = asyncio.run(call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", args))
     assert value["isError"] and not sdk.requests

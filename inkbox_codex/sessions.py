@@ -679,7 +679,7 @@ class ContactSession:
             self.mode, self.reply_meta = mode, meta
             await self._stop_turn()
             return False
-        is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
+        is_group = mode in {"sms", "imessage", "slack", "whatsapp"} and meta.get("conversation_kind") == "group"
         pending_reply = (self.pending is not None and not self.pending.future.done()
                          and not meta.get("reaction"))
         active_mode, active_meta = self._pending_reply_route or self._reply_route(
