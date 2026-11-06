@@ -406,7 +406,8 @@ def test_inadmissible_current_roster_does_not_block_next_sequence(monkeypatch, c
 def test_retry_ignores_current_projection_but_rejects_changed_source(monkeypatch):
     async def scenario():
         value = envelope()
-        receiver, _, session, _, _ = setup(value, monkeypatch)
+        receiver, _, session, _, gateway = setup(value, monkeypatch)
+        gateway._with_media = AsyncMock(side_effect=lambda text, *_args, **_kwargs: text)
         try:
             await receiver.accept(value)
             await drained(receiver)
@@ -416,13 +417,19 @@ def test_retry_ignores_current_projection_but_rejects_changed_source(monkeypatch
                 reply_to_message_id="20000000-0000-4000-8000-000000000091",
                 thread_id="20000000-0000-4000-8000-000000000092",
                 thread_root_message_id="20000000-0000-4000-8000-000000000093")
-            retry["data"]["message"]["mentions"][0]["phone_number"] = PEER
+            retry["data"]["message"]["agent_mentioned"] = False
+            retry["data"]["message"]["mentions"] = [{"text": "@456", "phone_number": PEER, "is_agent": False}]
+            retry["data"]["message"]["media"] = [{"id": "late-owned-attachment", "status": "unavailable"}]
             assert not await receiver.accept(retry)
             await drained(receiver)
             assert len(session._client.events) == 1
             stored = receiver.inbox.db.execute("SELECT payload FROM events WHERE event_id=?", (value["id"],)).fetchone()[0]
             import json
-            assert json.loads(stored)["data"]["message"].get("reply_to_message_id") == value["data"]["message"].get("reply_to_message_id")
+            stored_message = json.loads(stored)["data"]["message"]
+            assert stored_message.get("reply_to_message_id") == value["data"]["message"].get("reply_to_message_id")
+            assert stored_message.get("media") == value["data"]["message"].get("media")
+            assert stored_message["agent_mentioned"] is True
+            assert stored_message["mentions"] == value["data"]["message"]["mentions"]
             retry["data"]["message"]["content"] = "changed source body"
             with pytest.raises(CompanionError, match="Conflicting"):
                 await receiver.accept(retry)

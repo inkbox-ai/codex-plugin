@@ -110,15 +110,13 @@ def _receipt_content(envelope: dict) -> dict:
     if envelope.get("event_type") == "whatsapp.received":
         message = envelope["data"]["message"]
         # Delivery rebuilds current roster, visibility, media URLs and receipts.
-        # Reply/thread links can also be repaired after out-of-order ingestion.
+        # Late ingestion can repair links, append attachments and refresh native
+        # mention metadata. Retain the first admitted copy for routing and wake.
         # Only immutable source content and scope identify a repeated delivery.
         stable = {key: message.get(key) for key in (
             "id", "agent_identity_id", "conversation_id", "direction", "local_number",
-            "remote_number", "sender_number", "content", "is_group", "agent_mentioned",
+            "remote_number", "sender_number", "content", "is_group",
         )}
-        stable["media_ids"] = [item.get("id") for item in message.get("media") or []]
-        stable["mentions"] = [{"text": item.get("text"), "is_agent": item.get("is_agent")}
-                              for item in message.get("mentions") or []]
         content["data"] = {"message": stable}
     if envelope.get("event_type") in SLACK_INCOMING_EVENTS:
         # Optional contact/profile presentation may refresh on a retry.
