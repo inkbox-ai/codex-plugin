@@ -209,3 +209,31 @@ def test_explicit_group_destination_checks_actual_roster(sdk, monkeypatch, origi
             assert not response.get("isError"), response
             assert json.loads(sdk.calls[-1].content)["conversation_id"] == target
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("native, expected", [(True, "run"), (False, "context"), (None, "context"), ("true", "context"), (1, "context")])
+def test_native_mention_webhook_drives_group_gate_without_guessing_numeric_text(sdk, monkeypatch, native, expected):
+    from inkbox_codex.imessage import read_turn_context, write_turn_context
+    async def scenario():
+        monkeypatch.setattr(whatsapp, "group_sdk_available", lambda: True)
+        gw = bridge(sdk)
+        sent = []
+        session = make_session(sent)
+        session.cfg.group_reply_mode = "mention"
+        client = session._client = Client()
+        received = []
+        async def inbound(body, mode, meta):
+            received.append(meta)
+            await session.handle_inbound(body, mode, meta)
+        gw.sessions = NS(get=Mock(return_value=NS(handle_inbound=inbound)))
+        payload = group(content="@123456789 can you see this?", agent_mentioned=native,
+                        reply_to_message_id="00000000-0000-0000-0000-000000000099")
+        await whatsapp.receive(gw, {"data": {"message": payload}})
+        session._flush_imessage_burst()
+        await session._worker
+        assert [event[0] for event in client.events] == [expected]
+        assert len(sent) == (1 if expected == "run" else 0)
+        assert received[0]["whatsapp_mentioned"] is (native is True)
+        write_turn_context("native-group", gw.cfg, received[0])
+        assert read_turn_context("native-group")["route_meta"]["whatsapp_mentioned"] is (native is True)
+    asyncio.run(scenario())

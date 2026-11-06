@@ -701,7 +701,8 @@ class ContactSession:
             )
         mentioned = (
             meta.get("slack_mentioned") is True if mode == "slack"
-            else mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity)
+            else ((mode == "whatsapp" and is_group and meta.get("whatsapp_mentioned") is True)
+                  or mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity))
         )
         context_only = (
             mode == "slack" and is_group
