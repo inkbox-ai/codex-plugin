@@ -418,9 +418,14 @@ class Receiver:
         if envelope.get("event_type") == "whatsapp.received":
             if self.prepare_whatsapp is None:
                 raise CompanionError("WhatsApp Companion source validation is unavailable")
-            Event.parse(envelope)  # Malformed envelopes remain errors, not local-policy ignores.
+            received = Event.parse(envelope)  # Malformed envelopes remain errors, not local-policy ignores.
             envelope = await self.prepare_whatsapp(envelope)
             if envelope is None:
+                # A signed revocation retry can have an inadmissible current
+                # roster. Reconcile only an existing receipt; never admit it anew.
+                if self.inbox.db.execute("SELECT 1 FROM events WHERE event_id=?", (received.event_id,)).fetchone():
+                    self.inbox.accept(received)
+                    self.schedule(received.scope)
                 return False
         if envelope.get("event_type") in SLACK_INCOMING_EVENTS:
             if not self.cfg.slack_enabled:

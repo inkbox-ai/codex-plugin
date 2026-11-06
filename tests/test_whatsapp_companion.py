@@ -551,7 +551,8 @@ def test_revoked_phase_retry_acknowledges_without_replacing_saved_grant(monkeypa
 
 
 
-def test_revoked_unsubmitted_grant_retires_during_enrichment_and_next_event_runs(monkeypatch):
+@pytest.mark.parametrize("missing_sender", [False, True])
+def test_revoked_unsubmitted_grant_retires_during_enrichment_and_next_event_runs(monkeypatch, missing_sender):
     async def scenario():
         value = envelope()
         value["data"]["message"]["media"] = [{"id": "owned"}]
@@ -568,12 +569,14 @@ def test_revoked_unsubmitted_grant_retires_during_enrichment_and_next_event_runs
             retry["companion"] = {key: val for key, val in retry["companion"].items()
                 if key not in {"activation_id", "history", "history_complete", "history_next_cursor", "reply_context"}}
             retry["companion"]["phase"] = "ordinary"
+            if missing_sender:
+                retry["data"]["message"]["participants"] = [PEER]
             assert not await receiver.accept(retry)
             assert receiver.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (value["id"],)).fetchone()[0] == "done"
             following = deepcopy(retry)
             following["id"] += "-next"
             following["companion"]["sequence"] = 2
-            following["data"]["message"].update(id="20000000-0000-4000-8000-000000000099", media=[])
+            following["data"]["message"].update(id="20000000-0000-4000-8000-000000000099", media=[], participants=[SPONSOR, PEER])
             assert await receiver.accept(following)
             release.set()
             await drained(receiver)
