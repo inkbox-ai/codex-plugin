@@ -408,13 +408,13 @@ Offline regression harness: `python -m pytest -q tests/test_slack.py tests/test_
 
 Direct-message sessions are keyed by Inkbox contact, so one person = one conversation across channels. Group SMS, iMessage, and WhatsApp messages share a session keyed by the group conversation, separate from direct messages and other groups, while retaining each sender's identity metadata. Codex session ids are persisted in `~/.inkbox-codex/sessions.json` and resumed across bridge restarts — your conversation picks up where it left off. Replies go out on the channel you last used. If a voice call ends before Codex finishes a voice reply, that late voice reply is dropped instead of silently switching to SMS or email.
 
-**WhatsApp groups.** Existing groups become available after another participant sends a message. Group names are display labels; send using the stable conversation ID. Creating groups, adding members, and sending by group name are not supported. Group replies support media, reactions, and explicit quoted replies. Group metadata requires Inkbox SDK 0.7.29 or newer; until that release is published, install the corresponding SDK source. The supported older SDK remains usable for direct-message sends, but listings or reads containing group messages require the compatible SDK. Unresolved participants or disallowed members prevent group admission and replies.
+**WhatsApp groups.** Existing groups become available after another participant sends a message. Group names are display labels; send using the stable conversation ID. Creating groups, adding members, and sending by group name are not supported. Group replies support media, reactions, and explicit quoted replies. Group metadata requires Inkbox SDK 0.7.29 or newer; until that release is published, install the corresponding SDK source. The supported older SDK remains usable for direct-message sends, but listings or reads containing group messages require the compatible SDK. Unresolved participants and explicit blocks prevent group admission and replies. Without an active Companion grant, every group participant must have ordinary access.
 
-**Group replies.** The setup wizard offers **Automatic** (default) or **Mention required** for group SMS, iMessage, WhatsApp, and Slack, saved as `INKBOX_GROUP_REPLY_MODE=auto|mention`. Automatic keeps the existing behavior: the agent decides whether to answer. WhatsApp also accepts a verified native @mention of the agent. In both direct and group WhatsApp messages, verified mention tokens are displayed using a contact name when available, otherwise the known phone number or an explicit unresolved-mention label. Original message text is retained in metadata; contact notes and memories are not added. Structured mention context identifies other mentioned participants when their phone numbers are known; unresolved numbers stay unknown, and mentioning someone else does not wake the agent. For SMS/iMessage/WhatsApp, mention mode starts a reply when the new message itself includes `@agent` or `@<agent-handle>` as a whole mention, case-insensitively; older messages, links, and email addresses do not count. Slack requires a native @mention of the agent, including on follow-ups in an engaged thread. Other messages and group reactions are added to Codex's context without generating a reply or a typing indicator. While a turn is running, background messages wait until it finishes before being appended. Appended context persists with the Codex thread; messages still waiting in the bridge's queue are not persisted across a restart. Direct messages are unchanged. Commands such as `/stop`, and answers to the agent's pending questions from the sender it asked, do not require a mention.
+**Group replies.** The setup wizard offers **Automatic** (default) or **Mention required** for group SMS, iMessage, WhatsApp, and Slack, saved as `INKBOX_GROUP_REPLY_MODE=auto|mention`. Automatic keeps the existing behavior: the agent decides whether to answer. WhatsApp also accepts a verified native @mention of the agent. In both direct and group WhatsApp messages, verified self-mention tokens use the configured agent handle; other mention tokens use a contact name when available, otherwise the known phone number or an explicit unresolved-mention label. Original message text is retained in metadata; contact notes and memories are not added. Structured mention context identifies other mentioned participants when their phone numbers are known; unresolved numbers stay unknown, and mentioning someone else does not wake the agent. For SMS/iMessage/WhatsApp, mention mode starts a reply when the new message itself includes `@agent` or `@<agent-handle>` as a whole mention, case-insensitively; older messages, links, and email addresses do not count. Slack requires a native @mention of the agent, including on follow-ups in an engaged thread. Other messages and group reactions are added to Codex's context without generating a reply or a typing indicator. While a turn is running, background messages wait until it finishes before being appended. Appended context persists with the Codex thread; messages still waiting in the bridge's queue are not persisted across a restart. Direct messages are unchanged. Commands such as `/stop`, and answers to the agent's pending questions from the sender it asked, do not require a mention.
 
 ### Companion conversations (preview)
 
-Verified SMS/MMS, iMessage, email, and Slack webhooks may include a **top-level**
+Verified SMS/MMS, iMessage, WhatsApp, email, and Slack webhooks may include a **top-level**
 `companion` object. Webhooks without it (or with `null`) retain normal routing.
 The bridge loads the full authorized initialization snapshot using the Inkbox
 SDK, including every page, and submits **one combined input**. The sponsor trigger
@@ -433,8 +433,8 @@ existing identity:
 - **Group replies:** `INKBOX_GROUP_REPLY_MODE=auto|mention`, also applied to
   Companion email. **Automatic** lets an eligible message start a turn; the
   agent decides whether a reply is warranted. **Mention required** additionally
-  requires `@agent` or `@<agent-handle>` in the current SMS/iMessage text, or a
-  native Slack @mention. Slack direct messages do not require a mention.
+  requires `@agent` or `@<agent-handle>` in the current SMS/iMessage/WhatsApp text, or a
+  verified native WhatsApp or Slack @mention. Slack direct messages do not require a mention.
   For Companion email, putting the agent's mailbox in the current message's
   **To** recipients also counts as a mention. Address matching is case-insensitive
   and supports display names; **Cc/Bcc alone do not count**. Quoted headers,
@@ -442,7 +442,7 @@ existing identity:
   Reply-all may retain the agent in To and therefore satisfy this gate again.
 
 The signed webhook supplies `sender_access` on `data.text_message` for SMS/MMS
-or `data.message` for iMessage/email, and directly on `data` for Slack. `direct`
+or `data.message` for iMessage/WhatsApp/email, and directly on `data` for Slack. `direct`
 means contact rules permitted the message without sponsorship, including allowed-by-default senders; `sponsored`
 means delivery was authorized through sponsorship. Neither value grants command
 permissions or establishes permanent trust. Access is not inferred from the
@@ -1033,9 +1033,9 @@ without TOTP must have it configured before the agent can generate codes.
 | `INKBOX_ALLOW_ALL_USERS` | no | `false` | Allow all senders admitted by Inkbox contact rules. |
 | `INKBOX_BRIDGE_PORT` | no | `8767` | Local webhook server port. |
 | `INKBOX_PERMISSION_TIMEOUT_S` | no | `600` | Seconds to wait for a permission/poll reply. |
-| `INKBOX_GROUP_REPLY_MODE` | no | `auto` | Group SMS/iMessage, Slack, and Companion email replies: `auto` lets the agent decide; `mention` requires a native Slack @mention, SMS/iMessage `@agent` or `@<agent-handle>`, or Companion email addressed To the agent. Other messages become context without starting a turn. Also configurable in setup. |
+| `INKBOX_GROUP_REPLY_MODE` | no | `auto` | Group SMS/iMessage/WhatsApp, Slack, and Companion email replies: `auto` lets the agent decide; `mention` requires a native WhatsApp/Slack @mention, SMS/iMessage/WhatsApp `@agent` or `@<agent-handle>`, or Companion email addressed To the agent. Other messages become context without starting a turn. Also configurable in setup. |
 | `INKBOX_IMESSAGE_THREADED_REPLIES` | no | `false` | Preview native iMessage replies, ordinary burst collection, and queued follow-ups. Requires a compatible SDK and API; see [Native iMessage replies](#native-imessage-replies-opt-in-preview). Environment-only; no wizard change. |
-| `INKBOX_COMPANION_RESPONSE_MODE` | no | `safe` | Companion SMS/MMS, iMessage, email, and Slack: `safe` wakes only for direct access; `relaxed` permits any delivered sender. Both honor Auto/Mention. Sponsored access stays context-only in Safe mode; Slack rejects explicit unknown access labels. Also configurable in setup. |
+| `INKBOX_COMPANION_RESPONSE_MODE` | no | `safe` | Companion SMS/MMS, iMessage, WhatsApp, email, and Slack: `safe` wakes only for direct access; `relaxed` permits any delivered sender. Both honor Auto/Mention. Sponsored access stays context-only in Safe mode; Slack rejects explicit unknown access labels. Also configurable in setup. |
 | `INKBOX_CODEX_AUTO_APPROVE_INKBOX_TOOLS` | no | `false` | Auto-accept Codex MCP prompts for Inkbox tools only. The setup wizard writes `true` when you trust the agent to send through Inkbox without per-call approval. |
 | `INKBOX_A2A_PROGRESS_INTERVAL_SECONDS` | no | `180` | Seconds between progress updates for active inbound A2A tasks. Set to `0` to disable periodic updates. |
 | `INKBOX_VOICE_STACK` | no | `inkbox_tts_stt` | `inkbox_voice_ai`, `openai_realtime`, or `inkbox_tts_stt`. When absent, legacy Realtime settings remain compatible. |
@@ -1126,7 +1126,7 @@ on the remote connection. Hosted voice and managed speech modes are unchanged.
 
 ## Dedicated WhatsApp
 
-WhatsApp supports direct conversations only for approved agents with a dedicated iMessage number. Request access in the console. Once access is available, an already running bridge can receive WhatsApp messages without a new local toggle or restart.
+WhatsApp supports direct conversations and existing inbound-admitted groups for approved agents with a dedicated iMessage number. Request access in the console. Once access is available, an already running bridge can receive WhatsApp messages without a new local toggle or restart.
 
 Normal final answers reply to the original WhatsApp conversation automatically. The tools support fresh channel status, direct sends, conversation/message reads, one attachment upload, renewed attachment access, local read state and lookup of an accepted send by its original request key. A send accepts text up to 4000 characters and one owned attachment ID. Check `inkbox_get_whatsapp_status` for the current attachment limit: 5 MiB by default, with a hard 20 MiB transport ceiling. Sending is not delivery confirmation; delivery notifications do not start a new model turn or automatically resend.
 
@@ -1136,6 +1136,8 @@ Inbound images are attached to the native Codex turn, including photos without c
 
 WhatsApp requires Inkbox SDK 0.7.27 or newer (below 1.0.0). Its 15 tools are registered only when the bound identity reports `whatsapp_configured=true`. This uses configuration rather than current sending permission, so configured identities with restricted sending can still inspect status and accessible history. Capability is refreshed on MCP tool discovery; reconnect the session after enabling WhatsApp if the host caches its tool list. If discovery cannot read the identity, WhatsApp tools stay hidden while other tools remain available. Each operation still checks current access through the API.
 
-### WhatsApp direct-message update
+### WhatsApp Companion groups
 
-WhatsApp group creation, membership, routing, and group tool parameters have been removed. Unsupported inbound group events are ignored. Retained group send intents cannot be retried as direct messages; preserve the original request key for read-only receipt lookup. Direct-message quoted replies, threads, reactions, media, and recovery remain supported.
+Existing WhatsApp groups use the same Companion configuration, ordered durable inbox, complete initialization snapshot, and Safe/Relaxed response modes as iMessage. A current sponsor grant admits otherwise default-denied peers only within its group; it does not grant direct-message access or permission in another group. Explicit contact blocks remain authoritative. The bridge revalidates the exact activation before submitting a turn or sending a queued reply, and keeps original/native mention metadata separate from historical context. Group names remain display labels, never destinations; creating groups is not supported.
+
+Use a compatible SDK with WhatsApp Companion channel and sender-access support. Native thread expansion is unavailable inside a Companion turn: use its supplied scoped history. Retained legacy group send intents cannot be converted to direct messages; preserve the original request key for read-only receipt lookup.

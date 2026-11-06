@@ -29,6 +29,7 @@ CHANNELS = {
     "message.received": ("mail", "email", "message", "from_address", "body", "thread_id"),
     "text.received": ("phone", "sms", "text_message", "sender_phone_number", "text", "conversation_id"),
     "imessage.received": ("imessage", "imessage", "message", "sender_number", "content", "conversation_id"),
+    "whatsapp.received": ("whatsapp", "whatsapp", "message", "sender_number", "content", "conversation_id"),
 }
 
 
@@ -100,7 +101,8 @@ def _dict(value: Any) -> dict:
 def _receipt_content(envelope: dict) -> dict:
     # Retries can refresh delivery time and the inline history preview. The
     # authoritative snapshot is fetched through the SDK before initialization.
-    content = {key: value for key, value in envelope.items() if key != "timestamp"}
+    # Local display-name enrichment may refresh without changing signed source identity.
+    content = {key: value for key, value in envelope.items() if key not in {"timestamp", "_codex_whatsapp_source"}}
     content["companion"] = {
         key: value for key, value in envelope["companion"].items()
         if key not in {"history", "history_complete", "history_next_cursor"}
@@ -358,9 +360,10 @@ class Inbox:
 
 
 class Receiver:
-    def __init__(self, *, cfg, client, sessions, sender_allowed: Callable, mail_body: Callable):
+    def __init__(self, *, cfg, client, sessions, sender_allowed: Callable, mail_body: Callable, prepare_whatsapp: Callable | None = None):
         self.cfg, self.client, self.sessions = cfg, client, sessions
         self.sender_allowed, self.mail_body = sender_allowed, mail_body
+        self.prepare_whatsapp = prepare_whatsapp
         namespace = hashlib.sha256(f"{cfg.base_url}|{cfg.identity}".encode()).hexdigest()
         self.namespace = namespace
         self.inbox = Inbox(inbox_path(cfg))
@@ -378,6 +381,10 @@ class Receiver:
         return resource
 
     async def accept(self, envelope: dict) -> bool:
+        if envelope.get("event_type") == "whatsapp.received":
+            if self.prepare_whatsapp is None:
+                raise CompanionError("WhatsApp Companion source validation is unavailable")
+            envelope = await self.prepare_whatsapp(envelope)
         if envelope.get("event_type") in SLACK_INCOMING_EVENTS:
             if not self.cfg.slack_enabled:
                 return False
@@ -398,6 +405,8 @@ class Receiver:
         if receipt_state == "pending" and event.phase == "live" and not self.inbox.source_submitted(event):
             session = self.sessions.get(event.session_key(self.namespace))
             if self.author_allowed(event, event.author):
+                if event.channel == "whatsapp" and self.inbox.activation(event):
+                    await self.authorize_whatsapp(event, self.meta(event))
                 if await session.companion_interaction(event.text, self.meta(event)):
                     with self.inbox.db:
                         self.inbox.remember_sources(event, [event.source_id])
@@ -432,6 +441,11 @@ class Receiver:
                                             f"{meta.get('workspace_id')}:{meta.get('actor_id')}")):
                 await session._cancel_pending_turn()
         return matched
+
+    async def authorize_whatsapp(self, event, meta):
+        from .whatsapp import authorize_companion
+        if event.activation:
+            await asyncio.to_thread(authorize_companion, self.client, self.cfg, meta)
 
     async def authorize_slack(self, event):
         """Recheck this activation, not a replacement grant on the same Slack thread."""
@@ -772,6 +786,15 @@ class Receiver:
                 message = {"id": source_id, "content": ""}
             meta.update(source_metadata(message, event.event_id))
             meta["imessage_threaded_replies"] = True
+        if event.channel == "whatsapp":
+            source = event.envelope.get("_codex_whatsapp_source")
+            if not isinstance(source, dict):
+                raise CompanionError("WhatsApp Companion source metadata is missing")
+            meta.update(source)
+            if initialization and source_id and source_id != event.source_id:
+                meta.update(source_metadata({"id": source_id, "content": ""}, event.event_id))
+                meta.update(whatsapp_mentioned=False, mentions=[], original_text=None, rendered_text="")
+            meta["imessage_threaded_replies"] = True
         if event.channel == "slack":
             incoming = inbound_message(event.envelope, event.envelope["data"]["identity_id"])
             if incoming is None:
@@ -822,6 +845,8 @@ class Receiver:
                     raise CompanionError("Companion sponsor is no longer permitted locally")
                 if event.channel == "slack":
                     await self.authorize_slack(event)
+                elif event.channel == "whatsapp":
+                    await self.authorize_whatsapp(event, meta)
             with self.inbox.db:
                 thread_id = getattr(session._client, "thread_id", None)
                 if thread_id:
@@ -870,6 +895,10 @@ class Receiver:
         if self.inbox.source_submitted(event):
             return
         if event.phase == "ordinary":
+            if event.channel == "whatsapp":
+                from .whatsapp import _route_allowed
+                if not _route_allowed(self.sender_allowed, event.envelope["_codex_whatsapp_source"]):
+                    return
             if not self.author_allowed(event, event.author):
                 # Match ordinary inbound filtering: discard this input without
                 # blocking a later, permitted sponsor in the same scope.
@@ -916,6 +945,8 @@ class Receiver:
             return incoming[1]
         message = event.envelope["data"]["text_message" if event.channel == "phone" else "message"]
         text = event.text
+        if event.channel == "whatsapp":
+            text = event.envelope["_codex_whatsapp_source"]["rendered_text"]
         if event.channel == "mail":
             text = await asyncio.to_thread(self.mail_body, message)
         media = message.get("attachments") or message.get("media") or []

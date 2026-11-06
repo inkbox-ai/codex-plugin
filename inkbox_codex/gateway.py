@@ -2051,6 +2051,10 @@ class InkboxGateway:
             or (envelope.get("direction") == "inbound" and envelope.get("local_phone_number"))
         )
 
+    async def _prepare_whatsapp_companion(self, envelope):
+        from .whatsapp import prepare_companion
+        return await prepare_companion(self, envelope)
+
     def _companion(self):
         if self.sessions is None:
             raise CompanionError("Companion sessions are not ready")
@@ -2058,6 +2062,7 @@ class InkboxGateway:
             self._companion_receiver = CompanionReceiver(
                 cfg=self.cfg, client=self._inkbox, sessions=self.sessions,
                 sender_allowed=self._sender_allowed, mail_body=self._fetch_mail_body,
+                prepare_whatsapp=self._prepare_whatsapp_companion,
             )
         return self._companion_receiver
 
@@ -2106,8 +2111,6 @@ class InkboxGateway:
                 secret=self._provider_secret("inkbox"),
             ):
                 return web.Response(status=401, text="WhatsApp requires a valid Inkbox signature")
-            if envelope.get("companion") is not None:
-                return web.Response(status=422, text="Unsupported WhatsApp message")
 
         if envelope.get("companion") is not None:
             # Context grants require a verified Inkbox signature even when the

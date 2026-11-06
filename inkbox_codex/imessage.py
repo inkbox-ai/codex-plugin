@@ -24,7 +24,7 @@ _ROUTE_FIELDS = {
     "reply_to_message_id", "thread_id", "thread_root_message_id",
     "imessage_event_id", "imessage_event_ids", "imessage_sources", "imessage_reply_target",
     "companion", "companion_scope_id", "companion_activation_id", "companion_sequence",
-    "companion_reply_context", "companion_initialization", "companion_context_only",
+    "companion_reply_context", "companion_initialization", "companion_context_only", "companion_sponsor",
 }
 
 

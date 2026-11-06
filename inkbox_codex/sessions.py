@@ -457,6 +457,8 @@ class ContactSession:
             return meta.get("slack_mentioned") is True or meta.get("conversation_kind") == "direct"
         if mentions_agent(str(meta.get("raw_text") or ""), self.identity_info.get("handle") or self.cfg.identity):
             return True
+        if envelope.get("event_type") == "whatsapp.received":
+            return meta.get("whatsapp_mentioned") is True
         if envelope.get("event_type") != "message.received":
             return False
         address = (self.identity_info.get("email") or "").strip().casefold()
