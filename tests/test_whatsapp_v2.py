@@ -87,9 +87,7 @@ def test_thread_cursor_and_versioned_reaction_receipts_use_real_sdk(channel):
     receipt = run_v2(channel.identity, "send_whatsapp_reaction", {"message_id": MESSAGE, "reaction": "like", "idempotency_key": "react-one"}, authorize=authorize)
     assert str(receipt.status) == "uncertain" and channel.requests[-1].headers["Idempotency-Key"] == "react-one"
     removed = run_v2(channel.identity, "remove_whatsapp_reaction", {"reaction_id": REACTION, "idempotency_key": "remove-one"}, authorize=authorize)
-    from inkbox_codex.whatsapp import group_sdk_available
-    assert str(removed.status) == "removed"
-    assert authorize.call_count == (2 if group_sdk_available() else 3)
+    assert str(removed.status) == "removed" and authorize.call_count == 2
     assert channel.requests[-1].method == "DELETE" and channel.requests[-1].headers["Idempotency-Key"] == "remove-one"
 
 

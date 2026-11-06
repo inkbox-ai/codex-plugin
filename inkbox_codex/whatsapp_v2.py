@@ -58,10 +58,6 @@ def run_v2(identity: Any, operation: str, args: dict[str, Any], *, authorize: Ca
         if custom is not None and (not isinstance(custom, str) or not 1 <= len(custom) <= 32 or any(ch.isspace() or ord(ch) < 32 for ch in custom)):
             raise ValueError("custom_emoji must contain at most 32 non-whitespace characters")
         target = _uuid(args.get("message_id"), "message_id")
-        from .whatsapp import group_sdk_available, require_group_metadata
-        if not group_sdk_available():
-            authorize()
-            require_group_metadata(identity.get_whatsapp_message(target))
         authorize()
         try:
             return method(message_id=target, reaction=reaction, custom_emoji=custom, idempotency_key=key)

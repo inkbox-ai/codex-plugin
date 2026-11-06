@@ -173,3 +173,39 @@ def test_durable_group_turn_preserves_route_for_tools_and_restart(sdk, monkeypat
         blocked = await call_inkbox_tool(sdk.client, "agent", "inkbox_send_whatsapp", {"text": "Do not deliver"})
         assert blocked.get("isError") and len(sdk.calls) == before
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("origin", [None, "direct", "group"])
+@pytest.mark.parametrize("operation", ["send", "react"])
+def test_explicit_group_destination_checks_actual_roster(sdk, monkeypatch, origin, operation):
+    from tests.test_whatsapp_autoquote import admitted_source
+    async def scenario():
+        monkeypatch.setattr(whatsapp, "group_sdk_available", lambda: True)
+        gw = bridge(sdk)
+        target = "00000000-0000-0000-0000-000000000088"
+        allowed = NS(**{**sdk.conversation, "is_group": True, "group_name": "Allowed", "remote_number": None,
+                        "unresolved_participant_count": 0})
+        blocked = NS(**{**vars(allowed), "id": target, "participants": ["+15550000002", "+15550000004"]})
+        monkeypatch.setattr(type(gw._identity), "get_whatsapp_conversation", lambda self, cid: blocked if str(cid) == target else allowed)
+        monkeypatch.setattr(type(gw._identity), "get_whatsapp_message", lambda self, mid: NS(**{**group(), "conversation_id": target}))
+        if origin:
+            changes = {} if origin == "direct" else {"is_group": True, "group_name": "Allowed", "remote_number": None}
+            meta = await admitted_source(gw, **changes)
+            await gw._imessage_turn_state("source", "admitted", meta, "Question")
+            await gw._imessage_turn_state("source", "started", meta)
+            monkeypatch.setenv("INKBOX_CODEX_CHAT_ID", "source")
+        monkeypatch.setenv("INKBOX_ALLOWED_USERS", "+15550000002")
+        monkeypatch.setenv("INKBOX_ALLOW_ALL_USERS", "false")
+        name, args = ("inkbox_send_whatsapp", {"conversation_id": target, "text": "Do not deliver"}) if operation == "send" else (
+            "inkbox_react_whatsapp", {"message_id": MESSAGE, "reaction": "love", "idempotency_key": "blocked-group-reaction"})
+        before = len(sdk.calls)
+        response = await call_inkbox_tool(sdk.client, "agent", name, args)
+        assert response.get("isError"), response
+        assert "participants are not allowed" in response["content"][0]["text"]
+        assert len(sdk.calls) == before
+        if operation == "send":
+            blocked.participants = ["+15550000002"]
+            response = await call_inkbox_tool(sdk.client, "agent", name, {**args, "text": "Allowed destination"})
+            assert not response.get("isError"), response
+            assert json.loads(sdk.calls[-1].content)["conversation_id"] == target
+    asyncio.run(scenario())

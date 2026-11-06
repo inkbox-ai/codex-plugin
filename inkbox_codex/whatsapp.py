@@ -542,6 +542,20 @@ def _retained_legacy_key(owner, payload, key):
     return key
 
 
+def validate_group_destination(identity, conversation, cfg):
+    """Check the actual destination, including explicit outreach from another chat."""
+    current = require_group_metadata(require_method(identity, "get_whatsapp_conversation")(conversation))
+    if not is_group(current):
+        return
+    allowed = {user.lower() for user in cfg.allowed_users}
+    if (unsupported_shape(current) or str(field(current, "id")) != conversation
+            or str(field(current, "agent_identity_id")) != str(identity.id)
+            or not field(current, "participants")
+            or (not cfg.allow_all_users and allowed
+                and any(number.lower() not in allowed for number in field(current, "participants")))):
+        raise PermissionError("WhatsApp conversation participants are not allowed")
+
+
 def run_tool(client, identity_handle, name, args):
     """Resolve fresh capability and delegate policy to the identity-scoped SDK."""
     from .tools import _imessage_active_context, _json_safe
@@ -569,24 +583,27 @@ def run_tool(client, identity_handle, name, args):
             raise ValueError("Retained WhatsApp group routes cannot send; use read-only lookup")
     identity = client.get_identity(identity_handle)
     if mutation and owner and is_group(owner.get("route_meta") or {}):
-        if not group_sdk_available():
-            raise RuntimeError("WhatsApp groups require Inkbox SDK 0.7.29 or newer")
-        current = require_method(identity, "get_whatsapp_conversation")(owner["conversation_id"])
-        cfg = read_config()
-        allowed = {user.lower() for user in cfg.allowed_users}
-        if (not is_group(current) or unsupported_shape(current)
-                or str(field(current, "id")) != owner["conversation_id"]
-                or str(field(current, "agent_identity_id")) != str(identity.id)
-                or not field(current, "participants")
-                or (not cfg.allow_all_users and allowed
-                    and any(number.lower() not in allowed for number in field(current, "participants")))):
-            raise PermissionError("WhatsApp conversation participants are not allowed")
+        validate_group_destination(identity, owner["conversation_id"], read_config())
     if operation in V2_OPERATIONS:
+        def check_reaction_destination():
+            if operation not in {"send_whatsapp_reaction", "remove_whatsapp_reaction"}:
+                return
+            validate(origin)
+            if operation == "send_whatsapp_reaction":
+                target_id = args["message_id"]
+            else:
+                reaction = require_method(identity, "get_whatsapp_reaction")(args["reaction_id"])
+                target_id = field(reaction, "target_message_id")
+            target = require_group_metadata(require_method(identity, "get_whatsapp_message")(target_id))
+            validate_group_destination(identity, str(field(target, "conversation_id")), read_config())
+
         def authorize_v2():
             validate(origin)
             if owner and (owner.get("route_meta") or {}).get("channel") == "whatsapp":
                 from .imessage import validate_tool_target
                 validate_tool_target(owner, owner["conversation_id"], None)
+            check_reaction_destination()
+            validate(origin)
         return _json_safe(require_group_metadata(run_v2(identity, operation, args, authorize=authorize_v2)))
     if operation == "lookup_whatsapp_send":
         require_method(identity, "get_whatsapp_status")
@@ -642,8 +659,9 @@ def run_tool(client, identity_handle, name, args):
         if media_id:
             kwargs["media_ids"] = [media_id]
         method = require_method(identity, operation)
-        if conversation and not group_sdk_available():
-            require_group_metadata(require_method(identity, "get_whatsapp_conversation")(conversation))
+        if conversation:
+            validate(origin)
+            validate_group_destination(identity, conversation, read_config())
         if owner and (owner.get("route_meta") or {}).get("channel") == "whatsapp":
             from .imessage import validate_tool_target
             validate_tool_target(owner, owner["conversation_id"], None)
