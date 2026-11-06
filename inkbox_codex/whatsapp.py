@@ -160,17 +160,18 @@ async def render_mentions(gateway, text, mentions):
         phone = item.get("phone_number")
         if not isinstance(phone, str) or re.fullmatch(r"\+[1-9][0-9]{6,14}", phone) is None:
             phone = None
-        if phone and phone not in names:
+        is_agent = item.get("is_agent") is True
+        if phone and not is_agent and phone not in names:
             try:
                 contact = await gateway._resolve_contact_full(kind="phone", value=phone)
             except Exception:
                 contact = None
             name = field(contact, "name") if contact else None
             names[phone] = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", name).split())[:160] if isinstance(name, str) else ""
-        name = names.get(phone) or None
+        name = (field(getattr(gateway, "_identity", None), "agent_handle") or gateway.cfg.identity) if is_agent else names.get(phone) or None
         token = item.get("text")
         enriched.append({"text": token if isinstance(token, str) else None, "phone_number": phone,
-                         "is_agent": item.get("is_agent") is True, "display_name": name})
+                         "is_agent": is_agent, "display_name": name})
         if isinstance(token, str) and re.fullmatch(r"@[0-9]+", token):
             replacement = "@" + (name or phone) if name or phone else "@[unresolved mention]"
             if token in replacements and replacements[token] != replacement:
@@ -225,6 +226,7 @@ async def receive(gateway, envelope):
         original_text = text
         mentions = message.get("mentions") if isinstance(message.get("mentions"), list) else []
         text, mentions = await render_mentions(gateway, text, mentions)
+        rendered_text = text
         refreshed = []
         for item in media:
             if item.get("status") == "unavailable":
@@ -286,6 +288,7 @@ async def receive(gateway, envelope):
             "contact_memories": memories,
             "conversation_kind": "group" if is_group(message) else "direct",
             "mentions": mentions,
+            "rendered_text": rendered_text,
             "original_text": original_text if text != original_text else None,
             "whatsapp_mentioned": message.get("agent_mentioned") is True,
             "is_group": is_group(message),

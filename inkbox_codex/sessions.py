@@ -850,6 +850,11 @@ class ContactSession:
                 "thread_id": meta.get("thread_id"),
                 "thread_root_message_id": meta.get("thread_root_message_id"),
             }]
+        if meta.get("channel") == "whatsapp":
+            for source in meta["imessage_sources"]:
+                source.setdefault("mentions", deepcopy(meta.get("mentions") or []))
+                source.setdefault("agent_mentioned", meta.get("whatsapp_mentioned") is True)
+                source.setdefault("rendered_text", meta.get("rendered_text", text))
         if not meta.get("imessage_event_ids"):
             meta["imessage_event_ids"] = [meta["imessage_event_id"]] if meta.get("imessage_event_id") else []
         # An admitted source, not timing or native ancestry, selects the reply.
@@ -895,6 +900,9 @@ class ContactSession:
             route = self._imessage_burst.reply_meta
             route["imessage_sources"].extend(deepcopy(meta["imessage_sources"]))
             route["imessage_event_ids"].extend(meta["imessage_event_ids"])
+            if meta.get("channel") == "whatsapp":
+                route["whatsapp_mentioned"] = route.get("whatsapp_mentioned") is True or meta.get("whatsapp_mentioned") is True
+                route.setdefault("mentions", []).extend(deepcopy(meta.get("mentions") or []))
             first_id = route["imessage_sources"][0].get("id")
             if first_id:
                 route["imessage_reply_target"] = first_id

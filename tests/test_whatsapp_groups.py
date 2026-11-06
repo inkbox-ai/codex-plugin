@@ -356,3 +356,57 @@ def test_direct_mentions_render_without_group_reply_gating(sdk, agent_mentioned)
         assert meta["whatsapp_mentioned"] is agent_mentioned
         assert "do not inject mention" not in json.dumps(meta) + client.events[0][1]
     asyncio.run(scenario())
+
+
+def test_native_mentions_survive_burst_with_source_rendering(sdk, monkeypatch):
+    from inkbox_codex.imessage import read_turn_context, write_turn_context
+    async def scenario():
+        monkeypatch.setattr(whatsapp, "group_sdk_available", lambda: True)
+        gw = bridge(sdk)
+        gw._resolve_contact_full = AsyncMock(return_value={"name": "Alex"})
+        sent = []
+        session = make_session(sent)
+        session.cfg.group_reply_mode = "auto"
+        client = session._client = Client()
+        gw.sessions = NS(get=Mock(return_value=session))
+        for index, (token, native) in enumerate([("@123", False), ("@456", True)], 1):
+            await whatsapp.receive(gw, {"data": {"message": group(
+                id=f"00000000-0000-0000-0000-{index:012d}", content=f"Ask {token}",
+                agent_mentioned=native, mentions=[{"text": token,
+                "phone_number": "+15550000003", "is_agent": native}])}})
+        route = session._imessage_burst.reply_meta
+        assert route["whatsapp_mentioned"] is True
+        assert [m["display_name"] for m in route["mentions"]] == ["Alex", "agent"]
+        sources = route["imessage_sources"]
+        assert [s["text"] for s in sources] == ["Ask @123", "Ask @456"]
+        assert [s["rendered_text"] for s in sources] == ["Ask @Alex", "Ask @agent"]
+        assert [s["agent_mentioned"] for s in sources] == [False, True]
+        write_turn_context("mention-burst", gw.cfg, route)
+        assert read_turn_context("mention-burst")["route_meta"]["imessage_sources"] == sources
+        session._flush_imessage_burst()
+        await session._worker
+        assert [event[0] for event in client.events] == ["run"]
+        framed = client.events[0][1]
+        assert '"whatsapp_mentioned": true' in framed
+        assert all(value in framed for value in ("Ask @123", "Ask @456", "Ask @Alex", "Ask @agent"))
+        gw._resolve_contact_full.assert_awaited_once_with(kind="phone", value="+15550000003")
+    asyncio.run(scenario())
+
+
+def test_self_mention_uses_agent_handle_not_contact_nickname(sdk, monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(whatsapp, "group_sdk_available", lambda: True)
+        gw = bridge(sdk)
+        gw._resolve_contact_full = AsyncMock(return_value={"name": "Misleading nickname"})
+        received = []
+        async def inbound(body, mode, meta):
+            received.append((body, meta))
+        gw.sessions = NS(get=Mock(return_value=NS(handle_inbound=inbound)))
+        await whatsapp.receive(gw, {"data": {"message": group(content="Hello @123", agent_mentioned=True,
+            mentions=[{"text": "@123", "phone_number": "+15550000003", "is_agent": True}])}})
+        body, meta = received[0]
+        assert "Hello @agent" in body and "Misleading nickname" not in body
+        assert meta["raw_text"] == meta["original_text"] == "Hello @123"
+        assert meta["mentions"][0]["is_agent"] is True
+        gw._resolve_contact_full.assert_not_awaited()
+    asyncio.run(scenario())
