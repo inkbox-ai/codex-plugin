@@ -792,6 +792,7 @@ class Receiver:
             if initialization and context_only and source_id and source_id != event.source_id:
                 # A snapshot missing this live source is background only.
                 meta.update(source_metadata({"id": source_id, "content": ""}, event.event_id))
+                meta.update(whatsapp_mentioned=False, mentions=[], original_text=None, rendered_text="")
             meta["imessage_threaded_replies"] = True
         if event.channel == "slack":
             incoming = inbound_message(event.envelope, event.envelope["data"]["identity_id"])

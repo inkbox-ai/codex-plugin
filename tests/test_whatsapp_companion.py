@@ -351,3 +351,29 @@ def test_activation_read_outage_is_owned_by_durable_drain_and_retries(monkeypatc
         finally:
             await receiver.close()
     asyncio.run(scenario())
+
+
+
+def test_history_only_snapshot_does_not_label_trigger_with_absent_live_mentions(monkeypatch):
+    async def scenario():
+        value = envelope()
+        receiver, _, session, sent, _ = setup(value, monkeypatch, reply_mode="mention", response_mode="relaxed")
+        metas = []
+        original = session.submit_companion
+        async def capture(text, mode, meta, **kwargs):
+            metas.append(deepcopy(meta))
+            return await original(text, mode, meta, **kwargs)
+        session.submit_companion = capture
+        try:
+            await receiver.accept(next_event(value, native=True))
+            await drained(receiver)
+            assert [kind for kind, _ in session._client.events] == ["context", "run"]
+            history, current = metas
+            assert history["companion_context_only"] is True
+            assert history["whatsapp_mentioned"] is False and history["mentions"] == []
+            assert history["original_text"] is None and history["rendered_text"] == ""
+            assert current["whatsapp_mentioned"] is True and current["mentions"][0]["is_agent"] is True
+            assert len(sent) == 1
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
