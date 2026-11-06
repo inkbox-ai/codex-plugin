@@ -450,15 +450,20 @@ class ContactSession:
             and (self.cfg.group_reply_mode != "mention" or self._companion_mentioned(meta))
         )
 
+    def _whatsapp_mentioned(self, text: str, meta: Dict[str, Any]) -> bool:
+        handle = (self.identity_info.get("handle") or self.cfg.identity).lstrip("@")
+        # Numeric native tokens identify recipients, not textual agent handles.
+        return meta.get("whatsapp_mentioned") is True or mentions_agent(text, "" if handle.isdigit() else handle)
+
     def _companion_mentioned(self, meta: Dict[str, Any]) -> bool:
         """Current text mentions or email To recipients can address the agent."""
         envelope = meta.get("companion_envelope") or {}
         if str(envelope.get("event_type") or "").startswith("slack."):
             return meta.get("slack_mentioned") is True or meta.get("conversation_kind") == "direct"
+        if envelope.get("event_type") == "whatsapp.received":
+            return self._whatsapp_mentioned(str(meta.get("raw_text") or ""), meta)
         if mentions_agent(str(meta.get("raw_text") or ""), self.identity_info.get("handle") or self.cfg.identity):
             return True
-        if envelope.get("event_type") == "whatsapp.received":
-            return meta.get("whatsapp_mentioned") is True
         if envelope.get("event_type") != "message.received":
             return False
         address = (self.identity_info.get("email") or "").strip().casefold()
@@ -485,6 +490,8 @@ class ContactSession:
                 return parts[1] if len(parts) == 2 else ""
             return text
         handle = (self.identity_info.get("handle") or self.cfg.identity).lstrip("@").lower()
+        if meta and meta.get("channel") == "whatsapp" and handle.isdigit():
+            handle = ""
         if parts and parts[0].lower().rstrip(",:") in {"@agent", f"@{handle}"}:
             return parts[1] if len(parts) == 2 else ""
         return text
@@ -682,6 +689,9 @@ class ContactSession:
             if unsupported_shape(meta):
                 return False
         raw_text = str(meta.get("raw_text", text))
+        mention_text = raw_text
+        if mode == "whatsapp" and not meta.get("reaction"):
+            raw_text = self._companion_control_text(raw_text, {**meta, "channel": "whatsapp"})
         command = None if meta.get("reaction") else _control_command(raw_text)
         if mode == "slack" and meta.get("slack_native_stop") and command == "stop":
             self.mode, self.reply_meta = mode, meta
@@ -709,8 +719,8 @@ class ContactSession:
             )
         mentioned = (
             meta.get("slack_mentioned") is True if mode == "slack"
-            else ((mode == "whatsapp" and is_group and meta.get("whatsapp_mentioned") is True)
-                  or mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity))
+            else (self._whatsapp_mentioned(mention_text, meta) if mode == "whatsapp"
+                  else mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity))
         )
         context_only = (
             mode == "slack" and is_group
