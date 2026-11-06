@@ -609,19 +609,24 @@ def test_phase_downgrade_never_retires_checkpointed_work(monkeypatch, state):
 
 
 
-def test_new_signed_activation_unblocks_unsubmitted_borrowed_receipt_without_downgrade(monkeypatch):
+@pytest.mark.parametrize("late_old_delivery", [False, True])
+def test_new_signed_activation_unblocks_unsubmitted_borrowed_receipt_without_downgrade(monkeypatch, late_old_delivery):
     async def scenario():
         value = envelope()
         receiver, sdk, session, _, _ = setup(value, monkeypatch)
         try:
             old_live = next_event(value, sender=PEER)
             old_prepared = await receiver.prepare_whatsapp(old_live)
-            receiver.inbox.accept(Event.parse(old_prepared))
             replacement = deepcopy(value)
             replacement["id"] += "-replacement"
             replacement["companion"].update(sequence=3, activation_id="20000000-0000-4000-8000-000000000088")
             sdk.c = deepcopy(replacement["companion"])
-            assert await receiver.accept(replacement)
+            if late_old_delivery:
+                receiver.inbox.accept(Event.parse(await receiver.prepare_whatsapp(replacement)))
+                assert await receiver.accept(old_live)
+            else:
+                receiver.inbox.accept(Event.parse(old_prepared))
+                assert await receiver.accept(replacement)
             assert receiver.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (old_live["id"],)).fetchone()[0] == "done"
             await drained(receiver)
             assert len(session._client.events) == 1

@@ -323,12 +323,13 @@ class Inbox:
                 # A higher-sequence signed grant proves an older activation was
                 # replaced. Never infer revocation from an ambiguous read error.
                 for (previous_payload,) in self.db.execute(
-                    "SELECT payload FROM events WHERE scope=? AND sequence<? AND state IN ('pending','failed')",
-                    (event.scope, event.sequence),
+                    """SELECT payload FROM events WHERE scope=? AND
+                    ((sequence<? AND state IN ('pending','failed')) OR sequence>?)""",
+                    (event.scope, event.sequence, event.sequence),
                 ).fetchall():
                     previous_event = Event.parse(json.loads(previous_payload))
                     if previous_event.activation and previous_event.activation != event.activation:
-                        self.retire_unsubmitted(previous_event)
+                        self.retire_unsubmitted(previous_event if previous_event.sequence < event.sequence else event)
         return True
 
     def scopes(self) -> list[str]:
