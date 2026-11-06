@@ -109,8 +109,7 @@ def test_revoked_activation_blocks_new_turn_and_cannot_cross_destination(monkeyp
             await receiver.accept(value)
             await drained(receiver)
             sdk.denied = True
-            with pytest.raises(PermissionError, match="revoked"):
-                await receiver.accept(next_event(value, native=True, sender=SPONSOR))
+            assert await receiver.accept(next_event(value, native=True, sender=SPONSOR))
             await drained(receiver)
             assert len(session._client.events) == len(sent) == 1
             meta = sent[0][3]
@@ -319,6 +318,36 @@ def test_native_self_mention_answers_pending_approval_without_cancelling(monkeyp
             assert session._companion_control_text("@999 /stop", meta) == "@999 /stop"
             other = {**meta, "mentions": [{"text": "@123", "is_agent": False, "display_name": "agent"}]}
             assert session._companion_control_text("@123 /stop", other) == "@123 /stop"
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
+
+
+
+def test_activation_read_outage_is_owned_by_durable_drain_and_retries(monkeypatch):
+    async def scenario():
+        value = envelope()
+        receiver, sdk, session, sent, _ = setup(value, monkeypatch)
+        monkeypatch.setattr("inkbox_codex.companion.RETRY_MAX_SECONDS", 0.01)
+        try:
+            await receiver.accept(value)
+            await drained(receiver)
+            original = sdk.activation_messages
+            calls = 0
+            def temporarily_unavailable(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise TimeoutError("temporary authorization read outage")
+                return original(*args, **kwargs)
+            sdk.activation_messages = temporarily_unavailable
+            incoming = next_event(value, native=True, sender=SPONSOR)
+            assert await receiver.accept(incoming)
+            async def completed():
+                while receiver.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (incoming["id"],)).fetchone()[0] != "done":
+                    await asyncio.sleep(0.01)
+            await asyncio.wait_for(completed(), 3)
+            assert calls == 2 and len(sent) == 2 and len(session._client.events) == 2
         finally:
             await receiver.close()
     asyncio.run(scenario())

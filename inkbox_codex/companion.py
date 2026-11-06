@@ -405,8 +405,6 @@ class Receiver:
         if receipt_state == "pending" and event.phase == "live" and not self.inbox.source_submitted(event):
             session = self.sessions.get(event.session_key(self.namespace))
             if self.author_allowed(event, event.author):
-                if event.channel == "whatsapp" and self.inbox.activation(event):
-                    await self.authorize_whatsapp(event, self.meta(event))
                 if await session.companion_interaction(event.text, self.meta(event)):
                     with self.inbox.db:
                         self.inbox.remember_sources(event, [event.source_id])
