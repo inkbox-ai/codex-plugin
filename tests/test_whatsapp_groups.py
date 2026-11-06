@@ -237,3 +237,31 @@ def test_native_mention_webhook_drives_group_gate_without_guessing_numeric_text(
         write_turn_context("native-group", gw.cfg, received[0])
         assert read_turn_context("native-group")["route_meta"]["whatsapp_mentioned"] is (native is True)
     asyncio.run(scenario())
+
+
+def test_other_native_mentions_are_context_not_a_wake_signal(sdk, monkeypatch):
+    from inkbox_codex.imessage import read_turn_context, write_turn_context
+    async def scenario():
+        monkeypatch.setattr(whatsapp, "group_sdk_available", lambda: True)
+        gw = bridge(sdk)
+        sent = []
+        session = make_session(sent)
+        session.cfg.group_reply_mode = "mention"
+        client = session._client = Client()
+        received = []
+        async def inbound(body, mode, meta):
+            received.append(meta)
+            await session.handle_inbound(body, mode, meta)
+        gw.sessions = NS(get=Mock(return_value=NS(handle_inbound=inbound)))
+        mentions = [{"text": "@123456789", "phone_number": None, "is_agent": False},
+                    {"text": "@15550000003", "phone_number": "+15550000003", "is_agent": False}]
+        await whatsapp.receive(gw, {"data": {"message": group(content="@123456789 ask @15550000003", agent_mentioned=False, mentions=mentions)}})
+        session._flush_imessage_burst()
+        await session._worker
+        assert [event[0] for event in client.events] == ["context"] and not sent
+        assert received[0]["mentions"] == mentions
+        assert '"phone_number": null' in client.events[0][1]
+        assert "+15550000003" in client.events[0][1]
+        write_turn_context("other-mentions", gw.cfg, received[0])
+        assert read_turn_context("other-mentions")["route_meta"]["mentions"] == mentions
+    asyncio.run(scenario())

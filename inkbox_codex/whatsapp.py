@@ -248,6 +248,7 @@ async def receive(gateway, envelope):
             ),
             "contact_memories": memories,
             "conversation_kind": "group" if is_group(message) else "direct",
+            "mentions": message.get("mentions") if isinstance(message.get("mentions"), list) else [],
             "whatsapp_mentioned": is_group(message) and message.get("agent_mentioned") is True,
             "is_group": is_group(message),
             "group_name": message.get("group_name"),
