@@ -473,6 +473,12 @@ class ContactSession:
     def _companion_control_text(self, text: str, meta: Optional[Dict[str, Any]] = None) -> str:
         """Permit a leading mention on approval answers and local controls."""
         parts = text.strip().split(maxsplit=1)
+        if meta and meta.get("channel") == "whatsapp" and parts:
+            self_tokens = {mention.get("text") for mention in meta.get("mentions") or []
+                           if isinstance(mention, dict) and mention.get("is_agent") is True
+                           and isinstance(mention.get("text"), str)}
+            if parts[0].rstrip(",:") in self_tokens:
+                return parts[1] if len(parts) == 2 else ""
         if meta and meta.get("slack_bot_user_id"):
             token = f"<@{meta['slack_bot_user_id']}>"
             if meta.get("slack_mentioned") and parts and parts[0].rstrip(",:") == token:

@@ -856,7 +856,7 @@ async def send_reply(gateway, chat_id, content, meta):
     key_material = [gateway.cfg.base_url, str(identity.id), conversation, sources, text]
     if reply_options:
         key_material.append(reply_options)
-    if not final and not companion:
+    if not final and not meta.get("companion_reply_event_id"):
         key_material.append(uuid.uuid4().hex)
     key = (meta.get("whatsapp_idempotency_key") if final else None) or "codex-wa-" + hashlib.sha256(
         json.dumps(key_material, sort_keys=True).encode()).hexdigest()

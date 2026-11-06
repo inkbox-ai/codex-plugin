@@ -176,10 +176,15 @@ def test_grant_bypasses_local_peer_filter_only_for_its_group_and_rechecks_before
             assert identity.send_whatsapp.call_args.kwargs == first
             assert first["conversation_id"] == route["conversation_id"] and "to" not in first
             assert checkpoint.call_count == 2
+            interim = {key: value for key, value in route.items() if key != "companion_reply_event_id"}
+            await whatsapp.send_reply(gateway, "group", "Allow this command?", interim)
+            prompt_key = identity.send_whatsapp.call_args.kwargs["idempotency_key"]
+            await whatsapp.send_reply(gateway, "group", "Allow this command?", interim)
+            assert identity.send_whatsapp.call_args.kwargs["idempotency_key"] != prompt_key
             sdk.denied = True
             with pytest.raises(PermissionError, match="revoked"):
                 await whatsapp.send_reply(gateway, "group", "Blocked", route)
-            assert identity.send_whatsapp.call_count == 2
+            assert identity.send_whatsapp.call_count == 4
         finally:
             await receiver.close()
     asyncio.run(scenario())
@@ -263,4 +268,57 @@ def test_signed_whatsapp_companion_reaches_shared_receiver(monkeypatch, valid):
         response = await gateway._handle_webhook(_FakeRequest(json.dumps(envelope()).encode()))
         assert response.status == (200 if valid else 401)
         assert receiver.accept.await_count == int(valid)
+    asyncio.run(scenario())
+
+
+def test_live_first_native_mention_inside_snapshot_wakes_current_source(monkeypatch):
+    async def scenario():
+        value = envelope()
+        receiver, sdk, session, sent, _ = setup(value, monkeypatch, reply_mode="mention", response_mode="relaxed")
+        incoming = next_event(value, native=True)
+        source = incoming["data"]["message"]
+        sdk.c["history"].append({"id": source["id"], "author": PEER, "text": source["content"],
+            "historical": False, "is_trigger": False, "attachments": [], "sender_access": "sponsored"})
+        try:
+            await receiver.accept(incoming)
+            await drained(receiver)
+            assert [kind for kind, _ in session._client.events] == ["run"]
+            assert len(sent) == 1 and sent[0][3]["source_message_id"] == source["id"]
+            assert sent[0][3]["whatsapp_mentioned"] is True
+            assert sent[0][3]["message_id"] == source["id"]
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
+
+
+def test_native_self_mention_answers_pending_approval_without_cancelling(monkeypatch):
+    from inkbox_codex.escalation import PendingInteraction
+    async def scenario():
+        value = envelope()
+        receiver, _, session, sent, _ = setup(value, monkeypatch, reply_mode="mention")
+        waiting = asyncio.Event()
+        original = session._client.run
+        async def approving(text):
+            session.pending = PendingInteraction(kind="permission", prompt_text="approve?",
+                future=asyncio.get_running_loop().create_future())
+            waiting.set()
+            assert await asyncio.wait_for(session.pending.future, 3) == "allow"
+            session.pending = None
+            return await original(text)
+        session._client.run = approving
+        try:
+            await receiver.accept(value)
+            await asyncio.wait_for(waiting.wait(), 3)
+            answer = next_event(value, native=True, sender=SPONSOR)
+            answer["data"]["message"]["content"] = "@123 allow"
+            await receiver.accept(answer)
+            await drained(receiver)
+            assert len(sent) == 1 and len(session._client.events) == 1
+            meta = sent[0][3]
+            assert session._companion_control_text("@123 /stop", meta) == "/stop"
+            assert session._companion_control_text("@999 /stop", meta) == "@999 /stop"
+            other = {**meta, "mentions": [{"text": "@123", "is_agent": False, "display_name": "agent"}]}
+            assert session._companion_control_text("@123 /stop", other) == "@123 /stop"
+        finally:
+            await receiver.close()
     asyncio.run(scenario())
