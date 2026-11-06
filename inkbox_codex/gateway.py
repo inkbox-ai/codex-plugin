@@ -2051,9 +2051,9 @@ class InkboxGateway:
             or (envelope.get("direction") == "inbound" and envelope.get("local_phone_number"))
         )
 
-    async def _prepare_whatsapp_companion(self, envelope):
+    async def _prepare_whatsapp_companion(self, envelope, *, enrich=False):
         from .whatsapp import prepare_companion
-        return await prepare_companion(self, envelope)
+        return await prepare_companion(self, envelope, enrich=enrich)
 
     def _companion(self):
         if self.sessions is None:

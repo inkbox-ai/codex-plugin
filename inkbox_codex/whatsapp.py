@@ -227,7 +227,7 @@ async def with_media(gateway, message, text):
     return body, image_paths
 
 
-async def prepare_companion(gateway, envelope):
+async def prepare_companion(gateway, envelope, *, enrich=False):
     """Validate signed group context without importing direct-contact memories."""
     from copy import deepcopy
     from .companion import CompanionError
@@ -246,8 +246,11 @@ async def prepare_companion(gateway, envelope):
         return None  # Current local admission can change without invalidating the signed event.
 
     raw = str(message.get("content") or "")
-    rendered, mentions = await render_mentions(gateway, raw, message.get("mentions") or [])
-    body, image_paths = await with_media(gateway, message, rendered)
+    rendered, mentions = raw, message.get("mentions") or []
+    body, image_paths = raw, []
+    if enrich:
+        rendered, mentions = await render_mentions(gateway, raw, mentions)
+        body, image_paths = await with_media(gateway, message, rendered)
     meta = {**source_metadata(message, envelope.get("id")), "channel": "whatsapp",
         "is_group": True, "conversation_kind": "group", "conversation_id": message.get("conversation_id"),
         "group_name": message.get("group_name"), "remote_number": None,
@@ -255,7 +258,7 @@ async def prepare_companion(gateway, envelope):
         "sender": sender, "mentions": mentions, "whatsapp_mentioned": message.get("agent_mentioned") is True,
         "raw_text": raw, "rendered_text": rendered, "original_text": raw if raw != rendered else None,
         "contact": None, "contact_memories": [], "media": bool(message.get("media")),
-        "whatsapp_body": body, "whatsapp_image_paths": image_paths,
+        "whatsapp_body": body, "whatsapp_image_paths": image_paths, "whatsapp_enriched": enrich,
         "whatsapp_media_ids": [item["id"] for item in message.get("media") or [] if item.get("id")]}
     prepared = deepcopy(envelope)
     prepared["_codex_whatsapp_source"] = meta

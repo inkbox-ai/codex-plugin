@@ -40,7 +40,7 @@ def setup(value, monkeypatch, **kwargs):
     receiver, sdk, session, sent = harness(value, **kwargs)
     gateway = NS(_identity=NS(id=IDENTITY, agent_handle="test-agent"), cfg=session.cfg,
                  _resolve_contact_full=AsyncMock(return_value=None))
-    receiver.prepare_whatsapp = lambda incoming: whatsapp.prepare_companion(gateway, incoming)
+    receiver.prepare_whatsapp = lambda incoming, **kwargs: whatsapp.prepare_companion(gateway, incoming, **kwargs)
     return receiver, sdk, session, sent, gateway
 
 
@@ -494,6 +494,57 @@ def test_overlong_companion_answer_sends_notice_and_unblocks_next_event(monkeypa
             assert gateway._identity.send_whatsapp.call_args.kwargs["text"] == "Next answer"
             assert allowed.await_count == 2
             assert not receiver.inbox.scopes()
+        finally:
+            await receiver.close()
+    asyncio.run(scenario())
+
+
+
+def test_slow_media_is_after_receipt_ack_and_duplicate_does_not_download(monkeypatch):
+    async def scenario():
+        value = envelope()
+        value["data"]["message"]["media"] = [{"id": "owned"}]
+        receiver, _, _, _, gateway = setup(value, monkeypatch)
+        gateway._identity.get_whatsapp_media = Mock(return_value=NS(status="ready", url="https://example.test/photo", content_type="image/png", size=12))
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def slow(text, attachments, **kwargs):
+            entered.set()
+            await release.wait()
+            return text
+        gateway._with_media = AsyncMock(side_effect=slow)
+        try:
+            assert await asyncio.wait_for(receiver.accept(value), .5)
+            await entered.wait()
+            assert not await asyncio.wait_for(receiver.accept(value), .5)
+            assert gateway._with_media.await_count == 1
+            release.set()
+            await drained(receiver)
+        finally:
+            release.set()
+            await receiver.close()
+    asyncio.run(scenario())
+
+
+def test_revoked_phase_retry_acknowledges_without_replacing_saved_grant(monkeypatch):
+    async def scenario():
+        value = envelope()
+        receiver, _, session, _, _ = setup(value, monkeypatch)
+        try:
+            await receiver.accept(value)
+            await drained(receiver)
+            retry = deepcopy(value)
+            retry["companion"] = {key: val for key, val in retry["companion"].items()
+                                  if key not in {"activation_id", "history", "history_complete", "history_next_cursor", "reply_context"}}
+            retry["companion"]["phase"] = "ordinary"
+            assert not await receiver.accept(retry)
+            await drained(receiver)
+            assert len(session._client.events) == 1
+            import json
+            stored = json.loads(receiver.inbox.db.execute("SELECT payload FROM events WHERE event_id=?", (value["id"],)).fetchone()[0])
+            assert stored["companion"]["activation_id"] == value["companion"]["activation_id"]
+            retry["data"]["message"]["content"] = "changed"
+            with pytest.raises(CompanionError, match="Conflicting"):
+                await receiver.accept(retry)
         finally:
             await receiver.close()
     asyncio.run(scenario())

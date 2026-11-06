@@ -282,7 +282,19 @@ class Inbox:
             old = self.db.execute("SELECT event_id,payload FROM events WHERE event_id=? OR (scope=? AND sequence=?)",
                                   (event.event_id, event.scope, event.sequence)).fetchone()
             if old:
-                if old[0] != event.event_id or _receipt_content(json.loads(old[1])) != _receipt_content(event.envelope):
+                previous = _receipt_content(json.loads(old[1]))
+                incoming = _receipt_content(event.envelope)
+                if (event.channel == "whatsapp" and event.phase == "ordinary"
+                        and previous["companion"].get("phase") != "ordinary"):
+                    # Delivery may revoke an activation between attempts. This
+                    # is an acknowledgement only: never replace the saved grant.
+                    prior_scope = {key: value for key, value in previous["companion"].items()
+                                   if key not in {"phase", "activation_id", "reply_context"}}
+                    new_scope = {key: value for key, value in incoming["companion"].items()
+                                 if key != "phase"}
+                    if prior_scope == new_scope:
+                        incoming["companion"] = previous["companion"]
+                if old[0] != event.event_id or previous != incoming:
                     raise CompanionError("Conflicting Companion event ID or sequence")
                 return False
             if self.db.execute(
@@ -908,6 +920,16 @@ class Receiver:
         await self.deliver_reply(event, resume_activity=True)
         if self.inbox.source_submitted(event):
             return
+        if event.channel == "whatsapp" and not event.envelope["_codex_whatsapp_source"].get("whatsapp_enriched"):
+            # Receipt admission/HTTP acknowledgement must not wait on attachment
+            # downloads or contact lookups. Persist enrichment for restart replay.
+            prepared = await self.prepare_whatsapp(event.envelope, enrich=True)
+            if prepared is None:
+                return
+            event.envelope.update(prepared)
+            with self.inbox.db:
+                self.inbox.db.execute("UPDATE events SET payload=? WHERE event_id=?",
+                                     (json.dumps(event.envelope), event.event_id))
         if event.phase == "ordinary":
             if event.channel == "whatsapp":
                 from .whatsapp import _route_allowed
