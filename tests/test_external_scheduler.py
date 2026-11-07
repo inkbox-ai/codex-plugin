@@ -114,9 +114,12 @@ def test_restart_retains_external_ownership_and_pending_sync(store):
 def test_delayed_dispatch_uses_native_catchup_policy(store, catch_up, expected):
     saved = job(store, catch_up=catch_up)
     registration = acknowledge(store)
-    receipt = store.accept_occurrence(saved['id'], registration['revision'], 'delayed', 1060, now=1100)
+    receipt = store.accept_occurrence(saved['id'], registration['revision'], 'delayed', 1060, now=1961)
     assert receipt['status'] == expected
-    assert store.accept_occurrence(saved['id'], registration['revision'], 'delayed', 1060, now=1101)['status'] == expected
+    assert store.accept_occurrence(saved['id'], registration['revision'], 'delayed', 1060, now=1962)['status'] == expected
+    if catch_up:
+        assert store.claim(now=1962)['id'] == receipt['id']
+        assert store.claim(now=1963) is None
 
 
 def test_future_or_unacknowledged_occurrence_never_executes(store):
@@ -211,7 +214,7 @@ def test_genuinely_late_external_admission_still_misses(store):
     saved = job(store)
     registration = acknowledge(store)
     assert store.accept_occurrence(saved['id'], registration['revision'], 'late-admission', 1060,
-                                   admitted_at=1100, now=1120)['status'] == 'missed'
+                                   admitted_at=1100, now=1961)['status'] == 'missed'
 
 
 def test_external_quarantine_never_replays_and_requires_stopped_process(store):
@@ -228,3 +231,23 @@ def test_external_quarantine_never_replays_and_requires_stopped_process(store):
     assert store.quarantine_occurrence(saved['id'], registration['revision'], 'unknown', 1060)['status'] == 'dismissed'
     assert store.accept_occurrence(saved['id'], registration['revision'], 'unknown', 1060, now=1100)['status'] == 'dismissed'
     assert store.claim(now=1101) is None
+
+
+@pytest.mark.parametrize('delay,expected', [(899, 'pending'), (900, 'pending'), (901, 'missed')])
+def test_external_startup_grace_is_fifteen_minutes(store, delay, expected):
+    saved = job(store)
+    registration = acknowledge(store)
+    receipt = store.accept_occurrence(saved['id'], registration['revision'], 'grace', 1060,
+                                      admitted_at=1061, now=1060 + delay)
+    assert receipt['status'] == expected
+    assert store.accept_occurrence(saved['id'], registration['revision'], 'grace', 1060,
+                                   admitted_at=1061, now=5000)['status'] == expected
+
+
+def test_one_shot_late_without_catchup_is_not_run_again(store):
+    saved = store.create('Once', 'Check', {'kind': 'once', 'at': datetime.fromtimestamp(1060, UTC).isoformat()}, now=1000)
+    registration = acknowledge(store)
+    assert store.accept_occurrence(saved['id'], registration['revision'], 'once-late', 1060,
+                                   admitted_at=1060, now=1961)['status'] == 'missed'
+    assert store.claim(now=1962) is None
+    assert store.get(saved['id'])['next_run'] is None

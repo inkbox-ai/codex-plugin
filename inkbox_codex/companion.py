@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
+from .managed_inbox import boot_id, execution_stopped
 from .codex_client import recover_saved_answer
 from .imessage import source_metadata
 from .slack import SLACK_INCOMING_EVENTS, inbound_message
@@ -45,7 +46,7 @@ def inbox_path(cfg) -> Path:
 def inbox_summary(cfg) -> dict:
     """Read queue readiness without opening a writer or changing receipts."""
     summary = {"unfinished_count": 0, "pending_count": 0, "quarantined_count": 0,
-               "blocked_conversations": 0, "oldest_unfinished_age_s": None}
+               "blocked_conversations": 0, "execution_unknown": 0, "review_required": 0, "oldest_unfinished_age_s": None}
     path = inbox_path(cfg)
     if not path.exists():
         return summary
@@ -57,21 +58,24 @@ def inbox_summary(cfg) -> dict:
         activation = "a.state" if has_activations else "NULL"
         join = (" LEFT JOIN activations a ON a.scope=e.scope AND a.activation=json_extract(e.payload,'$.companion.activation_id')"
                 if has_activations else "")
-        rows = db.execute(f"SELECT e.scope,e.state,{received},{activation} FROM events e{join} WHERE e.state!='done' ORDER BY e.scope,e.sequence").fetchall()
+        execution_boot = "e.execution_boot_id" if "execution_boot_id" in columns else "NULL"
+        execution_owner = "e.execution_owner_id" if "execution_owner_id" in columns else "NULL"
+        rows = db.execute(f"SELECT e.scope,e.state,{received},{activation},{execution_boot},{execution_owner} FROM events e{join} WHERE e.state!='done' ORDER BY e.scope,e.sequence").fetchall()
     finally:
         db.close()
     heads = {}
-    for scope, state, _, activation in rows:
-        if state == "quarantined":
-            continue
-        heads.setdefault(scope, (state, activation))
+    for scope, state, _, activation, execution_boot, execution_owner in rows:
+        if state != "quarantined":
+            heads.setdefault(scope, (state, activation, execution_boot, execution_owner))
+    blocked = {scope: head for scope, head in heads.items()
+               if head[0] in {"uncertain", "failed"} or
+               (head[0] in {"pending", "reply_pending"} and head[1] in {"submitting", "uncertain"})}
+    review = sum(execution_stopped(head[2], head[3]) for head in blocked.values())
     summary.update(unfinished_count=len(rows),
-                   quarantined_count=sum(state == "quarantined" for _, state, _, _ in rows),
-                   pending_count=sum(state in {"pending", "reply_pending"} for _, state, _, _ in rows),
-                   blocked_conversations=sum(
-                       state in {"uncertain", "failed"} or
-                       (state in {"pending", "reply_pending"} and activation in {"submitting", "uncertain"})
-                       for state, activation in heads.values()))
+                   quarantined_count=sum(row[1] == "quarantined" for row in rows),
+                   pending_count=sum(row[1] in {"pending", "reply_pending"} and row[0] not in blocked for row in rows),
+                   blocked_conversations=len(blocked), execution_unknown=len(blocked) - review,
+                   review_required=review)
     if rows and all(row[2] is not None for row in rows):
         summary["oldest_unfinished_age_s"] = max(0, int(time.time() - min(row[2] for row in rows)))
     return summary
@@ -244,6 +248,13 @@ class Inbox:
         """)
         if "received_at" not in {row[1] for row in self.db.execute("PRAGMA table_info(events)")}:
             self.db.execute("ALTER TABLE events ADD COLUMN received_at REAL")
+        if "execution_boot_id" not in {row[1] for row in self.db.execute("PRAGMA table_info(events)")}:
+            self.db.execute("ALTER TABLE events ADD COLUMN execution_boot_id TEXT")
+        if "execution_owner_id" not in {row[1] for row in self.db.execute("PRAGMA table_info(events)")}:
+            self.db.execute("ALTER TABLE events ADD COLUMN execution_owner_id TEXT")
+        self.db.create_function("execution_owner_id", 0, lambda: os.getenv("INKBOX_MANAGED_OWNER_ID"))
+        self.db.create_function("execution_boot_id", 0, boot_id)
+        self.db.execute("CREATE TEMP TRIGGER execution_boot AFTER UPDATE OF state ON events WHEN NEW.state IN ('submitting','sending') BEGIN UPDATE events SET execution_boot_id=execution_boot_id(),execution_owner_id=execution_owner_id() WHERE event_id=NEW.event_id; END")
         # A lost host acknowledgement cannot safely be inferred from a receipt.
         with self.db:
             self.db.execute("UPDATE events SET state='uncertain' WHERE state IN ('submitting','sending')")

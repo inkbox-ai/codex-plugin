@@ -998,3 +998,16 @@ def test_pending_receipt_blocks_correction_when_host_summary_is_missing(tmp_path
         assert entry['retryable'] is False
 
     asyncio.run(scenario())
+
+
+def test_managed_startup_does_not_replay_uncertain_call_followups(tmp_path, monkeypatch):
+    async def scenario():
+        session = _Session()
+        gateway = _gateway(tmp_path, monkeypatch, session)
+        monkeypatch.setenv('INKBOX_HOSTED_ACTIVATION_ID', 'managed-activation')
+        def forbidden(*args, **kwargs):
+            raise AssertionError('Managed delivery owns recovery')
+        gateway._read_hosted_call_registry = forbidden
+        await gateway._recover_hosted_call_completions()
+        assert not session.prompts
+    asyncio.run(scenario())

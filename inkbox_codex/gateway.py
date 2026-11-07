@@ -1627,9 +1627,9 @@ class InkboxGateway:
         return {
             "ready": transport_ready, "active": active + inbox.get("pending_count", 0),
             "pending_schedule_sync": sum(not item['registered'] for item in scheduler.store.registrations()),
-            "unknown": bool(ingress_unknown or not inbox["readable"] or inbox.get("blocked_conversations")
+            "unknown": bool(ingress_unknown or not inbox["readable"] or inbox.get("execution_unknown", inbox.get("blocked_conversations", 0))
                             or not status.get("imessage_threading", {}).get("readable", True)
-                            or executions.get('uncertain') or scheduler._unrecorded_hosts),
+                            or scheduler.store.orphaned_hosts() or scheduler._unrecorded_hosts),
         }
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
@@ -1990,6 +1990,8 @@ class InkboxGateway:
 
     async def _recover_hosted_call_completions(self) -> None:
         """Requeue unfinished Voice AI completions from an earlier process."""
+        if os.getenv("INKBOX_HOSTED_ACTIVATION_ID"):
+            return
         for call_id, entry in self._read_hosted_call_registry().items():
             if not isinstance(entry, dict) or entry.get("state") == "completed":
                 continue

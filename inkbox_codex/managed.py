@@ -79,14 +79,14 @@ class ManagedControl:
                 return {'acknowledged': True}
             if action == 'quarantine_schedule' and set(data) in (fields | {'occurrence_id', 'due'}, fields | {'occurrence_id', 'due', 'admitted_at'}):
                 receipt = store.quarantine_occurrence(data['job_id'], data['revision'], data['occurrence_id'], data['due'])
-                return {'status': receipt['status']}
+                return {'status': receipt['status'], **({'execution_stopped': True} if receipt['status'] == 'uncertain' and receipt.get('host_pid') is None else {})}
             if action == 'cancel_schedule' and set(data) in (fields | {'occurrence_id', 'due'}, fields | {'occurrence_id', 'due', 'admitted_at'}):
                 receipt = store.cancel_occurrence(data['job_id'], data['revision'], data['occurrence_id'], data['due'])
-                return {'status': receipt['status']}
+                return {'status': receipt['status'], **({'execution_stopped': True} if receipt['status'] == 'uncertain' and receipt.get('host_pid') is None else {})}
             if action != 'invoke_schedule' or set(data) not in (fields | {'occurrence_id', 'due'}, fields | {'occurrence_id', 'due', 'admitted_at'}):
                 raise ValueError('Unknown action or fields')
             receipt = store.accept_occurrence(data['job_id'], data['revision'], data['occurrence_id'], data['due'], admitted_at=data.get('admitted_at'))
-            return {'run_id': receipt.get('id'), 'status': receipt['status']}
+            return {'run_id': receipt.get('id'), 'status': receipt['status'], **({'execution_stopped': True} if receipt['status'] == 'uncertain' and receipt.get('host_pid') is None else {})}
 
     async def handle(self, request):
         try:

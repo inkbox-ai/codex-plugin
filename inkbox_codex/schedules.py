@@ -637,8 +637,14 @@ class ScheduleStore:
             admitted = timestamp(admitted_at) if admitted_at is not None else now
             if not due <= admitted <= now:
                 raise ValueError('Invalid admission time')
-            self._materialize_safely(job, admitted)
+            self._materialize_safely(job, now if job['catch_up'] else due)
             active = self._active(job_id)
+            if active and not job['catch_up'] and now > due + 900:
+                self.db.execute("UPDATE runs SET status='missed',error='Execution missed its managed start window' WHERE id=?", (active['id'],))
+                active = None
+            if self._limit_reason(job, now):
+                self._stop_job(job, self._limit_reason(job, now), now)
+                active = self._active(job_id)
             run_id = active['id'] if active else None
             self.db.execute('INSERT INTO external_occurrences(occurrence_id,job_id,revision,due,run_id) VALUES(?,?,?,?,?)',
                             (occurrence_id, job_id, revision, due, run_id))
