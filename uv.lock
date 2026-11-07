@@ -435,7 +435,7 @@ wheels = [
 
 [[package]]
 name = "codex-plugin"
-version = "0.2.27"
+version = "0.2.28"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -451,7 +451,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.9" },
     { name = "audioop-lts", marker = "python_full_version >= '3.13'", specifier = ">=0.2.1" },
     { name = "croniter", specifier = ">=6.2,<7" },
-    { name = "inkbox", specifier = ">=0.7.27,<1.0.0" },
+    { name = "inkbox", specifier = ">=0.7.29,<1.0.0" },
     { name = "segno", specifier = ">=1.5" },
     { name = "tzdata", specifier = ">=2025.1" },
 ]
@@ -721,7 +721,7 @@ wheels = [
 
 [[package]]
 name = "inkbox"
-version = "0.7.28"
+version = "0.7.29"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "argon2-cffi" },
@@ -731,9 +731,9 @@ dependencies = [
     { name = "h2" },
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c3/4c/36149d242430391fd89fe89b78bd0868cefa730a44b9a32a1f9df1adb805/inkbox-0.7.28.tar.gz", hash = "sha256:5142af049da5b525f958a5b6f60cc895f090847ae2a3a150a30ede3fe4d1b644", size = 533778, upload-time = "2026-11-05T02:52:47.254Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/5a/35a7a0da949d71089b9739490fc2746a05772b7f6c480d842ca520da4284/inkbox-0.7.29.tar.gz", hash = "sha256:1625f782369eb0b2bb70348dea2597f0944b23842368452d1712b9e68c13d4bf", size = 537032, upload-time = "2026-11-07T07:44:08.01Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c8/c5/340efc6281e2ed677a5af2e2c634cdf8f3308a43fbfa872a1a549ba1fddb/inkbox-0.7.28-py3-none-any.whl", hash = "sha256:fb6498abf5562b9446ccc9dffc658c6011c05380ecd1e4f2c207cc59f6f73c9f", size = 343057, upload-time = "2026-11-05T02:52:45.605Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/d1/d57ce9178ff93a04ee13e9773d9bb0ee2459bf9e2a2efdb573bc9c91771c/inkbox-0.7.29-py3-none-any.whl", hash = "sha256:d1f469186ea98a098e624df55163ad84fdc4f8b0ecabe8500a383486e3c8f079", size = 344308, upload-time = "2026-11-07T07:44:06.463Z" },
 ]
 
 [[package]]

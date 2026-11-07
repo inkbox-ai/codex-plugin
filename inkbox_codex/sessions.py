@@ -455,11 +455,18 @@ class ContactSession:
             and (self.cfg.group_reply_mode != "mention" or self._companion_mentioned(meta))
         )
 
+    def _whatsapp_mentioned(self, text: str, meta: Dict[str, Any]) -> bool:
+        handle = (self.identity_info.get("handle") or self.cfg.identity).lstrip("@")
+        # Numeric native tokens identify recipients, not textual agent handles.
+        return meta.get("whatsapp_mentioned") is True or mentions_agent(text, "" if handle.isdigit() else handle)
+
     def _companion_mentioned(self, meta: Dict[str, Any]) -> bool:
         """Current text mentions or email To recipients can address the agent."""
         envelope = meta.get("companion_envelope") or {}
         if str(envelope.get("event_type") or "").startswith("slack."):
             return meta.get("slack_mentioned") is True or meta.get("conversation_kind") == "direct"
+        if envelope.get("event_type") == "whatsapp.received":
+            return self._whatsapp_mentioned(str(meta.get("raw_text") or ""), meta)
         if mentions_agent(str(meta.get("raw_text") or ""), self.identity_info.get("handle") or self.cfg.identity):
             return True
         if envelope.get("event_type") != "message.received":
@@ -476,13 +483,22 @@ class ContactSession:
     def _companion_control_text(self, text: str, meta: Optional[Dict[str, Any]] = None) -> str:
         """Permit a leading mention on approval answers and local controls."""
         parts = text.strip().split(maxsplit=1)
+        if meta and meta.get("channel") == "whatsapp" and parts:
+            self_tokens = {mention.get("text") for mention in meta.get("mentions") or []
+                           if isinstance(mention, dict) and mention.get("is_agent") is True
+                           and isinstance(mention.get("text"), str)}
+            if parts[0].rstrip(",:") in self_tokens:
+                return parts[1] if len(parts) == 2 else ""
         if meta and meta.get("slack_bot_user_id"):
             token = f"<@{meta['slack_bot_user_id']}>"
             if meta.get("slack_mentioned") and parts and parts[0].rstrip(",:") == token:
                 return parts[1] if len(parts) == 2 else ""
             return text
         handle = (self.identity_info.get("handle") or self.cfg.identity).lstrip("@").lower()
-        if parts and parts[0].lower().rstrip(",:") in {"@agent", f"@{handle}"}:
+        if meta and meta.get("channel") == "whatsapp" and handle.isdigit():
+            handle = ""
+        handles = {"@agent"} | ({f"@{handle}"} if handle else set())
+        if parts and parts[0].lower().rstrip(",:") in handles:
             return parts[1] if len(parts) == 2 else ""
         return text
 
@@ -679,12 +695,15 @@ class ContactSession:
             if unsupported_shape(meta):
                 return False
         raw_text = str(meta.get("raw_text", text))
+        mention_text = raw_text
+        if mode == "whatsapp" and not meta.get("reaction"):
+            raw_text = self._companion_control_text(raw_text, {**meta, "channel": "whatsapp"})
         command = None if meta.get("reaction") else _control_command(raw_text)
         if mode == "slack" and meta.get("slack_native_stop") and command == "stop":
             self.mode, self.reply_meta = mode, meta
             await self._stop_turn()
             return False
-        is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
+        is_group = mode in {"sms", "imessage", "slack", "whatsapp"} and meta.get("conversation_kind") == "group"
         pending_reply = (self.pending is not None and not self.pending.future.done()
                          and not meta.get("reaction"))
         active_mode, active_meta = self._pending_reply_route or self._reply_route(
@@ -706,7 +725,8 @@ class ContactSession:
             )
         mentioned = (
             meta.get("slack_mentioned") is True if mode == "slack"
-            else mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity)
+            else (self._whatsapp_mentioned(mention_text, meta) if mode == "whatsapp"
+                  else mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity))
         )
         context_only = (
             mode == "slack" and is_group
@@ -854,6 +874,11 @@ class ContactSession:
                 "thread_id": meta.get("thread_id"),
                 "thread_root_message_id": meta.get("thread_root_message_id"),
             }]
+        if meta.get("channel") == "whatsapp":
+            for source in meta["imessage_sources"]:
+                source.setdefault("mentions", deepcopy(meta.get("mentions") or []))
+                source.setdefault("agent_mentioned", meta.get("whatsapp_mentioned") is True)
+                source.setdefault("rendered_text", meta.get("rendered_text", text))
         if not meta.get("imessage_event_ids"):
             meta["imessage_event_ids"] = [meta["imessage_event_id"]] if meta.get("imessage_event_id") else []
         # An admitted source, not timing or native ancestry, selects the reply.
@@ -899,6 +924,9 @@ class ContactSession:
             route = self._imessage_burst.reply_meta
             route["imessage_sources"].extend(deepcopy(meta["imessage_sources"]))
             route["imessage_event_ids"].extend(meta["imessage_event_ids"])
+            if meta.get("channel") == "whatsapp":
+                route["whatsapp_mentioned"] = route.get("whatsapp_mentioned") is True or meta.get("whatsapp_mentioned") is True
+                route.setdefault("mentions", []).extend(deepcopy(meta.get("mentions") or []))
             first_id = route["imessage_sources"][0].get("id")
             if first_id:
                 route["imessage_reply_target"] = first_id

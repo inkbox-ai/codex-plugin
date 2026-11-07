@@ -30,6 +30,7 @@ CHANNELS = {
     "message.received": ("mail", "email", "message", "from_address", "body", "thread_id"),
     "text.received": ("phone", "sms", "text_message", "sender_phone_number", "text", "conversation_id"),
     "imessage.received": ("imessage", "imessage", "message", "sender_number", "content", "conversation_id"),
+    "whatsapp.received": ("whatsapp", "whatsapp", "message", "sender_number", "content", "conversation_id"),
 }
 
 
@@ -105,11 +106,23 @@ def _dict(value: Any) -> dict:
 def _receipt_content(envelope: dict) -> dict:
     # Retries can refresh delivery time and the inline history preview. The
     # authoritative snapshot is fetched through the SDK before initialization.
-    content = {key: value for key, value in envelope.items() if key != "timestamp"}
+    # Local display-name enrichment may refresh without changing signed source identity.
+    content = {key: value for key, value in envelope.items() if key not in {"timestamp", "_codex_whatsapp_source"}}
     content["companion"] = {
         key: value for key, value in envelope["companion"].items()
         if key not in {"history", "history_complete", "history_next_cursor"}
     }
+    if envelope.get("event_type") == "whatsapp.received":
+        message = envelope["data"]["message"]
+        # Delivery rebuilds current roster, visibility, media URLs and receipts.
+        # Late ingestion can repair links, append attachments and refresh native
+        # mention metadata. Retain the first admitted copy for routing and wake.
+        # Only immutable source content and scope identify a repeated delivery.
+        stable = {key: message.get(key) for key in (
+            "id", "agent_identity_id", "conversation_id", "direction", "local_number",
+            "remote_number", "sender_number", "content", "is_group",
+        )}
+        content["data"] = {"message": stable}
     if envelope.get("event_type") in SLACK_INCOMING_EVENTS:
         # Optional contact/profile presentation may refresh on a retry.
         content["data"] = {key: value for key, value in envelope["data"].items()
@@ -261,6 +274,16 @@ class Inbox:
             self.db.execute("UPDATE events SET state='uncertain' WHERE state IN ('submitting','sending')")
             self.db.execute("UPDATE activations SET state='uncertain' WHERE state='submitting'")
 
+    def retire_unsubmitted(self, event: Event) -> None:
+        """Only authoritative revocation/replacement may settle unstarted work."""
+        if self.source_submitted(event):
+            return
+        self.db.execute("""UPDATE events SET state='done'
+            WHERE event_id=? AND state IN ('pending','failed')
+            AND NOT EXISTS (SELECT 1 FROM host_receipts WHERE event_id=?)
+            AND NOT EXISTS (SELECT 1 FROM replies WHERE event_id=?)""",
+            (event.event_id, event.event_id, event.event_id))
+
     def accept(self, event: Event) -> bool:
         payload = json.dumps(event.envelope, sort_keys=True, separators=(",", ":"))
         if len(payload.encode()) > MAX_BYTES:
@@ -281,8 +304,25 @@ class Inbox:
             old = self.db.execute("SELECT event_id,payload FROM events WHERE event_id=? OR (scope=? AND sequence=?)",
                                   (event.event_id, event.scope, event.sequence)).fetchone()
             if old:
-                if old[0] != event.event_id or _receipt_content(json.loads(old[1])) != _receipt_content(event.envelope):
+                previous_envelope = json.loads(old[1])
+                previous = _receipt_content(previous_envelope)
+                downgraded = False
+                incoming = _receipt_content(event.envelope)
+                if (event.channel == "whatsapp" and event.phase == "ordinary"
+                        and previous["companion"].get("phase") != "ordinary"):
+                    # Delivery may revoke an activation between attempts. This
+                    # is an acknowledgement only: never replace the saved grant.
+                    prior_scope = {key: value for key, value in previous["companion"].items()
+                                   if key not in {"phase", "activation_id", "reply_context"}}
+                    new_scope = {key: value for key, value in incoming["companion"].items()
+                                 if key != "phase"}
+                    if prior_scope == new_scope:
+                        incoming["companion"] = previous["companion"]
+                        downgraded = True
+                if old[0] != event.event_id or previous != incoming:
                     raise CompanionError("Conflicting Companion event ID or sequence")
+                if downgraded:
+                    self.retire_unsubmitted(Event.parse(previous_envelope))
                 return False
             if self.db.execute(
                 "SELECT 1 FROM events WHERE scope=? AND sequence>? AND state!='pending' LIMIT 1",
@@ -291,6 +331,17 @@ class Inbox:
                 raise CompanionError("A later Companion sequence was already submitted; reconcile this late event")
             self.db.execute("INSERT INTO events(event_id,scope,sequence,payload,received_at) VALUES(?,?,?,?,?)",
                             (event.event_id, event.scope, event.sequence, payload, time.time()))
+            if event.channel == "whatsapp" and event.activation:
+                # A higher-sequence signed grant proves an older activation was
+                # replaced. Never infer revocation from an ambiguous read error.
+                for (previous_payload,) in self.db.execute(
+                    """SELECT payload FROM events WHERE scope=? AND
+                    ((sequence<? AND state IN ('pending','failed')) OR sequence>?)""",
+                    (event.scope, event.sequence, event.sequence),
+                ).fetchall():
+                    previous_event = Event.parse(json.loads(previous_payload))
+                    if previous_event.activation and previous_event.activation != event.activation:
+                        self.retire_unsubmitted(previous_event if previous_event.sequence < event.sequence else event)
         return True
 
     def scopes(self) -> list[str]:
@@ -370,9 +421,10 @@ class Inbox:
 
 
 class Receiver:
-    def __init__(self, *, cfg, client, sessions, sender_allowed: Callable, mail_body: Callable):
+    def __init__(self, *, cfg, client, sessions, sender_allowed: Callable, mail_body: Callable, prepare_whatsapp: Callable | None = None):
         self.cfg, self.client, self.sessions = cfg, client, sessions
         self.sender_allowed, self.mail_body = sender_allowed, mail_body
+        self.prepare_whatsapp = prepare_whatsapp
         namespace = hashlib.sha256(f"{cfg.base_url}|{cfg.identity}".encode()).hexdigest()
         self.namespace = namespace
         self.inbox = Inbox(inbox_path(cfg))
@@ -390,6 +442,18 @@ class Receiver:
         return resource
 
     async def accept(self, envelope: dict) -> bool:
+        if envelope.get("event_type") == "whatsapp.received":
+            if self.prepare_whatsapp is None:
+                raise CompanionError("WhatsApp Companion source validation is unavailable")
+            received = Event.parse(envelope)  # Malformed envelopes remain errors, not local-policy ignores.
+            envelope = await self.prepare_whatsapp(envelope)
+            if envelope is None:
+                # A signed revocation retry can have an inadmissible current
+                # roster. Reconcile only an existing receipt; never admit it anew.
+                if self.inbox.db.execute("SELECT 1 FROM events WHERE event_id=?", (received.event_id,)).fetchone():
+                    self.inbox.accept(received)
+                    self.schedule(received.scope)
+                return False
         if envelope.get("event_type") in SLACK_INCOMING_EVENTS:
             if not self.cfg.slack_enabled:
                 return False
@@ -444,6 +508,11 @@ class Receiver:
                                             f"{meta.get('workspace_id')}:{meta.get('actor_id')}")):
                 await session._cancel_pending_turn()
         return matched
+
+    async def authorize_whatsapp(self, event, meta):
+        from .whatsapp import authorize_companion
+        if event.activation:
+            await asyncio.to_thread(authorize_companion, self.client, self.cfg, meta)
 
     async def authorize_slack(self, event):
         """Recheck this activation, not a replacement grant on the same Slack thread."""
@@ -514,6 +583,8 @@ class Receiver:
                 # or send automatically; other conversation workers can continue.
                 row = self.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (event.event_id,)).fetchone()
                 retrying_reply = False
+                if event.channel == "whatsapp" and row[0] == "done":
+                    continue  # A signed downgrade retired unsubmitted work during preflight.
                 if row[0] in {"submitting", "sending"}:
                     self.inbox.state(event.event_id, "uncertain")
                     self.retries[scope] = asyncio.get_running_loop().call_later(min(2, RETRY_MAX_SECONDS), self.schedule, scope)
@@ -784,6 +855,17 @@ class Receiver:
                 message = {"id": source_id, "content": ""}
             meta.update(source_metadata(message, event.event_id))
             meta["imessage_threaded_replies"] = True
+        if event.channel == "whatsapp":
+            source = event.envelope.get("_codex_whatsapp_source")
+            if not isinstance(source, dict):
+                raise CompanionError("WhatsApp Companion source metadata is missing")
+            meta.update(source)
+            if initialization and context_only and source_id and source_id != event.source_id:
+                # A snapshot missing this live source is background only.
+                meta.update(source_metadata({"id": source_id, "content": ""}, event.event_id))
+                meta.update(whatsapp_mentioned=False, mentions=[], original_text=None, rendered_text="",
+                            whatsapp_body="", whatsapp_reply_context="", whatsapp_image_paths=[], whatsapp_media_ids=[], media=False)
+            meta["imessage_threaded_replies"] = True
         if event.channel == "slack":
             incoming = inbound_message(event.envelope, event.envelope["data"]["identity_id"])
             if incoming is None:
@@ -834,7 +916,13 @@ class Receiver:
                     raise CompanionError("Companion sponsor is no longer permitted locally")
                 if event.channel == "slack":
                     await self.authorize_slack(event)
+                elif event.channel == "whatsapp":
+                    await self.authorize_whatsapp(event, meta)
             with self.inbox.db:
+                if event.channel == "whatsapp" and self.inbox.db.execute(
+                    "SELECT state FROM events WHERE event_id=?", (event.event_id,),
+                ).fetchone()[0] == "done":
+                    raise CompanionError("WhatsApp Companion receipt retired before submission")
                 thread_id = getattr(session._client, "thread_id", None)
                 if thread_id:
                     self.inbox.db.execute("INSERT INTO threads VALUES(?,?) ON CONFLICT(session_key) DO UPDATE SET thread_id=excluded.thread_id",
@@ -882,10 +970,27 @@ class Receiver:
         if self.inbox.source_submitted(event):
             return
         if event.phase == "ordinary":
+            if event.channel == "whatsapp":
+                from .whatsapp import _route_allowed
+                if not _route_allowed(self.sender_allowed, event.envelope["_codex_whatsapp_source"]):
+                    return
             if not self.author_allowed(event, event.author):
                 # Match ordinary inbound filtering: discard this input without
                 # blocking a later, permitted sponsor in the same scope.
                 return
+        if event.channel == "whatsapp" and not event.envelope["_codex_whatsapp_source"].get("whatsapp_enriched"):
+            # Receipt admission/HTTP acknowledgement must not wait on attachment
+            # downloads or contact lookups. Persist enrichment for restart replay.
+            prepared = await self.prepare_whatsapp(event.envelope, enrich=True)
+            if prepared is None:
+                return
+            if self.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (event.event_id,)).fetchone()[0] == "done":
+                return
+            event.envelope.update(prepared)
+            with self.inbox.db:
+                self.inbox.db.execute("UPDATE events SET payload=? WHERE event_id=?",
+                                     (json.dumps(event.envelope), event.event_id))
+        if event.phase == "ordinary":
             await self.submit(event, await self.live_text(event), self.meta(event))
             return
         saved = self.inbox.activation(event)
@@ -903,6 +1008,12 @@ class Receiver:
             if any(entry["id"] == event.source_id and not same_author(event.channel, entry["author"], event.author)
                    for entry in entries):
                 raise CompanionError("Companion snapshot author does not match the received message")
+            if event.channel == "whatsapp" and event.source_id in source_ids:
+                source = event.envelope["_codex_whatsapp_source"]
+                if source.get("media"):
+                    text += "\nCurrent WhatsApp attachment context: " + source["whatsapp_body"]
+                elif source.get("whatsapp_reply_context"):
+                    text += "\n" + source["whatsapp_reply_context"]
             # A live-first receipt must not generate a separate historical turn.
             # If already in the snapshot, that receipt gates the combined input.
             await self.submit(event, text, self.meta(
@@ -928,10 +1039,12 @@ class Receiver:
             return incoming[1]
         message = event.envelope["data"]["text_message" if event.channel == "phone" else "message"]
         text = event.text
+        if event.channel == "whatsapp":
+            text = event.envelope["_codex_whatsapp_source"]["whatsapp_body"]
         if event.channel == "mail":
             text = await asyncio.to_thread(self.mail_body, message)
         media = message.get("attachments") or message.get("media") or []
-        if media:
+        if media and event.channel != "whatsapp":
             text += "\nAttachment data: " + json.dumps(media)
         if len(text.encode()) > MAX_BYTES:
             raise CompanionError("Companion live input exceeds the input limit")

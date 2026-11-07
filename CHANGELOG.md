@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.27
+## 0.2.28
 
 - Retry early schedule deliveries, enforce the start deadline when queued work begins, and synchronize changed schedules in bounded batches.
 
@@ -16,6 +16,10 @@
 
 ## Unreleased
 
+- Support WhatsApp Companion groups through the shared ordered inbox, complete scoped history, native mention gates, and Safe/Relaxed response modes. Revalidate the exact sponsorship before turns and sends without granting direct-message access.
+
+- Recognize verified native WhatsApp @mentions in group mention mode without interpreting numeric text as identity evidence. Preserve structured mentions of other participants as context, without inventing unknown phone numbers. Render verified mention tokens in direct and group chats using name-only contact lookups, with phone or unresolved fallbacks while retaining original text.
+
 - Reduce scheduled full-stack CI to once daily at noon Pacific Time, including daylight saving time changes.
 - Pin CI host tests and live suites to Codex 0.163.0 instead of the moving alpha channel.
 - Add 14 agent-scoped tools for email reads/replies/forwarding/read state, individual SMS/iMessage reads, iMessage reactions, call inspection/activity/hangup, and send-key lookup.
@@ -26,9 +30,11 @@
 
 - Ordinary WhatsApp replies are plain messages; use explicit quotes selectively. Saved sends retain their original payload and request key.
 - Captionless and consecutive WhatsApp images reach native image input; voice notes use the existing transcription credential when available.
-- Require the published Inkbox SDK >=0.7.27,<1.0.0 in plugin 0.2.26.
+- Require the published Inkbox SDK >=0.7.29,<1.0.0.
 
-- WhatsApp now supports direct messages only. `to` accepts exactly one E.164 string; arrays, formatted numbers, and comma-separated recipients are rejected.
-- Removed WhatsApp group creation, membership, routing, and group tool parameters. Unsupported inbound group messages and reactions do not start agent turns or replies.
+- WhatsApp supports direct messages and existing inbound group conversations. `to` accepts exactly one E.164 string; arrays, formatted numbers, and comma-separated recipients are rejected.
+- Group conversations have isolated sessions and support Automatic or Mention required mode, media, quoted replies, and reactions. Group names are display metadata; replies use conversation IDs. Group creation and membership changes remain unsupported.
+- Group routing uses the required SDK’s preserved group metadata.
+- Incoming inline replies show the accessible quoted author, text, and attachment labels alongside the source and parent message IDs, including Companion context. Unavailable targets are explicit; temporary quote lookup failures preserve the current message with a `temporarily_unavailable` marker and parent ID rather than retrying admission. Quoted mentions never count as mentions in the current message.
 - Retained group send intents cannot be converted to direct messages. Their original request keys remain available for read-only receipt lookup.
 - Direct-message quoted replies, threads, reactions, media, and idempotent recovery remain supported. Other channels' group support is unchanged.

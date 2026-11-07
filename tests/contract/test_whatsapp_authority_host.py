@@ -29,6 +29,11 @@ def test_actual_host_source_metadata_and_late_cancelled_tool(tmp_path, monkeypat
 
     class Handler(mock_openai.Handler):
         def do_GET(self):
+            if urlsplit(self.path).path == f"/api/v1/whatsapp/conversations/{CONVERSATION}":
+                self._send_json(200, {"id": CONVERSATION, "agent_identity_id": IDENTITY,
+                    "local_number": "+15550000001", "remote_number": "+15550000002",
+                    "participants": ["+15550000002"], "created_at": NOW, "updated_at": NOW})
+                return
             if self.path != "/api/v1/identities/agent":
                 self.send_error(404)
                 return
