@@ -1031,7 +1031,7 @@ class InkboxGateway:
         if not AIOHTTP_AVAILABLE:
             raise RuntimeError("aiohttp is not installed; run: pip install aiohttp")
         if not INKBOX_AVAILABLE:
-            raise RuntimeError("inkbox SDK is not installed; run: uv pip install 'inkbox>=0.7.27,<1.0.0'")
+            raise RuntimeError("inkbox SDK is not installed; run: uv pip install 'inkbox>=0.7.29,<1.0.0'")
         if not self.cfg.api_key or not self.cfg.identity:
             raise RuntimeError("INKBOX_API_KEY and INKBOX_IDENTITY must be set (see README)")
         if self.cfg.voice_stack_invalid_value:
@@ -2051,6 +2051,10 @@ class InkboxGateway:
             or (envelope.get("direction") == "inbound" and envelope.get("local_phone_number"))
         )
 
+    async def _prepare_whatsapp_companion(self, envelope, *, enrich=False):
+        from .whatsapp import prepare_companion
+        return await prepare_companion(self, envelope, enrich=enrich)
+
     def _companion(self):
         if self.sessions is None:
             raise CompanionError("Companion sessions are not ready")
@@ -2058,6 +2062,7 @@ class InkboxGateway:
             self._companion_receiver = CompanionReceiver(
                 cfg=self.cfg, client=self._inkbox, sessions=self.sessions,
                 sender_allowed=self._sender_allowed, mail_body=self._fetch_mail_body,
+                prepare_whatsapp=self._prepare_whatsapp_companion,
             )
         return self._companion_receiver
 
@@ -2106,8 +2111,6 @@ class InkboxGateway:
                 secret=self._provider_secret("inkbox"),
             ):
                 return web.Response(status=401, text="WhatsApp requires a valid Inkbox signature")
-            if envelope.get("companion") is not None:
-                return web.Response(status=422, text="Unsupported WhatsApp message")
 
         if envelope.get("companion") is not None:
             # Context grants require a verified Inkbox signature even when the
@@ -3708,7 +3711,7 @@ class InkboxGateway:
         try:
             matches = await asyncio.to_thread(self._inkbox.contacts.lookup, **{kind: value})
         except Exception:
-            logger.debug("[bridge] contacts.lookup(%s=%s) failed", kind, value, exc_info=True)
+            logger.debug("[bridge] contacts.lookup failed (kind=%s)", kind)
             self._contact_cache[cache_key] = (None, now + CONTACT_CACHE_TTL_SECONDS)
             return None
         if len(matches) != 1:

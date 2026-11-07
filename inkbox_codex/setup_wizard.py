@@ -47,8 +47,8 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 
 # Packages the wizard itself needs to talk to Inkbox during setup. The
 # gateway's Codex CLI dependency is checked by doctor.
-INKBOX_REQUIREMENTS = ("inkbox>=0.7.27,<1.0.0", "aiohttp>=3.9")
-MIN_INKBOX_VERSION = (0, 7, 27)
+INKBOX_REQUIREMENTS = ("inkbox>=0.7.29,<1.0.0", "aiohttp>=3.9")
+MIN_INKBOX_VERSION = (0, 7, 29)
 _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
 
 # Bundled avatar attached to the agent's Inkbox contact card during setup.
@@ -1000,7 +1000,7 @@ def _configure_voice_ai(
         "get_incoming_call_action", "set_incoming_call_action",
     )
     if any(not callable(getattr(identity, method, None)) for method in required_methods):
-        print_error("  Inkbox Voice AI setup requires Inkbox SDK 0.7.27 or newer.")
+        print_error("  Inkbox Voice AI setup requires Inkbox SDK 0.7.29 or newer.")
         return False, authority_identity, ""
     try:
         hosted_before = identity.get_hosted_agent_config()
@@ -2134,14 +2134,14 @@ def _configure_group_reply_mode() -> None:
     """Choose when group messages start a reply and retain the saved default."""
     print()
     print(color("  --- Group chat replies ---", Colors.CYAN))
-    print_info("  Applies to group SMS/iMessage, Slack groups/threads, and Companion email. Ordinary direct messages are unchanged.")
+    print_info("  Applies to group SMS/iMessage/WhatsApp, Slack groups/threads, and Companion email. Ordinary direct messages are unchanged.")
     print_info("  In mention mode, other messages are kept as context without starting a reply.")
     current = _env("INKBOX_GROUP_REPLY_MODE").strip().lower()
     choice = prompt_choice(
         "  When should the agent reply in group chats?",
         [
             "Automatic — the agent decides when to reply (default)",
-            "Mention required — native Slack @mention, SMS/iMessage @agent / @<agent-handle>, or Companion email addressed To the agent",
+            "Mention required — native Slack @mention, SMS/iMessage/WhatsApp @agent / @<agent-handle>, or Companion email addressed To the agent",
         ],
         1 if current == "mention" else 0,
     )

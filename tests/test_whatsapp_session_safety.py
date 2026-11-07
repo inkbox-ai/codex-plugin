@@ -365,3 +365,46 @@ def test_stop_acknowledgment_keeps_its_original_route_while_interrupt_is_held(ch
         await session.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("command", ["allow", "/stop"])
+def test_native_self_mention_controls_ordinary_whatsapp_turn(command):
+    async def scenario():
+        session, _, _ = make_session(enabled=False)
+        client = session._client
+        client.gate = asyncio.Event()
+        await session.handle_inbound("Work", "whatsapp", source(1))
+        session._flush_imessage_burst()
+        await client.started.wait()
+        future = asyncio.get_running_loop().create_future()
+        session.pending = PendingInteraction("permission", "Question", future)
+        session._pending_reply_route = ("whatsapp", deepcopy(session._current_turn.reply_meta))
+        await session.handle_inbound("@Agent " + command, "whatsapp", source(2,
+            raw_text="@123 " + command, whatsapp_mentioned=True,
+            mentions=[{"text": "@123", "is_agent": True}]))
+        assert future.done()
+        if command == "allow":
+            assert future.result() == "allow"
+        else:
+            assert client.interrupts >= 1
+        client.gate.set()
+        if session._worker:
+            await session._worker
+        await session.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("native,expected", [(False, False), (True, True)])
+def test_numeric_handle_never_treats_another_native_token_as_agent(native, expected):
+    session, _, _ = make_session(enabled=False)
+    session.cfg.identity = "123456789"
+    session.identity_info = {"handle": "123456789"}
+    meta = {"channel": "whatsapp", "raw_text": "@123456789 hello", "whatsapp_mentioned": native,
+            "mentions": [{"text": "@123456789", "is_agent": native}],
+            "companion_envelope": {"event_type": "whatsapp.received"}}
+    assert session._whatsapp_mentioned(meta["raw_text"], meta) is expected
+    assert session._companion_mentioned(meta) is expected
+    assert session._companion_control_text("@123456789 allow", meta) == ("allow" if native else "@123456789 allow")
+    assert session._whatsapp_mentioned("@agent hello", {**meta, "whatsapp_mentioned": False})
+    assert session._companion_control_text("@ allow", meta) == "@ allow"
+    assert session._companion_control_text("@: /stop", meta) == "@: /stop"

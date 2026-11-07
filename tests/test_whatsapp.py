@@ -62,9 +62,11 @@ def sdk(monkeypatch, tmp_path):
             return httpx.Response(state.limits_status, json={"agent_identity_id": IDENTITY, "limits": {"synthetic": 123}, "usage": {"whatsapp.texts_per_agent_identity_per_24h": 7}})
         if path == "/api/v1/identities/agent/channel-status":
             return httpx.Response(200, json={"whatsapp": {"enabled": True, "number": "+15550000001", "status": "ready"}})
-        if path == f"/api/v1/whatsapp/conversations/{CONVERSATION}":
+        if path.startswith("/api/v1/whatsapp/conversations/"):
+            requested = str(UUID(path.rsplit("/", 1)[1]))
             state.on_conversation_read()
-            return httpx.Response(state.conversation_status, json=state.conversation)
+            conversation = state.conversation if requested == CONVERSATION else {**state.conversation, "id": requested}
+            return httpx.Response(state.conversation_status, json=conversation)
         if path == "/api/v1/whatsapp/conversations":
             return httpx.Response(200, json=[])
         if request.method == "POST" and path == "/api/v1/whatsapp/messages":

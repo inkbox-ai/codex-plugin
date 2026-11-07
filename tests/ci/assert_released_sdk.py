@@ -7,7 +7,17 @@ import subprocess
 from inkbox_codex.config import BridgeConfig
 from inkbox_codex.tools import build_inkbox_mcp_server_config
 
-assert version("inkbox") == "0.7.27"
+assert version("inkbox") == "0.7.29"
 server, _ = build_inkbox_mcp_server_config(BridgeConfig())
-code = "from importlib.metadata import version; from inkbox.agent_identity import AgentIdentity; assert version('inkbox') == '0.7.27'; assert callable(AgentIdentity.send_whatsapp); assert callable(AgentIdentity.get_whatsapp_status); assert callable(AgentIdentity.get_whatsapp_limits); assert callable(AgentIdentity.upload_whatsapp_media)"
+code = """
+from importlib.metadata import version
+from inkbox.agent_identity import AgentIdentity
+from inkbox.whatsapp import WhatsAppConversation, WhatsAppMessage
+assert version("inkbox") == "0.7.29"
+for name in ("send_whatsapp", "get_whatsapp_message", "get_whatsapp_status",
+             "get_whatsapp_limits", "upload_whatsapp_media"):
+    assert callable(getattr(AgentIdentity, name))
+for model in (WhatsAppConversation, WhatsAppMessage):
+    assert "is_group" in model.__dataclass_fields__
+"""
 subprocess.run([server["command"], "-c", code], env={**os.environ, **server["env"]}, check=True)
