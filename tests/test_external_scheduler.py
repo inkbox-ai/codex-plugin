@@ -268,3 +268,65 @@ def test_one_shot_late_without_catchup_is_not_run_again(store):
                                    admitted_at=1060, now=1961)['status'] == 'missed'
     assert store.claim(now=1962) is None
     assert store.get(saved['id'])['next_run'] is None
+
+
+def test_admitted_catchup_can_start_after_next_recurrence(store):
+    saved = job(store, catch_up=True)
+    revision = acknowledge(store)['revision']
+    accepted = store.accept_occurrence(saved['id'], revision, 'queued', 1060, now=1959)
+    assert store.get(saved['id'])['next_run'] == 1960
+    assert store.claim(now=5000)['id'] == accepted['id']
+    assert store.claim(now=5001) is None
+
+
+@pytest.mark.parametrize('delay,expected', [(900, 'starting'), (901, 'missed'), (3940, 'missed')])
+def test_external_start_deadline_is_checked_when_claimed(store, delay, expected):
+    saved = job(store, catch_up=False)
+    revision = acknowledge(store)['revision']
+    accepted = store.accept_occurrence(saved['id'], revision, 'queued', 1060, now=1959)
+    claimed = store.claim(now=1060 + delay)
+    assert bool(claimed) == (expected == 'starting')
+    assert store.accept_occurrence(saved['id'], revision, 'queued', 1060, now=6000)['status'] == expected
+    assert store._run(accepted['id'])['status'] == expected
+
+
+def test_expired_external_work_does_not_expire_manual_work(store):
+    saved = job(store, catch_up=False)
+    run = store.enqueue(saved['id'], now=1060)
+    assert store.claim(now=5000)['id'] == run['id']
+
+
+def test_early_external_delivery_is_retryable_without_changing_registration(store):
+    from inkbox_codex.schedules import OccurrenceRejected
+    saved = job(store)
+    registration = acknowledge(store)
+    with pytest.raises(ValueError) as failure:
+        store.accept_occurrence(saved['id'], registration['revision'], 'early', 1060, now=1058)
+    assert not isinstance(failure.value, OccurrenceRejected)
+    assert store.registrations() == [registration | {'registered': True}]
+    accepted = store.accept_occurrence(saved['id'], registration['revision'], 'early', 1060, now=1060)
+    assert store.claim(now=1060)['id'] == accepted['id']
+
+
+def test_registration_batches_retire_acknowledged_history_and_keep_revisions(store):
+    import json
+    for _ in range(257):
+        saved = job(store)
+        store.delete(saved['id'])
+    saved = job(store)
+    seen = set()
+    while batch := store.registrations(pending_only=True):
+        assert len(batch) <= 128
+        assert len(json.dumps({'schedules': batch}).encode()) < 65536
+        for item in batch:
+            assert item['job_id'] not in seen
+            seen.add(item['job_id'])
+            store.acknowledge_registration(item['job_id'], item['revision'])
+    assert len(seen) == 258
+    assert len(store.registrations()) == 258
+    store.update(saved['id'], prompt='Changed', now=1020)
+    pending, = store.registrations(pending_only=True)
+    store.update(saved['id'], prompt='Changed again', now=1021)
+    with pytest.raises(ValueError):
+        store.acknowledge_registration(saved['id'], pending['revision'])
+    assert len(store.registrations(pending_only=True)) == 1

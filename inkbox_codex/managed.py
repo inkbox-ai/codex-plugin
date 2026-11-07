@@ -65,7 +65,7 @@ class ManagedControl:
             if action == 'schedules':
                 if set(data) != {'action'}:
                     raise ValueError('Unexpected fields')
-                return {'schedules': store.registrations()}
+                return {'schedules': store.registrations(pending_only=True)}
             fields = {'action', 'job_id', 'revision'}
             if action == 'update_schedule':
                 if set(data) != fields | {'command_id', 'schedule', 'enabled'}:

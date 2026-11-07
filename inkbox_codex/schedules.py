@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 import hashlib
 import json
 import math
@@ -525,15 +525,18 @@ class ScheduleStore:
         with self._transaction():
             self.db.execute("UPDATE settings SET timer_owner='external' WHERE id=1")
 
-    def registrations(self):
+    def registrations(self, *, pending_only=False):
         """Return durable timer metadata without exposing prompts or execution output."""
         if not self.external_timer():
             raise ValueError('External scheduling is not configured')
         enabled = bool(self.db.execute('SELECT enabled FROM settings WHERE id=1').fetchone()[0])
         rows = []
+        size = 32
         for job in self.list_jobs(include_deleted=True):
+            if pending_only and job['registered_revision'] == job['registration_revision']:
+                continue
             active = self._active(job['id'])
-            rows.append({
+            registration = {
                 'job_id': job['id'], 'revision': job['registration_revision'],
                 'enabled': enabled and job['enabled'] and not job['deleted'],
                 'deleted': job['deleted'], 'schedule': job['schedule'], 'catch_up': job['catch_up'],
@@ -542,7 +545,13 @@ class ScheduleStore:
                 'decision_required': job['decision_required'],
                 'registered': job['registered_revision'] == job['registration_revision'],
                 'error': job['registration_error'],
-            })
+            }
+            if pending_only:
+                encoded_size = len(json.dumps(registration).encode('utf-8')) + 2
+                if len(rows) >= 128 or size + encoded_size > 48000:
+                    break
+                size += encoded_size
+            rows.append(registration)
         return rows
 
     def acknowledge_registration(self, job_id, revision, *, error=None):
@@ -638,9 +647,11 @@ class ScheduleStore:
                 raise OccurrenceRejected('Schedule no longer exists') from exc
             if (not self.db.execute('SELECT enabled FROM settings WHERE id=1').fetchone()[0]
                     or not job['enabled'] or job['registration_revision'] != revision
-                    or job['registered_revision'] != revision or job['next_run'] != due or due > now
+                    or job['registered_revision'] != revision or job['next_run'] != due
                     or self._active(job_id)):
                 raise OccurrenceRejected('Schedule changed or is not due')
+            if due > now:
+                raise ValueError('Schedule is not due yet')
             admitted = timestamp(admitted_at) if admitted_at is not None else now
             if not due <= admitted <= now:
                 raise ValueError('Invalid admission time')
@@ -707,6 +718,10 @@ class ScheduleStore:
         with self._transaction():
             if not self.db.execute('SELECT enabled FROM settings WHERE id=1').fetchone()[0]:
                 return None
+            self.db.execute("""UPDATE runs SET status='missed',finished_at=?,error='Execution missed its managed start window'
+                WHERE status='pending' AND source NOT IN ('manual','retry','catch_up')
+                AND EXISTS(SELECT 1 FROM jobs j JOIN external_occurrences o ON o.job_id=j.id
+                    WHERE o.run_id=runs.id AND j.catch_up=0 AND o.due+900<?)""", (now, now))
             row = self.db.execute("""SELECT r.id,r.job_id FROM runs r JOIN jobs j ON j.id=r.job_id
                 WHERE r.status='pending' AND j.enabled=1 AND j.deleted=0
                 AND ((SELECT timer_owner FROM settings WHERE id=1)='local'
@@ -714,7 +729,8 @@ class ScheduleStore:
                      OR EXISTS(SELECT 1 FROM external_occurrences o WHERE o.run_id=r.id))
                 AND (j.end_at IS NULL OR j.end_at+? >= ?)
                 AND (j.max_runs IS NULL OR j.run_count<j.max_runs)
-                AND (r.source!='auto_catch_up' OR j.next_run IS NULL OR j.next_run>?)
+                AND (r.source!='auto_catch_up' OR j.next_run IS NULL OR j.next_run>?
+                     OR EXISTS(SELECT 1 FROM external_occurrences o WHERE o.run_id=r.id))
                 AND NOT EXISTS(SELECT 1 FROM runs h WHERE h.job_id=j.id AND h.host_pid IS NOT NULL)
                 ORDER BY r.created_at,r.rowid LIMIT 1""", (GRACE_SECONDS, now, now)).fetchone()
             if row is None:

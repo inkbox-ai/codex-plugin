@@ -2,6 +2,8 @@
 
 ## 0.2.27
 
+- Retry early schedule deliveries, enforce the start deadline when queued work begins, and synchronize changed schedules in bounded batches.
+
 - Coalesce delayed recurring schedules, report definite dispatch rejections, and keep failed preflight checks from pinning unrelated work.
 - Bound externally timed startup to 15 minutes unless native catch-up is enabled.
 - Keep stopped uncertain work isolated from unrelated activity and configuration changes.
