@@ -16,13 +16,14 @@ import logging
 import os
 import re
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from email.utils import getaddresses
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 try:
+    from . import managed_work
     from .codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
     from .companion import same_author
     from .elicitation import elicitation_response, format_elicitation, is_approval
@@ -40,6 +41,7 @@ try:
     )
     from .prompts import build_channel_prompt, frame_inbound, mentions_agent
 except ImportError:  # pragma: no cover - direct local import/test fallback
+    import managed_work
     from codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
     from companion import same_author
     from elicitation import elicitation_response, format_elicitation, is_approval
@@ -88,6 +90,8 @@ class _Turn:
     """
 
     text: str
+    managed_work: list = field(default_factory=list, repr=False)
+    managed_admitted: bool = False
     future: Optional["asyncio.Future[Any]"] = None
     # True for a one-shot turn spawned to recover from a rejected reply send.
     # A recovery turn that itself fails to send is not recovered again (no loop).
@@ -419,10 +423,11 @@ class ContactSession:
         self._source_authority = None
         self.always_allowed: set[str] = set()
 
+        self._client_lock = asyncio.Lock()
         self._client: Optional[CodexAppServerClient] = None
         self._connecting_client: Optional[CodexAppServerClient] = None
         self._last_closed_host = None
-        self._queue: asyncio.Queue[_Turn] = asyncio.Queue()
+        self._queue: asyncio.Queue[_Turn] = managed_work.TurnQueue()
         self._pending_context: list[str] = []
         self._worker: Optional[asyncio.Task] = None
         self._resume_task: Optional[asyncio.Task] = None  # /resume pick in flight
@@ -898,6 +903,7 @@ class ContactSession:
             if first_id:
                 route["imessage_reply_target"] = first_id
         turn = self._imessage_burst
+        managed_work.attach(turn)
         turn.text = frame_inbound(turn.reply_mode, turn.reply_meta, "\n\n".join(self._imessage_burst_parts))
         if self._imessage_burst_task is not None:
             self._imessage_burst_task.cancel()
@@ -951,6 +957,8 @@ class ContactSession:
             turn = await self._queue.get()
             outcome = "cancelled"
             tracked_imessage = self._threaded_turn(turn)
+            delivery_scope = managed_work.scope(turn.managed_work)
+            delivery_scope.__enter__()
             try:
                 if turn.completion is not None:
                     if turn.completion.cancelled():
@@ -1015,15 +1023,19 @@ class ContactSession:
                 outcome = "uncertain"
                 raise
             finally:
-                if not (turn.reply_mode == "slack" and turn.completion is not None
-                        and (turn.reply_meta or {}).get("companion")):
-                    await self._notify_turn_activity(turn, outcome)
-                if tracked_imessage:
-                    state = "done" if outcome == "completed" else "cancelled" if outcome == "cancelled" else "uncertain"
-                    try:
-                        await self._imessage_state(state, turn.reply_meta or {})
-                    except Exception:
-                        logger.warning("Could not checkpoint the iMessage turn outcome")
+                try:
+                    if not (turn.reply_mode == "slack" and turn.completion is not None
+                            and (turn.reply_meta or {}).get("companion")):
+                        await self._notify_turn_activity(turn, outcome)
+                    if tracked_imessage:
+                        state = "done" if outcome == "completed" else "cancelled" if outcome == "cancelled" else "uncertain"
+                        try:
+                            await self._imessage_state(state, turn.reply_meta or {})
+                        except Exception:
+                            logger.warning("Could not checkpoint the iMessage turn outcome")
+                finally:
+                    managed_work.finish(turn, outcome)
+                    delivery_scope.__exit__(None, None, None)
 
     async def _flush_context(self) -> None:
         if not self._pending_context:
@@ -1113,6 +1125,7 @@ class ContactSession:
                 await self._imessage_state("stopping", self._current_turn.reply_meta or {})
             await self._cancel_pending_turn()
         for turn in dropped:
+            managed_work.finish(turn, "cancelled")
             if self._threaded_turn(turn):
                 await self._imessage_state("cancelled", turn.reply_meta or {})
             if turn.completion is not None and not turn.completion.done():
@@ -1134,6 +1147,7 @@ class ContactSession:
         await self._cancel_pending_turn()
         buffered = self._take_imessage_burst()
         if buffered is not None:
+            managed_work.finish(buffered, "cancelled")
             await self._imessage_state("cancelled", buffered.reply_meta or {})
         # Discard messages queued but not yet started. Settle any capture-turn
         # futures (consult / post-call / failure recovery) so their awaiters
@@ -1143,6 +1157,7 @@ class ContactSession:
                 turn = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            managed_work.finish(turn, "cancelled")
             await self._notify_turn_activity(turn, "cancelled")
             if self._threaded_turn(turn):
                 await self._imessage_state("cancelled", turn.reply_meta or {})
@@ -1590,6 +1605,10 @@ class ContactSession:
             return
 
     async def _ensure_client(self) -> CodexAppServerClient:
+        async with self._client_lock:
+            return await self._connect_client()
+
+    async def _connect_client(self) -> CodexAppServerClient:
         if self._client is not None:
             if getattr(self._client, "is_alive", True):
                 return self._client

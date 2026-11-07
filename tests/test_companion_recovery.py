@@ -281,3 +281,44 @@ def test_receipt_age_and_readiness_endpoint_reflect_persisted_block(monkeypatch)
         assert asyncio.run(bridge._handle_ready(None)).status == 200
     finally:
         db.close()
+
+
+def test_previous_boot_uncertainty_keeps_scope_blocked_without_pinning_compute(monkeypatch):
+    from inkbox_codex import companion, managed_inbox
+    monkeypatch.setattr(managed_inbox, 'boot_id', lambda: 'old-boot')
+    monkeypatch.setattr(companion, 'boot_id', lambda: 'old-boot')
+    monkeypatch.setenv('INKBOX_MANAGED_OWNER_ID', 'old-owner')
+    cfg = BridgeConfig(identity='test-agent')
+    event = Event.parse(fixture())
+    db = Inbox(inbox_path(cfg))
+    try:
+        db.accept(event)
+        db.state(event.event_id, 'submitting')
+        db.state(event.event_id, 'uncertain')
+        db.accept(Event.parse(live(event.envelope, sequence=3)))
+        assert inbox_summary(cfg)['execution_unknown'] == 1
+        monkeypatch.setattr(managed_inbox, 'boot_id', lambda: 'new-boot')
+        monkeypatch.setattr(companion, 'boot_id', lambda: 'new-boot')
+        monkeypatch.setenv('INKBOX_MANAGED_OWNER_ID', 'new-owner')
+        summary = inbox_summary(cfg)
+        assert summary['blocked_conversations'] == summary['review_required'] == 1
+        assert summary['execution_unknown'] == summary['pending_count'] == 0
+        assert db.db.execute('SELECT state FROM events WHERE event_id=?', (event.event_id,)).fetchone()[0] == 'uncertain'
+    finally:
+        db.close()
+
+
+def test_definite_preflight_failure_blocks_only_its_conversation():
+    cfg = BridgeConfig(identity='test-agent')
+    event = Event.parse(fixture())
+    db = Inbox(inbox_path(cfg))
+    try:
+        db.accept(event)
+        db.state(event.event_id, 'failed')
+        summary = inbox_summary(cfg)
+        assert summary['blocked_conversations'] == 1
+        assert summary['execution_unknown'] == summary['review_required'] == 0
+        db.state(event.event_id, 'uncertain')
+        assert inbox_summary(cfg)['execution_unknown'] == 1
+    finally:
+        db.close()

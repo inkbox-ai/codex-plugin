@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.27
+
+- Retry early schedule deliveries, enforce the start deadline when queued work begins, and synchronize changed schedules in bounded batches.
+
+- Coalesce delayed recurring schedules, report definite dispatch rejections, and keep failed preflight checks from pinning unrelated work.
+- Bound externally timed startup to 15 minutes unless native catch-up is enabled.
+- Keep stopped uncertain work isolated from unrelated activity and configuration changes.
+- Add durable, bounded webhook acceptance and retain uncertain outcomes without automatic replay.
+- Preserve timely schedule admission across cold starts, serialize conversation admission, and separate completed receipts from pending capacity.
+- Limit hosted startup work to authorized deliveries and support explicit quarantine without replay.
+- Support externally timed native schedules, registration acknowledgements and cancellation without duplicate local execution. New cron jobs use the configured timezone, defaulting to UTC.
+- Expose supervised activity, configuration draining and read-only conversation access with one owner per native thread.
+- Apply hosted instructions and shared connected tools while preserving standalone behavior.
+
 ## Unreleased
 
 - Reduce scheduled full-stack CI to once daily at noon Pacific Time, including daylight saving time changes.
