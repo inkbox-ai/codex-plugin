@@ -194,3 +194,37 @@ def test_cancellation_alias_stops_same_native_occurrence(store):
     assert store.cancel_occurrence(saved['id'], revision, 'alias', 1060)['status'] == 'running'
     assert store.cancellation_requested(run['id'])
     assert store.accept_occurrence(saved['id'], revision, 'original', 1060, now=1061)['id'] == run['id']
+
+
+def test_timely_external_admission_survives_startup_latency(store):
+    saved = job(store)
+    registration = acknowledge(store)
+    receipt = store.accept_occurrence(saved['id'], registration['revision'], 'cold-start', 1060,
+                                     admitted_at=1061, now=1120)
+    assert receipt['status'] == 'pending'
+    assert store.claim(now=1121)['id'] == receipt['id']
+    assert store.accept_occurrence(saved['id'], registration['revision'], 'cold-start', 1060,
+                                   admitted_at=1061, now=1200)['id'] == receipt['id']
+
+
+def test_genuinely_late_external_admission_still_misses(store):
+    saved = job(store)
+    registration = acknowledge(store)
+    assert store.accept_occurrence(saved['id'], registration['revision'], 'late-admission', 1060,
+                                   admitted_at=1100, now=1120)['status'] == 'missed'
+
+
+def test_external_quarantine_never_replays_and_requires_stopped_process(store):
+    saved = job(store)
+    registration = acknowledge(store)
+    receipt = store.accept_occurrence(saved['id'], registration['revision'], 'unknown', 1060, now=1060)
+    claimed = store.claim(now=1061)
+    assert claimed['id'] == receipt['id']
+    store.record_host(claimed['id'], 999999, 'synthetic-start')
+    store.finish(claimed['id'], 'uncertain', now=1062)
+    with pytest.raises(ValueError, match='previous execution process'):
+        store.quarantine_occurrence(saved['id'], registration['revision'], 'unknown', 1060)
+    store.clear_host(claimed['id'])
+    assert store.quarantine_occurrence(saved['id'], registration['revision'], 'unknown', 1060)['status'] == 'dismissed'
+    assert store.accept_occurrence(saved['id'], registration['revision'], 'unknown', 1060, now=1100)['status'] == 'dismissed'
+    assert store.claim(now=1101) is None

@@ -596,10 +596,21 @@ class ScheduleStore:
                 return self._run(prior['run_id'])
             return {'status': 'cancelled'}
 
+    def quarantine_occurrence(self, job_id, revision, occurrence_id, due):
+        due = timestamp(due)
+        with self._transaction():
+            prior = self.db.execute('SELECT * FROM external_occurrences WHERE occurrence_id=?', (occurrence_id,)).fetchone()
+            if prior is None or (prior['job_id'], prior['revision'], prior['due']) != (job_id, revision, due) or not prior['run_id']:
+                raise ValueError('Occurrence does not match')
+            run = self._run(prior['run_id'])
+            if run['status'] == 'dismissed':
+                return run
+            return self.recover(run['id'], action='dismiss')
+
     def cancellation_requested(self, run_id):
         return bool(self.db.execute('SELECT 1 FROM external_cancellations c JOIN external_occurrences o ON o.job_id=c.job_id AND o.revision=c.revision AND o.due=c.due WHERE o.run_id=?', (run_id,)).fetchone())
 
-    def accept_occurrence(self, job_id, revision, occurrence_id, due, now=None):
+    def accept_occurrence(self, job_id, revision, occurrence_id, due, now=None, *, admitted_at=None):
         """Deduplicate dispatch before using the native catch-up and execution rules."""
         now, due = timestamp(now), timestamp(due)
         if (not self.external_timer() or type(revision) is not int or revision < 1
@@ -623,7 +634,10 @@ class ScheduleStore:
                     or job['registered_revision'] != revision or job['next_run'] != due or due > now
                     or self._active(job_id)):
                 raise ValueError('Schedule changed or is not due')
-            self._materialize_safely(job, now)
+            admitted = timestamp(admitted_at) if admitted_at is not None else now
+            if not due <= admitted <= now:
+                raise ValueError('Invalid admission time')
+            self._materialize_safely(job, admitted)
             active = self._active(job_id)
             run_id = active['id'] if active else None
             self.db.execute('INSERT INTO external_occurrences(occurrence_id,job_id,revision,due,run_id) VALUES(?,?,?,?,?)',

@@ -3440,6 +3440,8 @@ class InkboxGateway:
             await self._stop_a2a_progress(task_id, registry_key)
 
     async def _catch_up_a2a_tasks(self) -> None:
+        if os.getenv("INKBOX_HOSTED_ACTIVATION_ID"):
+            return
         try:
             for key, entry in self._read_a2a_registry().items():
                 if entry.get("state") == "finalized":

@@ -77,12 +77,15 @@ class ManagedControl:
                     raise ValueError('Unexpected fields')
                 store.acknowledge_registration(data['job_id'], data['revision'])
                 return {'acknowledged': True}
-            if action == 'cancel_schedule' and set(data) == fields | {'occurrence_id', 'due'}:
+            if action == 'quarantine_schedule' and set(data) in (fields | {'occurrence_id', 'due'}, fields | {'occurrence_id', 'due', 'admitted_at'}):
+                receipt = store.quarantine_occurrence(data['job_id'], data['revision'], data['occurrence_id'], data['due'])
+                return {'status': receipt['status']}
+            if action == 'cancel_schedule' and set(data) in (fields | {'occurrence_id', 'due'}, fields | {'occurrence_id', 'due', 'admitted_at'}):
                 receipt = store.cancel_occurrence(data['job_id'], data['revision'], data['occurrence_id'], data['due'])
                 return {'status': receipt['status']}
-            if action != 'invoke_schedule' or set(data) != fields | {'occurrence_id', 'due'}:
+            if action != 'invoke_schedule' or set(data) not in (fields | {'occurrence_id', 'due'}, fields | {'occurrence_id', 'due', 'admitted_at'}):
                 raise ValueError('Unknown action or fields')
-            receipt = store.accept_occurrence(data['job_id'], data['revision'], data['occurrence_id'], data['due'])
+            receipt = store.accept_occurrence(data['job_id'], data['revision'], data['occurrence_id'], data['due'], admitted_at=data.get('admitted_at'))
             return {'run_id': receipt.get('id'), 'status': receipt['status']}
 
     async def handle(self, request):
@@ -90,7 +93,11 @@ class ManagedControl:
             data = await request.json()
             if not isinstance(data, dict) or not isinstance(data.get('action'), str):
                 raise TypeError('Invalid request')
-            if data['action'] in {'conversations', 'conversation'}:
+            if data['action'] == 'quarantine_delivery' and set(data) == {'action', 'event_id'}:
+                if self.ingress is None:
+                    raise ValueError('Receiver unavailable')
+                result = self.ingress.inbox.quarantine(data['event_id'])
+            elif data['action'] in {'conversations', 'conversation'}:
                 from .managed_conversations import read
                 result = await read(self.gateway.sessions, data)
             elif data['action'] in {'status', 'drain', 'resume'}:
