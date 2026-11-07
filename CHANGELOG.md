@@ -16,10 +16,11 @@
 
 - Ordinary WhatsApp replies are plain messages; use explicit quotes selectively. Saved sends retain their original payload and request key.
 - Captionless and consecutive WhatsApp images reach native image input; voice notes use the existing transcription credential when available.
-- Require the published Inkbox SDK >=0.7.27,<1.0.0 in plugin 0.2.26.
+- Require the published Inkbox SDK >=0.7.29,<1.0.0.
 
 - WhatsApp supports direct messages and existing inbound group conversations. `to` accepts exactly one E.164 string; arrays, formatted numbers, and comma-separated recipients are rejected.
 - Group conversations have isolated sessions and support Automatic or Mention required mode, media, quoted replies, and reactions. Group names are display metadata; replies use conversation IDs. Group creation and membership changes remain unsupported.
-- Group routing requires an SDK that preserves group metadata (0.7.29 or newer); older supported SDKs retain direct-message sends, but lists or reads containing groups require the compatible SDK.
+- Group routing uses the required SDK’s preserved group metadata.
+- Incoming inline replies show the accessible quoted author, text, and attachment labels alongside the source and parent message IDs, including Companion context. Unavailable targets are explicit; quoted mentions never count as mentions in the current message.
 - Retained group send intents cannot be converted to direct messages. Their original request keys remain available for read-only receipt lookup.
 - Direct-message quoted replies, threads, reactions, media, and idempotent recovery remain supported. Other channels' group support is unchanged.

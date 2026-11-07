@@ -63,7 +63,7 @@ jobs:
       - name: Install bridge + test deps
         run: |
           uv pip install --system \
-            "inkbox==0.7.27" \
+            "inkbox==0.7.29" \
             -e . pytest
 
       - name: Install pinned Codex

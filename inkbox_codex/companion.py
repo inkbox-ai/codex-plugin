@@ -852,7 +852,7 @@ class Receiver:
                 # A snapshot missing this live source is background only.
                 meta.update(source_metadata({"id": source_id, "content": ""}, event.event_id))
                 meta.update(whatsapp_mentioned=False, mentions=[], original_text=None, rendered_text="",
-                            whatsapp_body="", whatsapp_image_paths=[], whatsapp_media_ids=[], media=False)
+                            whatsapp_body="", whatsapp_reply_context="", whatsapp_image_paths=[], whatsapp_media_ids=[], media=False)
             meta["imessage_threaded_replies"] = True
         if event.channel == "slack":
             incoming = inbound_message(event.envelope, event.envelope["data"]["identity_id"])
@@ -957,6 +957,15 @@ class Receiver:
         await self.deliver_reply(event, resume_activity=True)
         if self.inbox.source_submitted(event):
             return
+        if event.phase == "ordinary":
+            if event.channel == "whatsapp":
+                from .whatsapp import _route_allowed
+                if not _route_allowed(self.sender_allowed, event.envelope["_codex_whatsapp_source"]):
+                    return
+            if not self.author_allowed(event, event.author):
+                # Match ordinary inbound filtering: discard this input without
+                # blocking a later, permitted sponsor in the same scope.
+                return
         if event.channel == "whatsapp" and not event.envelope["_codex_whatsapp_source"].get("whatsapp_enriched"):
             # Receipt admission/HTTP acknowledgement must not wait on attachment
             # downloads or contact lookups. Persist enrichment for restart replay.
@@ -970,14 +979,6 @@ class Receiver:
                 self.inbox.db.execute("UPDATE events SET payload=? WHERE event_id=?",
                                      (json.dumps(event.envelope), event.event_id))
         if event.phase == "ordinary":
-            if event.channel == "whatsapp":
-                from .whatsapp import _route_allowed
-                if not _route_allowed(self.sender_allowed, event.envelope["_codex_whatsapp_source"]):
-                    return
-            if not self.author_allowed(event, event.author):
-                # Match ordinary inbound filtering: discard this input without
-                # blocking a later, permitted sponsor in the same scope.
-                return
             await self.submit(event, await self.live_text(event), self.meta(event))
             return
         saved = self.inbox.activation(event)
@@ -999,6 +1000,8 @@ class Receiver:
                 source = event.envelope["_codex_whatsapp_source"]
                 if source.get("media"):
                     text += "\nCurrent WhatsApp attachment context: " + source["whatsapp_body"]
+                elif source.get("whatsapp_reply_context"):
+                    text += "\n" + source["whatsapp_reply_context"]
             # A live-first receipt must not generate a separate historical turn.
             # If already in the snapshot, that receipt gates the combined input.
             await self.submit(event, text, self.meta(
