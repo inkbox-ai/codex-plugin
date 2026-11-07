@@ -100,6 +100,8 @@ class _Turn:
     capture_tools: bool = False
     hosted_sms_context: Optional[Dict[str, Any]] = None
     activity_handler: Optional[Callable[[str, str], None]] = None
+    event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
+    request_handler: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None
     context_only: bool = False
     reply_mode: Optional[str] = None
     reply_meta: Optional[Dict[str, Any]] = None
@@ -1368,6 +1370,8 @@ class ContactSession:
                 client.turn_started = lambda thread_id, turn_id: bind(source, thread_id, turn_id)
                 run = client.run_detailed if turn.capture_tools else client.run
                 options = {"activity_handler": turn.activity_handler} if turn.activity_handler is not None else {}
+                if turn.event_handler is not None:
+                    options["event_handler"] = turn.event_handler
                 if turn.reply_mode == "whatsapp" and (turn.reply_meta or {}).get("whatsapp_image_paths"):
                     options["image_paths"] = list(turn.reply_meta["whatsapp_image_paths"])
                 return await run(turn.text, **options)
@@ -1606,6 +1610,14 @@ class ContactSession:
             self._worker = asyncio.create_task(self._drain())
         return await future
 
+    async def run_chat(self, query, event_handler, request_handler, before_submit=None):
+        future = asyncio.get_running_loop().create_future()
+        await self._queue.put(_Turn(text=query, future=future, capture_tools=True,
+                                   event_handler=event_handler, request_handler=request_handler, before_submit=before_submit))
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+        return await future
+
     async def _typing_loop(self) -> None:
         """Refresh the channel's typing indicator until the turn ends.
 
@@ -1730,6 +1742,8 @@ class ContactSession:
     # ------------------------------------------------------------------
 
     async def _handle_codex_request(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        if self._current_turn is not None and self._current_turn.request_handler is not None:
+            return await self._current_turn.request_handler(method, params)
         if method == "item/tool/requestUserInput":
             questions = list(params.get("questions") or [])
             reply = await self._escalate("poll", format_poll(questions), questions=questions)

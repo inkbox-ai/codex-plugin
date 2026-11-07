@@ -39,8 +39,9 @@ def test_stale_schedule_rejection_is_proven_but_existing_execution_is_preserved(
         assert control.schedules(command)['run_id'] == accepted['run_id']
 
 
-def test_private_socket_dispatches_once_and_returns_no_prompt(tmp_path, monkeypatch):
+def test_private_socket_dispatches_once_and_returns_bounded_display_metadata(tmp_path, monkeypatch):
     monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path / 'state'))
+    monkeypatch.setenv('INKBOX_MANAGED_OWNER_ID', 'test-owner')
     cfg = BridgeConfig(identity='test-agent', project_dir=str(tmp_path))
     with ScheduleStore(schedule_path(cfg)) as store:
         store.use_external_timer()
@@ -48,7 +49,7 @@ def test_private_socket_dispatches_once_and_returns_no_prompt(tmp_path, monkeypa
         registration, = store.registrations()
     private = tmp_path / 'private'
     private.mkdir(mode=0o700)
-    control = ManagedControl(SimpleNamespace(cfg=cfg, _managed_draining=False, _managed_ingress=0, managed_status=AsyncMock(return_value={'ready': True})), private / 'control.sock')
+    control = ManagedControl(SimpleNamespace(cfg=cfg, sessions=SimpleNamespace(sessions={}), _managed_draining=False, _managed_ingress=0, managed_status=AsyncMock(return_value={'ready': True})), private / 'control.sock')
 
     async def scenario():
         await control.start()
@@ -59,8 +60,11 @@ def test_private_socket_dispatches_once_and_returns_no_prompt(tmp_path, monkeypa
                     async with client.post('http://localhost/control', json=data) as response:
                         return response.status, await response.json()
                 code, metadata = await call({'action': 'schedules'})
-                assert code == 200 and 'private prompt' not in json.dumps(metadata)
-                assert (await call({'action': 'status'})) == (200, {'ready': True})
+                assert code == 200
+                assert metadata['schedules'][0]['display']['task']['prompt'] == 'private prompt'
+                status, health = await call({'action': 'status'})
+                assert status == 200 and health['ready']
+                assert health['capabilities']['normalized_chat'] == 1
                 assert (await call({'action': 'acknowledge_schedule', 'job_id': job['id'], 'revision': registration['revision']}))[0] == 200
                 dispatch = {'action': 'invoke_schedule', 'job_id': job['id'], 'revision': registration['revision'],
                             'occurrence_id': 'test-occurrence', 'due': 1060}

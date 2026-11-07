@@ -5,8 +5,9 @@ import asyncio
 import json
 
 
-def page(thread, before):
+def page(thread, before, *, forward=False):
     messages = []
+    found = before is None
     for turn in thread.get('turns', []):
         for index, item in enumerate(turn.get('items', [])):
             kind = item.get('type')
@@ -17,7 +18,11 @@ def page(thread, before):
             if not isinstance(text, str):
                 continue
             identifier = str(item.get('id') or f"{turn.get('id')}:{index}")
-            if identifier == before:
+            if forward:
+                if not found:
+                    found = identifier == before
+                    continue
+            elif identifier == before:
                 break
             messages.append({'id': identifier, 'role': 'assistant' if kind == 'agentMessage' else 'user',
                              'text': text[:8192], 'truncated': len(text) > 8192})
@@ -25,17 +30,19 @@ def page(thread, before):
             continue
         break
     else:
-        if before is not None:
+        if before is not None and not (forward and found):
             raise ValueError('History cursor is no longer available')
     result, used = [], 0
-    for message in reversed(messages):
+    for message in messages if forward else reversed(messages):
         size = len(json.dumps(message).encode())
         if len(result) == 32 or used + size > 48000:
             break
         result.append(message)
         used += size
-    result.reverse()
-    return {'messages': result, 'next_before': result[0]['id'] if result and len(result) < len(messages) else None}
+    if not forward:
+        result.reverse()
+    cursor = result[-1 if forward else 0]['id'] if result and len(result) < len(messages) else None
+    return {'messages': result, 'next_before': cursor}
 
 
 async def read(manager, data):

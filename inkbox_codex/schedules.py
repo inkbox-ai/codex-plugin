@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -52,6 +52,12 @@ def validate_schedule(schedule: dict, now: float) -> tuple[dict, float]:
     if not isinstance(schedule, dict):
         raise ValueError('schedule must be an object')
     kind = schedule.get('kind')
+    zone = schedule.get('timezone', os.getenv('TZ') or 'UTC')
+    try:
+        if kind == "cron" or zone != "UTC":
+            ZoneInfo(zone)
+    except (ZoneInfoNotFoundError, TypeError, ValueError):
+        raise ValueError('Use a valid IANA timezone') from None
     if kind == 'once':
         try:
             at = datetime.fromisoformat(schedule['at'].replace('Z', '+00:00'))
@@ -60,12 +66,12 @@ def validate_schedule(schedule: dict, now: float) -> tuple[dict, float]:
             raise ValueError('once requires an ISO date and time with an explicit UTC offset') from None
         if due <= now:
             raise ValueError('The one-off execution must be in the future')
-        return {'kind': kind, 'at': at.isoformat()}, due
+        return {'kind': kind, 'at': at.isoformat(), 'timezone': zone}, due
     if kind == 'interval':
         seconds = schedule.get('seconds')
         if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or not 60 <= seconds <= 31536000:
             raise ValueError('Interval seconds must be between 60 and 31536000')
-        return {'kind': kind, 'seconds': seconds}, now + seconds
+        return {'kind': kind, 'seconds': seconds, 'timezone': zone}, now + seconds
     if kind == 'cron':
         expr, tz = schedule.get('expression'), schedule.get('timezone', os.getenv('TZ') or 'UTC')
         if not isinstance(expr, str) or len(expr.split()) != 5 or not croniter.is_valid(expr):
@@ -526,7 +532,7 @@ class ScheduleStore:
             self.db.execute("UPDATE settings SET timer_owner='external' WHERE id=1")
 
     def registrations(self, *, pending_only=False):
-        """Return durable timer metadata without exposing prompts or execution output."""
+        """Return bounded timer and task metadata for authorized management."""
         if not self.external_timer():
             raise ValueError('External scheduling is not configured')
         enabled = bool(self.db.execute('SELECT enabled FROM settings WHERE id=1').fetchone()[0])
@@ -545,6 +551,7 @@ class ScheduleStore:
                 'decision_required': job['decision_required'],
                 'registered': job['registered_revision'] == job['registration_revision'],
                 'error': job['registration_error'],
+                'display': {'name': job['name'], 'timing': job['schedule'], 'deleted': job['deleted'], 'catch_up': job['catch_up'], 'task': {'kind': 'prompt', 'prompt': job['prompt'].encode()[:4096].decode('utf-8','ignore')}, 'partial': len(job['prompt'].encode()) > 4096},
             }
             if pending_only:
                 encoded_size = len(json.dumps(registration).encode('utf-8')) + 2
@@ -565,6 +572,61 @@ class ScheduleStore:
                 (revision if error is None else 0, error, job_id, revision)).rowcount
             if changed != 1:
                 raise ValueError('Schedule changed before registration was acknowledged')
+
+    def mutate_external(self, command):
+        if not self.external_timer() or set(command) != {'action', 'command_id', 'operation', 'job_id', 'revision', 'fields'}:
+            raise ValueError('Invalid schedule command')
+        key = command['command_id']
+        if not isinstance(key, str) or not 1 <= len(key) <= 128:
+            raise ValueError('Invalid command identifier')
+        request = json.dumps(command, sort_keys=True, allow_nan=False)
+        fields = command['fields']
+        if not isinstance(fields, dict) or fields.keys() - {'name', 'task', 'timing', 'enabled', 'catch_up'}:
+            raise ValueError('Invalid schedule fields')
+        changes = {k: v for k, v in fields.items() if k in {'name', 'enabled', 'catch_up'}}
+        if 'task' in fields:
+            task = fields['task']
+            if not isinstance(task, dict) or set(task) != {'kind', 'prompt'} or task['kind'] != 'prompt':
+                raise ValueError('Only prompt tasks are supported')
+            changes['prompt'] = task['prompt']
+        if 'timing' in fields:
+            changes['schedule'] = fields['timing']
+        with self._transaction():
+            prior = self.db.execute('SELECT request,receipt FROM external_updates WHERE command_id=?', (key,)).fetchone()
+            if prior:
+                if prior['request'] != request:
+                    raise ValueError('Conflicting schedule command')
+                return json.loads(prior['receipt'])
+            operation = command['operation']
+            if operation == 'create':
+                if command['revision'] != 0 or command['job_id'] is not None:
+                    raise ValueError('Invalid creation version')
+                job = self.create(**changes)
+            else:
+                job = self.get(command['job_id'])
+                if job['registration_revision'] != command['revision']:
+                    raise ValueError('Schedule changed')
+                if operation == 'delete':
+                    self.delete(job['id'])
+                    job = self._job(self.db.execute('SELECT * FROM jobs WHERE id=?', (job['id'],)).fetchone())
+                elif operation == 'update':
+                    job = self.update(job['id'], **changes)
+                else:
+                    raise ValueError('Invalid schedule operation')
+            receipt = {'job_id': job['id'], 'revision': job['registration_revision'], 'registration_status': 'pending', 'deleted': job['deleted']}
+            self.db.execute('INSERT INTO external_updates VALUES(?,?,?)', (key, request, json.dumps(receipt)))
+            return receipt
+
+    def preview_external(self, timing, count=5):
+        now = time.time()
+        schedule, due = validate_schedule(timing, now)
+        values = [due]
+        for _ in range(min(count, 5) - 1):
+            if schedule['kind'] == 'once':
+                break
+            due = next_cron(schedule, due) if schedule['kind'] == 'cron' else due + schedule['seconds']
+            values.append(due)
+        return {'timing': schedule, 'next_occurrences': [datetime.fromtimestamp(v, timezone.utc).isoformat() for v in values]}
 
     def update_external(self, job_id, revision, command_id, schedule, enabled, now=None):
         """Commit a revision-checked edit and its replay receipt together."""

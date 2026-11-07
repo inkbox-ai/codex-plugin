@@ -75,3 +75,16 @@ def test_concurrent_history_and_turn_connection_have_one_owner(monkeypatch):
         assert (await first) is (await second)
         assert calls == 1
     asyncio.run(scenario())
+
+
+def test_observation_pages_import_oldest_first_without_repeating_boundary():
+    from inkbox_codex.managed_conversations import page
+
+    thread = {'turns': [{'id': 'turn', 'items': [
+        {'id': str(i), 'type': 'agentMessage', 'text': f'Message {i}'} for i in range(70)
+    ]}]}
+    first = page(thread, None, forward=True)
+    second = page(thread, first['next_before'], forward=True)
+    third = page(thread, second['next_before'], forward=True)
+    assert [m['id'] for p in (first, second, third) for m in p['messages']] == [str(i) for i in range(70)]
+    assert third['next_before'] is None

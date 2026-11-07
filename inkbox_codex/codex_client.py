@@ -33,6 +33,10 @@ TurnStartedHandler = Callable[[str, str], None]
 class CodexAppServerError(RuntimeError):
     """Raised when codex app-server returns an error or exits unexpectedly."""
 
+class CodexTurnFailed(CodexAppServerError):
+    """The native owner reported a terminal failure."""
+
+
 
 class CodexStartupError(CodexAppServerError):
     """A failure before any thread or turn submission, with safe diagnostics."""
@@ -133,6 +137,7 @@ class _TurnCapture:
     mcp_tool_calls: list["McpToolCallResult"] = field(default_factory=list)
     activity_handler: Optional[ActivityHandler] = None
     turn_started: Optional[TurnStartedHandler] = None
+    event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
 
 
 @dataclass(frozen=True)
@@ -265,9 +270,10 @@ class CodexAppServerClient:
         *,
         activity_handler: Optional[ActivityHandler] = None,
         image_paths: Optional[list[str]] = None,
+        event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> str:
         """Run one turn in the current thread and return the final reply text."""
-        return (await self.run_detailed(text, activity_handler=activity_handler, image_paths=image_paths)).text
+        return (await self.run_detailed(text, activity_handler=activity_handler, image_paths=image_paths, event_handler=event_handler)).text
 
     async def run_detailed(
         self,
@@ -275,6 +281,7 @@ class CodexAppServerClient:
         *,
         activity_handler: Optional[ActivityHandler] = None,
         image_paths: Optional[list[str]] = None,
+        event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> CodexTurnResult:
         """Run one turn and return its final reply and sanitized MCP outcomes."""
         if not self.thread_id:
@@ -300,6 +307,7 @@ class CodexAppServerClient:
             future=loop.create_future(),
             activity_handler=activity_handler,
             turn_started=self.turn_started,
+            event_handler=event_handler,
         )
         try:
             await self._request("turn/start", params, turn_capture=capture)
@@ -697,6 +705,10 @@ class CodexAppServerClient:
             self._early_notifications.setdefault(turn_id, []).append(message)
             return
 
+        capture = self._turns.get(turn_id)
+        if capture is not None and capture.event_handler is not None:
+            capture.event_handler(str(method), params)
+
         if method == "item/started":
             capture = self._turns.get(turn_id)
             item = params.get("item") or {}
@@ -736,7 +748,7 @@ class CodexAppServerClient:
             status = turn.get("status")
             if status == "failed":
                 error = turn.get("error") or turn.get("codexErrorInfo") or "turn failed"
-                capture.future.set_exception(CodexAppServerError(str(error)))
+                capture.future.set_exception(CodexTurnFailed(str(error)))
                 return
             capture.future.set_result(CodexTurnResult(
                 text=_final_message(capture),

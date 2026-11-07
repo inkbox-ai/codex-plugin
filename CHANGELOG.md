@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.29
+
+- Add supervised direct chat with streamed text, tool activity, approvals, questions, cancellation, and downloadable file references.
+- Retain control receipts across reconnects and expose bounded conversation observations without rerunning work.
+- Add revisioned native schedule management and explicit timezone previews.
+
 ## 0.2.28
 
 - Retry early schedule deliveries, enforce the start deadline when queued work begins, and synchronize changed schedules in bounded batches.

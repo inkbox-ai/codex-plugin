@@ -1613,10 +1613,15 @@ class InkboxGateway:
         active += self._managed_ingress
         ingress = getattr(getattr(self, "_managed_control", None), "ingress", None)
         ingress_unknown = False
+        chat = getattr(getattr(self, "_managed_control", None), "chat", None)
+        if chat is not None:
+            chat_status = chat.journal.activity()
+            active += chat_status["active"]
+            ingress_unknown = chat_status["unknown"]
         if ingress is not None:
             summary = ingress.inbox.summary()
             active += summary['pending'] + summary['active']
-            ingress_unknown = bool(summary['unknown'] or any(task.done() for task in ingress.tasks))
+            ingress_unknown |= bool(summary['unknown'] or any(task.done() for task in ingress.tasks))
         active += sum(not task.done() for task in self._hosted_call_jobs.values())
         active += sum(not task.done() for tasks in self._a2a_jobs.values() for task in tasks)
         scheduler = self._scheduler

@@ -19,6 +19,7 @@ class ManagedControl:
         self.runner = None
         self.inode = None
         self.ingress = None
+        self.chat = None
 
     async def start(self):
         parent = self.path.parent.stat()
@@ -26,6 +27,11 @@ class ManagedControl:
                 or parent.st_uid != os.getuid() or parent.st_mode & 0o077
                 or self.path.exists() or self.path.is_symlink()):
             raise ValueError('Managed control requires a private directory and unused socket')
+        from .managed_chat import ChatRuntime
+        from .chat_adapter import ChatAdapter
+        from .daemon import state_dir
+        adapter = ChatAdapter(self.gateway.sessions)
+        self.chat = ChatRuntime(state_dir() / "chat.sqlite", os.environ["INKBOX_MANAGED_OWNER_ID"], adapter.run, adapter.cancel)
         app = web.Application(client_max_size=65536)
         app.router.add_post('/control', self.handle)
         self.runner = web.AppRunner(app, access_log=None)
@@ -43,6 +49,9 @@ class ManagedControl:
             raise
 
     async def close(self):
+        if self.chat is not None:
+            await self.chat.close()
+            self.chat = None
         if self.ingress is not None:
             await self.ingress.close()
             self.ingress = None
@@ -62,6 +71,10 @@ class ManagedControl:
             if not store.external_timer():
                 raise ValueError('External scheduling is not ready')
             action = data['action']
+            if action == 'schedule_mutate':
+                return store.mutate_external(data)
+            if action == 'schedule_preview' and set(data) == {'action', 'timing'}:
+                return store.preview_external(data['timing'])
             if action == 'schedules':
                 if set(data) != {'action'}:
                     raise ValueError('Unexpected fields')
@@ -96,6 +109,12 @@ class ManagedControl:
             data = await request.json()
             if not isinstance(data, dict) or not isinstance(data.get('action'), str):
                 raise TypeError('Invalid request')
+            if data['action'] == 'observe_conversation':
+                from .observations import observe
+                return web.json_response(await observe(self.gateway, data))
+            if data['action'].startswith('chat_'):
+                self.chat.draining = self.gateway._managed_draining
+                return web.json_response(await self.chat.control(data))
             if data['action'] == 'quarantine_delivery' and set(data) == {'action', 'event_id'}:
                 if self.ingress is None:
                     raise ValueError('Receiver unavailable')
@@ -109,6 +128,7 @@ class ManagedControl:
                 if data['action'] != 'status':
                     self.gateway._managed_draining = data['action'] == 'drain'
                 result = await self.gateway.managed_status()
+                result["capabilities"] = {"normalized_chat": 1, "chat_interactions": 1, "chat_observation": 1, "workspace_schedules": 1}
             else:
                 if data['action'] == 'invoke_schedule' and self.gateway._managed_draining:
                     return web.json_response({'error': 'temporarily_unavailable'}, status=503)

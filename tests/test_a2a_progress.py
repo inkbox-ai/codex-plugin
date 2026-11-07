@@ -143,6 +143,7 @@ def test_activity_observer_receives_no_tool_arguments_or_results():
     capture = types.SimpleNamespace(
         future=types.SimpleNamespace(done=lambda: False),
         activity_handler=handler,
+        event_handler=None,
         messages=[],
         deltas=[],
         mcp_tool_calls=[],
