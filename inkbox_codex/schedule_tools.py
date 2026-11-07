@@ -17,7 +17,7 @@ SCHEDULE_SCHEMA = {
     "oneOf": [
         _schema({"kind": {"const": "once", "type": "string"}, "at": {"type": "string", "description": "ISO 8601 timestamp with UTC offset."}}, ("kind", "at")),
         _schema({"kind": {"const": "interval", "type": "string"}, "seconds": {"type": "integer", "minimum": 60}}, ("kind", "seconds")),
-        _schema({"kind": {"const": "cron", "type": "string"}, "expression": {"type": "string", "description": "Five-field cron expression."}, "timezone": {"type": "string", "description": "IANA timezone; defaults to UTC."}}, ("kind", "expression")),
+        _schema({"kind": {"const": "cron", "type": "string"}, "expression": {"type": "string", "description": "Five-field cron expression."}, "timezone": {"type": "string", "description": "IANA timezone; defaults to TZ, or UTC when unset."}}, ("kind", "expression")),
     ],
 }
 _FIELDS = {
@@ -33,7 +33,7 @@ _FIELDS = {
 }
 _ID = {"job_id": {"type": "string", "minLength": 1}}
 SCHEDULE_TOOLS = [
-    {"name": "inkbox_schedule_add", "description": "Save a persistent local scheduled job with its own prompt and session. Runs while the gateway is online; no messages are sent automatically. Only claim success after this tool returns the saved job.", "inputSchema": _schema(_FIELDS, ("name", "prompt", "schedule"))},
+    {"name": "inkbox_schedule_add", "description": "Save a persistent local scheduled job with its own prompt and session. Standalone jobs run while the gateway is online. Externally scheduled jobs require registration_status=registered before claiming offline execution is available. No messages are sent automatically.", "inputSchema": _schema(_FIELDS, ("name", "prompt", "schedule"))},
     {"name": "inkbox_schedule_list", "description": "List this conversation's jobs, next due times, end_at, max_runs, run_count, remaining_runs and stop_reason; use history to inspect outcomes and missed executions. Saved times are Unix seconds.", "inputSchema": _schema({})},
     {"name": "inkbox_schedule_update", "description": "Edit an existing job; enabled=false pauses it and catch_up controls automatic catch-up after downtime. Omitted fields are unchanged.", "inputSchema": _schema({**_ID, **_FIELDS}, ("job_id",))},
     {"name": "inkbox_schedule_delete", "description": "Delete a scheduled job and cancel future executions. Does not undo work already started.", "inputSchema": _schema(_ID, ("job_id",))},

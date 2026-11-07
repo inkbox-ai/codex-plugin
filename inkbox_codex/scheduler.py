@@ -133,6 +133,8 @@ class Scheduler:
         self.client_factory = client_factory or CodexAppServerClient
         self.clock = clock
         self.active = None
+        self.active_run_id = None
+        self.active_started = False
         self._loop_task = None
         self._lock = None
         self._unrecorded_hosts = {}
@@ -148,6 +150,10 @@ class Scheduler:
             fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if self.store is None:
                 self.store = ScheduleStore(path)
+            if os.getenv('INKBOX_EXTERNAL_SCHEDULER') == '1':
+                self.store.use_external_timer()
+            elif self.store.external_timer():
+                raise ValueError('This schedule store is registered with an external scheduler')
             self.store.recover_interrupted(self.clock())
             await self._fence_orphans()
         except BaseException:
@@ -173,6 +179,9 @@ class Scheduler:
                 self.store.clear_host(run['id'])
 
     async def tick(self):
+        if self.active is not None and not self.active.done() and self.active_started and self.active_run_id and self.store.cancellation_requested(self.active_run_id):
+            if not self.active.cancelling():
+                self.active.cancel()
         if self.active is not None and self.active.done():
             try:
                 self.active.result()
@@ -188,6 +197,8 @@ class Scheduler:
             await self._fence_orphans()
             run = self.store.claim(self.clock())
             if run:
+                self.active_started = False
+                self.active_run_id = run["id"]
                 self.active = asyncio.create_task(self._execute(run))
         self.store.heartbeat(now=self.clock())
 
@@ -204,12 +215,15 @@ class Scheduler:
             await asyncio.sleep(1)
 
     async def _execute(self, run):
+        self.active_started = True
         client = None
         submitted = False
         outcome = None
         result = ''
         error = ''
         try:
+            if self.store.cancellation_requested(run['id']):
+                raise asyncio.CancelledError()
             job = self.store.get(run['job_id'])
             server, _ = build_inkbox_mcp_server_config(self.cfg)
             env = dict(os.environ)
@@ -251,6 +265,8 @@ class Scheduler:
                                          process_env=env, process_started=process_started)
             async with asyncio.timeout(self.cfg.codex_turn_timeout_s):
                 thread_id = await client.connect(job['thread_id'])
+                if self.store.cancellation_requested(run['id']):
+                    raise asyncio.CancelledError()
                 self.store.mark_running(run['id'], thread_id)
                 prompt = (f"Scheduled execution: {run['id']}\n"
                           f"Occurrences represented: {run['count']}\n"

@@ -62,6 +62,7 @@ class _Sessions:
 
 def _gateway(tmp_path):
     gateway = object.__new__(InkboxGateway)
+    gateway._managed_control = None
     gateway._a2a_registry_path = tmp_path / "a2a.json"
     gateway._a2a_jobs = {}
     gateway._a2a_progress_jobs = {}

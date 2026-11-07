@@ -172,7 +172,7 @@ def test_progress_recovery_requires_exclusive_gateway_ownership(tmp_path, monkey
     async def recover():
         order.append('recover')
         raise RuntimeError('recovery-stop')
-    tracker = NS(recover=recover, notify=AsyncMock(), progress=AsyncMock())
+    tracker = NS(recover=recover, notify=AsyncMock(), progress=AsyncMock(), close=AsyncMock())
     monkeypatch.setattr(slack_activity, 'SlackActivity', lambda *args, **kwargs: tracker)
     instance = gateway.InkboxGateway(BridgeConfig(api_key='synthetic-key', identity='agent',
         slack_enabled=True, public_url='https://bridge.example.test'))
@@ -181,7 +181,7 @@ def test_progress_recovery_requires_exclusive_gateway_ownership(tmp_path, monkey
         order.append('acquire')
         if not acquired:
             raise RuntimeError('already-running')
-        return NS()
+        return NS(close=AsyncMock())
     instance._companion = acquire
     with pytest.raises(RuntimeError, match='recovery-stop' if acquired else 'already-running'):
         asyncio.run(instance.run())

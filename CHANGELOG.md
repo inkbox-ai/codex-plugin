@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.27
+
+- Add durable, bounded webhook acceptance and retain uncertain outcomes without automatic replay.
+- Support externally timed native schedules, registration acknowledgements and cancellation without duplicate local execution. New cron jobs use the configured timezone, defaulting to UTC.
+- Expose supervised activity, configuration draining and read-only conversation access with one owner per native thread.
+- Apply hosted instructions and shared connected tools while preserving standalone behavior.
+
 ## Unreleased
 
 - Reduce scheduled full-stack CI to once daily at noon Pacific Time, including daylight saving time changes.

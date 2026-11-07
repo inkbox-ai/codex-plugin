@@ -177,7 +177,8 @@ class CodexAppServerClient:
         turn_started: Optional[TurnStartedHandler] = None,
     ) -> None:
         self.cfg = cfg
-        self.developer_instructions = developer_instructions
+        from .hosted import instructions
+        self.developer_instructions = instructions(developer_instructions)
         self.mcp_server_config = dict(mcp_server_config or {})
         self.approval_handler = approval_handler
         self.tools_enabled = tools_enabled
@@ -188,6 +189,7 @@ class CodexAppServerClient:
         self._owns_process_group = os.name == "posix"
         self._process_group_id: Optional[int] = None
 
+        self._session_lock = None
         self.thread_id: Optional[str] = None
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task] = None
@@ -213,8 +215,32 @@ class CodexAppServerClient:
         return (self._proc is not None and self._proc.returncode is None
                 and self._reader_task is not None and not self._reader_task.done())
 
+    def _lock_session(self, thread_id: str) -> None:
+        directory = os.getenv("INKBOX_SESSION_LOCK_DIRECTORY")
+        if not directory or self._session_lock is not None:
+            return
+        import fcntl
+        import hashlib
+        import stat
+        from pathlib import Path
+
+        root = Path(directory)
+        metadata = root.lstat()
+        if not root.is_absolute() or not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise CodexAppServerError("Session locking unavailable")
+        path = root / ("codex-" + hashlib.sha256(thread_id.encode()).hexdigest())
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise CodexAppServerError("Session is already active") from None
+        self._session_lock = fd
+
     async def connect(self, resume_thread_id: Optional[str] = None) -> str:
         """Start app-server and create or resume a Codex thread."""
+        if resume_thread_id:
+            self._lock_session(resume_thread_id)
         await self._ensure_process()
         if not self._initialized:
             await self._initialize()
@@ -227,8 +253,9 @@ class CodexAppServerClient:
             result = await self._request("thread/start", params)
         thread = result.get("thread") or {}
         thread_id = str(thread.get("id") or "")
-        if not thread_id:
-            raise CodexAppServerError(f"app-server did not return a thread id: {result!r}")
+        if not thread_id or (resume_thread_id and thread_id != resume_thread_id):
+            raise CodexAppServerError("app-server returned an unexpected thread identity")
+        self._lock_session(thread_id)
         self.thread_id = thread_id
         return thread_id
 
@@ -367,6 +394,9 @@ class CodexAppServerClient:
             self._stderr_task.cancel()
         await asyncio.gather(*(task for task in (self._reader_task, self._stderr_task)
                                if task is not None), return_exceptions=True)
+        if self._session_lock is not None and (proc is None or proc.returncode is not None):
+            os.close(self._session_lock)
+            self._session_lock = None
         self._proc = None
         self._initialized = False
 
@@ -376,6 +406,11 @@ class CodexAppServerClient:
             # Scope runtime overrides to Inkbox so other servers keep their
             # launcher-supplied settings, including per-tool approval policies.
             config["mcp_servers.inkbox"] = self.mcp_server_config
+        if self.tools_enabled:
+            from .hosted import mcp_server
+            connected = mcp_server(self.cfg)
+            if connected is not None:
+                config["mcp_servers.inkbox_connected"] = connected
         params = {
             "cwd": self.cfg.project_dir or None,
             "model": self.cfg.codex_model or None,
