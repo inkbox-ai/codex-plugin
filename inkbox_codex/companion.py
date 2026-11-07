@@ -70,11 +70,12 @@ def inbox_summary(cfg) -> dict:
     blocked = {scope: head for scope, head in heads.items()
                if head[0] in {"uncertain", "failed"} or
                (head[0] in {"pending", "reply_pending"} and head[1] in {"submitting", "uncertain"})}
-    review = sum(execution_stopped(head[2], head[3]) for head in blocked.values())
+    uncertain = [head for head in blocked.values() if head[0] != "failed"]
+    review = sum(execution_stopped(head[2], head[3]) for head in uncertain)
     summary.update(unfinished_count=len(rows),
                    quarantined_count=sum(row[1] == "quarantined" for row in rows),
                    pending_count=sum(row[1] in {"pending", "reply_pending"} and row[0] not in blocked for row in rows),
-                   blocked_conversations=len(blocked), execution_unknown=len(blocked) - review,
+                   blocked_conversations=len(blocked), execution_unknown=len(uncertain) - review,
                    review_required=review)
     if rows and all(row[2] is not None for row in rows):
         summary["oldest_unfinished_age_s"] = max(0, int(time.time() - min(row[2] for row in rows)))

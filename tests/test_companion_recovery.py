@@ -306,3 +306,19 @@ def test_previous_boot_uncertainty_keeps_scope_blocked_without_pinning_compute(m
         assert db.db.execute('SELECT state FROM events WHERE event_id=?', (event.event_id,)).fetchone()[0] == 'uncertain'
     finally:
         db.close()
+
+
+def test_definite_preflight_failure_blocks_only_its_conversation():
+    cfg = BridgeConfig(identity='test-agent')
+    event = Event.parse(fixture())
+    db = Inbox(inbox_path(cfg))
+    try:
+        db.accept(event)
+        db.state(event.event_id, 'failed')
+        summary = inbox_summary(cfg)
+        assert summary['blocked_conversations'] == 1
+        assert summary['execution_unknown'] == summary['review_required'] == 0
+        db.state(event.event_id, 'uncertain')
+        assert inbox_summary(cfg)['execution_unknown'] == 1
+    finally:
+        db.close()

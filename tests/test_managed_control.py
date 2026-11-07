@@ -12,6 +12,33 @@ from inkbox_codex.managed import ManagedControl
 from inkbox_codex.schedules import ScheduleStore, schedule_path
 
 
+def test_stale_schedule_rejection_is_proven_but_existing_execution_is_preserved(tmp_path, monkeypatch):
+    monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
+    monkeypatch.setattr('inkbox_codex.schedules.time.time', lambda: 1060)
+    cfg = BridgeConfig(identity='test-agent', project_dir=str(tmp_path))
+    control = ManagedControl(SimpleNamespace(cfg=cfg), tmp_path / 'control.sock')
+    with ScheduleStore(schedule_path(cfg)) as store:
+        store.use_external_timer()
+        saved = store.create('Example', 'Check', {'kind': 'interval', 'seconds': 60}, now=1000)
+        revision = store.registrations()[0]['revision']
+        store.acknowledge_registration(saved['id'], revision)
+        command = {'action': 'invoke_schedule', 'job_id': saved['id'], 'revision': revision,
+                   'occurrence_id': 'original', 'due': 1060}
+        accepted = control.schedules(command)
+        assert accepted['status'] == 'pending'
+        store.update(saved['id'], prompt='Changed', now=1060)
+        replay = control.schedules(command)
+        assert replay['run_id'] == accepted['run_id']
+        assert replay['status'] == 'cancelled'
+        assert control.schedules({**command, 'occurrence_id': 'stale', 'due': 1120}) == {
+            'status': 'rejected', 'execution_stopped': True}
+        assert len(store.runs(saved['id'])) == 1
+        store.delete(saved['id'])
+        assert control.schedules({**command, 'occurrence_id': 'deleted', 'due': 1180}) == {
+            'status': 'rejected', 'execution_stopped': True}
+        assert control.schedules(command)['run_id'] == accepted['run_id']
+
+
 def test_private_socket_dispatches_once_and_returns_no_prompt(tmp_path, monkeypatch):
     monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path / 'state'))
     cfg = BridgeConfig(identity='test-agent', project_dir=str(tmp_path))

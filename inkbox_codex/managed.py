@@ -9,7 +9,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from .schedules import ScheduleStore, schedule_path
+from .schedules import OccurrenceRejected, ScheduleStore, schedule_path
 
 
 class ManagedControl:
@@ -85,7 +85,10 @@ class ManagedControl:
                 return {'status': receipt['status'], **({'execution_stopped': True} if receipt['status'] == 'uncertain' and receipt.get('host_pid') is None else {})}
             if action != 'invoke_schedule' or set(data) not in (fields | {'occurrence_id', 'due'}, fields | {'occurrence_id', 'due', 'admitted_at'}):
                 raise ValueError('Unknown action or fields')
-            receipt = store.accept_occurrence(data['job_id'], data['revision'], data['occurrence_id'], data['due'], admitted_at=data.get('admitted_at'))
+            try:
+                receipt = store.accept_occurrence(data['job_id'], data['revision'], data['occurrence_id'], data['due'], admitted_at=data.get('admitted_at'))
+            except OccurrenceRejected:
+                return {'status': 'rejected', 'execution_stopped': True}
             return {'run_id': receipt.get('id'), 'status': receipt['status'], **({'execution_stopped': True} if receipt['status'] == 'uncertain' and receipt.get('host_pid') is None else {})}
 
     async def handle(self, request):

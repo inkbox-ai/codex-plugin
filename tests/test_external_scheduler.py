@@ -79,6 +79,23 @@ def test_local_ticks_never_execute_externally_owned_jobs(store):
     assert store.claim(now=1062) is None
 
 
+@pytest.mark.parametrize('delay', [600, 2400, 86400])
+@pytest.mark.parametrize('catch_up', [False, True])
+def test_external_backlog_advances_in_one_dispatch(store, delay, catch_up):
+    saved = job(store, catch_up=catch_up)
+    registration = acknowledge(store)
+    now = 1060 + delay
+    receipt = store.accept_occurrence(saved['id'], registration['revision'], 'backlog', 1060, now=now)
+    assert store.get(saved['id'])['next_run'] > now
+    claimed = store.claim(now=now)
+    assert bool(claimed) == (catch_up or delay <= 900)
+    if claimed:
+        assert claimed['id'] == receipt['id']
+        store.finish(claimed['id'], 'succeeded', now=now)
+    assert store.claim(now=now) is None
+    assert store.accept_occurrence(saved['id'], registration['revision'], 'backlog', 1060, now=now)['status'] in {'succeeded', 'missed'}
+
+
 def test_edit_pause_and_delete_invalidate_registration(store):
     saved = job(store)
     first = acknowledge(store)

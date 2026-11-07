@@ -21,6 +21,10 @@ CRON_BATCH_SIZE = 1000
 ACTIVE = ('pending', 'starting', 'running', 'uncertain')
 
 
+class OccurrenceRejected(ValueError):
+    """Admission refused before any execution receipt was created."""
+
+
 def timestamp(value=None) -> float:
     if value is None:
         return time.time()
@@ -441,7 +445,7 @@ class ScheduleStore:
         self.db.execute("UPDATE runs SET catchup_run_id=? WHERE job_id=? AND status='missed' AND source!='paused' AND catchup_run_id IS NULL", (run_id, job['id']))
         return run_id
 
-    def _materialize_job(self, job, now):
+    def _materialize_job(self, job, now, grace=GRACE_SECONDS):
         if self._limit_reason(job, now) == 'max_runs':
             self._stop_job(job, 'max_runs', now)
             return
@@ -473,7 +477,7 @@ class ScheduleStore:
             if next_due is not None and job['end_at'] is not None and next_due > job['end_at']:
                 next_due = None
             caught_up = next_due is None or next_due > now
-            on_time = caught_up and last >= now - GRACE_SECONDS and not active
+            on_time = caught_up and last >= now - grace and not active
             missed_count = count - int(on_time)
             if missed_count:
                 if on_time and schedule['kind'] == 'interval':
@@ -496,10 +500,10 @@ class ScheduleStore:
         elif job['catch_up'] and (job['next_run'] is None or job['next_run'] > now):
             self._coalesce(job, now)
 
-    def _materialize_safely(self, job, now):
+    def _materialize_safely(self, job, now, grace=GRACE_SECONDS):
         self.db.execute('SAVEPOINT materialize_job')
         try:
-            self._materialize_job(job, now)
+            self._materialize_job(job, now, grace)
             return True
         except (ValueError, ZoneInfoNotFoundError, OverflowError):
             self.db.execute('ROLLBACK TO materialize_job')
@@ -628,16 +632,19 @@ class ScheduleStore:
                 if (prior['job_id'], prior['revision'], prior['due']) != (job_id, revision, due):
                     raise ValueError('Occurrence was already used for a different schedule')
                 return self._run(prior['run_id']) if prior['run_id'] else {'status': 'missed'}
-            job = self.get(job_id)
+            try:
+                job = self.get(job_id)
+            except ValueError as exc:
+                raise OccurrenceRejected('Schedule no longer exists') from exc
             if (not self.db.execute('SELECT enabled FROM settings WHERE id=1').fetchone()[0]
                     or not job['enabled'] or job['registration_revision'] != revision
                     or job['registered_revision'] != revision or job['next_run'] != due or due > now
                     or self._active(job_id)):
-                raise ValueError('Schedule changed or is not due')
+                raise OccurrenceRejected('Schedule changed or is not due')
             admitted = timestamp(admitted_at) if admitted_at is not None else now
             if not due <= admitted <= now:
                 raise ValueError('Invalid admission time')
-            self._materialize_safely(job, now if job['catch_up'] else due)
+            self._materialize_safely(job, now, grace=900)
             active = self._active(job_id)
             if active and not job['catch_up'] and now > due + 900:
                 self.db.execute("UPDATE runs SET status='missed',error='Execution missed its managed start window' WHERE id=?", (active['id'],))
