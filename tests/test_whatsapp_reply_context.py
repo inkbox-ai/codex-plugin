@@ -250,55 +250,72 @@ def test_two_parents_with_shared_thread_stay_associated_inside_one_burst(sdk):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("status", [429, 500, 503])
-def test_retryable_parent_status_does_not_become_unavailable(status):
+def temporary_failure(status):
     import httpx
+    if status is None:
+        return TimeoutError("temporary")
     response = httpx.Response(status, request=httpx.Request("GET", "https://example.com/message"))
-    failure = httpx.HTTPStatusError("temporary", request=response.request, response=response)
-    gw = gateway(parent()); gw._identity.get_whatsapp_message.side_effect = failure
-    with pytest.raises(httpx.HTTPStatusError):
-        asyncio.run(whatsapp.render_reply_context(gw, message(reply_to_message_id=OUTBOUND)))
+    return httpx.HTTPStatusError("temporary", request=response.request, response=response)
 
 
-def test_native_parent_timeout_releases_ordering_and_dedup_for_retry(sdk):
+@pytest.mark.parametrize("status", [429, 500, 503, None, 403, 404])
+def test_failed_parent_lookup_is_bounded_best_effort(status):
+    gw = gateway(parent()); gw._identity.get_whatsapp_message.side_effect = temporary_failure(status)
+    result = decode(asyncio.run(whatsapp.render_reply_context(gw, message(reply_to_message_id=OUTBOUND))))
+    temporary = status not in {403, 404}
+    assert result == {"message_id": MESSAGE, "reply_to_message_id": OUTBOUND,
+        "status": "temporarily_unavailable" if temporary else "unavailable",
+        "note": "The reply target could not be read" + (" right now" if temporary else "") + ". Do not infer its author or content."}
+    gw._identity.get_whatsapp_message.assert_called_once_with(OUTBOUND)
+
+
+@pytest.mark.parametrize("status", [429, 503, None])
+def test_native_optional_parent_failure_admits_once_and_later_quote_recovers(sdk, status):
     async def scenario():
         gw = bridge(sdk)
-        gw._identity.get_whatsapp_message = Mock(side_effect=[TimeoutError("temporary"), parent()])
+        gw._identity.get_whatsapp_message = Mock(side_effect=[temporary_failure(status), parent()])
         inbound = AsyncMock(); gw.sessions = NS(get=Mock(return_value=NS(handle_inbound=inbound)))
         source = message(reply_to_message_id=OUTBOUND)
-        with pytest.raises(TimeoutError):
-            await whatsapp.receive(gw, {"data": {"message": source}})
-        inbound.assert_not_awaited()
+        await whatsapp.receive(gw, {"data": {"message": source}})
         await whatsapp.receive(gw, {"data": {"message": source}})
         inbound.assert_awaited_once()
+        body, _, meta = inbound.call_args.args
+        assert '"status": "temporarily_unavailable"' in body
+        assert meta["raw_text"] == "Question" and meta["rendered_text"] == "Question"
+        assert not meta["whatsapp_mentioned"]
+        assert meta["reply_to_message_id"] == OUTBOUND
+        gw._identity.get_whatsapp_message.assert_called_once_with(OUTBOUND)
+        later = dict(source, id="20000000-0000-4000-8000-000000000999")
+        await whatsapp.receive(gw, {"data": {"message": later}})
+        assert inbound.await_count == 2
         assert '"status": "available"' in inbound.call_args.args[0]
-        assert all(not lock.locked() for lock in gw._whatsapp_receive_locks.values())
+        assert '"text": "The earlier proposal"' in inbound.call_args.args[0]
+        assert gw._identity.get_whatsapp_message.call_count == 2
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("status", [429, 503, None])
-def test_companion_parent_failure_retries_pending_receipt_without_losing_quote(monkeypatch, status):
+def test_companion_optional_parent_failure_admits_once_and_later_quote_recovers(monkeypatch, status):
     async def scenario():
-        monkeypatch.setattr("inkbox_codex.companion.RETRY_MAX_SECONDS", 0.01)
         value = envelope(); value["data"]["message"]["reply_to_message_id"] = OUTBOUND
-        receiver, client, session, sent, gw = setup(value, monkeypatch)
+        receiver, client, session, sent, gw = setup(value, monkeypatch, reply_mode="mention", response_mode="relaxed")
         target = parent(); target["conversation_id"] = value["data"]["message"]["conversation_id"]
-        import httpx
-        response = httpx.Response(status or 503, request=httpx.Request("GET", "https://example.com/message"))
-        failure = (httpx.HTTPStatusError("temporary", request=response.request, response=response)
-                   if status else TimeoutError("temporary"))
-        gw._identity.get_whatsapp_message = Mock(side_effect=[failure, target])
+        gw._identity.get_whatsapp_message = Mock(side_effect=[temporary_failure(status), target])
         try:
-            await receiver.accept(value)
-            async def completed():
-                while receiver.inbox.db.execute("SELECT state FROM events WHERE event_id=?", (value["id"],)).fetchone()[0] != "done":
-                    await asyncio.sleep(0.01)
-            await asyncio.wait_for(completed(), 2)
-            await drained(receiver)
-            assert gw._identity.get_whatsapp_message.call_count == 2
+            await receiver.accept(value); await drained(receiver)
+            await receiver.accept(value); await drained(receiver)
+            assert gw._identity.get_whatsapp_message.call_count == 1
             assert len(session._client.events) == 1
-            assert '"text": "The earlier proposal"' in session._client.events[0][1]
-            assert '"status": "unavailable"' not in session._client.events[0][1]
+            assert '"status": "temporarily_unavailable"' in session._client.events[0][1]
+            assert OUTBOUND in session._client.events[0][1]
+            live = next_event(value, native=False)
+            await receiver.accept(live); await drained(receiver)
+            assert gw._identity.get_whatsapp_message.call_count == 2
+            assert [kind for kind, _ in session._client.events] == ["run", "context"]
+            assert '"text": "The earlier proposal"' in session._client.events[1][1]
+            assert '"status": "available"' in session._client.events[1][1]
+            assert live["data"]["message"]["content"] == "a quiet update"
+            assert live["data"]["message"]["agent_mentioned"] is False
         finally:
             await receiver.close()
     asyncio.run(scenario())

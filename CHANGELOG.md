@@ -21,6 +21,6 @@
 - WhatsApp supports direct messages and existing inbound group conversations. `to` accepts exactly one E.164 string; arrays, formatted numbers, and comma-separated recipients are rejected.
 - Group conversations have isolated sessions and support Automatic or Mention required mode, media, quoted replies, and reactions. Group names are display metadata; replies use conversation IDs. Group creation and membership changes remain unsupported.
 - Group routing uses the required SDK’s preserved group metadata.
-- Incoming inline replies show the accessible quoted author, text, and attachment labels alongside the source and parent message IDs, including Companion context. Unavailable targets are explicit; quoted mentions never count as mentions in the current message.
+- Incoming inline replies show the accessible quoted author, text, and attachment labels alongside the source and parent message IDs, including Companion context. Unavailable targets are explicit; temporary quote lookup failures preserve the current message with a `temporarily_unavailable` marker and parent ID rather than retrying admission. Quoted mentions never count as mentions in the current message.
 - Retained group send intents cannot be converted to direct messages. Their original request keys remain available for read-only receipt lookup.
 - Direct-message quoted replies, threads, reactions, media, and idempotent recovery remain supported. Other channels' group support is unchanged.
