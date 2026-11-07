@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.30
+
+- Preserve cancellation and expired interactions across pending responses, bound oversized chat output, and recover confirmed completed work without replay.
+- Report known model-access failures with actionable codes and avoid reopening dormant conversations during observation.
+- Include native execution timing and output identities in schedule receipts.
+
 ## 0.2.29
 
 - Add supervised direct chat with streamed text, tool activity, approvals, questions, cancellation, and downloadable file references.

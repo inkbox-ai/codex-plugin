@@ -10,6 +10,7 @@ class ChatAdapter:
     def __init__(self, sessions):
         self.sessions = sessions
         self.cancelled = set()
+        self.native_turns = {}
 
     async def cancel(self, session_id):
         self.cancelled.add(session_id)
@@ -18,16 +19,26 @@ class ChatAdapter:
             session._interrupting = True
             await session._interrupt_client()
 
+    async def settled(self, session_id):
+        session = self.sessions.sessions.get(f"chat:{session_id}")
+        client = getattr(session, "_client", None)
+        turn = self.native_turns.get(session_id)
+        return bool(client and turn and turn in client._finished_turns)
+
     async def run(self, spec, emit, ask):
-        from .managed_chat import file_instruction, safe_text
+        from .managed_chat import failure_code, file_instruction, safe_text
 
         if spec["session_id"] in self.cancelled:
             self.cancelled.discard(spec["session_id"])
             return {"text": "", "cancelled": True}
+        self.native_turns.pop(spec["session_id"], None)
         session = self.sessions.get(f"chat:{spec['session_id']}")
         tool_ids = {}
 
         def event(method, params):
+            turn = params.get("turnId") or (params.get("turn") or {}).get("id")
+            if turn:
+                self.native_turns[spec["session_id"]] = turn
             if method == "item/agentMessage/delta":
                 emit("message.delta", {"text": str(params.get("delta") or "")})
             if method not in {"item/started", "item/completed"}:
@@ -91,6 +102,8 @@ class ChatAdapter:
                 result = await ask(
                     {"kind": "question", "title": "Input needed", "fields": fields}
                 )
+                if result.get("cancelled") or spec["session_id"] in self.cancelled:
+                    return {"answers": {}}
                 answers = {}
                 for field in fields:
                     answer = result["answers"][field["id"]]
@@ -132,7 +145,11 @@ class ChatAdapter:
                     "decisions": ["approve_once", "deny"],
                 }
             )
-            approved = result["decision"] == "approve_once"
+            approved = (
+                not result.get("cancelled")
+                and spec["session_id"] not in self.cancelled
+                and result.get("decision") == "approve_once"
+            )
             if permission:
                 return {
                     "permissions": params.get("permissions") or {} if approved else {},
@@ -149,8 +166,13 @@ class ChatAdapter:
                 request,
                 before_submit=lambda: self.check_cancelled(spec["session_id"]),
             )
-        except CodexTurnFailed:
-            return {"text": "", "failed": True, "session_id": session.resume_session_id}
+        except CodexTurnFailed as exc:
+            return {
+                "text": "",
+                "failed": True,
+                "error_code": failure_code(exc.error),
+                "session_id": session.resume_session_id,
+            }
         finally:
             self.cancelled.discard(spec["session_id"])
         return {

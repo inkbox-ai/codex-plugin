@@ -312,3 +312,22 @@ def test_concurrent_start_responses_match_early_notifications_by_turn_id():
             client._reader_task.cancel()
             await asyncio.gather(client._reader_task, return_exceptions=True)
     asyncio.run(scenario())
+
+
+def test_failing_chat_observer_does_not_fail_other_turns():
+    from inkbox_codex.codex_client import _TurnCapture
+    async def scenario():
+        client = CodexAppServerClient(BridgeConfig(), developer_instructions="test")
+        def broken(*_):
+            raise ValueError("oversized observation")
+        first = asyncio.get_running_loop().create_future()
+        other = asyncio.get_running_loop().create_future()
+        client._turns["first"] = _TurnCapture(thread_id="thread", turn_id="first", future=first, event_handler=broken)
+        client._turns["other"] = _TurnCapture(thread_id="thread", turn_id="other", future=other)
+        client._handle_notification({"method":"item/agentMessage/delta","params":{"turnId":"first","delta":"text"}})
+        with pytest.raises(CodexAppServerError):
+            await first
+        assert not other.done()
+        client._handle_notification({"method":"turn/completed","params":{"turn":{"id":"other","status":"completed"}}})
+        await other
+    asyncio.run(scenario())

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import fcntl
 import hashlib
@@ -16,6 +17,51 @@ import uuid
 from pathlib import Path
 
 TERMINAL = {"succeeded", "failed", "cancelled", "interrupted", "outcome_unknown"}
+
+
+def failure_code(value):
+    allowed = {
+        "model_key_invalid",
+        "model_key_missing",
+        "model_rate_limited",
+        "model_upstream_failed",
+        "included_credits_exhausted",
+        "included_credits_unavailable",
+        "model_capacity_reserved",
+    }
+    if isinstance(value, dict):
+        for key in ("error_code", "code", "error", "message"):
+            item = value.get(key)
+            if isinstance(item, str) and item in allowed:
+                return item
+            if isinstance(item, dict) and (code := failure_code(item)):
+                return code
+            if isinstance(item, str) and len(item) <= 8192:
+                match = re.fullmatch(
+                    r"unexpected status [0-9]+ [^:]+: ([a-z_]+)(?:, url:.*)?", item
+                )
+                if match and match[1] in allowed:
+                    return match[1]
+                body = re.sub(r"^Error code: [0-9]+ - ", "", item)
+                try:
+                    parsed = json.loads(body)
+                except ValueError:
+                    try:
+                        parsed = (
+                            ast.literal_eval(body) if body.startswith("{") else None
+                        )
+                    except (ValueError, SyntaxError, RecursionError):
+                        parsed = None
+                if isinstance(parsed, dict) and (code := failure_code(parsed)):
+                    return code
+        info = value.get("codexErrorInfo")
+        if isinstance(info, dict) and isinstance(
+            info.get("httpConnectionFailed"), dict
+        ):
+            return {401: "model_key_invalid", 429: "model_rate_limited"}.get(
+                info["httpConnectionFailed"].get("httpStatusCode")
+            )
+    return None
 
 
 def milliseconds():
@@ -245,10 +291,11 @@ class Journal:
 
 
 class ChatRuntime:
-    def __init__(self, path, owner_id, run, cancel):
+    def __init__(self, path, owner_id, run, cancel, settled=None):
         self.journal = Journal(path, owner_id)
         self.run = run
         self.cancel = cancel
+        self.settled = settled
         self.tasks = {}
         self.answers = {}
         self.draining = False
@@ -270,6 +317,14 @@ class ChatRuntime:
             return {"type": "receipt", "receipt": self.journal.get(identifier)}
         identifier = data["run_id"]
         receipt = self.journal.get(identifier)
+        if (
+            receipt["state"] == "outcome_unknown"
+            and not receipt["children_complete"]
+            and self.settled
+            and await self.settled(receipt["session_id"])
+        ):
+            receipt["children_complete"] = True
+            self.journal.save(receipt)
         if action == "chat_events":
             return {
                 "type": "events",
@@ -296,7 +351,7 @@ class ChatRuntime:
             if receipt["state"] not in TERMINAL:
                 receipt["state"] = "cancelling"
                 self.journal.save(receipt)
-                await self.cancel(receipt["session_id"])
+                await self.cancel_turn(identifier)
         elif action == "chat_respond":
             request = next(
                 (row for row in receipt["requests"] if row["id"] == data["request_id"]),
@@ -304,6 +359,11 @@ class ChatRuntime:
             )
             if request is None or request["version"] != data["version"]:
                 raise ValueError("Stale interaction")
+            dispatch_until = data.get(
+                "dispatch_until_unix_ms", request["deadline_unix_ms"]
+            )
+            if dispatch_until <= milliseconds():
+                raise ValueError("Response dispatch expired")
             response = data["response"]
             validate_answer(request["payload"], response)
             if len(encode(response).encode()) > 8192:
@@ -330,15 +390,27 @@ class ChatRuntime:
                 self.journal.save(
                     receipt, {"type": "interaction.updated", "data": request["payload"]}
                 )
-                waiter.set_result(response)
+                waiter.set_result({**response, "_dispatch_until": dispatch_until})
         elif action != "chat_inspect":
             raise ValueError("Unknown action")
         return {"type": "receipt", "receipt": self.journal.get(identifier)}
+
+    async def cancel_turn(self, identifier):
+        receipt = self.journal.get(identifier)
+        if receipt["state"] not in TERMINAL:
+            receipt["state"] = "cancelling"
+            self.journal.save(receipt)
+        for request in receipt["requests"]:
+            waiter = self.answers.get(request["id"])
+            if waiter is not None and not waiter.done():
+                waiter.set_result({"cancelled": True})
+        await self.cancel(receipt["session_id"])
 
     async def execute(self, spec):
         identifier = spec["run_id"]
         receipt = self.journal.get(identifier)
         text = ""
+        output_limited = False
         pending = ""
         redactor = StreamRedactor()
         flush_handle = None
@@ -360,14 +432,20 @@ class ChatRuntime:
                     },
                 )
 
+        def append_text(delta):
+            nonlocal text, pending, output_limited
+            remaining = max(0, 60000 - len(text.encode()))
+            if len(delta.encode()) > remaining:
+                output_limited = True
+                delta = delta.encode()[:remaining].decode("utf-8", "ignore")
+            text += delta
+            pending += delta
+
         def emit(kind, data):
-            nonlocal text, pending, flush_handle
+            nonlocal text, pending, flush_handle, output_limited
             if kind == "message.delta":
                 delta = redactor.feed(str(data.get("text", "")))
-                text += delta
-                pending += delta
-                if len(text.encode()) > 65536:
-                    raise ValueError("Response too large")
+                append_text(delta)
                 if len(pending.encode()) >= 2048:
                     flush()
                 elif flush_handle is None:
@@ -375,7 +453,8 @@ class ChatRuntime:
                 return
             flush()
             if len(encode(data).encode()) > 16384:
-                raise ValueError("Event too large")
+                output_limited = True
+                return
             self.journal.save(
                 self.journal.get(identifier), {"type": kind, "data": data}
             )
@@ -422,6 +501,15 @@ class ChatRuntime:
                     waiter, max(0, (deadline - milliseconds()) / 1000)
                 )
                 current = self.journal.get(identifier)
+                expired = result.pop("_dispatch_until", deadline) <= milliseconds()
+                if expired:
+                    await self.cancel_turn(identifier)
+                if (
+                    expired
+                    or current["state"] in TERMINAL | {"cancelling"}
+                    or result.get("cancelled")
+                ):
+                    return {"cancelled": True}
                 current["state"] = "running"
                 self.journal.save(
                     current,
@@ -444,8 +532,8 @@ class ChatRuntime:
                 self.journal.save(
                     current, {"type": "interaction.updated", "data": item["payload"]}
                 )
-                await self.cancel(spec["session_id"])
-                raise
+                await self.cancel_turn(identifier)
+                return {"cancelled": True}
             finally:
                 self.answers.pop(request_id, None)
 
@@ -494,7 +582,7 @@ class ChatRuntime:
                     max(0, (spec["deadline_unix_ms"] - milliseconds()) / 1000),
                 )
             except (TimeoutError, asyncio.CancelledError):
-                await self.cancel(spec["session_id"])
+                await self.cancel_turn(identifier)
                 try:
                     result = await asyncio.wait_for(asyncio.shield(operation), 10)
                     result = {**result, "cancelled": True}
@@ -506,9 +594,11 @@ class ChatRuntime:
             if not result.get("failed") and not result.get("cancelled"):
                 publish_files(identifier, emit)
             tail = redactor.feed("", final=True)
-            text += tail
-            pending += tail
+            append_text(tail)
             final_text = safe_text(result.get("text", text))
+            if len(final_text.encode()) > 60000:
+                output_limited = True
+                final_text = final_text.encode()[:60000].decode("utf-8", "ignore")
             if final_text != text:
                 emit(
                     "message.created",
@@ -522,18 +612,18 @@ class ChatRuntime:
                 redactor = StreamRedactor()
                 emit("message.delta", {"text": final_text})
             tail = redactor.feed("", final=True)
-            text += tail
-            pending += tail
+            append_text(tail)
             emit(
                 "message.completed",
                 {"id": message_id, "role": "assistant", "completed": True},
             )
             receipt = self.journal.get(identifier)
             receipt.update(
+                error_code="output_limit" if output_limited else failure_code(result),
                 state="cancelled"
-                if result.get("cancelled")
+                if result.get("cancelled") or receipt["state"] == "cancelling"
                 else "failed"
-                if result.get("failed")
+                if result.get("failed") or output_limited
                 else "succeeded",
                 children_complete=True,
                 native_session_id=result.get("session_id"),
@@ -551,6 +641,13 @@ class ChatRuntime:
                 finished_unix_ms=milliseconds(),
                 children_complete=False,
             )
+            if self.settled:
+                try:
+                    receipt["children_complete"] = await self.settled(
+                        spec["session_id"]
+                    )
+                except Exception:  # noqa: BLE001, S110 - Missing proof retains the uncertain outcome.
+                    pass
         for request in receipt["requests"]:
             if request["payload"]["status"] != "expired":
                 request["payload"]["status"] = (
@@ -571,11 +668,19 @@ class ChatRuntime:
                     ),
                     "terminal": True,
                     "blocker": {
-                        "code": "execution_failed",
+                        "code": receipt.get("error_code") or "execution_failed",
                         "message": "The turn failed. Check agent and model access status before trying again.",
                         "scope": "turn",
                         "retryable": False,
-                        "actions": ["refresh_status"],
+                        "actions": ["manage_model_key", "refresh_status"]
+                        if receipt.get("error_code")
+                        in {
+                            "model_key_invalid",
+                            "model_key_missing",
+                            "included_credits_exhausted",
+                            "included_credits_unavailable",
+                        }
+                        else ["refresh_status"],
                     }
                     if receipt["state"] == "failed"
                     else None,

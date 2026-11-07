@@ -27,11 +27,11 @@ class ManagedControl:
                 or parent.st_uid != os.getuid() or parent.st_mode & 0o077
                 or self.path.exists() or self.path.is_symlink()):
             raise ValueError('Managed control requires a private directory and unused socket')
-        from .managed_chat import ChatRuntime
         from .chat_adapter import ChatAdapter
         from .daemon import state_dir
+        from .managed_chat import ChatRuntime
         adapter = ChatAdapter(self.gateway.sessions)
-        self.chat = ChatRuntime(state_dir() / "chat.sqlite", os.environ["INKBOX_MANAGED_OWNER_ID"], adapter.run, adapter.cancel)
+        self.chat = ChatRuntime(state_dir() / "chat.sqlite", os.environ["INKBOX_MANAGED_OWNER_ID"], adapter.run, adapter.cancel, adapter.settled)
         app = web.Application(client_max_size=65536)
         app.router.add_post('/control', self.handle)
         self.runner = web.AppRunner(app, access_log=None)
@@ -102,7 +102,7 @@ class ManagedControl:
                 receipt = store.accept_occurrence(data['job_id'], data['revision'], data['occurrence_id'], data['due'], admitted_at=data.get('admitted_at'))
             except OccurrenceRejected:
                 return {'status': 'rejected', 'execution_stopped': True}
-            return {'run_id': receipt.get('id'), 'status': receipt['status'], **({'execution_stopped': True} if receipt['status'] == 'uncertain' and receipt.get('host_pid') is None else {})}
+            return {'execution': {'native_run_id': receipt.get('id'), 'started_at': receipt.get('started_at'), 'finished_at': receipt.get('finished_at'), 'output_source_ids': [receipt['id'] + ':assistant'] if receipt.get('id') and receipt.get('result') else []}, 'run_id': receipt.get('id'), 'status': receipt['status'], **({'execution_stopped': True} if receipt['status'] == 'uncertain' and receipt.get('host_pid') is None else {})}
 
     async def handle(self, request):
         try:

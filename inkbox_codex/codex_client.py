@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import signal
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -35,6 +36,10 @@ class CodexAppServerError(RuntimeError):
 
 class CodexTurnFailed(CodexAppServerError):
     """The native owner reported a terminal failure."""
+
+    def __init__(self, error):
+        self.error = error
+        super().__init__(str(error))
 
 
 
@@ -181,6 +186,7 @@ class CodexAppServerClient:
         process_started: Optional[Callable[[int], None]] = None,
         turn_started: Optional[TurnStartedHandler] = None,
     ) -> None:
+        self.observation_id = uuid.uuid4().hex
         self.cfg = cfg
         from .hosted import instructions
         self.developer_instructions = instructions(developer_instructions)
@@ -688,6 +694,7 @@ class CodexAppServerClient:
             logger.debug("Discarded response for a closed app-server request")
 
     def _handle_notification(self, message: Dict[str, Any]) -> None:
+        self._observation_version = getattr(self, "_observation_version", 0) + 1
         method = message.get("method")
         params = message.get("params") or {}
         turn_id = str(params.get("turnId") or (params.get("turn") or {}).get("id") or "")
@@ -707,7 +714,12 @@ class CodexAppServerClient:
 
         capture = self._turns.get(turn_id)
         if capture is not None and capture.event_handler is not None:
-            capture.event_handler(str(method), params)
+            try:
+                capture.event_handler(str(method), params)
+            except Exception:  # noqa: BLE001 - Isolate observers from the shared reader.
+                logger.error("Chat event handler failed")
+                if not capture.future.done():
+                    capture.future.set_exception(CodexAppServerError("Chat event handler failed"))
 
         if method == "item/started":
             capture = self._turns.get(turn_id)
@@ -748,7 +760,7 @@ class CodexAppServerClient:
             status = turn.get("status")
             if status == "failed":
                 error = turn.get("error") or turn.get("codexErrorInfo") or "turn failed"
-                capture.future.set_exception(CodexTurnFailed(str(error)))
+                capture.future.set_exception(CodexTurnFailed(error))
                 return
             capture.future.set_result(CodexTurnResult(
                 text=_final_message(capture),

@@ -27,6 +27,9 @@ async def observe(gateway, command):
         f"contact:{native}": (key, native)
         for key, native in manager._session_ids.items()
         if not key.startswith("chat:")
+        and key in manager.sessions
+        and getattr(manager.sessions[key], "_client", None) is not None
+        and manager.sessions[key]._client.is_alive
     }
     with ScheduleStore(schedule_path(gateway.cfg)) as store:
         for job in store.list_jobs(include_deleted=True):
@@ -43,13 +46,20 @@ async def observe(gateway, command):
             )
         if source is None:
             return {"source_id": None, "complete": True}
+        if command["source_id"] is None:
+            return {"source_id": source, "selected": True}
         if source not in sources:
             return {"source_id": source, "missing": True}
         label, native = sources[source]
+        checkpoint = command["before"] if isinstance(command["before"], dict) else {}
+        position = checkpoint.get(
+            "position",
+            command["before"] if isinstance(command["before"], str) else None,
+        )
         if source.startswith("schedule:"):
             rows = store.db.execute(
                 "SELECT id,prompt,result,status,rowid FROM runs WHERE job_id=? AND (? IS NULL OR rowid>?) ORDER BY rowid LIMIT 16",
-                (native, command["before"], command["before"]),
+                (native, position, position),
             ).fetchall()
             events = []
             for row in rows:
@@ -98,17 +108,30 @@ async def observe(gateway, command):
                 "origin": "schedule",
                 "title": safe_text(label[:128]),
                 "events": selected,
-                "next_before": str(rows[taken - 1]["rowid"]) if taken else None,
+                "next_before": str(rows[taken - 1]["rowid"])
+                if taken and (taken < len(rows) or taken == 16)
+                else None,
+                "checkpoint": {
+                    "position": str(rows[max(0, taken - 2)]["rowid"] - 1)
+                    if taken
+                    else position
+                },
                 "history_completeness": "partial",
             }
-    client = await asyncio.wait_for(manager.get(label)._ensure_client(), 10)
+    client = manager.sessions[label]._client
+    version = f"{client.observation_id}:{getattr(client, '_observation_version', 0)}"
+    if checkpoint.get("version") == version:
+        return {"source_id": source, "unchanged": True, "checkpoint": checkpoint}
     result = await asyncio.wait_for(
         client._request("thread/read", {"threadId": native, "includeTurns": True}), 5
     )
     thread = result.get("thread", {})
     if thread.get("id") != native:
         raise ValueError("Conversation unavailable")
-    history = page(thread, command["before"], forward=True)
+    try:
+        history = page(thread, position, forward=True)
+    except ValueError:
+        history = page(thread, None, forward=True)
     events = [
         {
             "source_id": message["id"],
@@ -160,5 +183,11 @@ async def observe(gateway, command):
         "title": safe_text(label[:128]),
         "events": events,
         "next_before": history["next_before"],
+        "checkpoint": {
+            "position": history["messages"][-2]["id"]
+            if len(history["messages"]) > 1
+            else position,
+            "version": version,
+        },
         "history_completeness": "partial",
     }
