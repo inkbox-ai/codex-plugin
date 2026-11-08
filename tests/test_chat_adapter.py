@@ -7,6 +7,65 @@ import pytest
 from inkbox_codex.chat_adapter import ChatAdapter
 
 
+@pytest.mark.parametrize("decision,expected", [
+    ("approve_once", "accept"), ("deny", "decline"),
+    ("cancel", "cancel"), ("cancel_after_approval", "cancel"),
+])
+def test_mcp_approval_becomes_a_card_without_persistent_permission(decision, expected):
+    async def scenario():
+        cards = []
+        spec = {"run_id": str(uuid4()), "session_id": str(uuid4()), "prompt": "Example"}
+
+        async def run_chat(prompt, event, request, **kwargs):
+            event("item/started", {"item": {"type": "mcpToolCall", "id": "native-tool"}})
+            response = await request("mcpServer/elicitation/request", {
+                "serverName": "example", "itemId": "native-tool",
+                "message": "Allow example to call create_schedule?",
+                "requestedSchema": {"type": "object", "properties": {}},
+                "_meta": {"persist": ["session", "always"]},
+            })
+            assert response == {"action": expected, "content": None}
+            return SimpleNamespace(text="Finished", aborted=False)
+
+        async def ask(card):
+            cards.append(card)
+            if decision == "cancel_after_approval":
+                adapter.cancelled.add(spec["session_id"])
+                return {"decision": "approve_once"}
+            return {"decision": decision, "cancelled": decision == "cancel"}
+
+        session = SimpleNamespace(run_chat=run_chat, resume_session_id="native")
+        adapter = ChatAdapter(SimpleNamespace(get=lambda _: session, sessions={}))
+        await adapter.run(spec, lambda *_: None, ask)
+        assert len(cards) == 1
+        assert cards[0]["decisions"] == ["approve_once", "deny"]
+        assert cards[0]["effective_scope"] == "operation"
+        assert cards[0]["tool_call_id"]
+        assert cards[0]["detail"] == "Allow example to call create_schedule?"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("params", [
+    {"mode": "url", "url": "https://example.com/authorize"},
+    {"requestedSchema": {"type": "object", "properties": {"token": {"type": "string"}}}},
+])
+def test_mcp_forms_are_not_mistaken_for_approval(params):
+    async def scenario():
+        async def run_chat(prompt, event, request, **kwargs):
+            return await request("mcpServer/elicitation/request", params)
+
+        async def ask(_):
+            pytest.fail("Unsupported forms must not be offered as approvals")
+
+        session = SimpleNamespace(run_chat=run_chat, resume_session_id="native")
+        adapter = ChatAdapter(SimpleNamespace(get=lambda _: session, sessions={}))
+        with pytest.raises(ValueError, match="Unsupported MCP input form"):
+            await adapter.run({"run_id": str(uuid4()), "session_id": str(uuid4()), "prompt": "Example"}, lambda *_: None, ask)
+
+    asyncio.run(scenario())
+
+
 def test_native_chat_maps_permission_scope_and_structured_questions():
     asyncio.run(native_chat())
 

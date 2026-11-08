@@ -74,6 +74,29 @@ class ChatAdapter:
             )
 
         async def request(method, params):
+            if method == "mcpServer/elicitation/request":
+                from .elicitation import elicitation_response, is_approval
+
+                if not is_approval(params):
+                    raise ValueError("Unsupported MCP input form")
+                result = await ask(
+                    {
+                        "kind": "approval",
+                        "title": "Tool permission requested",
+                        "effective_scope": "operation",
+                        "detail": safe_text(
+                            params.get("message") or params.get("prompt")
+                            or "Allow this tool call?"
+                        )[:2048],
+                        "tool_call_id": tool_ids.get(params.get("itemId")),
+                        "decisions": ["approve_once", "deny"],
+                    }
+                )
+                cancelled = result.get("cancelled") or spec["session_id"] in self.cancelled
+                return elicitation_response(
+                    params, None if cancelled else "allow"
+                    if result.get("decision") == "approve_once" else "deny",
+                )
             if method == "item/tool/requestUserInput":
                 questions = params.get("questions") or []
                 if not 1 <= len(questions) <= 8:

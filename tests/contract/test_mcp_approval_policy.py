@@ -7,11 +7,14 @@ from pathlib import Path
 import shutil
 import sys
 import threading
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
 from inkbox_codex.codex_client import CodexAppServerClient
 from inkbox_codex.config import BridgeConfig
+from inkbox_codex.chat_adapter import ChatAdapter
 
 
 CODEX_BIN = shutil.which("codex")
@@ -21,7 +24,8 @@ pytestmark = pytest.mark.skipif(CODEX_BIN is None, reason="contract suite: needs
 @pytest.mark.parametrize("resume", [False, True], ids=["new-thread", "resumed-thread"])
 @pytest.mark.parametrize("decision", ["accept", "decline"])
 @pytest.mark.parametrize("policy_source", ["config-file", "launcher"])
-def test_inkbox_override_preserves_other_server_tool_approval(tmp_path, monkeypatch, resume, decision, policy_source):
+@pytest.mark.parametrize("managed_chat", [False, True], ids=["channel", "managed-chat"])
+def test_inkbox_override_preserves_other_server_tool_approval(tmp_path, monkeypatch, resume, decision, policy_source, managed_chat):
     root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(root / "tests" / "live"))
     import mock_openai
@@ -98,6 +102,19 @@ def test_inkbox_override_preserves_other_server_tool_approval(tmp_path, monkeypa
         mcp_server_config={"command": sys.executable,
                            "args": [str(fixture), str(tmp_path / "inkbox-executed")]},
     )
+    cards = []
+
+    async def run_chat(prompt, event, request, **kwargs):
+        async def forward(method, params):
+            approvals.append((method, params))
+            return await request(method, params)
+
+        client.approval_handler = forward
+        return await client.run_detailed(prompt, event_handler=event)
+
+    async def answer(card):
+        cards.append(card)
+        return {"decision": "approve_once" if decision == "accept" else "deny"}
 
     async def scenario():
         try:
@@ -106,7 +123,15 @@ def test_inkbox_override_preserves_other_server_tool_approval(tmp_path, monkeypa
                 await asyncio.wait_for(client.run("Record a seed turn for resumption."), timeout=30)
                 await client.disconnect()
                 assert await asyncio.wait_for(client.connect(resume_thread_id=thread), timeout=10) == thread
-            await asyncio.wait_for(client.run("Look up the example."), timeout=30)
+            if managed_chat:
+                session = SimpleNamespace(run_chat=run_chat, resume_session_id=client.thread_id)
+                adapter = ChatAdapter(SimpleNamespace(get=lambda _: session, sessions={}))
+                await asyncio.wait_for(adapter.run(
+                    {"run_id": str(uuid4()), "session_id": str(uuid4()), "prompt": "Look up the example."},
+                    lambda *_: None, answer,
+                ), timeout=30)
+            else:
+                await asyncio.wait_for(client.run("Look up the example."), timeout=30)
         finally:
             await client.disconnect()
 
@@ -122,3 +147,7 @@ def test_inkbox_override_preserves_other_server_tool_approval(tmp_path, monkeypa
     assert approvals[0][1]["serverName"] == "example"
     assert executed.exists() is (decision == "accept"), "Tool execution did not honor the approval decision"
     assert not (tmp_path / "inkbox-executed").exists(), "Called the wrong MCP server"
+    if managed_chat:
+        assert len(cards) == 1
+        assert cards[0]["decisions"] == ["approve_once", "deny"]
+        assert cards[0]["effective_scope"] == "operation"

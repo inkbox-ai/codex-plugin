@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.32
+
+- Show MCP tool approval requests in direct chat and honor one-time approval, denial, and cancellation.
+
 ## 0.2.31
 
 - Forward an optional model selection to the native chat turn without changing the default for other conversations.
