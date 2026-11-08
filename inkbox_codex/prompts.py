@@ -94,11 +94,15 @@ Outbound calls (inkbox_place_call) can go out over two lines; match the
 channel you're already talking on:
 
 - A request such as "call me", "ring me", or "dial me" is an explicit action.
-  You MUST call inkbox_place_call in that same turn, using the sender/contact
-  phone from the inbound metadata and a short purpose. Do not merely text that
-  you will call, ask them to wait, or replace the call with an SMS reply.
-  This applies regardless of whether the request arrived by email, SMS,
-  iMessage, or another inbound channel.
+  Once the recipient is known, call inkbox_place_call with their verified phone
+  number and a short purpose. Use a number explicitly supplied by the user,
+  inbound sender metadata, or a matching saved contact. Never invent a number
+  or use an example/placeholder. inkbox_whoami describes YOU, not the caller.
+  In direct chat, "me" does not identify a phone number. Look up a named person
+  with inkbox_list_contacts and inspect inkbox_list_imessage_conversations for
+  an existing iMessage recipient. If the match is missing or ambiguous, ask
+  which number to call before invoking the tool. Do not assume the newest or
+  only conversation belongs to the requester.
 
 - Someone in an SMS/phone conversation: call from your dedicated phone
   line (origination "dedicated_number") — the same number the
@@ -106,8 +110,9 @@ channel you're already talking on:
 - Someone connected to you over iMessage: call over the shared iMessage
   line (origination "shared_imessage_number") — the same line you're
   already messaging them on. This only works while they stay connected;
-  if the call is refused, ask them to message you over iMessage first,
-  or fall back to your dedicated number. Never state a number for the
+  if the call is refused, verify the exact recipient against the existing
+  iMessage conversation before concluding they are disconnected. Ask when
+  unclear; do not switch recipients or calling lines to bypass the rejection. Never state a number for the
   shared line — Inkbox manages it and it is not yours to give out.
 
 If you omit origination it resolves automatically: the only available

@@ -289,7 +289,9 @@ def test_place_call_without_any_line_is_a_clear_error(monkeypatch, tmp_path):
     assert identity.place_call_kwargs is None
 
 
-def test_place_call_no_shared_connection_error_is_legible(monkeypatch, tmp_path):
+@pytest.mark.parametrize("voice_stack", ["openai_realtime", "inkbox_voice_ai"])
+def test_place_call_no_shared_connection_error_is_legible(monkeypatch, tmp_path, voice_stack):
+    monkeypatch.setenv("INKBOX_VOICE_STACK", voice_stack)
     identity = _PlacingIdentity(
         has_number=False,
         imessage=True,
@@ -301,8 +303,11 @@ def test_place_call_no_shared_connection_error_is_legible(monkeypatch, tmp_path)
         monkeypatch,
         tmp_path,
     )
-    assert "isn't connected to you over iMessage" in data["error"]
-    assert "dedicated_number" in data["error"]
+    assert "no_shared_connection" in data["error"]
+    assert data["attempted_recipient"] == "+15551112222"
+    assert "inkbox_list_imessage_conversations" in data["recovery"]
+    assert "ask for their phone number" in data["recovery"]
+    assert "without their instruction" in data["recovery"]
 
 
 def test_place_call_requires_current_sdk_call_contract(monkeypatch, tmp_path):

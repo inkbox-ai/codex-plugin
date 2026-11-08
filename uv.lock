@@ -435,7 +435,7 @@ wheels = [
 
 [[package]]
 name = "codex-plugin"
-version = "0.2.33"
+version = "0.2.34"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

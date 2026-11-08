@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.34
+
+- Resolve call recipients from explicit numbers or matching contacts; ask when the recipient is unknown.
+- Preserve the attempted recipient and provide lookup guidance when a shared-line call has no matching connection.
+
 ## 0.2.33
 
 - Run saved scheduled tasks without repeated tool-approval prompts, with approvals scoped to each execution.

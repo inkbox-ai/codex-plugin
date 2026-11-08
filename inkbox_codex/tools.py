@@ -294,7 +294,7 @@ TOOL_SPECS: List[ToolSpec] = [
         "with a concrete task; voicemail behavior comes from gateway configuration.",
         _schema_with_exactly_one_alias(
             {
-                "to_number": _str("E.164 recipient number, e.g. +15551234567."),
+                "to_number": _str("Verified recipient phone number in E.164 format. Use user-provided or looked-up contact data, never an example or guessed number."),
                 "toNumber": _str("Alias for to_number."),
                 "purpose": _str("Why Codex is placing this call."),
                 "origination": {
@@ -350,7 +350,8 @@ TOOL_SPECS: List[ToolSpec] = [
     ),
     ToolSpec(
         "inkbox_list_imessage_conversations",
-        "List this agent's iMessage conversations, newest first.",
+        "List this agent's iMessage conversations, newest first. Use the remote recipient "
+        "to resolve an existing iMessage contact before calling; do not assume it is the person in direct chat.",
         _schema({**PAGE_FIELDS, **DATE_FIELDS, "include_groups": {"type": "boolean", "default": True}}),
     ),
     ToolSpec(
@@ -1408,17 +1409,6 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 raise RuntimeError(
                     "configured call options require inkbox SDK 0.7.11 or newer"
                 )
-            except Exception as exc:
-                if "no_shared_connection" in str(exc):
-                    # Surface a legible reason the agent can act on.
-                    raise RuntimeError(
-                        "Can't place a shared iMessage-line call: this person "
-                        "isn't connected to you over iMessage yet. They need to "
-                        "message your iMessage number first. To call from your "
-                        "own phone number instead, set origination to "
-                        '"dedicated_number".'
-                    ) from exc
-                raise
             return {
                 "placed": True,
                 "id": str(getattr(call, "id", "")),
@@ -1789,6 +1779,15 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
         return _tool_result(result)
     except Exception as exc:
         fields = _tool_exception_fields(exc)
+        if name == "inkbox_place_call" and "no_shared_connection" in str(exc):
+            fields.update(
+                attempted_recipient=args.get("to_number") or args.get("toNumber"),
+                recovery="No active shared iMessage connection matches this exact recipient. "
+                "Verify the number with inkbox_list_imessage_conversations or inkbox_list_contacts. "
+                "If the intended person cannot be matched, ask for their phone number. "
+                "Do not invent a number, infer that the requester is disconnected, "
+                "or switch to a dedicated line without their instruction.",
+            )
         if response_notices:
             fields["notices"] = response_notices
         if args.get("_send_operation"):
@@ -1815,7 +1814,7 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
 def _place_call_tool_entry(voice_stack: VoiceStack) -> Dict[str, Any]:
     hosted = voice_stack is VoiceStack.INKBOX_VOICE_AI
     properties: Dict[str, Any] = {
-        "to_number": _str("E.164 recipient number, e.g. +15551234567."),
+        "to_number": _str("Verified recipient phone number in E.164 format. Use user-provided or looked-up contact data, never an example or guessed number."),
         "toNumber": _str("Alias for to_number."),
         "purpose": _str(
             "Why Codex is placing this call; becomes Inkbox Voice AI's task brief."
@@ -1847,7 +1846,9 @@ def _place_call_tool_entry(voice_stack: VoiceStack) -> Dict[str, Any]:
         })
     return {
         "name": "inkbox_place_call",
-        "description": (
+        "description": "Resolve the recipient before calling: use a user-provided number or a matching "
+        "contact/iMessage conversation. For an unknown or ambiguous 'me', ask for the number. "
+        "Never guess or use placeholders. " + (
             "Ask Inkbox Voice AI to place an outbound call and complete the stated "
             "task over either of the identity's two lines. Return after placement; "
             "do not poll or wait for the call to end. A separate call-ended turn "
