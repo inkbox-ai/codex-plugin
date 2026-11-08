@@ -29,7 +29,7 @@ START = 1767268800.0
 @pytest.fixture
 def offline_host(tmp_path, monkeypatch):
     requests = []
-    state = SimpleNamespace(block=False, received=threading.Event(), release=threading.Event())
+    state = SimpleNamespace(block=False, received=threading.Event(), release=threading.Event(), tool_call=None)
 
     class Handler(mock_openai.Handler):
         def _respond_responses(self, request):
@@ -37,6 +37,23 @@ def offline_host(tmp_path, monkeypatch):
             state.received.set()
             if state.block:
                 state.release.wait(timeout=30)
+            if state.tool_call:
+                item, state.tool_call = state.tool_call, None
+                response = {'id': 'resp_tool', 'object': 'response', 'status': 'completed',
+                            'model': 'mock-model', 'output': [item],
+                            'usage': {'input_tokens': 1, 'output_tokens': 1, 'total_tokens': 2}}
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                for name, payload in [
+                    ('response.created', {'response': {**response, 'status': 'in_progress', 'output': []}}),
+                    ('response.output_item.done', {'output_index': 0, 'item': item}),
+                    ('response.completed', {'response': response}),
+                ]:
+                    self.wfile.write(f"event: {name}\ndata: {json.dumps({'type': name, **payload})}\n\n".encode())
+                self.wfile.flush()
+                return
             try:
                 super()._respond_responses(request)
             except (BrokenPipeError, ConnectionResetError):
@@ -88,6 +105,48 @@ async def run_due(worker):
         await asyncio.sleep(0.02)
     assert worker.active is not None, "No due execution was started"
     await asyncio.wait_for(asyncio.shield(worker.active), timeout=40)
+
+
+def test_recurring_tool_approval_executes_without_human_input(offline_host, monkeypatch):
+    from inkbox_codex import scheduler as scheduler_module
+    from inkbox_codex.codex_client import CodexAppServerClient
+
+    cfg, path, _, state = offline_host
+    cfg.codex_approval_policy = 'on-request'
+    marker = path.with_suffix('.executed')
+    fixture = Path(__file__).parents[1] / 'fixtures' / 'approval_policy_server.py'
+    server = {'command': sys.executable, 'args': [str(fixture), str(marker)], 'env': {},
+              'tools': {'lookup_example': {'approval_mode': 'prompt'}}}
+    monkeypatch.setattr(scheduler_module, 'build_inkbox_mcp_server_config', lambda _: (server.copy(), []))
+    approvals = []
+
+    def client_factory(config, **options):
+        approve = options['approval_handler']
+        async def record(method, params):
+            response = await approve(method, params)
+            approvals.append((method, response))
+            return response
+        return CodexAppServerClient(config, **{**options, 'approval_handler': record})
+
+    async def scenario():
+        clock = [START]
+        with ScheduleStore(path) as store:
+            job = store.create('Recurring tool', 'Look up the example.', {'kind': 'interval', 'seconds': 60}, now=START)
+            worker = Scheduler(cfg, store=store, clock=lambda: clock[0], client_factory=client_factory)
+            try:
+                for index in range(2):
+                    marker.unlink(missing_ok=True)
+                    state.tool_call = {'type': 'function_call', 'id': f'fc_{index}', 'call_id': f'call_{index}',
+                                       'name': 'lookup_example', 'namespace': 'mcp__inkbox',
+                                       'arguments': '{}', 'status': 'completed'}
+                    clock[0] += 60
+                    await run_due(worker)
+                    assert store.runs(job['id'])[0]['status'] == 'succeeded'
+                    assert marker.read_text() == 'executed'
+                assert approvals == [('mcpServer/elicitation/request', {'action': 'accept', 'content': None})] * 2
+            finally:
+                await worker.close()
+    asyncio.run(scenario())
 
 
 def test_real_host_forwards_run_ownership_to_mcp_child(offline_host, monkeypatch):

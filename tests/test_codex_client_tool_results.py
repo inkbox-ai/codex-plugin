@@ -213,3 +213,10 @@ def test_mcp_failed_item_uses_structured_sms_error_metadata(
             assert rule not in repr(call)
 
     asyncio.run(scenario())
+
+
+def test_completed_mcp_item_with_error_result_is_failed():
+    from inkbox_codex.codex_client import _mcp_tool_call_result
+    call = _mcp_tool_call_result({'server': 'example', 'tool': 'send_example',
+                                 'status': 'completed', 'result': {'isError': True}})
+    assert call.status == 'failed'

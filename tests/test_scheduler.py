@@ -2,6 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -37,14 +38,19 @@ class FakeClient:
             raise self.factory.connect_error
         return resume_thread_id or f"dedicated-job-thread-{len(self.factory.clients)}"
 
-    async def run(self, text):
+    async def run_detailed(self, text):
         self.prompts.append(text)
         self.factory.started.set()
         if self.factory.gate:
             await self.factory.gate.wait()
         if self.factory.run_error:
             raise self.factory.run_error
-        return "The scheduled report is ready."
+        for method, params in self.factory.requests:
+            try:
+                self.factory.responses.append(await self.options['approval_handler'](method, params))
+            except RuntimeError:
+                pass
+        return SimpleNamespace(text="The scheduled report is ready.", mcp_tool_calls=self.factory.tool_calls, aborted=False)
 
     async def disconnect(self):
         if self.factory.disconnect_error:
@@ -60,6 +66,9 @@ class ClientFactory:
         self.disconnect_error = None
         self.gate = None
         self.started = asyncio.Event()
+        self.requests = []
+        self.responses = []
+        self.tool_calls = []
 
     def __call__(self, cfg, **options):
         client = FakeClient(self, cfg, options)
@@ -89,6 +98,102 @@ async def settle(scheduler):
     await scheduler.tick()
     if scheduler.active is not None:
         await asyncio.wait_for(asyncio.shield(scheduler.active), timeout=3)
+
+
+@pytest.mark.parametrize('method,params,expected', [
+    ('mcpServer/elicitation/request', {'serverName': 'inkbox', 'message': 'Allow Inkbox to send email?',
+     'requestedSchema': {'type': 'object', 'properties': {}}, '_meta': {'persist': ['session', 'always']}},
+     {'action': 'accept', 'content': None}),
+    ('mcpServer/elicitation/request', {'serverName': 'example', 'message': 'Allow example to run tool?',
+     'requestedSchema': {'type': 'object', 'properties': {}}}, {'action': 'accept', 'content': None}),
+    ('item/commandExecution/requestApproval', {}, {'decision': 'accept'}),
+    ('item/fileChange/requestApproval', {}, {'decision': 'accept'}),
+    ('item/permissions/requestApproval', {'permissions': {'network': {'enabled': True}}},
+     {'permissions': {'network': {'enabled': True}}, 'scope': 'turn'}),
+])
+def test_saved_task_authorizes_each_execution_without_persistent_approval(environment, method, params, expected):
+    async def scenario():
+        cfg, store, clock = environment
+        job = add_job(store, clock)
+        clients = ClientFactory()
+        clients.requests = [(method, params)]
+        scheduler = Scheduler(cfg, store=store, client_factory=clients, clock=clock)
+        try:
+            for _ in range(2):
+                clock.value += 60
+                await settle(scheduler)
+                assert store.runs(job['id'])[0]['status'] == 'succeeded'
+            assert clients.responses == [expected, expected]
+            assert cfg.auto_approve_inkbox_tools is False
+        finally:
+            await scheduler.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('method,params', [
+    ('mcpServer/elicitation/request', {'mode': 'url', 'url': 'https://example.test/login'}),
+    ('mcpServer/elicitation/request', {'requestedSchema': {'type': 'object', 'properties': {'value': {'type': 'string'}}}}),
+    ('item/tool/requestUserInput', {'questions': []}),
+    ('unsupported/request', {}),
+])
+def test_missing_input_is_not_fabricated_or_reported_as_success(environment, method, params):
+    async def scenario():
+        cfg, store, clock = environment
+        job = add_job(store, clock)
+        clients = ClientFactory()
+        clients.requests = [(method, params)]
+        scheduler = Scheduler(cfg, store=store, client_factory=clients, clock=clock)
+        try:
+            clock.value += 60
+            await settle(scheduler)
+            run = store.runs(job['id'])[0]
+            assert run['status'] == 'failed'
+            assert 'requires additional input' in run['error']
+            assert clients.responses == []
+        finally:
+            await scheduler.close()
+    asyncio.run(scenario())
+
+
+def test_failed_tool_is_not_hidden_by_completed_assistant_response(environment):
+    async def scenario():
+        cfg, store, clock = environment
+        job = add_job(store, clock)
+        clients = ClientFactory()
+        clients.tool_calls = [SimpleNamespace(status='failed')]
+        scheduler = Scheduler(cfg, store=store, client_factory=clients, clock=clock)
+        try:
+            clock.value += 60
+            await settle(scheduler)
+            run = store.runs(job['id'])[0]
+            assert run['status'] == 'failed'
+            assert 'tool call failed' in run['error']
+        finally:
+            await scheduler.close()
+    asyncio.run(scenario())
+
+
+def test_cancelled_occurrence_cannot_approve_a_tool(environment, monkeypatch):
+    async def scenario():
+        cfg, store, clock = environment
+        job = add_job(store, clock)
+        clients = ClientFactory()
+        clients.gate = asyncio.Event()
+        clients.requests = [('item/commandExecution/requestApproval', {})]
+        scheduler = Scheduler(cfg, store=store, client_factory=clients, clock=clock)
+        try:
+            clock.value += 60
+            await scheduler.tick()
+            await clients.started.wait()
+            monkeypatch.setattr(store, 'cancellation_requested', lambda _: True)
+            clients.gate.set()
+            with pytest.raises(asyncio.CancelledError):
+                await scheduler.active
+            assert clients.responses == []
+            assert store.runs(job['id'])[0]['status'] != 'succeeded'
+        finally:
+            await scheduler.close()
+    asyncio.run(scenario())
 
 
 def test_worker_saves_result_and_resumes_job_session_next_time(environment):

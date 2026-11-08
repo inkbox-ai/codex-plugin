@@ -853,7 +853,7 @@ def _mcp_tool_call_result(item: Dict[str, Any]) -> McpToolCallResult:
     return McpToolCallResult(
         server=str(item.get("server") or ""),
         tool=str(item.get("tool") or ""),
-        status=str(item.get("status") or ""),
+        status="failed" if isinstance(result, dict) and result.get("isError") is True else str(item.get("status") or ""),
         arguments=safe_arguments,
         sent=sent,
         error_kind=sms_tool_failure_kind(

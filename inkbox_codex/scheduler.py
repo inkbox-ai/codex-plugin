@@ -14,6 +14,7 @@ import sys
 import time
 
 from .codex_client import CodexAppServerClient
+from .elicitation import elicitation_response, is_approval
 from .schedules import ScheduleStore, schedule_path
 from .tools import build_inkbox_mcp_server_config
 
@@ -221,6 +222,22 @@ class Scheduler:
         outcome = None
         result = ''
         error = ''
+        interaction_error = ''
+
+        async def approve(method, params):
+            nonlocal interaction_error
+            if self.store.cancellation_requested(run['id']):
+                raise asyncio.CancelledError()
+            if method == 'mcpServer/elicitation/request' and is_approval(params):
+                return elicitation_response(params, 'allow')
+            if method in {'item/commandExecution/requestApproval', 'item/fileChange/requestApproval',
+                          'execCommandApproval', 'applyPatchApproval'}:
+                return {'decision': 'accept'}
+            if method == 'item/permissions/requestApproval':
+                return {'permissions': params.get('permissions') or {}, 'scope': 'turn'}
+            interaction_error = 'Scheduled task requires additional input; update the saved task or connected service before retrying'
+            raise RuntimeError(interaction_error)
+
         try:
             if self.store.cancellation_requested(run['id']):
                 raise asyncio.CancelledError()
@@ -241,7 +258,10 @@ class Scheduler:
                 'the task and any authorized recipients. Use Inkbox tools only when the prompt asks '
                 'for a message or other action. Your final response is saved in local execution history '
                 'and is not automatically sent. Do not create or change schedules. '
-                'If a required action needs approval, explain that it was not performed. '
+                'Saving this schedule authorizes its recurring task, including the tool operations '
+                'needed to perform it. Do not ask for approval again. Stay within the saved task '
+                'and its authorized recipients. If required information is missing, report it; '
+                'do not invent answers. '
                 'The current saved task supersedes conflicting instructions in previous runs.'
             )
             if job['decision_required']:
@@ -262,7 +282,8 @@ class Scheduler:
 
             client = self.client_factory(self.cfg, developer_instructions=instructions,
                                          mcp_server_config=server, isolate_process_group=True,
-                                         process_env=env, process_started=process_started)
+                                         process_env=env, process_started=process_started,
+                                         approval_handler=approve)
             async with asyncio.timeout(self.cfg.codex_turn_timeout_s):
                 thread_id = await client.connect(job['thread_id'])
                 if self.store.cancellation_requested(run['id']):
@@ -273,8 +294,13 @@ class Scheduler:
                           f"Scheduled UTC range: {run['first_due']} through {run['last_due']}\n"
                           'Perform the saved task once, accounting for the range above.\n\n' + run['prompt'])
                 submitted = True
-                result = await client.run(prompt)
-                outcome = 'succeeded'
+                response = await client.run_detailed(prompt)
+                result = response.text
+                failed_tools = any(call.status == 'failed' for call in response.mcp_tool_calls)
+                error = interaction_error or ('A scheduled tool call failed; inspect the execution output' if failed_tools else '')
+                if response.aborted:
+                    error = error or 'Scheduled execution was interrupted'
+                outcome = 'failed' if error else 'succeeded'
         except asyncio.CancelledError:
             outcome = 'uncertain' if submitted else 'failed'
             error = 'Execution interrupted; inspect its session before retrying' if submitted else 'Stopped before turn submission'

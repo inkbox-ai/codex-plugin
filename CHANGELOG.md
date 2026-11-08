@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.33
+
+- Run saved scheduled tasks without repeated tool-approval prompts, with approvals scoped to each execution.
+- Record failed scheduled tool calls and requests for missing input as failures instead of successful runs.
+
 ## 0.2.32
 
 - Show MCP tool approval requests in direct chat and honor one-time approval, denial, and cancellation.

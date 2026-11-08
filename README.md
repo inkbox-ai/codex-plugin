@@ -722,9 +722,12 @@ is already in progress cannot be deleted or have its prompt/schedule changed.
 is not proof that it has executed: inspect `runs` for the outcome, `thread_id`,
 result, and error. Plain Codex output is saved, not automatically sent to the last
 chat. To request a message, include the exact recipient and channel in the saved
-prompt. Scheduled turns use the configured sandbox and do not have a person
-available for interactive approval; choose tasks that can finish under the saved
-permissions. Jobs do not overlap their own executions. When a job already has an
+prompt. Saving a schedule authorizes its recurring task: scheduled turns accept
+tool-operation approvals without asking again, only for that execution. Other
+chats keep their own approval policy. Credentials and service permissions still
+apply. Requests for missing information or sign-in cannot be answered unattended
+and are recorded as failed runs. Failed tool calls are also recorded as failures,
+even if the agent returns a final response. Jobs do not overlap their own executions. When a job already has an
 active or manually queued run, newly due occurrences are recorded as missed and
 follow that job's catch-up setting. Other jobs queued while the online worker is
 busy are preserved until the worker becomes available.
