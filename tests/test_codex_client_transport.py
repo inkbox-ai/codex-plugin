@@ -331,3 +331,24 @@ def test_failing_chat_observer_does_not_fail_other_turns():
         client._handle_notification({"method":"turn/completed","params":{"turn":{"id":"other","status":"completed"}}})
         await other
     asyncio.run(scenario())
+
+
+def test_selected_model_applies_only_to_the_requested_turn():
+    async def scenario():
+        cfg = BridgeConfig(codex_model="gpt-5.4")
+        client = CodexAppServerClient(cfg, developer_instructions="test")
+        client.thread_id = "thread-1"
+        models = []
+
+        async def request(method, params, *, turn_capture):
+            assert method == "turn/start"
+            models.append(params["model"])
+            turn_capture.future.set_result(SimpleNamespace(text="Done"))
+
+        client._request = request
+        await client.run_detailed("First", model="gpt-6.1-sol")
+        await client.run_detailed("Second")
+        assert models == ["gpt-6.1-sol", "gpt-5.4"]
+        assert cfg.codex_model == "gpt-5.4"
+
+    asyncio.run(scenario())

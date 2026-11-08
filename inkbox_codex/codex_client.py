@@ -288,6 +288,7 @@ class CodexAppServerClient:
         activity_handler: Optional[ActivityHandler] = None,
         image_paths: Optional[list[str]] = None,
         event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        model: Optional[str] = None,
     ) -> CodexTurnResult:
         """Run one turn and return its final reply and sanitized MCP outcomes."""
         if not self.thread_id:
@@ -299,7 +300,7 @@ class CodexAppServerClient:
             "input": [{"type": "text", "text": text},
                       *({"type": "localImage", "path": path} for path in (image_paths or []))],
             "cwd": self.cfg.project_dir or None,
-            "model": self.cfg.codex_model or None,
+            "model": model or self.cfg.codex_model or None,
             "approvalPolicy": self.cfg.codex_approval_policy or "on-request",
         }
         if not self.tools_enabled:

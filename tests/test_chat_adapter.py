@@ -15,7 +15,8 @@ async def native_chat():
     public = []
     requests = []
 
-    async def run_chat(prompt, event, request, before_submit):
+    async def run_chat(prompt, event, request, before_submit, model=None):
+        assert model == "gpt-6.1-sol"
         await before_submit()
         event("item/reasoning/textDelta", {"delta": "private reasoning"})
         event("item/agentMessage/delta", {"delta": "Working"})
@@ -71,7 +72,7 @@ async def native_chat():
         )
 
     result = await adapter.run(
-        {"run_id": str(uuid4()), "session_id": str(uuid4()), "prompt": "Example"},
+        {"run_id": str(uuid4()), "session_id": str(uuid4()), "prompt": "Example", "model": "gpt-6.1-sol"},
         lambda k, v: public.append((k, v)),
         ask,
     )

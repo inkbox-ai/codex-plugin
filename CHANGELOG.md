@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.31
+
+- Forward an optional model selection to the native chat turn without changing the default for other conversations.
+
 ## 0.2.30
 
 - Preserve cancellation and expired interactions across pending responses, bound oversized chat output, and recover confirmed completed work without replay.

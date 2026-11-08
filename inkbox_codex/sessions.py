@@ -98,6 +98,7 @@ class _Turn:
     recovery: bool = False
     a2a_context: Optional[Dict[str, Any]] = None
     capture_tools: bool = False
+    model: Optional[str] = None
     hosted_sms_context: Optional[Dict[str, Any]] = None
     activity_handler: Optional[Callable[[str, str], None]] = None
     event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
@@ -1370,6 +1371,8 @@ class ContactSession:
                 client.turn_started = lambda thread_id, turn_id: bind(source, thread_id, turn_id)
                 run = client.run_detailed if turn.capture_tools else client.run
                 options = {"activity_handler": turn.activity_handler} if turn.activity_handler is not None else {}
+                if turn.model is not None:
+                    options["model"] = turn.model
                 if turn.event_handler is not None:
                     options["event_handler"] = turn.event_handler
                 if turn.reply_mode == "whatsapp" and (turn.reply_meta or {}).get("whatsapp_image_paths"):
@@ -1610,10 +1613,10 @@ class ContactSession:
             self._worker = asyncio.create_task(self._drain())
         return await future
 
-    async def run_chat(self, query, event_handler, request_handler, before_submit=None):
+    async def run_chat(self, query, event_handler, request_handler, before_submit=None, model=None):
         future = asyncio.get_running_loop().create_future()
         await self._queue.put(_Turn(text=query, future=future, capture_tools=True,
-                                   event_handler=event_handler, request_handler=request_handler, before_submit=before_submit))
+                                   event_handler=event_handler, request_handler=request_handler, before_submit=before_submit, model=model))
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())
         return await future

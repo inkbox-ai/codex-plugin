@@ -165,6 +165,7 @@ class ChatAdapter:
                 event,
                 request,
                 before_submit=lambda: self.check_cancelled(spec["session_id"]),
+                **({"model": spec["model"]} if spec.get("model") else {}),
             )
         except CodexTurnFailed as exc:
             return {
