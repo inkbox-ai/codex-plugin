@@ -71,7 +71,11 @@ def test_private_socket_dispatches_once_and_returns_bounded_display_metadata(tmp
                 first = await call(dispatch)
                 assert first[0] == 200
                 assert await call(dispatch) == first
-                assert set(first[1]) == {'run_id', 'status'}
+                assert set(first[1]) == {'run_id', 'status', 'execution'}
+                assert first[1]['execution'] == {
+                    'native_run_id': first[1]['run_id'], 'started_at': None,
+                    'finished_at': None, 'output_source_ids': [],
+                }
                 assert (await call({'action': 'drain'}))[0] == 200
                 assert (await call(dispatch))[0] == 503
                 assert (await call({'action': 'resume'}))[0] == 200
