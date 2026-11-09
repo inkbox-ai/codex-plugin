@@ -573,6 +573,10 @@ sending an unthreaded reply. The existing SDK minimum is unchanged when disabled
   message trigger start fresh, without a reply target. The bridge never picks the
   last message from conversation history. Scheduled jobs must run independently,
   without inheriting the active chat's tool-process environment.
+- **Approval answers:** reply directly to the displayed approval message with
+  your choice. Unthreaded choices and replies to a different request cannot
+  approve the current request. After a restart, replies to saved old approval
+  messages report that the request is no longer active; request the action again.
 - **No audience changes:** targeted tools must use a visible source in the same
   conversation; in a running chat they must also belong to that active input.
   Opaque native thread IDs are not message IDs or new Codex sessions. Replies use

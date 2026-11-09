@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import secrets
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -527,6 +528,9 @@ class ContactSession:
         if (self.pending is None or self.pending.future.done()
                 or not self._companion_interaction_allowed(meta) or _control_command(text)
                 or (self.pending.kind == "permission" and parse_permission_reply(text) is None)
+                or (self.pending.kind == "permission" and self.cfg.imessage_threaded_replies
+                    and self._reply_route(self._current_turn)[0] == "imessage"
+                    and not self._imessage_permission_matches(meta))
                 or (self.pending.validate_reply and not self.pending.validate_reply(text))):
             return False
         self.pending.future.set_result(text)
@@ -537,6 +541,8 @@ class ContactSession:
         if not self._companion_interaction_allowed(meta):
             return False
         text = self._companion_control_text(text, meta)
+        if await self._route_imessage_permission_reply(text, self._reply_route(self._current_turn)[0], meta):
+            return True
         command = _control_command(text)
         if command in {"reset", "resume"}:
             # Unblock the receiver, then let its normal durable control path
@@ -559,6 +565,45 @@ class ContactSession:
             # A second answer cannot authorize a question not yet displayed.
             return True
         return await self._answer_pending(text)
+
+    def _imessage_permission_record(self, meta):
+        from .imessage import IMessageState
+        parent = meta.get("reply_to_message_id")
+        if not parent:
+            return None
+        record = IMessageState(self.cfg).lookup_outbound(parent)
+        if record and record.get("chat_id") == self.chat_id:
+            return record.get("meta")
+        return None
+
+    def _imessage_permission_matches(self, meta):
+        mode, expected = self._pending_reply_route or (None, {})
+        if mode != "imessage" or not expected.get("imessage_permission_id"):
+            return False
+        if any(meta.get(key) != expected.get(key) for key in (
+            "sender", "conversation_id", "companion_scope_id", "companion_activation_id",
+        )):
+            return False
+        record = self._imessage_permission_record(meta)
+        return bool(record and record.get("imessage_permission_id") == expected["imessage_permission_id"])
+
+    async def _route_imessage_permission_reply(self, text, mode, meta):
+        """Only a direct reply to the current displayed prompt may grant permission."""
+        if not self.cfg.imessage_threaded_replies or parse_permission_reply(text) is None:
+            return False
+        pending = self.pending
+        active_mode = (self._pending_reply_route or (None, {}))[0]
+        if pending is not None and not pending.future.done() and pending.kind == "permission" and active_mode == "imessage":
+            if mode == "imessage" and self._imessage_permission_matches(meta):
+                return False  # Continue through the existing authorization/receipt path.
+            await self.send_fn(self.chat_id, "Reply directly to the current iMessage approval prompt to choose an option. No approval was saved.", mode, meta)
+            return True
+        if mode == "imessage":
+            record = self._imessage_permission_record(meta)
+            if record and record.get("imessage_permission_id"):
+                await self.send_fn(self.chat_id, "That approval request is no longer active. No approval was saved. Ask for the action again to receive a new request.", mode, meta)
+                return True
+        return False
 
     async def _answer_pending(self, text: str, consumed_meta: Optional[Dict[str, Any]] = None) -> bool:
         pending = self.pending
@@ -804,6 +849,11 @@ class ContactSession:
             return False
         if command == "health":
             await self._report_health()
+            return False
+
+        if not meta.get("reaction") and await self._route_imessage_permission_reply(raw_text, mode, meta):
+            if consumed_meta is not None:
+                await self._imessage_state("consumed", consumed_meta, raw_text)
             return False
 
         if not meta.get("reaction") and await self._answer_expired_approval(raw_text, mode, meta):
@@ -1864,6 +1914,10 @@ class ContactSession:
         self.pending = pending
         self._expired_approval_route = None
         reply_mode, reply_meta = self._reply_route(self._current_turn)
+        reply_meta = deepcopy(reply_meta)
+        if kind == "permission" and reply_mode == "imessage" and self.cfg.imessage_threaded_replies:
+            reply_meta["imessage_permission_id"] = secrets.token_hex(16)
+            prompt_text += "\nReply directly to this message to choose an option; an unthreaded answer cannot approve it."
         self._pending_reply_route = (reply_mode, deepcopy(reply_meta))
         if kind == "permission":
             seconds = self.cfg.permission_timeout_s
@@ -1877,7 +1931,7 @@ class ContactSession:
                 if reply_mode == "slack"
                 else "\nInclude @agent before your answer (for example, @agent allow)."
             )
-        sending = asyncio.create_task(self._reply(prompt_text, turn=self._current_turn))
+        sending = asyncio.create_task(self.send_fn(self.chat_id, prompt_text, reply_mode, reply_meta))
         turn = self._current_turn
         try:
             if turn is not None:
