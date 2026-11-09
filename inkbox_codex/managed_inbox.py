@@ -143,14 +143,13 @@ class ManagedInbox:
             return row.rowcount == 1
 
     def quarantine(self, event_id: str) -> dict:
-        current = boot_id()
         with self.transaction():
-            row = self.db.execute("SELECT receipt,state,boot_id,settled_at FROM deliveries WHERE activation=? AND event_id=?",
+            row = self.db.execute("SELECT receipt,state,boot_id,settled_at,owner_id FROM deliveries WHERE activation=? AND event_id=?",
                                   (self.activation_id, event_id)).fetchone()
             if row is None or row[1] != 'unknown':
                 raise InboxError('Only unknown outcomes may be quarantined')
             if row[3] is None:
-                if current is None or row[2] is None or current == row[2]:
+                if not execution_stopped(row[2], row[4]):
                     raise InboxError('Cold restart required to confirm the previous execution has stopped')
                 self.db.execute("UPDATE deliveries SET settled_at=?,finished=?,payload=NULL,bytes=0 WHERE activation=? AND event_id=?",
                                 (time.time(), time.time(), self.activation_id, event_id))
