@@ -782,7 +782,7 @@ def _final_message(capture: _TurnCapture) -> str:
     final = [
         str(item.get("text") or "")
         for item in capture.messages
-        if item.get("phase") in ("final", None)
+        if item.get("phase") in ("final", "final_answer", None)
     ]
     text = "\n\n".join(t for t in final if t).strip()
     if text:

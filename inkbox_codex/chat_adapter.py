@@ -34,17 +34,40 @@ class ChatAdapter:
         self.native_turns.pop(spec["session_id"], None)
         session = self.sessions.get(f"chat:{spec['session_id']}")
         tool_ids = {}
+        message_ids = {}
+
+        def message_id(native_id):
+            # Scope stable native item identities to this execution.
+            return message_ids.setdefault(
+                native_id, str(uuid.uuid5(uuid.NAMESPACE_URL, f"{spec['run_id']}:{native_id}"))
+            )
 
         def event(method, params):
             turn = params.get("turnId") or (params.get("turn") or {}).get("id")
             if turn:
                 self.native_turns[spec["session_id"]] = turn
             if method == "item/agentMessage/delta":
-                emit("message.delta", {"text": str(params.get("delta") or "")})
+                emit("message.delta", {
+                    **({"id": message_id(params["itemId"])} if params.get("itemId") else {}),
+                    "text": str(params.get("delta") or ""),
+                })
             if method not in {"item/started", "item/completed"}:
                 return
             item = params.get("item") or {}
             kind = item.get("type")
+            if kind == "agentMessage" and item.get("id"):
+                phase = item.get("phase")
+                phase = "final_answer" if phase == "final" else phase
+                payload = {
+                    "id": message_id(item["id"]), "role": "assistant",
+                    **({"phase": phase} if phase in {"commentary", "final_answer"} else {}),
+                }
+                if method == "item/completed":
+                    payload["completed"] = True
+                    if item.get("text") is not None:
+                        payload["content"] = [{"type": "text", "text": str(item["text"])}]
+                emit("message.created" if method == "item/started" else "message.completed", payload)
+                return
             titles = {
                 "commandExecution": "Run command",
                 "fileChange": "Change files",
@@ -201,6 +224,7 @@ class ChatAdapter:
             self.cancelled.discard(spec["session_id"])
         return {
             "text": result.text,
+            "streamed_messages": bool(message_ids),
             "cancelled": result.aborted,
             "session_id": session.resume_session_id,
         }

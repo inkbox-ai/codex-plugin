@@ -244,11 +244,15 @@ class ScheduleStore:
             value[field] = bool(value[field])
         if self.external_timer():
             value['registration_status'] = (
-                'registered' if value['registered_revision'] == value['registration_revision']
+                ('rejected' if value['registration_error'] else 'registered')
+                if value['registered_revision'] == value['registration_revision']
                 else 'pending'
             )
             if value['registration_status'] == 'pending':
-                value['notice'] = 'Saved locally; external registration is pending. Offline execution is not yet confirmed.'
+                value['registration_error'] = None
+                value['notice'] = 'Saved locally only; registration is pending. Recurring execution is not yet confirmed. Do not report this as scheduled or executed.'
+            elif value['registration_status'] == 'rejected':
+                value['notice'] = 'Registration rejected: ' + value['registration_error'] + ' Edit this job to correct it; it will not run on this schedule.'
         value['remaining_runs'] = None if value['max_runs'] is None else max(0, value['max_runs'] - value['run_count'])
         return value
 
@@ -549,7 +553,7 @@ class ScheduleStore:
                 'next_due': None if active else job['next_run'],
                 'end_at': job['end_at'], 'max_runs': job['max_runs'], 'run_count': job['run_count'],
                 'decision_required': job['decision_required'],
-                'registered': job['registered_revision'] == job['registration_revision'],
+                'registered': job['registration_status'] == 'registered',
                 'error': job['registration_error'],
                 'display': {'name': job['name'], 'timing': job['schedule'], 'deleted': job['deleted'], 'catch_up': job['catch_up'], 'task': {'kind': 'prompt', 'prompt': job['prompt'].encode()[:4096].decode('utf-8','ignore')}, 'partial': len(job['prompt'].encode()) > 4096},
             }
@@ -569,7 +573,7 @@ class ScheduleStore:
         with self._transaction():
             changed = self.db.execute('''UPDATE jobs SET registered_revision=?,registration_error=?
                 WHERE id=? AND registration_revision=?''',
-                (revision if error is None else 0, error, job_id, revision)).rowcount
+                (revision, error, job_id, revision)).rowcount
             if changed != 1:
                 raise ValueError('Schedule changed before registration was acknowledged')
 
@@ -709,7 +713,7 @@ class ScheduleStore:
                 raise OccurrenceRejected('Schedule no longer exists') from exc
             if (not self.db.execute('SELECT enabled FROM settings WHERE id=1').fetchone()[0]
                     or not job['enabled'] or job['registration_revision'] != revision
-                    or job['registered_revision'] != revision or job['next_run'] != due
+                    or job['registered_revision'] != revision or job['registration_error'] is not None or job['next_run'] != due
                     or self._active(job_id)):
                 raise OccurrenceRejected('Schedule changed or is not due')
             if due > now:

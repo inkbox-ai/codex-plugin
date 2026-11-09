@@ -86,9 +86,9 @@ class ManagedControl:
                 return store.update_external(data['job_id'], data['revision'], data['command_id'],
                                              data['schedule'], data['enabled'])
             if action == 'acknowledge_schedule':
-                if set(data) != fields:
+                if set(data) not in (fields, fields | {'error'}):
                     raise ValueError('Unexpected fields')
-                store.acknowledge_registration(data['job_id'], data['revision'])
+                store.acknowledge_registration(data['job_id'], data['revision'], error=data.get('error'))
                 return {'acknowledged': True}
             if action == 'quarantine_schedule' and set(data) in (fields | {'occurrence_id', 'due'}, fields | {'occurrence_id', 'due', 'admitted_at'}):
                 receipt = store.quarantine_occurrence(data['job_id'], data['revision'], data['occurrence_id'], data['due'])

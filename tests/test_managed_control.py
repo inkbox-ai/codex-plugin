@@ -1,6 +1,5 @@
 """Local control never exposes scheduling mutations on public ingress."""
 import asyncio
-import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -118,6 +117,35 @@ def test_pending_registration_is_honest_and_acknowledgement_clears_it(tmp_path):
         saved = store.get(job['id'])
         assert saved['registration_status'] == 'registered'
         assert 'notice' not in saved
+
+
+def test_rejection_is_durable_not_retried_and_edit_can_register_same_job(tmp_path, monkeypatch):
+    monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
+    cfg = BridgeConfig(identity='test-agent', project_dir=str(tmp_path))
+    control = ManagedControl(SimpleNamespace(cfg=cfg), tmp_path / 'control.sock')
+    with ScheduleStore(schedule_path(cfg)) as store:
+        store.use_external_timer()
+        job = store.create('Example', 'Check', {'kind': 'interval', 'seconds': 300}, now=1000)
+        revision = job['registration_revision']
+        control.schedules({'action': 'acknowledge_schedule', 'job_id': job['id'], 'revision': revision,
+                           'error': 'Minimum interval is 10 minutes (600 seconds).'})
+        rejected = store.get(job['id'])
+        assert rejected['registration_status'] == 'rejected'
+        assert '10 minutes' in rejected['notice']
+        assert not store.registrations()[0]['registered']
+        assert control.schedules({'action': 'schedules'}) == {'schedules': []}
+        assert control.schedules({'action': 'invoke_schedule', 'job_id': job['id'], 'revision': revision,
+                                  'occurrence_id': 'rejected', 'due': 1300})['status'] == 'rejected'
+        edited = store.update(job['id'], schedule={'kind': 'interval', 'seconds': 600}, now=1100)
+        assert edited['registration_status'] == 'pending' and edited['registration_error'] is None
+        pending, = control.schedules({'action': 'schedules'})['schedules']
+        assert pending['job_id'] == job['id'] and pending['revision'] > revision
+        control.schedules({'action': 'acknowledge_schedule', 'job_id': job['id'], 'revision': pending['revision']})
+        assert store.get(job['id'])['registration_status'] == 'registered'
+        assert control.schedules({'action': 'schedules'}) == {'schedules': []}
+    with ScheduleStore(schedule_path(cfg)) as restarted:
+        assert restarted.get(job['id'])['registration_status'] == 'registered'
+        assert len(restarted.list_jobs()) == 1
 
 
 def test_drain_fences_new_webhooks_without_interrupting_admitted_ingress():

@@ -414,55 +414,82 @@ class ChatRuntime:
     async def execute(self, spec):
         identifier = spec["run_id"]
         receipt = self.journal.get(identifier)
-        text = ""
         output_limited = False
-        pending = ""
-        redactor = StreamRedactor()
+        output_bytes = 0
         flush_handle = None
-        message_id = f"{identifier}:assistant"
+        messages = {}
+        default_message_id = f"{identifier}:assistant"
+
+        def save(kind, data):
+            self.journal.save(self.journal.get(identifier), {"type": kind, "data": data})
 
         def flush():
-            nonlocal pending, flush_handle
+            nonlocal flush_handle
             if flush_handle is not None:
                 flush_handle.cancel()
                 flush_handle = None
-            while pending:
-                chunk = pending[:2048]
-                pending = pending[len(chunk) :]
-                self.journal.save(
-                    self.journal.get(identifier),
-                    {
-                        "type": "message.delta",
-                        "data": {"id": message_id, "text": chunk},
-                    },
-                )
+            for mid, message in messages.items():
+                while message["pending"]:
+                    chunk = message["pending"][:2048]
+                    message["pending"] = message["pending"][len(chunk):]
+                    save("message.delta", {"id": mid, "text": chunk})
 
-        def append_text(delta):
-            nonlocal text, pending, output_limited
-            remaining = max(0, 60000 - len(text.encode()))
+        def ensure_message(mid, data):
+            if mid not in messages:
+                flush()
+                messages[mid] = {"text": "", "pending": "", "redactor": StreamRedactor(), "completed": False}
+                save("message.created", {
+                    "id": mid, "role": "assistant", "content": [{"type": "text", "text": ""}],
+                    **({"phase": data["phase"]} if data.get("phase") else {}),
+                })
+            return messages[mid]
+
+        def append_text(message, delta):
+            nonlocal output_bytes, output_limited
+            remaining = max(0, 60000 - output_bytes)
             if len(delta.encode()) > remaining:
                 output_limited = True
                 delta = delta.encode()[:remaining].decode("utf-8", "ignore")
-            text += delta
-            pending += delta
+            output_bytes += len(delta.encode())
+            message["text"] += delta
+            message["pending"] += delta
+
+        def complete(mid, data):
+            message = ensure_message(mid, data)
+            if message["completed"]:
+                return
+            append_text(message, message["redactor"].feed("", final=True))
+            # A completed native item may include text that had no delta notification.
+            content = data.get("content") or []
+            final = safe_text(content[0].get("text", "")) if content else ""
+            if final.startswith(message["text"]):
+                append_text(message, final[len(message["text"]):])
+            flush()
+            save("message.completed", {
+                "id": mid, "role": "assistant", "completed": True,
+                **({"phase": data["phase"]} if data.get("phase") else {}),
+            })
+            message["completed"] = True
 
         def emit(kind, data):
-            nonlocal text, pending, flush_handle, output_limited
-            if kind == "message.delta":
-                delta = redactor.feed(str(data.get("text", "")))
-                append_text(delta)
-                if len(pending.encode()) >= 2048:
-                    flush()
-                elif flush_handle is None:
-                    flush_handle = asyncio.get_running_loop().call_later(0.1, flush)
+            nonlocal flush_handle, output_limited
+            if kind.startswith("message."):
+                mid = data.get("id") or default_message_id
+                message = ensure_message(mid, data)
+                if kind == "message.delta" and not message["completed"]:
+                    append_text(message, message["redactor"].feed(str(data.get("text", ""))))
+                    if len(message["pending"].encode()) >= 2048:
+                        flush()
+                    elif flush_handle is None:
+                        flush_handle = asyncio.get_running_loop().call_later(0.1, flush)
+                elif kind == "message.completed":
+                    complete(mid, data)
                 return
             flush()
             if len(encode(data).encode()) > 16384:
                 output_limited = True
                 return
-            self.journal.save(
-                self.journal.get(identifier), {"type": kind, "data": data}
-            )
+            save(kind, data)
 
         async def ask(payload):
             emit(
@@ -572,14 +599,6 @@ class ChatRuntime:
                     "data": {"id": identifier, "status": "running", "terminal": False},
                 },
             )
-            emit(
-                "message.created",
-                {
-                    "id": message_id,
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": ""}],
-                },
-            )
             operation = asyncio.create_task(self.run(spec, emit, ask))
             try:
                 result = await asyncio.wait_for(
@@ -598,30 +617,17 @@ class ChatRuntime:
                     raise
             if not result.get("failed") and not result.get("cancelled"):
                 publish_files(identifier, emit)
-            tail = redactor.feed("", final=True)
-            append_text(tail)
-            final_text = safe_text(result.get("text", text))
-            if len(final_text.encode()) > 60000:
-                output_limited = True
-                final_text = final_text.encode()[:60000].decode("utf-8", "ignore")
-            if final_text != text:
-                emit(
-                    "message.created",
-                    {
-                        "id": message_id,
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": ""}],
-                    },
-                )
-                text = ""
-                redactor = StreamRedactor()
-                emit("message.delta", {"text": final_text})
-            tail = redactor.feed("", final=True)
-            append_text(tail)
-            emit(
-                "message.completed",
-                {"id": message_id, "role": "assistant", "completed": True},
-            )
+            for mid in list(messages):
+                complete(mid, {})
+            # Native item messages are authoritative. Legacy runners may only return
+            # a final reply; put it after activity without replacing partial output.
+            if not result.get("failed") and not result.get("cancelled") and not result.get("streamed_messages"):
+                final_text = safe_text(result.get("text", ""))
+                last_text = next(reversed(messages.values()))["text"] if messages else ""
+                if final_text and final_text != last_text:
+                    mid = f"{identifier}:final" if messages else default_message_id
+                    emit("message.delta", {"id": mid, "text": final_text})
+                    complete(mid, {})
             receipt = self.journal.get(identifier)
             receipt.update(
                 error_code="output_limit" if output_limited else failure_code(result),
@@ -653,6 +659,8 @@ class ChatRuntime:
                     )
                 except Exception:  # noqa: BLE001, S110 - Missing proof retains the uncertain outcome.
                     pass
+        for mid in list(messages):
+            complete(mid, {})
         for request in receipt["requests"]:
             if request["payload"]["status"] != "expired":
                 request["payload"]["status"] = (
@@ -674,7 +682,7 @@ class ChatRuntime:
                     "terminal": True,
                     "blocker": {
                         "code": receipt.get("error_code") or "execution_failed",
-                        "message": "The turn failed. Check agent and model access status before trying again.",
+                        "message": "The turn failed. Any partial response is preserved; completion was not confirmed.",
                         "scope": "turn",
                         "retryable": False,
                         "actions": ["manage_model_key", "refresh_status"]
