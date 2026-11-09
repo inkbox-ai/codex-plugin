@@ -4,7 +4,7 @@ import asyncio
 import json
 
 from .managed_chat import safe_text
-from .managed_conversations import page
+from .managed_conversations import bounded_text, page
 from .schedules import ScheduleStore, schedule_path
 
 
@@ -75,7 +75,7 @@ async def observe(gateway, command):
                                     {
                                         "type": "text",
                                         "text": safe_text(
-                                            str(row["prompt"] or "")[:4096]
+                                            bounded_text(str(row["prompt"] or ""),4096)
                                         ),
                                     }
                                 ],
@@ -91,7 +91,7 @@ async def observe(gateway, command):
                                     {
                                         "type": "text",
                                         "text": safe_text(
-                                            str(row["result"] or "")[:4096]
+                                            bounded_text(str(row["result"] or ""),4096)
                                         ),
                                     }
                                 ],

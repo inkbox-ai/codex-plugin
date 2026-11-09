@@ -330,3 +330,36 @@ def test_registration_batches_retire_acknowledged_history_and_keep_revisions(sto
     with pytest.raises(ValueError):
         store.acknowledge_registration(saved['id'], pending['revision'])
     assert len(store.registrations(pending_only=True)) == 1
+
+
+def test_exact_occurrence_token_survives_precision_loss_restart_and_consecutive_runs(tmp_path):
+    import json
+    original = 1794215665.6857781
+    rounded = 1794215665.685778
+    assert original != rounded
+    path = tmp_path / 'exact.sqlite3'
+    with ScheduleStore(path) as store:
+        store.use_external_timer()
+        saved = store.create('Example', 'Read notes', {'kind': 'interval', 'seconds': 600}, now=original-600)
+        store.db.execute('UPDATE jobs SET next_run=? WHERE id=?', (original,saved['id']))
+        for index in range(2):
+            registration, = store.registrations(pending_only=True)
+            store.acknowledge_registration(saved['id'], registration['revision'])
+            token = registration['next_due_token']
+            assert isinstance(token, str)
+            due = float(token)
+            if index == 0:
+                assert due == original
+                with pytest.raises(ValueError, match='not due'):
+                    store.accept_occurrence(saved['id'], registration['revision'], 'wrong', rounded, now=due+1)
+            command = json.loads(json.dumps({'job_id':saved['id'],'revision':registration['revision'],
+                'occurrence_id':f'exact-{index}','due':token}))
+            receipt = store.accept_occurrence(**command, now=due+1)
+            assert store.accept_occurrence(**command, now=due+2)['id'] == receipt['id']
+            claimed = store.claim(now=due+1)
+            assert claimed['id'] == receipt['id']
+            store.finish(claimed['id'],'succeeded',now=due+2)
+            assert store.get(saved['id'])['next_run'] == due+600
+            with ScheduleStore(path) as restarted:
+                assert restarted.accept_occurrence(**command,now=due+3)['id'] == receipt['id']
+        assert len(store.runs(saved['id'])) == 2

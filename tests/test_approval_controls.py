@@ -421,3 +421,24 @@ def test_companion_stop_requires_the_prompted_author_access_and_mention(channel,
             await receiver.close()
 
     asyncio.run(scenario())
+
+
+def test_expired_email_approval_does_not_consume_another_thread():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.mode = "email"
+        session.reply_meta = {"thread_id": "thread-a", "sender": "sender@example.test"}
+        session.cfg.permission_timeout_s = .02
+        try:
+            await session._handle_codex_request("mcpServer/elicitation/request", REQUEST)
+            await session.handle_inbound("1", "email", session.reply_meta.copy())
+            assert session._queue.empty()
+            count = len(sent)
+            session._drain = AsyncMock()
+            await session.handle_inbound("1", "email", {"thread_id": "thread-b", "sender": "sender@example.test"})
+            assert not session._queue.empty()
+            assert len(sent) == count
+        finally:
+            await session.close()
+    asyncio.run(scenario())

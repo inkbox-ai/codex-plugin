@@ -37,6 +37,15 @@ def timestamp(value=None) -> float:
     return float(value)
 
 
+def occurrence_time(value):
+    """Decode the exact decimal token; legacy numeric commands remain supported."""
+    if isinstance(value, str):
+        if not 1 <= len(value) <= 64:
+            raise ValueError('Invalid occurrence time')
+        value = float(value)
+    return timestamp(value)
+
+
 def schedule_path(cfg) -> Path:
     if not cfg.identity:
         raise ValueError('Configure an Inkbox identity before managing schedules')
@@ -551,6 +560,7 @@ class ScheduleStore:
                 'enabled': enabled and job['enabled'] and not job['deleted'],
                 'deleted': job['deleted'], 'schedule': job['schedule'], 'catch_up': job['catch_up'],
                 'next_due': None if active else job['next_run'],
+                'next_due_token': None if active or job['next_run'] is None else repr(job['next_run']),
                 'end_at': job['end_at'], 'max_runs': job['max_runs'], 'run_count': job['run_count'],
                 'decision_required': job['decision_required'],
                 'registered': job['registration_status'] == 'registered',
@@ -658,7 +668,7 @@ class ScheduleStore:
             return receipt
 
     def cancel_occurrence(self, job_id, revision, occurrence_id, due):
-        due = timestamp(due)
+        due = occurrence_time(due)
         if (not self.external_timer() or type(revision) is not int or revision < 1
                 or not isinstance(occurrence_id, str) or not 1 <= len(occurrence_id) <= 128):
             raise ValueError('Invalid scheduled occurrence')
@@ -676,7 +686,7 @@ class ScheduleStore:
             return {'status': 'cancelled'}
 
     def quarantine_occurrence(self, job_id, revision, occurrence_id, due):
-        due = timestamp(due)
+        due = occurrence_time(due)
         with self._transaction():
             prior = self.db.execute('SELECT * FROM external_occurrences WHERE occurrence_id=?', (occurrence_id,)).fetchone()
             if prior is None or (prior['job_id'], prior['revision'], prior['due']) != (job_id, revision, due) or not prior['run_id']:
@@ -691,7 +701,7 @@ class ScheduleStore:
 
     def accept_occurrence(self, job_id, revision, occurrence_id, due, now=None, *, admitted_at=None):
         """Deduplicate dispatch before using the native catch-up and execution rules."""
-        now, due = timestamp(now), timestamp(due)
+        now, due = timestamp(now), occurrence_time(due)
         if (not self.external_timer() or type(revision) is not int or revision < 1
                 or not isinstance(occurrence_id, str) or not 1 <= len(occurrence_id) <= 128):
             raise ValueError('Invalid scheduled occurrence')

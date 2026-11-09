@@ -30,11 +30,11 @@ def test_stale_schedule_rejection_is_proven_but_existing_execution_is_preserved(
         assert replay['run_id'] == accepted['run_id']
         assert replay['status'] == 'cancelled'
         assert control.schedules({**command, 'occurrence_id': 'stale', 'due': 1120}) == {
-            'status': 'rejected', 'execution_stopped': True}
+            'status': 'rejected', 'execution_stopped': True, 'reason': 'schedule_changed_or_not_due'}
         assert len(store.runs(saved['id'])) == 1
         store.delete(saved['id'])
         assert control.schedules({**command, 'occurrence_id': 'deleted', 'due': 1180}) == {
-            'status': 'rejected', 'execution_stopped': True}
+            'status': 'rejected', 'execution_stopped': True, 'reason': 'schedule_changed_or_not_due'}
         assert control.schedules(command)['run_id'] == accepted['run_id']
 
 
@@ -167,4 +167,37 @@ def test_drain_fences_new_webhooks_without_interrupting_admitted_ingress():
         release.set()
         assert await task == 'accepted'
         assert gateway._managed_ingress == 0
+    asyncio.run(scenario())
+
+
+def test_unicode_questions_fit_actual_handler_wire_budget(tmp_path):
+    import json
+    from inkbox_codex.managed_chat import ChatRuntime
+    from tests.test_managed_chat import spec
+    async def scenario():
+        ready = asyncio.Event()
+        async def run(value, emit, ask):
+            ready.set()
+            await ask({"kind": "question", "fields": [
+                {"id": f"q{i}", "type": "text", "label": "🙂" * 1900} for i in range(2)
+            ]})
+            return {"text": "Done"}
+        async def cancel(_):
+            pass
+        runtime = ChatRuntime(tmp_path / 'chat.sqlite', 'owner', run, cancel)
+        control = ManagedControl(SimpleNamespace(_managed_draining=False), tmp_path / 'control.sock')
+        control.chat = runtime
+        try:
+            await runtime.control({"action": "chat_start", "spec": spec()})
+            await ready.wait()
+            async def body():
+                return {"action": "chat_events", "run_id": "turn", "after": 0}
+            response = await control.handle(SimpleNamespace(json=body))
+            assert response.status == 200
+            assert len(response.body) <= 65536
+            value = json.loads(response.body)
+            assert value['receipt']['requests'][0]['payload']['fields'][0]['label'] == '🙂' * 1900
+            assert any(e['kind'] == 'interaction.created' for e in value['events'])
+        finally:
+            await runtime.close()
     asyncio.run(scenario())

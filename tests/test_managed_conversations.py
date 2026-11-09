@@ -221,3 +221,40 @@ def test_observer_never_starts_historical_contacts_and_reuses_checkpoint(monkeyp
         assert client.calls == 2
 
     asyncio.run(scenario())
+
+
+def test_unicode_first_history_item_makes_progress_both_directions():
+    import json
+    thread = {"turns": [{"id": "turn", "items": [
+        {"id": str(i), "type": "agentMessage", "text": "界" * 8192} for i in range(20)
+    ]}]}
+    for forward in (True, False):
+        cursor = None
+        seen = []
+        while True:
+            result = page(thread, cursor, forward=forward)
+            assert result["messages"]
+            assert len(json.dumps(result).encode()) < 65536
+            seen.extend(m["id"] for m in result["messages"])
+            cursor = result["next_before"]
+            if cursor is None:
+                break
+        assert len(seen) == 20 and len(set(seen)) == 20
+
+
+def test_unicode_schedule_pair_keeps_progress(tmp_path, monkeypatch):
+    from inkbox_codex import observations
+    from inkbox_codex.config import BridgeConfig
+    from inkbox_codex.schedules import ScheduleStore, schedule_path
+    monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
+    cfg = BridgeConfig(identity='example', project_dir=str(tmp_path))
+    with ScheduleStore(schedule_path(cfg)) as store:
+        job = store.create('Example', '🙂' * 4096, {'kind': 'interval', 'seconds': 600})
+        for _ in range(3):
+            run = store.enqueue(job['id'])
+            assert store.claim()['id'] == run['id']
+            store.finish(run['id'], 'succeeded', result='🙂' * 4096)
+    gateway = SimpleNamespace(cfg=cfg, sessions=SimpleNamespace(_session_ids={}, sessions={}))
+    result = asyncio.run(observations.observe(gateway, {'action': 'observe_conversation', 'after': None, 'source_id': 'schedule:' + job['id'], 'before': None}))
+    assert len(result['events']) == 6
+    assert result['checkpoint']['position'] is not None

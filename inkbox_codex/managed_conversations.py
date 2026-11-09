@@ -5,6 +5,18 @@ import asyncio
 import json
 
 
+def bounded_text(text, limit=8192):
+    """Bound the serialized string, including JSON escaping, on a character boundary."""
+    lo, hi = 0, min(len(text), limit)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(json.dumps(text[:mid]).encode()) <= limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo]
+
+
 def page(thread, before, *, forward=False):
     messages = []
     found = before is None
@@ -25,7 +37,7 @@ def page(thread, before, *, forward=False):
             elif identifier == before:
                 break
             messages.append({'id': identifier, 'role': 'assistant' if kind == 'agentMessage' else 'user',
-                             'text': text[:8192], 'truncated': len(text) > 8192})
+                             'text': bounded_text(text), 'truncated': bounded_text(text) != text})
         else:
             continue
         break

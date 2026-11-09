@@ -12,6 +12,14 @@ from aiohttp import web
 from .schedules import OccurrenceRejected, ScheduleStore, schedule_path
 
 
+def json_response(value, **kwargs):
+    import json
+    body = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if len(body.encode()) > 65536:
+        raise RuntimeError("Control response exceeds capacity")
+    return web.Response(text=body, content_type="application/json", **kwargs)
+
+
 class ManagedControl:
     def __init__(self, gateway, path: Path):
         self.gateway = gateway
@@ -101,7 +109,7 @@ class ManagedControl:
             try:
                 receipt = store.accept_occurrence(data['job_id'], data['revision'], data['occurrence_id'], data['due'], admitted_at=data.get('admitted_at'))
             except OccurrenceRejected:
-                return {'status': 'rejected', 'execution_stopped': True}
+                return {'status': 'rejected', 'execution_stopped': True, 'reason': 'schedule_changed_or_not_due'}
             return {'execution': {'native_run_id': receipt.get('id'), 'started_at': receipt.get('started_at'), 'finished_at': receipt.get('finished_at'), 'output_source_ids': [receipt['id'] + ':assistant'] if receipt.get('id') and receipt.get('result') else []}, 'run_id': receipt.get('id'), 'status': receipt['status'], **({'execution_stopped': True} if receipt['status'] == 'uncertain' and receipt.get('host_pid') is None else {})}
 
     async def handle(self, request):
@@ -111,10 +119,10 @@ class ManagedControl:
                 raise TypeError('Invalid request')
             if data['action'] == 'observe_conversation':
                 from .observations import observe
-                return web.json_response(await observe(self.gateway, data))
+                return json_response(await observe(self.gateway, data))
             if data['action'].startswith('chat_'):
                 self.chat.draining = self.gateway._managed_draining
-                return web.json_response(await self.chat.control(data))
+                return json_response(await self.chat.control(data))
             if data['action'] == 'quarantine_delivery' and set(data) == {'action', 'event_id'}:
                 if self.ingress is None:
                     raise ValueError('Receiver unavailable')
@@ -131,14 +139,14 @@ class ManagedControl:
                 result["capabilities"] = {"normalized_chat": 1, "chat_model_selection": 1, "chat_interactions": 1, "chat_observation": 1, "workspace_schedules": 1}
             else:
                 if data['action'] == 'invoke_schedule' and self.gateway._managed_draining:
-                    return web.json_response({'error': 'temporarily_unavailable'}, status=503)
+                    return json_response({'error': 'temporarily_unavailable'}, status=503)
                 self.gateway._managed_ingress += 1
                 try:
                     result = await asyncio.to_thread(self.schedules, data)
                 finally:
                     self.gateway._managed_ingress -= 1
-            return web.json_response(result)
+            return json_response(result)
         except (ValueError, TypeError, KeyError):
-            return web.json_response({'error': 'invalid_or_stale_request'}, status=409)
+            return json_response({'error': 'invalid_or_stale_request'}, status=409)
         except (OSError, sqlite3.Error, RuntimeError, TimeoutError):
-            return web.json_response({'error': 'temporarily_unavailable'}, status=503)
+            return json_response({'error': 'temporarily_unavailable'}, status=503)

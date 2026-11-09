@@ -632,7 +632,7 @@ class ContactSession:
         route = self._expired_approval_route
         if route is None or (self.pending is not None and not self.pending.future.done()):
             return False
-        if mode != route[0] or any(meta.get(key) != route[1].get(key) for key in ("sender", "conversation_id")):
+        if mode != route[0] or any(meta.get(key) != route[1].get(key) for key in ("sender", "thread_id" if mode == "email" else "conversation_id")):
             return False
         if parse_permission_reply(text) is None:
             self._expired_approval_route = None
