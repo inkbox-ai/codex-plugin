@@ -136,7 +136,7 @@ class ManagedControl:
                 if data['action'] != 'status':
                     self.gateway._managed_draining = data['action'] == 'drain'
                 result = await self.gateway.managed_status()
-                result["capabilities"] = {"normalized_chat": 1, "chat_model_selection": 1, "chat_interactions": 1, "chat_observation": 1, "workspace_schedules": 1}
+                result["capabilities"] = {"normalized_chat": 1, "chat_model_selection": 1, "chat_interactions": 1, "chat_observation": 1, "workspace_schedules": 1, "schedule_rejection_ack": 1}
             else:
                 if data['action'] == 'invoke_schedule' and self.gateway._managed_draining:
                     return json_response({'error': 'temporarily_unavailable'}, status=503)

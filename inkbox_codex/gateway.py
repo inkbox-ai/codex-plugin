@@ -1635,7 +1635,7 @@ class InkboxGateway:
         return {
             "ready": transport_ready, "active": active + inbox.get("pending_count", 0),
             "last_completed_unix_ms": last_completed,
-            "pending_schedule_sync": sum(not item['registered'] for item in scheduler.store.registrations()),
+            "pending_schedule_sync": len(scheduler.store.registrations(pending_only=True)),
             "unknown": bool(ingress_unknown or not inbox["readable"] or inbox.get("execution_unknown", inbox.get("blocked_conversations", 0))
                             or not status.get("imessage_threading", {}).get("readable", True)
                             or scheduler.store.orphaned_hosts() or scheduler._unrecorded_hosts),

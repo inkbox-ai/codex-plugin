@@ -64,6 +64,7 @@ def test_private_socket_dispatches_once_and_returns_bounded_display_metadata(tmp
                 status, health = await call({'action': 'status'})
                 assert status == 200 and health['ready']
                 assert health['capabilities']['normalized_chat'] == 1
+                assert health['capabilities']['schedule_rejection_ack'] == 1
                 assert (await call({'action': 'acknowledge_schedule', 'job_id': job['id'], 'revision': registration['revision']}))[0] == 200
                 dispatch = {'action': 'invoke_schedule', 'job_id': job['id'], 'revision': registration['revision'],
                             'occurrence_id': 'test-occurrence', 'due': 1060}
@@ -201,3 +202,23 @@ def test_unicode_questions_fit_actual_handler_wire_budget(tmp_path):
         finally:
             await runtime.close()
     asyncio.run(scenario())
+
+
+def test_rejected_registration_does_not_pin_managed_lifecycle(tmp_path):
+    from inkbox_codex.gateway import InkboxGateway
+    with ScheduleStore(tmp_path / 'jobs.sqlite') as store:
+        store.use_external_timer()
+        job = store.create('Example', 'Check', {'kind': 'interval', 'seconds': 600}, now=1000)
+        gateway = InkboxGateway.__new__(InkboxGateway)
+        gateway._readiness = AsyncMock(return_value={'companion': {'readable': True}, 'codex': {'startup_ok': True}})
+        gateway.sessions = SimpleNamespace(sessions={})
+        gateway._companion_receiver = SimpleNamespace(last_completed_unix_ms=0)
+        gateway._managed_draining = False
+        gateway._managed_ingress = 0
+        gateway._hosted_call_jobs = {}
+        gateway._a2a_jobs = {}
+        gateway._scheduler = SimpleNamespace(store=store, _unrecorded_hosts=set())
+        assert asyncio.run(gateway.managed_status())['pending_schedule_sync'] == 1
+        store.acknowledge_registration(job['id'], store.registrations()[0]['revision'], error='Minimum interval is 10 minutes')
+        assert store.registrations()[0]['registered'] is False
+        assert asyncio.run(gateway.managed_status())['pending_schedule_sync'] == 0
