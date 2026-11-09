@@ -95,19 +95,45 @@ def _action_details(params: dict[str, Any]) -> list[str]:
     display = _meta(params).get("tool_params_display")
     if not isinstance(display, list):
         return []
+    labels = {"to": "To", "to_address": "To", "to_addresses": "To", "recipient": "To",
+              "recipients": "To", "phone_number": "To", "to_number": "To", "toNumber": "To", "cc": "CC", "cc_addresses": "CC",
+              "bcc": "BCC", "bcc_addresses": "BCC", "subject": "Subject", "body": "Message"}
+    recipients = set(labels) - {"subject", "body"}
+    hidden = {"idempotency_key", "request_id", "correlation_id", "trace_id"}
+    display = [item for item in display if isinstance(item, dict) and isinstance(item.get("name"), str) and item["name"] not in hidden]
+    def priority(item):
+        name = item.get("name")
+        return 0 if name in recipients else 1 if name == "subject" else 2 if name == "body" else 3
+    display.sort(key=priority)
+    limit = max(3, min(6, sum(item.get("name") in recipients for item in display) + 2))
     result = []
     for item in display:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str) or "value" not in item:
             continue
-        name = item.get("display_name") or item["name"]
+        name = item.get("display_name") or labels.get(item["name"], item["name"])
         if not isinstance(name, str) or not name.strip():
             continue
         sensitive = re.search(r"password|secret|token|credential|api.?key|authorization", item["name"] + " " + name, re.IGNORECASE)
         value = "[hidden]" if sensitive else _line(item["value"])
         result.append(f"{_line(name, 60)}: {value}")
-        if len(result) == 3:
+        if len(result) == limit:
             break
     return result
+
+
+def _approval_title(params: dict[str, Any], fallback: str) -> str:
+    """Translate known communication requests without changing their authority."""
+    server = params.get("serverName") or params.get("server_name") or params.get("server")
+    tool = params.get("toolName") or params.get("tool_name") or _meta(params).get("tool_name")
+    legacy = re.fullmatch(r'Allow the inkbox MCP server to run tool "(inkbox_[a-z_]+)"\?', fallback)
+    if server not in (None, "inkbox") or (server is None and not legacy):
+        return fallback
+    tool = tool or (legacy.group(1) if legacy else None)
+    if not isinstance(tool, str):
+        return fallback
+    return {"inkbox_send_email": "Send this email?", "inkbox_send_imessage": "Send this iMessage?",
+            "inkbox_send_sms": "Send this text message?", "inkbox_place_call": "Place this call?",
+            "inkbox_lookup_send": "Check this message's delivery status?"}.get(tool, fallback)
 
 
 _ANNOTATIONS = {"title", "description", "default"}
@@ -171,7 +197,7 @@ def format_elicitation(params: dict[str, Any]) -> str:
     if _url_request(params):
         return f"{message}\n\nOpen this URL and complete the requested step yourself:\n{params.get('url') or '(URL unavailable)'}\nReply DONE after completing it, or /stop to cancel the task."
     if is_approval(params):
-        lines = [message, *_action_details(params), ""]
+        lines = [_approval_title(params, message), *_action_details(params), ""]
         lines.extend(f"{index} — {label}" for index, (_, label) in enumerate(_approval_options(params), 1))
         lines.append("/stop — Cancel the entire task")
         return "\n".join(lines)

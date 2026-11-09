@@ -32,6 +32,44 @@ async def wait_until(predicate):
     await asyncio.wait_for(wait(), 2)
 
 
+@pytest.mark.parametrize("channel", ["sms", "imessage", "email"])
+def test_expired_approval_is_reported_and_late_answer_is_not_new_work(channel):
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.mode = channel
+        session.reply_meta = {"conversation_id": "example-conversation", "sender": "example-sender"}
+        session.cfg.permission_timeout_s = .02
+        try:
+            response = await session._handle_codex_request("mcpServer/elicitation/request", REQUEST)
+            assert response["action"] == "cancel"
+            assert "expires" in sent[0][1].lower()
+            assert "expired" in sent[-1][1].lower()
+            await session.handle_inbound("4", channel, session.reply_meta.copy())
+            assert "expired" in sent[-1][1].lower()
+            assert session._queue.empty() and session._worker is None
+            session._drain = AsyncMock()
+            await session.handle_inbound("Send a new project update", channel, session.reply_meta.copy())
+            assert session._expired_approval_route is None
+        finally:
+            await session.close()
+    asyncio.run(scenario())
+
+
+def test_expiry_notice_is_not_sent_when_prompt_delivery_times_out():
+    async def scenario():
+        session = make_session([])
+        session.send_fn = AsyncMock(side_effect=TimeoutError())
+        try:
+            response = await session._handle_codex_request("mcpServer/elicitation/request", REQUEST)
+            assert response["action"] == "cancel"
+            assert session.send_fn.await_count == 1
+            assert session._expired_approval_route is None
+        finally:
+            await session.close()
+    asyncio.run(scenario())
+
+
 def enforce_reply_route(receiver, session):
     send = session.send_fn
 

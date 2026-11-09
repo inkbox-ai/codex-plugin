@@ -419,6 +419,7 @@ class ContactSession:
         self.reply_meta: Dict[str, Any] = {}
         self.pending: Optional[PendingInteraction] = None
         self._pending_reply_route: Optional[tuple[str, Dict[str, Any]]] = None
+        self._expired_approval_route: Optional[tuple[str, Dict[str, Any]]] = None
         self._interaction_lock = asyncio.Lock()
         self._interaction_generation = 0
         self._approval_waiters = 0
@@ -581,8 +582,22 @@ class ContactSession:
         pending.future.set_result(text)
         return True
 
+    async def _answer_expired_approval(self, text, mode, meta) -> bool:
+        """A late choice on the same route cannot become a new task."""
+        route = self._expired_approval_route
+        if route is None or (self.pending is not None and not self.pending.future.done()):
+            return False
+        if mode != route[0] or any(meta.get(key) != route[1].get(key) for key in ("sender", "conversation_id")):
+            return False
+        if parse_permission_reply(text) is None:
+            self._expired_approval_route = None
+            return False
+        await self._reply("That approval request expired. No approval was saved. Ask for the action again to receive a new request.")
+        return True
+
     def _cancel_interactions(self) -> None:
         self._interaction_generation += 1
+        self._expired_approval_route = None
         pending, self.pending = self.pending, None
         self._pending_reply_route = None
         if pending is not None and not pending.future.done():
@@ -789,6 +804,11 @@ class ContactSession:
             return False
         if command == "health":
             await self._report_health()
+            return False
+
+        if not meta.get("reaction") and await self._answer_expired_approval(raw_text, mode, meta):
+            if consumed_meta is not None:
+                await self._imessage_state("consumed", consumed_meta, raw_text)
             return False
 
         if (not meta.get("reaction") and not foreign_whatsapp and not pending_reply and self._approval_waiters
@@ -1842,8 +1862,13 @@ class ContactSession:
             validate_reply=validate_reply,
         )
         self.pending = pending
+        self._expired_approval_route = None
         reply_mode, reply_meta = self._reply_route(self._current_turn)
         self._pending_reply_route = (reply_mode, deepcopy(reply_meta))
+        if kind == "permission":
+            seconds = self.cfg.permission_timeout_s
+            duration = f"{seconds / 60:g} minutes" if seconds >= 60 and seconds % 60 == 0 else f"{seconds:g} seconds"
+            prompt_text += f"\nThis approval request expires {duration} after delivery."
         if reply_meta.get("companion") and self.cfg.group_reply_mode == "mention":
             prompt_text += (
                 "\nKeep the agent in To or include @agent before your answer."
@@ -1865,6 +1890,12 @@ class ContactSession:
                 pending.future, timeout=self.cfg.permission_timeout_s
             )
         except asyncio.TimeoutError:
+            if kind == "permission" and sending.done() and not sending.cancelled() and sending.exception() is None:
+                self._expired_approval_route = (reply_mode, deepcopy(reply_meta))
+                try:
+                    await self._reply("This approval request expired. No approval was saved. Ask for the action again if you still want it.", turn=turn)
+                except Exception:
+                    logger.warning("Could not deliver approval expiry notice")
             return None
         finally:
             if not sending.done():

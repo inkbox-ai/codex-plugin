@@ -522,5 +522,5 @@ def test_native_stop_cancels_pending_input_without_new_model_turn(tmp_path, monk
         await tracker.flush()
         assert statuses(sdk) == ["processing", "suspended", "active"]
         assert client.calls == 1
-        assert [item[1] for item in sent] == ["Approve?", "Stopped."]
+        assert [item[1] for item in sent] == ["Approve?\nThis approval request expires 2 seconds after delivery.", "Stopped."]
     asyncio.run(scenario())

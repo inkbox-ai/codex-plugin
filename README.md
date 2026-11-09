@@ -179,6 +179,8 @@ The bridge honors Codex's configured approval policy and relays its requests ove
 - MCP tool approvals number the available choices consecutively; reply with the number shown or a word from the table below. A different instruction cancels the pending approval turn and becomes fresh work instead of being consumed as an approval answer.
 - Request-user-input prompts are formatted as numbered options; reply with the number or free text.
 - No reply within `INKBOX_PERMISSION_TIMEOUT_S` (default 10 min) cancels an MCP request; command/file approvals are denied.
+- Approval prompts state their reply window and send an expiry notice. A late choice on the same conversation route, while no new approval is pending, is rejected instead of becoming a new task; ask for the action again to receive a new request.
+- Communication approvals put recipients before subject/content and omit idempotency and tracing fields. Only the supplied display metadata is shown; raw tool arguments are not exposed.
 
 | Reply | Decision |
 |---|---|

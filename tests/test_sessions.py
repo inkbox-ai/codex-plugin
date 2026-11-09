@@ -317,7 +317,8 @@ def test_pending_escalation_consumes_next_inbound():
             session._escalate("permission", "ok to run tests?", tool_name="Bash")
         )
         await asyncio.sleep(0.05)  # escalation text goes out, future is pending
-        assert sent and sent[0][1] == "ok to run tests?"
+        assert sent and sent[0][1].startswith("ok to run tests?\n")
+        assert "expires 2 seconds after delivery" in sent[0][1]
 
         # The human's reply answers the escalation instead of queueing a turn.
         await session.handle_inbound("yes", "sms", {"conversation_id": "c1"})
