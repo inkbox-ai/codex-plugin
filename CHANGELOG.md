@@ -46,6 +46,8 @@
 
 ## Unreleased
 
+- Mask generated webhook secrets in workflow output.
+
 - Support WhatsApp Companion groups through the shared ordered inbox, complete scoped history, native mention gates, and Safe/Relaxed response modes. Revalidate the exact sponsorship before turns and sends without granting direct-message access.
 
 - Recognize verified native WhatsApp @mentions in group mention mode without interpreting numeric text as identity evidence. Preserve structured mentions of other participants as context, without inventing unknown phone numbers. Render verified mention tokens in direct and group chats using name-only contact lookups, with phone or unresolved fallbacks while retaining original text.

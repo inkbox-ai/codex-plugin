@@ -84,6 +84,7 @@ jobs:
           # Per-run GitHub webhook secret: shared by the gateway (to verify) and
           # the test (to sign). Generated fresh so nothing is committed.
           GH_SECRET="$(openssl rand -hex 24)"
+          echo "::add-mask::$GH_SECRET"
           {
             echo "INKBOX_IDENTITY=$HANDLE"
             # NB: no INKBOX_ALLOW_ALL_USERS here on purpose — external events
