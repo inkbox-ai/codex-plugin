@@ -587,6 +587,29 @@ class ScheduleStore:
             if changed != 1:
                 raise ValueError('Schedule changed before registration was acknowledged')
 
+    def mutate_managed(self, command):
+        """Durably settle a rejected create without confusing it with a lost reply."""
+        if command.get('operation') != 'create':
+            return self.mutate_external(command)
+        key = command.get('command_id')
+        if not isinstance(key, str) or not 1 <= len(key) <= 128:
+            raise ValueError('Invalid command identifier')
+        request = json.dumps(command, sort_keys=True, allow_nan=False)
+        with self._transaction():
+            prior = self.db.execute('SELECT request,receipt FROM external_updates WHERE command_id=?', (key,)).fetchone()
+            if prior:
+                if prior['request'] != request:
+                    raise ValueError('Conflicting schedule command')
+                return json.loads(prior['receipt'])
+            try:
+                # The savepoint rolls back every write before recording non-creation.
+                with self._transaction():
+                    return self.mutate_external(command)
+            except (ValueError, TypeError, KeyError):
+                receipt = {'command_id': key, 'state': 'rejected', 'creation_rejected': True}
+                self.db.execute('INSERT INTO external_updates VALUES(?,?,?)', (key, request, json.dumps(receipt)))
+                return receipt
+
     def mutate_external(self, command):
         if not self.external_timer() or set(command) != {'action', 'command_id', 'operation', 'job_id', 'revision', 'fields'}:
             raise ValueError('Invalid schedule command')

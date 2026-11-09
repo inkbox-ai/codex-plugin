@@ -80,7 +80,7 @@ class ManagedControl:
                 raise ValueError('External scheduling is not ready')
             action = data['action']
             if action == 'schedule_mutate':
-                return store.mutate_external(data)
+                return store.mutate_managed(data)
             if action == 'schedule_preview' and set(data) == {'action', 'timing'}:
                 return store.preview_external(data['timing'])
             if action == 'schedules':
