@@ -428,6 +428,7 @@ class Receiver:
         namespace = hashlib.sha256(f"{cfg.base_url}|{cfg.identity}".encode()).hexdigest()
         self.namespace = namespace
         self.inbox = Inbox(inbox_path(cfg))
+        self.last_completed_unix_ms = int(time.time() * 1000)
         self.tasks: dict[str, asyncio.Task] = {}
         self.active_sessions: set = set()
         self.closing = False
@@ -525,6 +526,9 @@ class Receiver:
         ):
             raise CompanionError("Companion Slack activation no longer matches the received scope")
         self.validate_reply(event, _dict(page.reply_context))
+
+    def _work_completed(self, _task):
+        self.last_completed_unix_ms = int(time.time() * 1000)
 
     def schedule(self, scope):
         if not self.closing and (scope not in self.tasks or self.tasks[scope].done()):
@@ -757,6 +761,7 @@ class Receiver:
         finally:
             if outcome is not None:
                 await notify(outcome)
+            self._work_completed(None)
 
     async def deliver_reply(self, event, *, resume_activity=False):
         row = self.inbox.db.execute(

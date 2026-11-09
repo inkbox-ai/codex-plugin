@@ -933,3 +933,54 @@ def test_filtered_ordinary_event_does_not_block_later_authorized_activation():
             assert len(sent) == 1
         finally: await r.close()
     asyncio.run(scenario())
+
+
+def test_last_companion_task_completion_advances_idle_clock(monkeypatch):
+    from inkbox_codex import companion
+
+    async def scenario():
+        receiver = Receiver.__new__(Receiver)
+        receiver.closing = False
+        receiver.tasks = {}
+        receiver.last_completed_unix_ms = 1000
+        receiver.namespace = "test"
+        receiver.sessions = NS(get=lambda key: NS())
+        gates = {key: asyncio.Event() for key in ('first', 'second')}
+
+        async def drain(value):
+            key = value if isinstance(value, str) else value['key']
+            event = NS(mode='phone', session_key=lambda namespace: key)
+            async with receiver.activity(event, {}):
+                await gates[key].wait()
+
+        receiver._drain = drain
+        for key in gates:
+            receiver.schedule(key)
+        tasks = dict(receiver.tasks)
+        monkeypatch.setattr(companion.time, 'time', lambda: 2.0)
+        gates['first'].set()
+        await tasks['first']
+        await asyncio.sleep(0)
+        assert receiver.last_completed_unix_ms == 2000
+        assert not tasks['second'].done()
+        monkeypatch.setattr(companion.time, 'time', lambda: 3.0)
+        gates['second'].set()
+        await tasks['second']
+        await asyncio.sleep(0)
+        assert receiver.last_completed_unix_ms == 3000
+
+    asyncio.run(scenario())
+
+
+def test_companion_recovery_without_work_does_not_reset_idle_clock():
+    async def scenario():
+        receiver = Receiver.__new__(Receiver)
+        receiver.closing = False
+        receiver.tasks = {}
+        receiver.retries = {}
+        receiver.inbox = NS(next=lambda scope: None)
+        receiver.last_completed_unix_ms = 1000
+        receiver.schedule('empty')
+        await receiver.tasks['empty']
+        assert receiver.last_completed_unix_ms == 1000
+    asyncio.run(scenario())

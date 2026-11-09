@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.35
+
+- Report durable managed message and chat completion timestamps so supervisors can count inactivity after work finishes. Status reads do not extend the idle window.
+
 ## 0.2.34
 
 - Resolve call recipients from explicit numbers or matching contacts; ask when the recipient is unknown.

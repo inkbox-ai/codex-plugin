@@ -1613,12 +1613,15 @@ class InkboxGateway:
         active += self._managed_ingress
         ingress = getattr(getattr(self, "_managed_control", None), "ingress", None)
         ingress_unknown = False
+        last_completed = getattr(self._companion_receiver, "last_completed_unix_ms", 0)
         chat = getattr(getattr(self, "_managed_control", None), "chat", None)
         if chat is not None:
+            last_completed = max(last_completed, chat.journal.last_completed_unix_ms())
             chat_status = chat.journal.activity()
             active += chat_status["active"]
             ingress_unknown = chat_status["unknown"]
         if ingress is not None:
+            last_completed = max(last_completed, ingress.inbox.last_completed_unix_ms())
             summary = ingress.inbox.summary()
             active += summary['pending'] + summary['active']
             ingress_unknown |= bool(summary['unknown'] or any(task.done() for task in ingress.tasks))
@@ -1631,6 +1634,7 @@ class InkboxGateway:
         active += sum(executions.get(state, 0) for state in ('pending', 'starting', 'running'))
         return {
             "ready": transport_ready, "active": active + inbox.get("pending_count", 0),
+            "last_completed_unix_ms": last_completed,
             "pending_schedule_sync": sum(not item['registered'] for item in scheduler.store.registrations()),
             "unknown": bool(ingress_unknown or not inbox["readable"] or inbox.get("execution_unknown", inbox.get("blocked_conversations", 0))
                             or not status.get("imessage_threading", {}).get("readable", True)
