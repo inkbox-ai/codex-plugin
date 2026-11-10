@@ -42,6 +42,7 @@ class ManagedIngress:
             completed = False
             try:
                 async with asyncio.timeout(86400):
+                    payload = await refresh_media(self.gateway, payload)
                     if payload.get('companion') is not None:
                         await self.gateway._companion().accept(payload)
                         completed = True
@@ -58,3 +59,31 @@ class ManagedIngress:
                 completed = False
             finally:
                 self.inbox.finish(event_id, completed=completed)
+
+
+async def refresh_media(gateway, payload):
+    """Refresh expiring media at dispatch, including deliveries with no retry.
+
+    Read through the identity-scoped SDK. Only media is replaced; routing and
+    sender authorization continue to use the accepted delivery. Lookup failures
+    propagate so a media-only message cannot silently run without its files.
+    """
+    from dataclasses import asdict, is_dataclass
+
+    channel = payload.get('event_type')
+    if channel not in {'text.received', 'imessage.received'}:
+        return payload
+    key = 'text_message' if channel == 'text.received' else 'message'
+    message = (payload.get('data') or {}).get(key) or {}
+    if not message.get('media'):
+        return payload
+    message_id = message.get('id')
+    if not message_id:
+        raise ValueError('Media message identity required')
+    lookup = gateway._identity.get_text if channel == 'text.received' else gateway._identity.get_imessage
+    fresh = await asyncio.to_thread(lookup, message_id)
+    media = fresh.get('media') if isinstance(fresh, dict) else fresh.media
+    if not media:
+        raise ValueError('Fresh media unavailable')
+    media = [asdict(item) if is_dataclass(item) else dict(item) for item in media]
+    return {**payload, 'data': {**payload['data'], key: {**message, 'media': media}}}

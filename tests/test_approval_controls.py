@@ -442,3 +442,54 @@ def test_expired_email_approval_does_not_consume_another_thread():
         finally:
             await session.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('hosted', [False, True])
+@pytest.mark.parametrize('method,params,accepted', [
+    ('mcpServer/elicitation/request', REQUEST, {'action': 'accept', 'content': None}),
+    ('item/commandExecution/requestApproval', {}, {'decision': 'accept'}),
+    ('item/fileChange/requestApproval', {}, {'decision': 'accept'}),
+    ('item/permissions/requestApproval', {'permissions': {'network': {'enabled': True}}},
+     {'permissions': {'network': {'enabled': True}}, 'scope': 'turn'}),
+])
+def test_hosted_incoming_tool_approval_preserves_browser_and_unhosted(monkeypatch, hosted, method, params, accepted):
+    from types import SimpleNamespace
+    if hosted:
+        monkeypatch.setenv('INKBOX_HOSTED_ACTIVATION_ID', 'synthetic-activation')
+    else:
+        monkeypatch.delenv('INKBOX_HOSTED_ACTIVATION_ID', raising=False)
+
+    async def scenario():
+        session = make_session([])
+        session._escalate = AsyncMock(return_value='deny')
+        try:
+            response = await session._handle_codex_request(method, params)
+            assert (response == accepted) is hosted
+            assert session._escalate.await_count == (0 if hosted else 1)
+            # Browser Ask must take precedence even in a hosted process.
+            browser = AsyncMock(return_value={'browser': 'asked'})
+            session._current_turn = SimpleNamespace(request_handler=browser)
+            assert await session._handle_codex_request(method, params) == {'browser': 'asked'}
+            browser.assert_awaited_once_with(method, params)
+            session._current_turn = None
+            session._interrupting = True
+            assert await session._handle_codex_request(method, params) != accepted
+        finally:
+            session._current_turn = None
+            await session.close()
+    asyncio.run(scenario())
+
+
+def test_hosted_missing_information_is_not_autoanswered(monkeypatch):
+    monkeypatch.setenv('INKBOX_HOSTED_ACTIVATION_ID', 'synthetic-activation')
+
+    async def scenario():
+        session = make_session([])
+        session._escalate = AsyncMock(return_value=None)
+        try:
+            form = {'requestedSchema': {'type': 'object', 'properties': {'format': {'type': 'string'}}}}
+            assert await session._handle_codex_request('mcpServer/elicitation/request', form) == {'action': 'cancel', 'content': None}
+            session._escalate.assert_awaited_once()
+        finally:
+            await session.close()
+    asyncio.run(scenario())

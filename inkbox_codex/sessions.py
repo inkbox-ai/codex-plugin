@@ -100,6 +100,7 @@ class _Turn:
     a2a_context: Optional[Dict[str, Any]] = None
     capture_tools: bool = False
     model: Optional[str] = None
+    browser_permission_mode: Optional[str] = None
     hosted_sms_context: Optional[Dict[str, Any]] = None
     activity_handler: Optional[Callable[[str, str], None]] = None
     event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
@@ -1441,6 +1442,9 @@ class ContactSession:
                 client.turn_started = lambda thread_id, turn_id: bind(source, thread_id, turn_id)
                 run = client.run_detailed if turn.capture_tools else client.run
                 options = {"activity_handler": turn.activity_handler} if turn.activity_handler is not None else {}
+                if turn.browser_permission_mode is not None:
+                    options['approval_policy'] = 'never' if turn.browser_permission_mode == 'yolo' else 'on-request'
+                    options['sandbox'] = 'danger-full-access' if turn.browser_permission_mode == 'yolo' else 'workspace-write'
                 if turn.model is not None:
                     options["model"] = turn.model
                 if turn.event_handler is not None:
@@ -1683,10 +1687,10 @@ class ContactSession:
             self._worker = asyncio.create_task(self._drain())
         return await future
 
-    async def run_chat(self, query, event_handler, request_handler, before_submit=None, model=None):
+    async def run_chat(self, query, event_handler, request_handler, before_submit=None, model=None, permission_mode="ask"):
         future = asyncio.get_running_loop().create_future()
         await self._queue.put(_Turn(text=query, future=future, capture_tools=True,
-                                   event_handler=event_handler, request_handler=request_handler, before_submit=before_submit, model=model))
+                                   event_handler=event_handler, request_handler=request_handler, before_submit=before_submit, model=model, browser_permission_mode=permission_mode))
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())
         return await future
@@ -1747,8 +1751,12 @@ class ContactSession:
         from .turn_authority import HOST_ENV, new_host
         self._host_epoch = new_host(self.chat_id, self.cfg)
         self.mcp_server_config["env"] = {**self.mcp_server_config.get("env", {}), HOST_ENV: self._host_epoch}
+        # Browser sessions must not inherit the hosted non-chat process defaults,
+        # including when a native thread is resumed after reconnect.
+        client_cfg = (replace(self.cfg, codex_approval_policy="on-request", codex_sandbox="workspace-write")
+                      if self.chat_id.startswith("chat:") else self.cfg)
         client = CodexAppServerClient(
-            self.cfg,
+            client_cfg,
             developer_instructions=developer_instructions,
             mcp_server_config=self.mcp_server_config,
             approval_handler=self._handle_codex_request,
@@ -1817,6 +1825,16 @@ class ContactSession:
     async def _handle_codex_request(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         if self._current_turn is not None and self._current_turn.request_handler is not None:
             return await self._current_turn.request_handler(method, params)
+        # Browser turns supply their own handler above. Hosted non-chat work
+        # autoapproves tools only; server-side access and contact policy remain.
+        if os.getenv("INKBOX_HOSTED_ACTIVATION_ID") and not self._interrupting:
+            if method == "mcpServer/elicitation/request" and is_approval(params):
+                return elicitation_response(params, "allow")
+            if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+                          "execCommandApproval", "applyPatchApproval"}:
+                return {"decision": "accept"}
+            if method == "item/permissions/requestApproval":
+                return {"permissions": params.get("permissions") or {}, "scope": "turn"}
         if method == "item/tool/requestUserInput":
             questions = list(params.get("questions") or [])
             reply = await self._escalate("poll", format_poll(questions), questions=questions)

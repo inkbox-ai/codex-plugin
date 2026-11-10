@@ -111,7 +111,12 @@ async def settle(scheduler):
     ('item/permissions/requestApproval', {'permissions': {'network': {'enabled': True}}},
      {'permissions': {'network': {'enabled': True}}, 'scope': 'turn'}),
 ])
-def test_saved_task_authorizes_each_execution_without_persistent_approval(environment, method, params, expected):
+@pytest.mark.parametrize('hosted', [False, True])
+def test_saved_task_authorizes_each_execution_without_persistent_approval(environment, method, params, expected, hosted, monkeypatch):
+    if hosted:
+        monkeypatch.setenv('INKBOX_HOSTED_ACTIVATION_ID', 'synthetic-activation')
+    else:
+        monkeypatch.delenv('INKBOX_HOSTED_ACTIVATION_ID', raising=False)
     async def scenario():
         cfg, store, clock = environment
         job = add_job(store, clock)

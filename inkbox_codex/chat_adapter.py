@@ -210,6 +210,8 @@ class ChatAdapter:
                 spec["prompt"] + file_instruction(spec["run_id"]),
                 event,
                 request,
+                permission_mode=('yolo' if (spec.get('options') or {}).get('approval_policy') == 'never'
+                                 and (spec.get('options') or {}).get('sandbox') == 'danger-full-access' else 'ask'),
                 before_submit=lambda: self.check_cancelled(spec["session_id"]),
                 **({"model": spec["model"]} if spec.get("model") else {}),
             )

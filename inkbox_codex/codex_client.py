@@ -289,6 +289,8 @@ class CodexAppServerClient:
         image_paths: Optional[list[str]] = None,
         event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         model: Optional[str] = None,
+        approval_policy: Optional[str] = None,
+        sandbox: Optional[str] = None,
     ) -> CodexTurnResult:
         """Run one turn and return its final reply and sanitized MCP outcomes."""
         if not self.thread_id:
@@ -301,8 +303,11 @@ class CodexAppServerClient:
                       *({"type": "localImage", "path": path} for path in (image_paths or []))],
             "cwd": self.cfg.project_dir or None,
             "model": model or self.cfg.codex_model or None,
-            "approvalPolicy": self.cfg.codex_approval_policy or "on-request",
+            "approvalPolicy": approval_policy or self.cfg.codex_approval_policy or "on-request",
         }
+        if sandbox is not None:
+            params['sandboxPolicy'] = ({'type': 'dangerFullAccess'} if sandbox == 'danger-full-access'
+                                       else {'type': 'workspaceWrite'})
         if not self.tools_enabled:
             # A turn-level cwd override otherwise restores the default local
             # environment after thread/start disabled it.

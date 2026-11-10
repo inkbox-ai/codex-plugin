@@ -109,11 +109,24 @@ class ManagedInbox:
         with self.transaction():
             self.db.execute("DELETE FROM deliveries WHERE (state='completed' OR settled_at IS NOT NULL) AND finished<?",
                             (time.time() - RECEIPT_RETENTION,))
-            row = self.db.execute('SELECT receipt,state,digest FROM deliveries WHERE activation=? AND event_id=?',
+            row = self.db.execute('SELECT receipt,state,digest,bytes,payload FROM deliveries WHERE activation=? AND event_id=?',
                                   (self.activation_id, metadata['event_id'])).fetchone()
             if row is not None:
                 if row[2] != digest:
                     raise InboxError('Conflicting delivery content')
+                if row[1] == 'pending':
+                    # Refresh source projections, never the routing/scope identity.
+                    refreshed = json.loads(row[4])
+                    for field in ('data', 'timestamp'):
+                        if field in envelope:
+                            refreshed[field] = envelope[field]
+                    payload = json.dumps(refreshed, sort_keys=True, separators=(',', ':'), allow_nan=False)
+                    size = len(payload.encode())
+                    used = self.db.execute("SELECT coalesce(sum(bytes),0) FROM deliveries WHERE state != 'completed' AND settled_at IS NULL").fetchone()[0]
+                    if size > 512 * 1024 or used - row[3] + size > MAX_BYTES:
+                        raise InboxFull('Delivery inbox is full')
+                    self.db.execute("UPDATE deliveries SET payload=?,bytes=? WHERE activation=? AND event_id=? AND state='pending'",
+                                    (payload, size, self.activation_id, metadata['event_id']))
                 return self.receipt(metadata['event_id'], row[0], row[1])
             count, used = self.db.execute("SELECT count(*),coalesce(sum(bytes),0) FROM deliveries WHERE state != 'completed' AND settled_at IS NULL").fetchone()
             if count >= MAX_EVENTS or used + size > MAX_BYTES:

@@ -55,14 +55,14 @@ def test_started_work_is_quarantined_after_restart_and_not_replayed(tmp_path):
         inbox.close()
 
 
-def test_duplicate_identity_keeps_first_payload_despite_refreshed_projection(tmp_path):
+def test_duplicate_identity_refreshes_pending_projection(tmp_path):
     activation, path = str(uuid4()), tmp_path / 'inbox' / 'events.sqlite3'
     inbox = ManagedInbox(path, activation)
     try:
         original = inbox.accept(event(activation))
         assert inbox.accept(event(activation) | {'timestamp': 'changed'}) == original
         assert inbox.accept(event(activation) | {'data': {'body': 'updated', 'url': 'refreshed'}}) == original
-        assert inbox.claim()[1] == event(activation)
+        assert inbox.claim()[1] == event(activation) | {'timestamp': 'changed', 'data': {'body': 'updated', 'url': 'refreshed'}}
         with pytest.raises(InboxError):
             inbox.accept(event(activation) | {'event_type': 'text.received'})
         with pytest.raises(InboxError):
@@ -280,5 +280,43 @@ def test_quarantine_after_owner_replacement_unblocks_scope(tmp_path, monkeypatch
         assert inbox.quarantine(first['id'])['quarantined']
         assert inbox.claim()[0] == second['id']
         assert inbox.accept(first)['state'] == 'unknown'
+    finally:
+        inbox.close()
+
+
+@pytest.mark.parametrize('state', ['dispatching', 'completed', 'unknown'])
+def test_retry_after_claim_never_mutates_or_replays(tmp_path, state):
+    activation = str(uuid4())
+    inbox = ManagedInbox(tmp_path / 'inbox' / 'events.sqlite3', activation)
+    try:
+        inbox.accept(event(activation))
+        claimed = inbox.claim()
+        if state != 'dispatching':
+            inbox.finish(claimed[0], completed=state == 'completed')
+        before = inbox.db.execute('SELECT payload,bytes FROM deliveries').fetchone()
+        inbox.accept(event(activation) | {'data': {'media': ['new URL']}})
+        assert inbox.db.execute('SELECT payload,bytes FROM deliveries').fetchone() == before
+        assert inbox.claim() is None
+        assert claimed[1] == event(activation)
+    finally:
+        inbox.close()
+
+
+def test_pending_refresh_capacity_is_atomic_and_counts_replacement(tmp_path, monkeypatch):
+    import inkbox_codex.managed_inbox as module
+    activation = str(uuid4())
+    inbox = ManagedInbox(tmp_path / 'inbox' / 'events.sqlite3', activation)
+    try:
+        receipt = inbox.accept(event(activation))
+        old = inbox.db.execute('SELECT payload,bytes FROM deliveries').fetchone()
+        monkeypatch.setattr(module, 'MAX_BYTES', old[1] + 20)
+        with pytest.raises(InboxFull):
+            inbox.accept(event(activation) | {'data': {'body': 'x' * 100}})
+        assert inbox.db.execute('SELECT payload,bytes FROM deliveries').fetchone() == old
+        updated = event(activation) | {'data': {'body': 'smaller'}}
+        assert inbox.accept(updated) == receipt
+        payload, size = inbox.db.execute('SELECT payload,bytes FROM deliveries').fetchone()
+        assert size == len(payload.encode())
+        assert inbox.claim()[1] == updated
     finally:
         inbox.close()

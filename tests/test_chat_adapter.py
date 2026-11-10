@@ -74,7 +74,7 @@ async def native_chat():
     public = []
     requests = []
 
-    async def run_chat(prompt, event, request, before_submit, model=None):
+    async def run_chat(prompt, event, request, before_submit, model=None, permission_mode="ask"):
         assert model == "gpt-6.1-sol"
         await before_submit()
         event("item/reasoning/textDelta", {"delta": "private reasoning"})
@@ -194,4 +194,19 @@ def test_native_items_keep_order_phase_and_partial_text_across_journal_restart(t
         assert events[-1]['kind'] == 'turn.updated' and events[-1]['payload']['terminal']
         if failed:
             assert 'model access' not in events[-1]['payload']['blocker']['message']
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('options,mode', [({}, 'ask'),
+    ({'approval_policy': 'never', 'sandbox': 'danger-full-access'}, 'yolo'),
+    ({'approval_policy': 'never'}, 'ask')])
+def test_browser_permission_is_explicit_per_turn(options, mode):
+    async def scenario():
+        async def run_chat(prompt, event, request, **kwargs):
+            assert kwargs['permission_mode'] == mode
+            return SimpleNamespace(text='done', aborted=False)
+        session = SimpleNamespace(run_chat=run_chat, resume_session_id='native')
+        adapter = ChatAdapter(SimpleNamespace(get=lambda _: session, sessions={}))
+        await adapter.run({'run_id': str(uuid4()), 'session_id': str(uuid4()),
+                           'prompt': 'Example', 'options': options}, lambda *_: None, None)
     asyncio.run(scenario())
