@@ -148,6 +148,33 @@ def test_action_details_are_bounded_and_use_explicit_display_metadata_only():
     assert "fourth field" not in text
 
 
+def test_email_approval_prioritizes_recipients_and_omits_internal_keys():
+    params = approval(["session", "always"])
+    params.update(serverName="inkbox", message='Allow the inkbox MCP server to run tool "inkbox_send_email"?')
+    params["_meta"].update(tool_name="inkbox_send_email", tool_params_display=[
+        {"name": "body", "value": "A synthetic follow-up."},
+        {"name": "idempotency_key", "value": "synthetic-internal-key"},
+        {"name": "subject", "value": "Project update"},
+        {"name": "to", "value": "recipient@example.test"},
+        {"name": "cc", "value": "copy@example.test"},
+        {"name": "bcc", "value": "archive@example.test"},
+    ])
+    text = format_elicitation(params)
+    assert text.startswith("Send this email?")
+    assert "To: recipient@example.test" in text and "CC: copy@example.test" in text
+    assert "BCC: archive@example.test" in text
+    assert text.index("To:") < text.index("Subject:") < text.index("Message:")
+    assert "synthetic-internal-key" not in text and "idempotency_key" not in text
+    assert "inkbox_send_email" not in text
+
+
+def test_friendly_tool_title_does_not_replace_another_servers_request():
+    params = approval()
+    params.update(serverName="example")
+    params["_meta"]["tool_name"] = "inkbox_send_email"
+    assert format_elicitation(params).startswith(params["message"])
+
+
 def test_nonempty_schema_is_a_form_even_with_approval_metadata():
     params = form({"locale": {"type": "string"}})
     params["_meta"] = {"codex_approval_kind": "mcp_tool_call", "persist": "always"}

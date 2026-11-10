@@ -21,6 +21,10 @@ CRON_BATCH_SIZE = 1000
 ACTIVE = ('pending', 'starting', 'running', 'uncertain')
 
 
+class OccurrenceRejected(ValueError):
+    """Admission refused before any execution receipt was created."""
+
+
 def timestamp(value=None) -> float:
     if value is None:
         return time.time()
@@ -31,6 +35,15 @@ def timestamp(value=None) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ValueError('Invalid timestamp')
     return float(value)
+
+
+def occurrence_time(value):
+    """Decode the exact decimal token; legacy numeric commands remain supported."""
+    if isinstance(value, str):
+        if not 1 <= len(value) <= 64:
+            raise ValueError('Invalid occurrence time')
+        value = float(value)
+    return timestamp(value)
 
 
 def schedule_path(cfg) -> Path:
@@ -48,6 +61,12 @@ def validate_schedule(schedule: dict, now: float) -> tuple[dict, float]:
     if not isinstance(schedule, dict):
         raise ValueError('schedule must be an object')
     kind = schedule.get('kind')
+    zone = schedule.get('timezone', os.getenv('TZ') or 'UTC')
+    try:
+        if kind == "cron" or zone != "UTC":
+            ZoneInfo(zone)
+    except (ZoneInfoNotFoundError, TypeError, ValueError):
+        raise ValueError('Use a valid IANA timezone') from None
     if kind == 'once':
         try:
             at = datetime.fromisoformat(schedule['at'].replace('Z', '+00:00'))
@@ -56,14 +75,14 @@ def validate_schedule(schedule: dict, now: float) -> tuple[dict, float]:
             raise ValueError('once requires an ISO date and time with an explicit UTC offset') from None
         if due <= now:
             raise ValueError('The one-off execution must be in the future')
-        return {'kind': kind, 'at': at.isoformat()}, due
+        return {'kind': kind, 'at': at.isoformat(), 'timezone': zone}, due
     if kind == 'interval':
         seconds = schedule.get('seconds')
         if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or not 60 <= seconds <= 31536000:
             raise ValueError('Interval seconds must be between 60 and 31536000')
-        return {'kind': kind, 'seconds': seconds}, now + seconds
+        return {'kind': kind, 'seconds': seconds, 'timezone': zone}, now + seconds
     if kind == 'cron':
-        expr, tz = schedule.get('expression'), schedule.get('timezone', 'UTC')
+        expr, tz = schedule.get('expression'), schedule.get('timezone', os.getenv('TZ') or 'UTC')
         if not isinstance(expr, str) or len(expr.split()) != 5 or not croniter.is_valid(expr):
             raise ValueError('Use a valid five-field cron expression')
         try:
@@ -168,11 +187,38 @@ class ScheduleStore:
             columns = {row['name'] for row in self.db.execute('PRAGMA table_info(jobs)')}
             for name, definition in (('end_at', 'REAL'), ('max_runs', 'INTEGER'),
                                      ('run_count', 'INTEGER NOT NULL DEFAULT 0'), ('stop_reason', 'TEXT'),
-                                     ('decision_required', 'INTEGER NOT NULL DEFAULT 0')):
+                                     ('decision_required', 'INTEGER NOT NULL DEFAULT 0'),
+                                     ('registration_revision', 'INTEGER NOT NULL DEFAULT 1'),
+                                     ('registered_revision', 'INTEGER NOT NULL DEFAULT 0'),
+                                     ('registration_error', 'TEXT')):
                 if name not in columns:
                     self.db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {definition}')
                     if name == 'run_count':
                         self.db.execute('UPDATE jobs SET run_count=(SELECT COUNT(*) FROM runs WHERE job_id=jobs.id AND started_at IS NOT NULL)')
+            settings_columns = {row['name'] for row in self.db.execute('PRAGMA table_info(settings)')}
+            if 'timer_owner' not in settings_columns:
+                self.db.execute("ALTER TABLE settings ADD COLUMN timer_owner TEXT NOT NULL DEFAULT 'local'")
+            self.db.execute('''CREATE TABLE IF NOT EXISTS external_occurrences (
+                occurrence_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id),
+                revision INTEGER NOT NULL, due REAL NOT NULL, run_id TEXT REFERENCES runs(id),
+                UNIQUE(job_id,revision,due)
+            )''')
+            self.db.execute('''CREATE TABLE IF NOT EXISTS external_cancellations (
+                occurrence_id TEXT PRIMARY KEY, job_id TEXT NOT NULL,
+                revision INTEGER NOT NULL, due REAL NOT NULL
+            )''')
+            self.db.execute('''CREATE TABLE IF NOT EXISTS external_updates (
+                command_id TEXT PRIMARY KEY, request TEXT NOT NULL, receipt TEXT NOT NULL
+            )''')
+            self.db.execute('''CREATE TRIGGER IF NOT EXISTS schedule_registration_changed
+                AFTER UPDATE OF name,prompt,schedule,catch_up,enabled,next_run,deleted,end_at,max_runs,
+                    run_count,stop_reason,decision_required,thread_id ON jobs
+                BEGIN UPDATE jobs SET registration_revision=registration_revision+1 WHERE id=NEW.id; END''')
+            self.db.execute('''CREATE TRIGGER IF NOT EXISTS schedule_run_inserted AFTER INSERT ON runs
+                BEGIN UPDATE jobs SET registration_revision=registration_revision+1 WHERE id=NEW.job_id; END''')
+            self.db.execute('''CREATE TRIGGER IF NOT EXISTS schedule_run_changed AFTER UPDATE OF status ON runs
+                WHEN NEW.status<>OLD.status
+                BEGIN UPDATE jobs SET registration_revision=registration_revision+1 WHERE id=NEW.job_id; END''')
             if self.db.execute('PRAGMA user_version').fetchone()[0] < 4:
                 self.db.execute('PRAGMA user_version=4')
 
@@ -187,20 +233,35 @@ class ScheduleStore:
 
     @contextmanager
     def _transaction(self):
-        self.db.execute('BEGIN IMMEDIATE')
+        savepoint = 'nested_' + uuid.uuid4().hex if self.db.in_transaction else None
+        self.db.execute('SAVEPOINT ' + savepoint if savepoint else 'BEGIN IMMEDIATE')
         try:
             yield
-            self.db.execute('COMMIT')
+            self.db.execute('RELEASE ' + savepoint if savepoint else 'COMMIT')
         except BaseException:
-            self.db.execute('ROLLBACK')
+            if savepoint:
+                self.db.execute('ROLLBACK TO ' + savepoint)
+                self.db.execute('RELEASE ' + savepoint)
+            else:
+                self.db.execute('ROLLBACK')
             raise
 
-    @staticmethod
-    def _job(row):
+    def _job(self, row):
         value = dict(row)
         value['schedule'] = json.loads(value['schedule'])
         for field in ('enabled', 'catch_up', 'deleted', 'decision_required'):
             value[field] = bool(value[field])
+        if self.external_timer():
+            value['registration_status'] = (
+                ('rejected' if value['registration_error'] else 'registered')
+                if value['registered_revision'] == value['registration_revision']
+                else 'pending'
+            )
+            if value['registration_status'] == 'pending':
+                value['registration_error'] = None
+                value['notice'] = 'Saved locally only; registration is pending. Recurring execution is not yet confirmed. Do not report this as scheduled or executed.'
+            elif value['registration_status'] == 'rejected':
+                value['notice'] = 'Registration rejected: ' + value['registration_error'] + ' Edit this job to correct it; it will not run on this schedule.'
         value['remaining_runs'] = None if value['max_runs'] is None else max(0, value['max_runs'] - value['run_count'])
         return value
 
@@ -403,7 +464,7 @@ class ScheduleStore:
         self.db.execute("UPDATE runs SET catchup_run_id=? WHERE job_id=? AND status='missed' AND source!='paused' AND catchup_run_id IS NULL", (run_id, job['id']))
         return run_id
 
-    def _materialize_job(self, job, now):
+    def _materialize_job(self, job, now, grace=GRACE_SECONDS):
         if self._limit_reason(job, now) == 'max_runs':
             self._stop_job(job, 'max_runs', now)
             return
@@ -435,7 +496,7 @@ class ScheduleStore:
             if next_due is not None and job['end_at'] is not None and next_due > job['end_at']:
                 next_due = None
             caught_up = next_due is None or next_due > now
-            on_time = caught_up and last >= now - GRACE_SECONDS and not active
+            on_time = caught_up and last >= now - grace and not active
             missed_count = count - int(on_time)
             if missed_count:
                 if on_time and schedule['kind'] == 'interval':
@@ -458,10 +519,10 @@ class ScheduleStore:
         elif job['catch_up'] and (job['next_run'] is None or job['next_run'] > now):
             self._coalesce(job, now)
 
-    def _materialize_safely(self, job, now):
+    def _materialize_safely(self, job, now, grace=GRACE_SECONDS):
         self.db.execute('SAVEPOINT materialize_job')
         try:
-            self._materialize_job(job, now)
+            self._materialize_job(job, now, grace)
             return True
         except (ValueError, ZoneInfoNotFoundError, OverflowError):
             self.db.execute('ROLLBACK TO materialize_job')
@@ -475,10 +536,241 @@ class ScheduleStore:
         finally:
             self.db.execute('RELEASE materialize_job')
 
+    def external_timer(self):
+        return self.db.execute('SELECT timer_owner FROM settings WHERE id=1').fetchone()[0] == 'external'
+
+    def use_external_timer(self):
+        """Persist ownership so an accidental environment change cannot double-fire jobs."""
+        with self._transaction():
+            self.db.execute("UPDATE settings SET timer_owner='external' WHERE id=1")
+
+    def registrations(self, *, pending_only=False):
+        """Return bounded timer and task metadata for authorized management."""
+        if not self.external_timer():
+            raise ValueError('External scheduling is not configured')
+        enabled = bool(self.db.execute('SELECT enabled FROM settings WHERE id=1').fetchone()[0])
+        rows = []
+        size = 32
+        for job in self.list_jobs(include_deleted=True):
+            if pending_only and job['registered_revision'] == job['registration_revision']:
+                continue
+            active = self._active(job['id'])
+            registration = {
+                'job_id': job['id'], 'revision': job['registration_revision'],
+                'enabled': enabled and job['enabled'] and not job['deleted'],
+                'deleted': job['deleted'], 'schedule': job['schedule'], 'catch_up': job['catch_up'],
+                'next_due': None if active else job['next_run'],
+                'next_due_token': None if active or job['next_run'] is None else repr(job['next_run']),
+                'end_at': job['end_at'], 'max_runs': job['max_runs'], 'run_count': job['run_count'],
+                'decision_required': job['decision_required'],
+                'registered': job['registration_status'] == 'registered',
+                'error': job['registration_error'],
+                'display': {'name': job['name'], 'timing': job['schedule'], 'deleted': job['deleted'], 'catch_up': job['catch_up'], 'task': {'kind': 'prompt', 'prompt': job['prompt'].encode()[:4096].decode('utf-8','ignore')}, 'partial': len(job['prompt'].encode()) > 4096},
+            }
+            if pending_only:
+                encoded_size = len(json.dumps(registration).encode('utf-8')) + 2
+                if len(rows) >= 128 or size + encoded_size > 48000:
+                    break
+                size += encoded_size
+            rows.append(registration)
+        return rows
+
+    def acknowledge_registration(self, job_id, revision, *, error=None):
+        if not self.external_timer() or type(revision) is not int or revision < 1:
+            raise ValueError('Invalid schedule registration')
+        if error is not None and (not isinstance(error, str) or len(error) > 128):
+            raise ValueError('Invalid registration error')
+        with self._transaction():
+            changed = self.db.execute('''UPDATE jobs SET registered_revision=?,registration_error=?
+                WHERE id=? AND registration_revision=?''',
+                (revision, error, job_id, revision)).rowcount
+            if changed != 1:
+                raise ValueError('Schedule changed before registration was acknowledged')
+
+    def mutate_managed(self, command):
+        """Durably settle a rejected create without confusing it with a lost reply."""
+        if command.get('operation') != 'create':
+            return self.mutate_external(command)
+        key = command.get('command_id')
+        if not isinstance(key, str) or not 1 <= len(key) <= 128:
+            raise ValueError('Invalid command identifier')
+        request = json.dumps(command, sort_keys=True, allow_nan=False)
+        with self._transaction():
+            prior = self.db.execute('SELECT request,receipt FROM external_updates WHERE command_id=?', (key,)).fetchone()
+            if prior:
+                if prior['request'] != request:
+                    raise ValueError('Conflicting schedule command')
+                return json.loads(prior['receipt'])
+            try:
+                # The savepoint rolls back every write before recording non-creation.
+                with self._transaction():
+                    return self.mutate_external(command)
+            except (ValueError, TypeError, KeyError):
+                receipt = {'command_id': key, 'state': 'rejected', 'creation_rejected': True}
+                self.db.execute('INSERT INTO external_updates VALUES(?,?,?)', (key, request, json.dumps(receipt)))
+                return receipt
+
+    def mutate_external(self, command):
+        if not self.external_timer() or set(command) != {'action', 'command_id', 'operation', 'job_id', 'revision', 'fields'}:
+            raise ValueError('Invalid schedule command')
+        key = command['command_id']
+        if not isinstance(key, str) or not 1 <= len(key) <= 128:
+            raise ValueError('Invalid command identifier')
+        request = json.dumps(command, sort_keys=True, allow_nan=False)
+        fields = command['fields']
+        if not isinstance(fields, dict) or fields.keys() - {'name', 'task', 'timing', 'enabled', 'catch_up'}:
+            raise ValueError('Invalid schedule fields')
+        changes = {k: v for k, v in fields.items() if k in {'name', 'enabled', 'catch_up'}}
+        if 'task' in fields:
+            task = fields['task']
+            if not isinstance(task, dict) or set(task) != {'kind', 'prompt'} or task['kind'] != 'prompt':
+                raise ValueError('Only prompt tasks are supported')
+            changes['prompt'] = task['prompt']
+        if 'timing' in fields:
+            changes['schedule'] = fields['timing']
+        with self._transaction():
+            prior = self.db.execute('SELECT request,receipt FROM external_updates WHERE command_id=?', (key,)).fetchone()
+            if prior:
+                if prior['request'] != request:
+                    raise ValueError('Conflicting schedule command')
+                return json.loads(prior['receipt'])
+            operation = command['operation']
+            if operation == 'create':
+                if command['revision'] != 0 or command['job_id'] is not None:
+                    raise ValueError('Invalid creation version')
+                job = self.create(**changes)
+            else:
+                job = self.get(command['job_id'])
+                if job['registration_revision'] != command['revision']:
+                    raise ValueError('Schedule changed')
+                if operation == 'delete':
+                    self.delete(job['id'])
+                    job = self._job(self.db.execute('SELECT * FROM jobs WHERE id=?', (job['id'],)).fetchone())
+                elif operation == 'update':
+                    job = self.update(job['id'], **changes)
+                else:
+                    raise ValueError('Invalid schedule operation')
+            receipt = {'job_id': job['id'], 'revision': job['registration_revision'], 'registration_status': 'pending', 'deleted': job['deleted']}
+            self.db.execute('INSERT INTO external_updates VALUES(?,?,?)', (key, request, json.dumps(receipt)))
+            return receipt
+
+    def preview_external(self, timing, count=5):
+        now = time.time()
+        schedule, due = validate_schedule(timing, now)
+        values = [due]
+        for _ in range(min(count, 5) - 1):
+            if schedule['kind'] == 'once':
+                break
+            due = next_cron(schedule, due) if schedule['kind'] == 'cron' else due + schedule['seconds']
+            values.append(due)
+        return {'timing': schedule, 'next_occurrences': [datetime.fromtimestamp(v, timezone.utc).isoformat() for v in values]}
+
+    def update_external(self, job_id, revision, command_id, schedule, enabled, now=None):
+        """Commit a revision-checked edit and its replay receipt together."""
+        if (not self.external_timer() or type(revision) is not int or revision < 1
+                or not isinstance(job_id, str) or not isinstance(schedule, dict)
+                or type(enabled) is not bool or not isinstance(command_id, str)
+                or not 1 <= len(command_id) <= 128):
+            raise ValueError('Invalid schedule update')
+        request = json.dumps([job_id, revision, schedule, enabled], sort_keys=True, allow_nan=False)
+        with self._transaction():
+            saved = self.db.execute('SELECT request,receipt FROM external_updates WHERE command_id=?', (command_id,)).fetchone()
+            if saved:
+                if saved['request'] != request:
+                    raise ValueError('Update identifier already used')
+                return json.loads(saved['receipt'])
+            job = self.get(job_id)
+            if job['registration_revision'] != revision:
+                raise ValueError('Schedule changed before update')
+            changes = {'enabled': enabled}
+            if schedule != job['schedule']:
+                changes['schedule'] = schedule
+            updated = self.update(job_id, now=now, **changes)
+            receipt = {'job_id': job_id, 'revision': updated['registration_revision'], 'enabled': updated['enabled']}
+            self.db.execute('INSERT INTO external_updates VALUES(?,?,?)', (command_id, request, json.dumps(receipt)))
+            return receipt
+
+    def cancel_occurrence(self, job_id, revision, occurrence_id, due):
+        due = occurrence_time(due)
+        if (not self.external_timer() or type(revision) is not int or revision < 1
+                or not isinstance(occurrence_id, str) or not 1 <= len(occurrence_id) <= 128):
+            raise ValueError('Invalid scheduled occurrence')
+        with self._transaction():
+            prior = self.db.execute('SELECT * FROM external_occurrences WHERE occurrence_id=? OR (job_id=? AND revision=? AND due=?)', (occurrence_id, job_id, revision, due)).fetchone()
+            if prior and (prior['job_id'], prior['revision'], prior['due']) != (job_id, revision, due):
+                raise ValueError('Occurrence was already used')
+            saved = self.db.execute('SELECT * FROM external_cancellations WHERE occurrence_id=?', (occurrence_id,)).fetchone()
+            if saved and (saved['job_id'], saved['revision'], saved['due']) != (job_id, revision, due):
+                raise ValueError('Cancellation was already used')
+            self.db.execute('INSERT OR IGNORE INTO external_cancellations VALUES(?,?,?,?)', (occurrence_id, job_id, revision, due))
+            if prior and prior['run_id']:
+                self.db.execute("UPDATE runs SET status='cancelled',finished_at=? WHERE id=? AND status='pending'", (time.time(), prior['run_id']))
+                return self._run(prior['run_id'])
+            return {'status': 'cancelled'}
+
+    def quarantine_occurrence(self, job_id, revision, occurrence_id, due):
+        due = occurrence_time(due)
+        with self._transaction():
+            prior = self.db.execute('SELECT * FROM external_occurrences WHERE occurrence_id=?', (occurrence_id,)).fetchone()
+            if prior is None or (prior['job_id'], prior['revision'], prior['due']) != (job_id, revision, due) or not prior['run_id']:
+                raise ValueError('Occurrence does not match')
+            run = self._run(prior['run_id'])
+            if run['status'] == 'dismissed':
+                return run
+            return self.recover(run['id'], action='dismiss')
+
+    def cancellation_requested(self, run_id):
+        return bool(self.db.execute('SELECT 1 FROM external_cancellations c JOIN external_occurrences o ON o.job_id=c.job_id AND o.revision=c.revision AND o.due=c.due WHERE o.run_id=?', (run_id,)).fetchone())
+
+    def accept_occurrence(self, job_id, revision, occurrence_id, due, now=None, *, admitted_at=None):
+        """Deduplicate dispatch before using the native catch-up and execution rules."""
+        now, due = timestamp(now), occurrence_time(due)
+        if (not self.external_timer() or type(revision) is not int or revision < 1
+                or not isinstance(occurrence_id, str) or not 1 <= len(occurrence_id) <= 128):
+            raise ValueError('Invalid scheduled occurrence')
+        with self._transaction():
+            cancelled = self.db.execute('SELECT * FROM external_cancellations WHERE occurrence_id=? OR (job_id=? AND revision=? AND due=?)', (occurrence_id, job_id, revision, due)).fetchone()
+            if cancelled:
+                if (cancelled['job_id'], cancelled['revision'], cancelled['due']) != (job_id, revision, due):
+                    raise ValueError('Cancellation was already used')
+                return self.cancel_occurrence(job_id, revision, cancelled['occurrence_id'], due)
+            prior = self.db.execute('SELECT * FROM external_occurrences WHERE occurrence_id=? OR (job_id=? AND revision=? AND due=?)',
+                                    (occurrence_id, job_id, revision, due)).fetchone()
+            if prior is not None:
+                if (prior['job_id'], prior['revision'], prior['due']) != (job_id, revision, due):
+                    raise ValueError('Occurrence was already used for a different schedule')
+                return self._run(prior['run_id']) if prior['run_id'] else {'status': 'missed'}
+            try:
+                job = self.get(job_id)
+            except ValueError as exc:
+                raise OccurrenceRejected('Schedule no longer exists') from exc
+            if (not self.db.execute('SELECT enabled FROM settings WHERE id=1').fetchone()[0]
+                    or not job['enabled'] or job['registration_revision'] != revision
+                    or job['registered_revision'] != revision or job['registration_error'] is not None or job['next_run'] != due
+                    or self._active(job_id)):
+                raise OccurrenceRejected('Schedule changed or is not due')
+            if due > now:
+                raise ValueError('Schedule is not due yet')
+            admitted = timestamp(admitted_at) if admitted_at is not None else now
+            if not due <= admitted <= now:
+                raise ValueError('Invalid admission time')
+            self._materialize_safely(job, now, grace=900)
+            active = self._active(job_id)
+            if active and not job['catch_up'] and now > due + 900:
+                self.db.execute("UPDATE runs SET status='missed',error='Execution missed its managed start window' WHERE id=?", (active['id'],))
+                active = None
+            if self._limit_reason(job, now):
+                self._stop_job(job, self._limit_reason(job, now), now)
+                active = self._active(job_id)
+            run_id = active['id'] if active else None
+            self.db.execute('INSERT INTO external_occurrences(occurrence_id,job_id,revision,due,run_id) VALUES(?,?,?,?,?)',
+                            (occurrence_id, job_id, revision, due, run_id))
+            return self._run(run_id) if run_id else {'status': 'missed'}
+
     def materialize(self, now=None):
         now = timestamp(now)
         with self._transaction():
-            if not self.db.execute('SELECT enabled FROM settings WHERE id=1').fetchone()[0]:
+            if self.external_timer() or not self.db.execute('SELECT enabled FROM settings WHERE id=1').fetchone()[0]:
                 return
             for job in self.list_jobs():
                 if job['enabled']:
@@ -525,11 +817,19 @@ class ScheduleStore:
         with self._transaction():
             if not self.db.execute('SELECT enabled FROM settings WHERE id=1').fetchone()[0]:
                 return None
+            self.db.execute("""UPDATE runs SET status='missed',finished_at=?,error='Execution missed its managed start window'
+                WHERE status='pending' AND source NOT IN ('manual','retry','catch_up')
+                AND EXISTS(SELECT 1 FROM jobs j JOIN external_occurrences o ON o.job_id=j.id
+                    WHERE o.run_id=runs.id AND j.catch_up=0 AND o.due+900<?)""", (now, now))
             row = self.db.execute("""SELECT r.id,r.job_id FROM runs r JOIN jobs j ON j.id=r.job_id
                 WHERE r.status='pending' AND j.enabled=1 AND j.deleted=0
+                AND ((SELECT timer_owner FROM settings WHERE id=1)='local'
+                     OR r.source IN ('manual','retry','catch_up')
+                     OR EXISTS(SELECT 1 FROM external_occurrences o WHERE o.run_id=r.id))
                 AND (j.end_at IS NULL OR j.end_at+? >= ?)
                 AND (j.max_runs IS NULL OR j.run_count<j.max_runs)
-                AND (r.source!='auto_catch_up' OR j.next_run IS NULL OR j.next_run>?)
+                AND (r.source!='auto_catch_up' OR j.next_run IS NULL OR j.next_run>?
+                     OR EXISTS(SELECT 1 FROM external_occurrences o WHERE o.run_id=r.id))
                 AND NOT EXISTS(SELECT 1 FROM runs h WHERE h.job_id=j.id AND h.host_pid IS NOT NULL)
                 ORDER BY r.created_at,r.rowid LIMIT 1""", (GRACE_SECONDS, now, now)).fetchone()
             if row is None:
@@ -670,6 +970,7 @@ class ScheduleStore:
             raise ValueError('enabled must be a boolean')
         with self._transaction():
             self.db.execute('UPDATE settings SET enabled=? WHERE id=1', (enabled,))
+            self.db.execute('UPDATE jobs SET registration_revision=registration_revision+1')
             if not enabled:
                 self.db.execute("UPDATE runs SET status='missed',error='Scheduling disabled before execution' WHERE status='pending' AND source='schedule'")
         return self.status()

@@ -263,3 +263,40 @@ def test_real_sdk_gateway_routes_and_correlates_native_queued_reply(sdk):
     assert stored["reply_to_message_id"] == SOURCE_ID
     assert stored["thread_id"] == THREAD_ID
     assert stored["status"] == "pending"
+
+
+def test_real_sdk_permission_prompt_and_native_answer_keep_exact_message_ids(sdk):
+    from inkbox_codex.sessions import _Turn
+    from tests.test_approval_controls import REQUEST, wait_until
+    from tests.test_imessage_sessions import make_session
+
+    async def run():
+        cfg = BridgeConfig(identity="agent", base_url="https://example.com",
+                           imessage_threaded_replies=True, permission_timeout_s=5)
+        gateway = InkboxGateway(cfg)
+        gateway._inkbox = sdk.client
+        sdk.outbound.update(reply_to_message_id=SOURCE_ID, thread_id=THREAD_ID)
+        session, _, _ = make_session(hook=gateway._imessage_turn_state, send=gateway.send_to_contact)
+        session.cfg = cfg
+        meta = {"conversation_id": CONVERSATION_ID, "sender": "+15550100100",
+                **source_metadata(sdk.source, "request-event")}
+        session._current_turn = _Turn(text="Request", reply_mode="imessage", reply_meta=meta)
+        task = asyncio.create_task(session._handle_codex_request("mcpServer/elicitation/request", REQUEST))
+        try:
+            await wait_until(lambda: gateway._threaded_imessage_state().lookup_outbound(OUTBOUND_ID))
+            payload = json.loads(posts(sdk)[0].content)
+            assert payload["reply_to_message_id"] == SOURCE_ID
+            assert payload["conversation_id"] == CONVERSATION_ID
+            assert payload["plain_reply_fallback"] is True
+            assert posts(sdk)[0].url.params["agent_identity_id"] == IDENTITY_ID
+            incoming = {"conversation_id": CONVERSATION_ID, "sender": meta["sender"],
+                        **source_metadata(message(id=str(UUID(int=8)), content="4",
+                                                  reply_to_message_id=OUTBOUND_ID), "answer-event")}
+            await session.handle_inbound("4", "imessage", incoming)
+            assert (await task)["_meta"] == {"persist": "always"}
+            assert len(posts(sdk)) == 1
+            assert not session._client.calls
+        finally:
+            await session.close()
+            await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(run())

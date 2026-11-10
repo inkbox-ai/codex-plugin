@@ -76,6 +76,7 @@ try:
         release_a2a_progress_gate,
         try_acquire_a2a_progress_gate,
     )
+    from . import managed_work
     from .config import (
         DEFAULT_WEBHOOK_PATH,
         INKBOX_WS_PATH,
@@ -105,6 +106,7 @@ try:
     from .tools import build_inkbox_mcp_server_config
     from .webhook_providers import match_provider
 except ImportError:  # pragma: no cover - direct local import/test fallback
+    import managed_work
     from a2a_progress import (
         A2A_PROGRESS_MAX_IDENTIFIERS,
         build_progress_update,
@@ -963,12 +965,19 @@ class InkboxGateway:
 
     def __init__(self, cfg: BridgeConfig):
         self.cfg = cfg
+        if os.getenv("INKBOX_MANAGED_SOCKET") and (
+            not cfg.skip_webhook_reconcile or os.getenv("INKBOX_EXTERNAL_SCHEDULER") != "1"
+        ):
+            raise ValueError("Managed gateways require external scheduling and disabled subscription reconciliation")
         self._inkbox: Any = None
         self._identity: Any = None
         self._tunnel: Any = None
         self._public_url: str = ""
         self._public_host: str = ""
         self._runner: Any = None
+        self._managed_control = None
+        self._managed_draining = False
+        self._managed_ingress = 0
         self.sessions: Optional[SessionManager] = None
         self._slack_activity = None
         self._companion_receiver = None
@@ -1022,6 +1031,12 @@ class InkboxGateway:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
+        try:
+            await self._run()
+        finally:
+            await self._cleanup()
+
+    async def _run(self) -> None:
         """Connect to Inkbox, start the webhook server, and serve forever.
 
         Returns:
@@ -1124,12 +1139,13 @@ class InkboxGateway:
             identity_info["handle"], identity_info["email"] or "(no mailbox)",
             identity_info["phone"] or "(no phone)", self.cfg.project_dir,
         )
-        try:
-            self._scheduler_start_error = "Scheduled jobs are starting."
-            self._scheduler_start_task = asyncio.create_task(self._start_scheduler())
-            await asyncio.Event().wait()  # serve until cancelled
-        finally:
-            await self._cleanup()
+        if socket_path := os.getenv("INKBOX_MANAGED_SOCKET"):
+            from .managed import ManagedControl
+            self._managed_control = ManagedControl(self, Path(socket_path))
+            await self._managed_control.start()
+        self._scheduler_start_error = "Scheduled jobs are starting."
+        self._scheduler_start_task = asyncio.create_task(self._start_scheduler())
+        await asyncio.Event().wait()  # serve until cancelled
 
     async def _start_scheduler(self) -> None:
         """Retry scheduler startup without taking incoming conversations offline."""
@@ -1388,6 +1404,9 @@ class InkboxGateway:
         logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
     async def _cleanup(self) -> None:
+        if self._managed_control is not None:
+            await self._managed_control.close()
+            self._managed_control = None
         if getattr(self, '_scheduler_start_task', None) is not None:
             self._scheduler_start_task.cancel()
             await asyncio.gather(self._scheduler_start_task, return_exceptions=True)
@@ -1575,6 +1594,52 @@ class InkboxGateway:
                     continue
                 meta["_imessage_replay"] = True
                 await self.sessions.get(item["chat_id"]).handle_inbound(item["text"], mode, meta)
+
+    async def managed_status(self) -> dict:
+        status = await self._readiness()
+        inbox = status["companion"]
+        transport_ready = bool(
+            self.sessions is not None and self._companion_receiver is not None
+            and status["codex"]["startup_ok"] and inbox["readable"]
+            and not self._managed_draining
+            and status.get("imessage_threading", {}).get("readable", True)
+        )
+        sessions = list(self.sessions.sessions.values()) if self.sessions is not None else []
+        active = sum(bool(
+            session._turn_active or session._current_turn or session._delivering_turn
+            or not session._queue.empty() or session._imessage_burst
+            or session._pending_context or session.pending
+        ) for session in sessions)
+        active += self._managed_ingress
+        ingress = getattr(getattr(self, "_managed_control", None), "ingress", None)
+        ingress_unknown = False
+        last_completed = getattr(self._companion_receiver, "last_completed_unix_ms", 0)
+        chat = getattr(getattr(self, "_managed_control", None), "chat", None)
+        if chat is not None:
+            last_completed = max(last_completed, chat.journal.last_completed_unix_ms())
+            chat_status = chat.journal.activity()
+            active += chat_status["active"]
+            ingress_unknown = chat_status["unknown"]
+        if ingress is not None:
+            last_completed = max(last_completed, ingress.inbox.last_completed_unix_ms())
+            summary = ingress.inbox.summary()
+            active += summary['pending'] + summary['active']
+            ingress_unknown |= bool(summary['unknown'] or any(task.done() for task in ingress.tasks))
+        active += sum(not task.done() for task in self._hosted_call_jobs.values())
+        active += sum(not task.done() for tasks in self._a2a_jobs.values() for task in tasks)
+        scheduler = self._scheduler
+        if scheduler is None or scheduler.store is None:
+            return {"ready": transport_ready, "active": active, "unknown": True}
+        executions = scheduler.store.status()['executions']
+        active += sum(executions.get(state, 0) for state in ('pending', 'starting', 'running'))
+        return {
+            "ready": transport_ready, "active": active + inbox.get("pending_count", 0),
+            "last_completed_unix_ms": last_completed,
+            "pending_schedule_sync": len(scheduler.store.registrations(pending_only=True)),
+            "unknown": bool(ingress_unknown or not inbox["readable"] or inbox.get("execution_unknown", inbox.get("blocked_conversations", 0))
+                            or not status.get("imessage_threading", {}).get("readable", True)
+                            or scheduler.store.orphaned_hosts() or scheduler._unrecorded_hosts),
+        }
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         return web.json_response({"ok": True, "identity": self.cfg.identity, **await self._readiness()})
@@ -1812,7 +1877,7 @@ class InkboxGateway:
         payload: Dict[str, Any],
     ) -> None:
         """Schedule one completion turn and retain it through shutdown."""
-        task = asyncio.create_task(
+        task = managed_work.spawn(
             self._run_hosted_call_completion(call_id, event_id, payload),
             name=f"hosted-call-completion:{call_id}",
         )
@@ -1830,7 +1895,7 @@ class InkboxGateway:
         event_id: str,
         payload: Dict[str, Any],
     ) -> None:
-        task = asyncio.create_task(
+        task = managed_work.spawn(
             self._run_hosted_sms_correction_recovery(call_id, event_id, payload),
             name=f"hosted-sms-correction:{call_id}",
         )
@@ -1934,6 +1999,8 @@ class InkboxGateway:
 
     async def _recover_hosted_call_completions(self) -> None:
         """Requeue unfinished Voice AI completions from an earlier process."""
+        if os.getenv("INKBOX_HOSTED_ACTIVATION_ID"):
+            return
         for call_id, entry in self._read_hosted_call_registry().items():
             if not isinstance(entry, dict) or entry.get("state") == "completed":
                 continue
@@ -2067,6 +2134,15 @@ class InkboxGateway:
         return self._companion_receiver
 
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
+        if self._managed_draining:
+            return web.json_response({"error": "temporarily_unavailable"}, status=503)
+        self._managed_ingress += 1
+        try:
+            return await self._accept_webhook(request)
+        finally:
+            self._managed_ingress -= 1
+
+    async def _accept_webhook(self, request: "web.Request") -> "web.Response":
         body = await request.read()
 
         # Authenticate FIRST, then route on the verified source — never on the
@@ -2104,6 +2180,35 @@ class InkboxGateway:
             # downstream reader assumes a dict.
             self._dedup_rollback(request_id)
             return web.Response(status=400, text="invalid json")
+
+        if "hosted_delivery" in envelope:
+            from .managed_inbox import InboxError, InboxFull
+
+            if source != "inkbox" or not provider.verify(
+                body=body, headers=dict(request.headers), url=str(request.url),
+                secret=self._provider_secret("inkbox"),
+            ):
+                return web.Response(status=401, text="Invalid signature")
+            control = getattr(self, "_managed_control", None)
+            ingress = control.ingress if control is not None else None
+            if ingress is None or any(task.done() for task in ingress.tasks):
+                return web.Response(status=503, text="Temporarily unavailable")
+            try:
+                receipt = ingress.inbox.accept(envelope)
+            except InboxError:
+                return web.Response(status=409, text="Invalid or conflicting delivery")
+            except (InboxFull, OSError, sqlite3.Error):
+                return web.Response(status=503, text="Temporarily unavailable")
+            return web.json_response(receipt, status=202)
+
+        if os.getenv("INKBOX_HOSTED_ACTIVATION_ID"):
+            # A legacy subscription must not bypass managed event selection.
+            if source != "inkbox" or not provider.verify(
+                body=body, headers=dict(request.headers), url=str(request.url),
+                secret=self._provider_secret("inkbox"),
+            ):
+                return web.Response(status=401, text="Invalid signature")
+            return web.json_response({"ok": True, "ignored": "managed-delivery-required"})
 
         if str(envelope.get("event_type") or "").startswith("whatsapp."):
             if source != "inkbox" or not provider.verify(
@@ -2657,7 +2762,7 @@ class InkboxGateway:
         registry_key: str,
         data: Dict[str, Any],
     ) -> None:
-        job = asyncio.create_task(self._run_a2a_turn(registry_key, data))
+        job = managed_work.spawn(self._run_a2a_turn(registry_key, data))
         self._a2a_jobs.setdefault(task_id, set()).add(job)
         job.add_done_callback(
             lambda done, value=task_id: self._a2a_jobs.get(value, set()).discard(done)
@@ -3349,6 +3454,8 @@ class InkboxGateway:
             await self._stop_a2a_progress(task_id, registry_key)
 
     async def _catch_up_a2a_tasks(self) -> None:
+        if os.getenv("INKBOX_HOSTED_ACTIVATION_ID"):
+            return
         try:
             for key, entry in self._read_a2a_registry().items():
                 if entry.get("state") == "finalized":
@@ -4591,7 +4698,7 @@ class InkboxGateway:
         )
         # Run in the background so the webhook returns promptly; the turn can
         # take a while (the agent may send on another channel).
-        asyncio.create_task(self._run_failure_turn(chat_id, prompt, channel, recipient))
+        managed_work.spawn(self._run_failure_turn(chat_id, prompt, channel, recipient))
         return web.json_response({"ok": True})
 
     async def _run_failure_turn(self, chat_id: str, prompt: str, channel: str, recipient: str) -> None:

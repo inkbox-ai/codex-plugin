@@ -15,14 +15,16 @@ import json
 import logging
 import os
 import re
+import secrets
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from email.utils import getaddresses
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 try:
+    from . import managed_work
     from .codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
     from .companion import same_author
     from .elicitation import elicitation_response, format_elicitation, is_approval
@@ -40,6 +42,7 @@ try:
     )
     from .prompts import build_channel_prompt, frame_inbound, mentions_agent
 except ImportError:  # pragma: no cover - direct local import/test fallback
+    import managed_work
     from codex_client import CodexAppServerClient, CodexAppServerError, CodexTurnResult
     from companion import same_author
     from elicitation import elicitation_response, format_elicitation, is_approval
@@ -88,14 +91,20 @@ class _Turn:
     """
 
     text: str
+    managed_work: list = field(default_factory=list, repr=False)
+    managed_admitted: bool = False
     future: Optional["asyncio.Future[Any]"] = None
     # True for a one-shot turn spawned to recover from a rejected reply send.
     # A recovery turn that itself fails to send is not recovered again (no loop).
     recovery: bool = False
     a2a_context: Optional[Dict[str, Any]] = None
     capture_tools: bool = False
+    model: Optional[str] = None
+    browser_permission_mode: Optional[str] = None
     hosted_sms_context: Optional[Dict[str, Any]] = None
     activity_handler: Optional[Callable[[str, str], None]] = None
+    event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
+    request_handler: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None
     context_only: bool = False
     reply_mode: Optional[str] = None
     reply_meta: Optional[Dict[str, Any]] = None
@@ -412,6 +421,7 @@ class ContactSession:
         self.reply_meta: Dict[str, Any] = {}
         self.pending: Optional[PendingInteraction] = None
         self._pending_reply_route: Optional[tuple[str, Dict[str, Any]]] = None
+        self._expired_approval_route: Optional[tuple[str, Dict[str, Any]]] = None
         self._interaction_lock = asyncio.Lock()
         self._interaction_generation = 0
         self._approval_waiters = 0
@@ -419,10 +429,11 @@ class ContactSession:
         self._source_authority = None
         self.always_allowed: set[str] = set()
 
+        self._client_lock = asyncio.Lock()
         self._client: Optional[CodexAppServerClient] = None
         self._connecting_client: Optional[CodexAppServerClient] = None
         self._last_closed_host = None
-        self._queue: asyncio.Queue[_Turn] = asyncio.Queue()
+        self._queue: asyncio.Queue[_Turn] = managed_work.TurnQueue()
         self._pending_context: list[str] = []
         self._worker: Optional[asyncio.Task] = None
         self._resume_task: Optional[asyncio.Task] = None  # /resume pick in flight
@@ -518,6 +529,9 @@ class ContactSession:
         if (self.pending is None or self.pending.future.done()
                 or not self._companion_interaction_allowed(meta) or _control_command(text)
                 or (self.pending.kind == "permission" and parse_permission_reply(text) is None)
+                or (self.pending.kind == "permission" and self.cfg.imessage_threaded_replies
+                    and self._reply_route(self._current_turn)[0] == "imessage"
+                    and not self._imessage_permission_matches(meta))
                 or (self.pending.validate_reply and not self.pending.validate_reply(text))):
             return False
         self.pending.future.set_result(text)
@@ -528,6 +542,8 @@ class ContactSession:
         if not self._companion_interaction_allowed(meta):
             return False
         text = self._companion_control_text(text, meta)
+        if await self._route_imessage_permission_reply(text, self._reply_route(self._current_turn)[0], meta):
+            return True
         command = _control_command(text)
         if command in {"reset", "resume"}:
             # Unblock the receiver, then let its normal durable control path
@@ -551,6 +567,45 @@ class ContactSession:
             return True
         return await self._answer_pending(text)
 
+    def _imessage_permission_record(self, meta):
+        from .imessage import IMessageState
+        parent = meta.get("reply_to_message_id")
+        if not parent:
+            return None
+        record = IMessageState(self.cfg).lookup_outbound(parent)
+        if record and record.get("chat_id") == self.chat_id:
+            return record.get("meta")
+        return None
+
+    def _imessage_permission_matches(self, meta):
+        mode, expected = self._pending_reply_route or (None, {})
+        if mode != "imessage" or not expected.get("imessage_permission_id"):
+            return False
+        if any(meta.get(key) != expected.get(key) for key in (
+            "sender", "conversation_id", "companion_scope_id", "companion_activation_id",
+        )):
+            return False
+        record = self._imessage_permission_record(meta)
+        return bool(record and record.get("imessage_permission_id") == expected["imessage_permission_id"])
+
+    async def _route_imessage_permission_reply(self, text, mode, meta):
+        """Only a direct reply to the current displayed prompt may grant permission."""
+        if not self.cfg.imessage_threaded_replies or parse_permission_reply(text) is None:
+            return False
+        pending = self.pending
+        active_mode = (self._pending_reply_route or (None, {}))[0]
+        if pending is not None and not pending.future.done() and pending.kind == "permission" and active_mode == "imessage":
+            if mode == "imessage" and self._imessage_permission_matches(meta):
+                return False  # Continue through the existing authorization/receipt path.
+            await self.send_fn(self.chat_id, "Reply directly to the current iMessage approval prompt to choose an option. No approval was saved.", mode, meta)
+            return True
+        if mode == "imessage":
+            record = self._imessage_permission_record(meta)
+            if record and record.get("imessage_permission_id"):
+                await self.send_fn(self.chat_id, "That approval request is no longer active. No approval was saved. Ask for the action again to receive a new request.", mode, meta)
+                return True
+        return False
+
     async def _answer_pending(self, text: str, consumed_meta: Optional[Dict[str, Any]] = None) -> bool:
         pending = self.pending
         if pending is None or pending.future.done():
@@ -573,8 +628,22 @@ class ContactSession:
         pending.future.set_result(text)
         return True
 
+    async def _answer_expired_approval(self, text, mode, meta) -> bool:
+        """A late choice on the same route cannot become a new task."""
+        route = self._expired_approval_route
+        if route is None or (self.pending is not None and not self.pending.future.done()):
+            return False
+        if mode != route[0] or any(meta.get(key) != route[1].get(key) for key in ("sender", "thread_id" if mode == "email" else "conversation_id")):
+            return False
+        if parse_permission_reply(text) is None:
+            self._expired_approval_route = None
+            return False
+        await self._reply("That approval request expired. No approval was saved. Ask for the action again to receive a new request.")
+        return True
+
     def _cancel_interactions(self) -> None:
         self._interaction_generation += 1
+        self._expired_approval_route = None
         pending, self.pending = self.pending, None
         self._pending_reply_route = None
         if pending is not None and not pending.future.done():
@@ -783,6 +852,16 @@ class ContactSession:
             await self._report_health()
             return False
 
+        if not meta.get("reaction") and await self._route_imessage_permission_reply(raw_text, mode, meta):
+            if consumed_meta is not None:
+                await self._imessage_state("consumed", consumed_meta, raw_text)
+            return False
+
+        if not meta.get("reaction") and await self._answer_expired_approval(raw_text, mode, meta):
+            if consumed_meta is not None:
+                await self._imessage_state("consumed", consumed_meta, raw_text)
+            return False
+
         if (not meta.get("reaction") and not foreign_whatsapp and not pending_reply and self._approval_waiters
                 and (not is_group or meta.get("sender") == self._reply_route(self._current_turn)[1].get("sender"))):
             if parse_permission_reply(raw_text) is not None:
@@ -926,6 +1005,7 @@ class ContactSession:
             if first_id:
                 route["imessage_reply_target"] = first_id
         turn = self._imessage_burst
+        managed_work.attach(turn)
         turn.text = frame_inbound(turn.reply_mode, turn.reply_meta, "\n\n".join(self._imessage_burst_parts))
         if self._imessage_burst_task is not None:
             self._imessage_burst_task.cancel()
@@ -979,6 +1059,8 @@ class ContactSession:
             turn = await self._queue.get()
             outcome = "cancelled"
             tracked_imessage = self._threaded_turn(turn)
+            delivery_scope = managed_work.scope(turn.managed_work)
+            delivery_scope.__enter__()
             try:
                 if turn.completion is not None:
                     if turn.completion.cancelled():
@@ -1043,15 +1125,19 @@ class ContactSession:
                 outcome = "uncertain"
                 raise
             finally:
-                if not (turn.reply_mode == "slack" and turn.completion is not None
-                        and (turn.reply_meta or {}).get("companion")):
-                    await self._notify_turn_activity(turn, outcome)
-                if tracked_imessage:
-                    state = "done" if outcome == "completed" else "cancelled" if outcome == "cancelled" else "uncertain"
-                    try:
-                        await self._imessage_state(state, turn.reply_meta or {})
-                    except Exception:
-                        logger.warning("Could not checkpoint the iMessage turn outcome")
+                try:
+                    if not (turn.reply_mode == "slack" and turn.completion is not None
+                            and (turn.reply_meta or {}).get("companion")):
+                        await self._notify_turn_activity(turn, outcome)
+                    if tracked_imessage:
+                        state = "done" if outcome == "completed" else "cancelled" if outcome == "cancelled" else "uncertain"
+                        try:
+                            await self._imessage_state(state, turn.reply_meta or {})
+                        except Exception:
+                            logger.warning("Could not checkpoint the iMessage turn outcome")
+                finally:
+                    managed_work.finish(turn, outcome)
+                    delivery_scope.__exit__(None, None, None)
 
     async def _flush_context(self) -> None:
         if not self._pending_context:
@@ -1141,6 +1227,7 @@ class ContactSession:
                 await self._imessage_state("stopping", self._current_turn.reply_meta or {})
             await self._cancel_pending_turn()
         for turn in dropped:
+            managed_work.finish(turn, "cancelled")
             if self._threaded_turn(turn):
                 await self._imessage_state("cancelled", turn.reply_meta or {})
             if turn.completion is not None and not turn.completion.done():
@@ -1162,6 +1249,7 @@ class ContactSession:
         await self._cancel_pending_turn()
         buffered = self._take_imessage_burst()
         if buffered is not None:
+            managed_work.finish(buffered, "cancelled")
             await self._imessage_state("cancelled", buffered.reply_meta or {})
         # Discard messages queued but not yet started. Settle any capture-turn
         # futures (consult / post-call / failure recovery) so their awaiters
@@ -1171,6 +1259,7 @@ class ContactSession:
                 turn = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            managed_work.finish(turn, "cancelled")
             await self._notify_turn_activity(turn, "cancelled")
             if self._threaded_turn(turn):
                 await self._imessage_state("cancelled", turn.reply_meta or {})
@@ -1353,6 +1442,13 @@ class ContactSession:
                 client.turn_started = lambda thread_id, turn_id: bind(source, thread_id, turn_id)
                 run = client.run_detailed if turn.capture_tools else client.run
                 options = {"activity_handler": turn.activity_handler} if turn.activity_handler is not None else {}
+                if turn.browser_permission_mode is not None:
+                    options['approval_policy'] = 'never' if turn.browser_permission_mode == 'yolo' else 'on-request'
+                    options['sandbox'] = 'danger-full-access' if turn.browser_permission_mode == 'yolo' else 'workspace-write'
+                if turn.model is not None:
+                    options["model"] = turn.model
+                if turn.event_handler is not None:
+                    options["event_handler"] = turn.event_handler
                 if turn.reply_mode == "whatsapp" and (turn.reply_meta or {}).get("whatsapp_image_paths"):
                     options["image_paths"] = list(turn.reply_meta["whatsapp_image_paths"])
                 return await run(turn.text, **options)
@@ -1591,6 +1687,14 @@ class ContactSession:
             self._worker = asyncio.create_task(self._drain())
         return await future
 
+    async def run_chat(self, query, event_handler, request_handler, before_submit=None, model=None, permission_mode="ask"):
+        future = asyncio.get_running_loop().create_future()
+        await self._queue.put(_Turn(text=query, future=future, capture_tools=True,
+                                   event_handler=event_handler, request_handler=request_handler, before_submit=before_submit, model=model, browser_permission_mode=permission_mode))
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+        return await future
+
     async def _typing_loop(self) -> None:
         """Refresh the channel's typing indicator until the turn ends.
 
@@ -1618,6 +1722,10 @@ class ContactSession:
             return
 
     async def _ensure_client(self) -> CodexAppServerClient:
+        async with self._client_lock:
+            return await self._connect_client()
+
+    async def _connect_client(self) -> CodexAppServerClient:
         if self._client is not None:
             if getattr(self._client, "is_alive", True):
                 return self._client
@@ -1643,8 +1751,12 @@ class ContactSession:
         from .turn_authority import HOST_ENV, new_host
         self._host_epoch = new_host(self.chat_id, self.cfg)
         self.mcp_server_config["env"] = {**self.mcp_server_config.get("env", {}), HOST_ENV: self._host_epoch}
+        # Browser sessions must not inherit the hosted non-chat process defaults,
+        # including when a native thread is resumed after reconnect.
+        client_cfg = (replace(self.cfg, codex_approval_policy="on-request", codex_sandbox="workspace-write")
+                      if self.chat_id.startswith("chat:") else self.cfg)
         client = CodexAppServerClient(
-            self.cfg,
+            client_cfg,
             developer_instructions=developer_instructions,
             mcp_server_config=self.mcp_server_config,
             approval_handler=self._handle_codex_request,
@@ -1711,6 +1823,18 @@ class ContactSession:
     # ------------------------------------------------------------------
 
     async def _handle_codex_request(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        if self._current_turn is not None and self._current_turn.request_handler is not None:
+            return await self._current_turn.request_handler(method, params)
+        # Browser turns supply their own handler above. Hosted non-chat work
+        # autoapproves tools only; server-side access and contact policy remain.
+        if os.getenv("INKBOX_HOSTED_ACTIVATION_ID") and not self._interrupting:
+            if method == "mcpServer/elicitation/request" and is_approval(params):
+                return elicitation_response(params, "allow")
+            if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+                          "execCommandApproval", "applyPatchApproval"}:
+                return {"decision": "accept"}
+            if method == "item/permissions/requestApproval":
+                return {"permissions": params.get("permissions") or {}, "scope": "turn"}
         if method == "item/tool/requestUserInput":
             questions = list(params.get("questions") or [])
             reply = await self._escalate("poll", format_poll(questions), questions=questions)
@@ -1806,8 +1930,17 @@ class ContactSession:
             validate_reply=validate_reply,
         )
         self.pending = pending
+        self._expired_approval_route = None
         reply_mode, reply_meta = self._reply_route(self._current_turn)
+        reply_meta = deepcopy(reply_meta)
+        if kind == "permission" and reply_mode == "imessage" and self.cfg.imessage_threaded_replies:
+            reply_meta["imessage_permission_id"] = secrets.token_hex(16)
+            prompt_text += "\nReply directly to this message to choose an option; an unthreaded answer cannot approve it."
         self._pending_reply_route = (reply_mode, deepcopy(reply_meta))
+        if kind == "permission":
+            seconds = self.cfg.permission_timeout_s
+            duration = f"{seconds / 60:g} minutes" if seconds >= 60 and seconds % 60 == 0 else f"{seconds:g} seconds"
+            prompt_text += f"\nThis approval request expires {duration} after delivery."
         if reply_meta.get("companion") and self.cfg.group_reply_mode == "mention":
             prompt_text += (
                 "\nKeep the agent in To or include @agent before your answer."
@@ -1816,7 +1949,7 @@ class ContactSession:
                 if reply_mode == "slack"
                 else "\nInclude @agent before your answer (for example, @agent allow)."
             )
-        sending = asyncio.create_task(self._reply(prompt_text, turn=self._current_turn))
+        sending = asyncio.create_task(self.send_fn(self.chat_id, prompt_text, reply_mode, reply_meta))
         turn = self._current_turn
         try:
             if turn is not None:
@@ -1829,6 +1962,12 @@ class ContactSession:
                 pending.future, timeout=self.cfg.permission_timeout_s
             )
         except asyncio.TimeoutError:
+            if kind == "permission" and sending.done() and not sending.cancelled() and sending.exception() is None:
+                self._expired_approval_route = (reply_mode, deepcopy(reply_meta))
+                try:
+                    await self._reply("This approval request expired. No approval was saved. Ask for the action again if you still want it.", turn=turn)
+                except Exception:
+                    logger.warning("Could not deliver approval expiry notice")
             return None
         finally:
             if not sending.done():

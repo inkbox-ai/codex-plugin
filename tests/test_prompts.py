@@ -205,10 +205,11 @@ def test_channel_prompt_mentions_identity_and_dir():
     assert "The requested cross-channel\nmessage belongs in the tool call" in text
     assert "NEVER call an Inkbox send tool to answer the current inbound message" not in text
     assert "include the literal requested value" in text
-    assert "You MUST call inkbox_place_call in that same turn" in text
-    assert "regardless of whether the request arrived by email" in text
-    assert "Do not merely text that" in text
-    assert "replace the call with an SMS reply" in text
+    assert "Once the recipient is known, call inkbox_place_call" in text
+    assert "Never invent a number" in text
+    assert "ask\n  which number to call before invoking the tool" in text
+    assert "Do not assume the newest or" in text
+    assert "inkbox_whoami describes YOU, not the caller" in text
     assert "shared Inkbox contacts" in text
     assert "shared address book" in text
     assert "inkbox_create_contact" in text

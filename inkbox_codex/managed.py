@@ -1,0 +1,152 @@
+"""Private local control for an externally supervised gateway."""
+from __future__ import annotations
+
+import asyncio
+import os
+import sqlite3
+import stat
+from pathlib import Path
+
+from aiohttp import web
+
+from .schedules import OccurrenceRejected, ScheduleStore, schedule_path
+
+
+def json_response(value, **kwargs):
+    import json
+    body = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if len(body.encode()) > 65536:
+        raise RuntimeError("Control response exceeds capacity")
+    return web.Response(text=body, content_type="application/json", **kwargs)
+
+
+class ManagedControl:
+    def __init__(self, gateway, path: Path):
+        self.gateway = gateway
+        self.path = path
+        self.runner = None
+        self.inode = None
+        self.ingress = None
+        self.chat = None
+
+    async def start(self):
+        parent = self.path.parent.stat()
+        if (not self.path.is_absolute() or not stat.S_ISDIR(parent.st_mode)
+                or parent.st_uid != os.getuid() or parent.st_mode & 0o077
+                or self.path.exists() or self.path.is_symlink()):
+            raise ValueError('Managed control requires a private directory and unused socket')
+        from .chat_adapter import ChatAdapter
+        from .daemon import state_dir
+        from .managed_chat import ChatRuntime
+        adapter = ChatAdapter(self.gateway.sessions)
+        self.chat = ChatRuntime(state_dir() / "chat.sqlite", os.environ["INKBOX_MANAGED_OWNER_ID"], adapter.run, adapter.cancel, adapter.settled)
+        app = web.Application(client_max_size=65536)
+        app.router.add_post('/control', self.handle)
+        self.runner = web.AppRunner(app, access_log=None)
+        await self.runner.setup()
+        try:
+            await web.UnixSite(self.runner, str(self.path)).start()
+            self.inode = self.path.stat().st_ino
+            self.path.chmod(0o600)
+            if activation := os.getenv("INKBOX_HOSTED_ACTIVATION_ID"):
+                from .managed_ingress import ManagedIngress
+                self.ingress = ManagedIngress(self.gateway, activation)
+                self.ingress.start()
+        except BaseException:
+            await self.close()
+            raise
+
+    async def close(self):
+        if self.chat is not None:
+            await self.chat.close()
+            self.chat = None
+        if self.ingress is not None:
+            await self.ingress.close()
+            self.ingress = None
+        if self.runner is not None:
+            await self.runner.cleanup()
+            self.runner = None
+        if self.inode is not None:
+            try:
+                if self.path.lstat().st_ino == self.inode:
+                    self.path.unlink()
+            except FileNotFoundError:
+                pass
+            self.inode = None
+
+    def schedules(self, data):
+        with ScheduleStore(schedule_path(self.gateway.cfg)) as store:
+            if not store.external_timer():
+                raise ValueError('External scheduling is not ready')
+            action = data['action']
+            if action == 'schedule_mutate':
+                return store.mutate_managed(data)
+            if action == 'schedule_preview' and set(data) == {'action', 'timing'}:
+                return store.preview_external(data['timing'])
+            if action == 'schedules':
+                if set(data) != {'action'}:
+                    raise ValueError('Unexpected fields')
+                return {'schedules': store.registrations(pending_only=True)}
+            fields = {'action', 'job_id', 'revision'}
+            if action == 'update_schedule':
+                if set(data) != fields | {'command_id', 'schedule', 'enabled'}:
+                    raise ValueError('Unexpected fields')
+                return store.update_external(data['job_id'], data['revision'], data['command_id'],
+                                             data['schedule'], data['enabled'])
+            if action == 'acknowledge_schedule':
+                if set(data) not in (fields, fields | {'error'}):
+                    raise ValueError('Unexpected fields')
+                store.acknowledge_registration(data['job_id'], data['revision'], error=data.get('error'))
+                return {'acknowledged': True}
+            if action == 'quarantine_schedule' and set(data) in (fields | {'occurrence_id', 'due'}, fields | {'occurrence_id', 'due', 'admitted_at'}):
+                receipt = store.quarantine_occurrence(data['job_id'], data['revision'], data['occurrence_id'], data['due'])
+                return {'status': receipt['status'], **({'execution_stopped': True} if receipt['status'] == 'uncertain' and receipt.get('host_pid') is None else {})}
+            if action == 'cancel_schedule' and set(data) in (fields | {'occurrence_id', 'due'}, fields | {'occurrence_id', 'due', 'admitted_at'}):
+                receipt = store.cancel_occurrence(data['job_id'], data['revision'], data['occurrence_id'], data['due'])
+                return {'status': receipt['status'], **({'execution_stopped': True} if receipt['status'] == 'uncertain' and receipt.get('host_pid') is None else {})}
+            if action != 'invoke_schedule' or set(data) not in (fields | {'occurrence_id', 'due'}, fields | {'occurrence_id', 'due', 'admitted_at'}):
+                raise ValueError('Unknown action or fields')
+            try:
+                receipt = store.accept_occurrence(data['job_id'], data['revision'], data['occurrence_id'], data['due'], admitted_at=data.get('admitted_at'))
+            except OccurrenceRejected:
+                return {'status': 'rejected', 'execution_stopped': True, 'reason': 'schedule_changed_or_not_due'}
+            return {'execution': {'native_run_id': receipt.get('id'), 'started_at': receipt.get('started_at'), 'finished_at': receipt.get('finished_at'), 'output_source_ids': [receipt['id'] + ':assistant'] if receipt.get('id') and receipt.get('result') else []}, 'run_id': receipt.get('id'), 'status': receipt['status'], **({'execution_stopped': True} if receipt['status'] == 'uncertain' and receipt.get('host_pid') is None else {})}
+
+    async def handle(self, request):
+        try:
+            data = await request.json()
+            if not isinstance(data, dict) or not isinstance(data.get('action'), str):
+                raise TypeError('Invalid request')
+            if data['action'] == 'observe_conversation':
+                from .observations import observe
+                return json_response(await observe(self.gateway, data))
+            if data['action'].startswith('chat_'):
+                self.chat.draining = self.gateway._managed_draining
+                return json_response(await self.chat.control(data))
+            if data['action'] == 'quarantine_delivery' and set(data) == {'action', 'event_id'}:
+                if self.ingress is None:
+                    raise ValueError('Receiver unavailable')
+                result = self.ingress.inbox.quarantine(data['event_id'])
+            elif data['action'] in {'conversations', 'conversation'}:
+                from .managed_conversations import read
+                result = await read(self.gateway.sessions, data)
+            elif data['action'] in {'status', 'drain', 'resume'}:
+                if set(data) != {'action'}:
+                    raise ValueError('Unexpected fields')
+                if data['action'] != 'status':
+                    self.gateway._managed_draining = data['action'] == 'drain'
+                result = await self.gateway.managed_status()
+                result["capabilities"] = {"normalized_chat": 1, "chat_model_selection": 1, "chat_interactions": 1, "chat_observation": 1, "workspace_schedules": 1, "schedule_rejection_ack": 1}
+            else:
+                if data['action'] == 'invoke_schedule' and self.gateway._managed_draining:
+                    return json_response({'error': 'temporarily_unavailable'}, status=503)
+                self.gateway._managed_ingress += 1
+                try:
+                    result = await asyncio.to_thread(self.schedules, data)
+                finally:
+                    self.gateway._managed_ingress -= 1
+            return json_response(result)
+        except (ValueError, TypeError, KeyError):
+            return json_response({'error': 'invalid_or_stale_request'}, status=409)
+        except (OSError, sqlite3.Error, RuntimeError, TimeoutError):
+            return json_response({'error': 'temporarily_unavailable'}, status=503)

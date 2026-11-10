@@ -62,6 +62,7 @@ class _Sessions:
 
 def _gateway(tmp_path):
     gateway = object.__new__(InkboxGateway)
+    gateway._managed_control = None
     gateway._a2a_registry_path = tmp_path / "a2a.json"
     gateway._a2a_jobs = {}
     gateway._a2a_progress_jobs = {}
@@ -1763,3 +1764,12 @@ def test_a2a_sent_update_returns_to_the_delegating_session(
     assert "Which region?" in prompt
     assert mode == "external"
     assert meta["a2a_task_id"] == "task-1"
+
+
+def test_hosted_startup_does_not_discover_unadmitted_tasks(monkeypatch):
+    monkeypatch.setenv('INKBOX_HOSTED_ACTIVATION_ID', 'activation-example')
+    gateway = object.__new__(InkboxGateway)
+    def forbidden():
+        raise AssertionError('Hosted work must come through durable admission')
+    gateway._read_a2a_registry = forbidden
+    asyncio.run(gateway._catch_up_a2a_tasks())

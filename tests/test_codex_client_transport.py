@@ -312,3 +312,96 @@ def test_concurrent_start_responses_match_early_notifications_by_turn_id():
             client._reader_task.cancel()
             await asyncio.gather(client._reader_task, return_exceptions=True)
     asyncio.run(scenario())
+
+
+def test_failing_chat_observer_does_not_fail_other_turns():
+    from inkbox_codex.codex_client import _TurnCapture
+    async def scenario():
+        client = CodexAppServerClient(BridgeConfig(), developer_instructions="test")
+        def broken(*_):
+            raise ValueError("oversized observation")
+        first = asyncio.get_running_loop().create_future()
+        other = asyncio.get_running_loop().create_future()
+        client._turns["first"] = _TurnCapture(thread_id="thread", turn_id="first", future=first, event_handler=broken)
+        client._turns["other"] = _TurnCapture(thread_id="thread", turn_id="other", future=other)
+        client._handle_notification({"method":"item/agentMessage/delta","params":{"turnId":"first","delta":"text"}})
+        with pytest.raises(CodexAppServerError):
+            await first
+        assert not other.done()
+        client._handle_notification({"method":"turn/completed","params":{"turn":{"id":"other","status":"completed"}}})
+        await other
+    asyncio.run(scenario())
+
+
+def test_selected_model_applies_only_to_the_requested_turn():
+    async def scenario():
+        cfg = BridgeConfig(codex_model="gpt-5.4")
+        client = CodexAppServerClient(cfg, developer_instructions="test")
+        client.thread_id = "thread-1"
+        models = []
+
+        async def request(method, params, *, turn_capture):
+            assert method == "turn/start"
+            models.append(params["model"])
+            turn_capture.future.set_result(SimpleNamespace(text="Done"))
+
+        client._request = request
+        await client.run_detailed("First", model="gpt-6.1-sol")
+        await client.run_detailed("Second")
+        assert models == ["gpt-6.1-sol", "gpt-5.4"]
+        assert cfg.codex_model == "gpt-5.4"
+
+    asyncio.run(scenario())
+
+
+def test_browser_turn_policy_overrides_hosted_defaults_and_previous_yolo():
+    async def scenario():
+        client = CodexAppServerClient(BridgeConfig(codex_approval_policy='never',
+                                     codex_sandbox='danger-full-access'), developer_instructions='test')
+        client.thread_id = 'thread-1'
+        requests = []
+        client._proc = SimpleNamespace(stdin=SimpleNamespace(write=lambda data: requests.append(json.loads(data))))
+        for index, (approval, sandbox, wire) in enumerate([
+            ('on-request', 'workspace-write', 'workspaceWrite'),
+            ('never', 'danger-full-access', 'dangerFullAccess'),
+            ('on-request', 'workspace-write', 'workspaceWrite'),
+        ]):
+            task = asyncio.create_task(client.run_detailed('test', approval_policy=approval, sandbox=sandbox))
+            await asyncio.sleep(0)
+            request = requests[-1]
+            assert request['params']['approvalPolicy'] == approval
+            assert request['params']['sandboxPolicy'] == {'type': wire}
+            turn = f'turn-{index}'
+            client._handle_response({'id': request['id'], 'result': {'turn': {'id': turn}}})
+            client._handle_notification({'method': 'turn/completed', 'params': {'turn': {'id': turn, 'status': 'completed'}}})
+            await asyncio.wait_for(task, 1)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('resume', [None, 'existing-thread'])
+def test_browser_connection_and_resume_do_not_inherit_hosted_yolo(tmp_path, monkeypatch, resume):
+    from tests.test_sessions import make_session
+    monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
+
+    async def scenario():
+        session = make_session([])
+        session.chat_id = 'chat:synthetic-browser'
+        session.cfg.codex_approval_policy = 'never'
+        session.cfg.codex_sandbox = 'danger-full-access'
+        session.resume_session_id = resume
+        captured = []
+        async def connect(client, thread=None):
+            captured.append((client._thread_params(), thread))
+            client.thread_id = thread or 'new-thread'
+            return client.thread_id
+        monkeypatch.setattr(CodexAppServerClient, 'connect', connect)
+        try:
+            await session._connect_client()
+            params, thread = captured[0]
+            assert thread == resume
+            assert params['approvalPolicy'] == 'on-request'
+            assert params['sandbox'] == 'workspace-write'
+            assert session.cfg.codex_approval_policy == 'never'
+        finally:
+            await session.close()
+    asyncio.run(scenario())

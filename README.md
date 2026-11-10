@@ -179,6 +179,8 @@ The bridge honors Codex's configured approval policy and relays its requests ove
 - MCP tool approvals number the available choices consecutively; reply with the number shown or a word from the table below. A different instruction cancels the pending approval turn and becomes fresh work instead of being consumed as an approval answer.
 - Request-user-input prompts are formatted as numbered options; reply with the number or free text.
 - No reply within `INKBOX_PERMISSION_TIMEOUT_S` (default 10 min) cancels an MCP request; command/file approvals are denied.
+- Approval prompts state their reply window and send an expiry notice. A late choice on the same conversation route, while no new approval is pending, is rejected instead of becoming a new task; ask for the action again to receive a new request.
+- Communication approvals put recipients before subject/content and omit idempotency and tracing fields. Only the supplied display metadata is shown; raw tool arguments are not exposed.
 
 | Reply | Decision |
 |---|---|
@@ -571,6 +573,10 @@ sending an unthreaded reply. The existing SDK minimum is unchanged when disabled
   message trigger start fresh, without a reply target. The bridge never picks the
   last message from conversation history. Scheduled jobs must run independently,
   without inheriting the active chat's tool-process environment.
+- **Approval answers:** reply directly to the displayed approval message with
+  your choice. Unthreaded choices and replies to a different request cannot
+  approve the current request. After a restart, replies to saved old approval
+  messages report that the request is no longer active; request the action again.
 - **No audience changes:** targeted tools must use a visible source in the same
   conversation; in a running chat they must also belong to that active input.
   Opaque native thread IDs are not message IDs or new Codex sessions. Replies use
@@ -722,9 +728,12 @@ is already in progress cannot be deleted or have its prompt/schedule changed.
 is not proof that it has executed: inspect `runs` for the outcome, `thread_id`,
 result, and error. Plain Codex output is saved, not automatically sent to the last
 chat. To request a message, include the exact recipient and channel in the saved
-prompt. Scheduled turns use the configured sandbox and do not have a person
-available for interactive approval; choose tasks that can finish under the saved
-permissions. Jobs do not overlap their own executions. When a job already has an
+prompt. Saving a schedule authorizes its recurring task: scheduled turns accept
+tool-operation approvals without asking again, only for that execution. Other
+chats keep their own approval policy. Credentials and service permissions still
+apply. Requests for missing information or sign-in cannot be answered unattended
+and are recorded as failed runs. Failed tool calls are also recorded as failures,
+even if the agent returns a final response. Jobs do not overlap their own executions. When a job already has an
 active or manually queued run, newly due occurrences are recorded as missed and
 follow that job's catch-up setting. Other jobs queued while the online worker is
 busy are preserved until the worker becomes available.
@@ -1141,3 +1150,7 @@ WhatsApp requires Inkbox SDK 0.7.29 or newer (below 1.0.0). Its 15 tools are reg
 Existing WhatsApp groups use the same Companion configuration, ordered durable inbox, complete initialization snapshot, and Safe/Relaxed response modes as iMessage. A current sponsor grant admits otherwise default-denied peers only within its group; it does not grant direct-message access or permission in another group. Explicit contact blocks remain authoritative. The bridge revalidates the exact activation before submitting a turn or sending a queued reply, and keeps original/native mention metadata separate from historical context. Group names remain display labels, never destinations; creating groups is not supported.
 
 Use a compatible SDK with WhatsApp Companion channel and sender-access support. Native thread expansion is unavailable inside a Companion turn: use its supplied scoped history. Retained legacy group send intents cannot be converted to direct messages; preserve the original request key for read-only receipt lookup.
+
+### Externally registered schedules
+
+When timing is managed externally, saving a job is a local intent, not confirmation that it is scheduled or has executed. Read `registration_status` in the schedule result: `pending` means registration is still waiting, `registered` confirms acceptance, and `rejected` includes an actionable `registration_error`. A rejected revision is acknowledged once and does not retry indefinitely. Edit the same job to correct it; do not silently change the requested cadence. Execution is confirmed separately in schedule history.

@@ -243,7 +243,7 @@ def test_email_approval_and_answer_keep_original_audience(tmp_path, monkeypatch)
 
         async def send(*args):
             await original_send(*args)
-            if args[1] == "Allow?":
+            if args[1].startswith("Allow?\nThis approval request expires"):
                 prompted.set()
 
         class Client:

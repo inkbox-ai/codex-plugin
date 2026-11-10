@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import signal
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -32,6 +33,14 @@ TurnStartedHandler = Callable[[str, str], None]
 
 class CodexAppServerError(RuntimeError):
     """Raised when codex app-server returns an error or exits unexpectedly."""
+
+class CodexTurnFailed(CodexAppServerError):
+    """The native owner reported a terminal failure."""
+
+    def __init__(self, error):
+        self.error = error
+        super().__init__(str(error))
+
 
 
 class CodexStartupError(CodexAppServerError):
@@ -133,6 +142,7 @@ class _TurnCapture:
     mcp_tool_calls: list["McpToolCallResult"] = field(default_factory=list)
     activity_handler: Optional[ActivityHandler] = None
     turn_started: Optional[TurnStartedHandler] = None
+    event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
 
 
 @dataclass(frozen=True)
@@ -176,8 +186,10 @@ class CodexAppServerClient:
         process_started: Optional[Callable[[int], None]] = None,
         turn_started: Optional[TurnStartedHandler] = None,
     ) -> None:
+        self.observation_id = uuid.uuid4().hex
         self.cfg = cfg
-        self.developer_instructions = developer_instructions
+        from .hosted import instructions
+        self.developer_instructions = instructions(developer_instructions)
         self.mcp_server_config = dict(mcp_server_config or {})
         self.approval_handler = approval_handler
         self.tools_enabled = tools_enabled
@@ -188,6 +200,7 @@ class CodexAppServerClient:
         self._owns_process_group = os.name == "posix"
         self._process_group_id: Optional[int] = None
 
+        self._session_lock = None
         self.thread_id: Optional[str] = None
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task] = None
@@ -213,8 +226,32 @@ class CodexAppServerClient:
         return (self._proc is not None and self._proc.returncode is None
                 and self._reader_task is not None and not self._reader_task.done())
 
+    def _lock_session(self, thread_id: str) -> None:
+        directory = os.getenv("INKBOX_SESSION_LOCK_DIRECTORY")
+        if not directory or self._session_lock is not None:
+            return
+        import fcntl
+        import hashlib
+        import stat
+        from pathlib import Path
+
+        root = Path(directory)
+        metadata = root.lstat()
+        if not root.is_absolute() or not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise CodexAppServerError("Session locking unavailable")
+        path = root / ("codex-" + hashlib.sha256(thread_id.encode()).hexdigest())
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise CodexAppServerError("Session is already active") from None
+        self._session_lock = fd
+
     async def connect(self, resume_thread_id: Optional[str] = None) -> str:
         """Start app-server and create or resume a Codex thread."""
+        if resume_thread_id:
+            self._lock_session(resume_thread_id)
         await self._ensure_process()
         if not self._initialized:
             await self._initialize()
@@ -227,8 +264,9 @@ class CodexAppServerClient:
             result = await self._request("thread/start", params)
         thread = result.get("thread") or {}
         thread_id = str(thread.get("id") or "")
-        if not thread_id:
-            raise CodexAppServerError(f"app-server did not return a thread id: {result!r}")
+        if not thread_id or (resume_thread_id and thread_id != resume_thread_id):
+            raise CodexAppServerError("app-server returned an unexpected thread identity")
+        self._lock_session(thread_id)
         self.thread_id = thread_id
         return thread_id
 
@@ -238,9 +276,10 @@ class CodexAppServerClient:
         *,
         activity_handler: Optional[ActivityHandler] = None,
         image_paths: Optional[list[str]] = None,
+        event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> str:
         """Run one turn in the current thread and return the final reply text."""
-        return (await self.run_detailed(text, activity_handler=activity_handler, image_paths=image_paths)).text
+        return (await self.run_detailed(text, activity_handler=activity_handler, image_paths=image_paths, event_handler=event_handler)).text
 
     async def run_detailed(
         self,
@@ -248,6 +287,10 @@ class CodexAppServerClient:
         *,
         activity_handler: Optional[ActivityHandler] = None,
         image_paths: Optional[list[str]] = None,
+        event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        model: Optional[str] = None,
+        approval_policy: Optional[str] = None,
+        sandbox: Optional[str] = None,
     ) -> CodexTurnResult:
         """Run one turn and return its final reply and sanitized MCP outcomes."""
         if not self.thread_id:
@@ -259,9 +302,12 @@ class CodexAppServerClient:
             "input": [{"type": "text", "text": text},
                       *({"type": "localImage", "path": path} for path in (image_paths or []))],
             "cwd": self.cfg.project_dir or None,
-            "model": self.cfg.codex_model or None,
-            "approvalPolicy": self.cfg.codex_approval_policy or "on-request",
+            "model": model or self.cfg.codex_model or None,
+            "approvalPolicy": approval_policy or self.cfg.codex_approval_policy or "on-request",
         }
+        if sandbox is not None:
+            params['sandboxPolicy'] = ({'type': 'dangerFullAccess'} if sandbox == 'danger-full-access'
+                                       else {'type': 'workspaceWrite'})
         if not self.tools_enabled:
             # A turn-level cwd override otherwise restores the default local
             # environment after thread/start disabled it.
@@ -273,6 +319,7 @@ class CodexAppServerClient:
             future=loop.create_future(),
             activity_handler=activity_handler,
             turn_started=self.turn_started,
+            event_handler=event_handler,
         )
         try:
             await self._request("turn/start", params, turn_capture=capture)
@@ -367,6 +414,9 @@ class CodexAppServerClient:
             self._stderr_task.cancel()
         await asyncio.gather(*(task for task in (self._reader_task, self._stderr_task)
                                if task is not None), return_exceptions=True)
+        if self._session_lock is not None and (proc is None or proc.returncode is not None):
+            os.close(self._session_lock)
+            self._session_lock = None
         self._proc = None
         self._initialized = False
 
@@ -376,6 +426,11 @@ class CodexAppServerClient:
             # Scope runtime overrides to Inkbox so other servers keep their
             # launcher-supplied settings, including per-tool approval policies.
             config["mcp_servers.inkbox"] = self.mcp_server_config
+        if self.tools_enabled:
+            from .hosted import mcp_server
+            connected = mcp_server(self.cfg)
+            if connected is not None:
+                config["mcp_servers.inkbox_connected"] = connected
         params = {
             "cwd": self.cfg.project_dir or None,
             "model": self.cfg.codex_model or None,
@@ -645,6 +700,7 @@ class CodexAppServerClient:
             logger.debug("Discarded response for a closed app-server request")
 
     def _handle_notification(self, message: Dict[str, Any]) -> None:
+        self._observation_version = getattr(self, "_observation_version", 0) + 1
         method = message.get("method")
         params = message.get("params") or {}
         turn_id = str(params.get("turnId") or (params.get("turn") or {}).get("id") or "")
@@ -661,6 +717,15 @@ class CodexAppServerClient:
             # Retain them only while starts are outstanding, keyed by turn ID.
             self._early_notifications.setdefault(turn_id, []).append(message)
             return
+
+        capture = self._turns.get(turn_id)
+        if capture is not None and capture.event_handler is not None:
+            try:
+                capture.event_handler(str(method), params)
+            except Exception:  # noqa: BLE001 - Isolate observers from the shared reader.
+                logger.error("Chat event handler failed")
+                if not capture.future.done():
+                    capture.future.set_exception(CodexAppServerError("Chat event handler failed"))
 
         if method == "item/started":
             capture = self._turns.get(turn_id)
@@ -701,7 +766,7 @@ class CodexAppServerClient:
             status = turn.get("status")
             if status == "failed":
                 error = turn.get("error") or turn.get("codexErrorInfo") or "turn failed"
-                capture.future.set_exception(CodexAppServerError(str(error)))
+                capture.future.set_exception(CodexTurnFailed(error))
                 return
             capture.future.set_result(CodexTurnResult(
                 text=_final_message(capture),
@@ -722,7 +787,7 @@ def _final_message(capture: _TurnCapture) -> str:
     final = [
         str(item.get("text") or "")
         for item in capture.messages
-        if item.get("phase") in ("final", None)
+        if item.get("phase") in ("final", "final_answer", None)
     ]
     text = "\n\n".join(t for t in final if t).strip()
     if text:
@@ -793,7 +858,7 @@ def _mcp_tool_call_result(item: Dict[str, Any]) -> McpToolCallResult:
     return McpToolCallResult(
         server=str(item.get("server") or ""),
         tool=str(item.get("tool") or ""),
-        status=str(item.get("status") or ""),
+        status="failed" if isinstance(result, dict) and result.get("isError") is True else str(item.get("status") or ""),
         arguments=safe_arguments,
         sent=sent,
         error_kind=sms_tool_failure_kind(

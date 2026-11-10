@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.2.35
+
+- Report durable managed message and chat completion timestamps so supervisors can count inactivity after work finishes. Status reads do not extend the idle window.
+
+## 0.2.34
+
+- Resolve call recipients from explicit numbers or matching contacts; ask when the recipient is unknown.
+- Preserve the attempted recipient and provide lookup guidance when a shared-line call has no matching connection.
+
+## 0.2.33
+
+- Run saved scheduled tasks without repeated tool-approval prompts, with approvals scoped to each execution.
+- Record failed scheduled tool calls and requests for missing input as failures instead of successful runs.
+
+## 0.2.32
+
+- Show MCP tool approval requests in direct chat and honor one-time approval, denial, and cancellation.
+
+## 0.2.31
+
+- Forward an optional model selection to the native chat turn without changing the default for other conversations.
+
+## 0.2.30
+
+- Preserve cancellation and expired interactions across pending responses, bound oversized chat output, and recover confirmed completed work without replay.
+- Report known model-access failures with actionable codes and avoid reopening dormant conversations during observation.
+- Include native execution timing and output identities in schedule receipts.
+
+## 0.2.29
+
+- Add supervised direct chat with streamed text, tool activity, approvals, questions, cancellation, and downloadable file references.
+- Retain control receipts across reconnects and expose bounded conversation observations without rerunning work.
+- Add revisioned native schedule management and explicit timezone previews.
+
+## 0.2.28
+
+- Retry early schedule deliveries, enforce the start deadline when queued work begins, and synchronize changed schedules in bounded batches.
+
+- Coalesce delayed recurring schedules, report definite dispatch rejections, and keep failed preflight checks from pinning unrelated work.
+- Bound externally timed startup to 15 minutes unless native catch-up is enabled.
+- Keep stopped uncertain work isolated from unrelated activity and configuration changes.
+- Add durable, bounded webhook acceptance and retain uncertain outcomes without automatic replay.
+- Preserve timely schedule admission across cold starts, serialize conversation admission, and separate completed receipts from pending capacity.
+- Limit hosted startup work to authorized deliveries and support explicit quarantine without replay.
+- Support externally timed native schedules, registration acknowledgements and cancellation without duplicate local execution. New cron jobs use the configured timezone, defaulting to UTC.
+- Expose supervised activity, configuration draining and read-only conversation access with one owner per native thread.
+- Apply hosted instructions and shared connected tools while preserving standalone behavior.
+
 ## Unreleased
 
 - Mask generated webhook secrets in workflow output.
