@@ -172,7 +172,7 @@ def test_mcp_server_uses_codex_native_auto_approval_when_enabled():
 def test_mcp_server_preserves_codex_approval_prompts_by_default():
     server, _tool_names = tools_mod.build_inkbox_mcp_server_config(BridgeConfig())
 
-    assert "default_tools_approval_mode" not in server
+    assert server["default_tools_approval_mode"] == "prompt"
 
 
 def test_coding_agent_tool_tier_is_registered():

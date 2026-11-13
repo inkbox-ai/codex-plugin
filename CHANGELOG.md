@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.36
+
+- Reuse valid tunnel certificates across reconnects and renew mismatched or expired state with Inkbox SDK 0.7.38 or newer.
+- Bound tunnel startup and reconcile cancelled attempts before reconnecting, including late listener cleanup.
+
 ## 0.2.35
 
 - Report durable managed message and chat completion timestamps so supervisors can count inactivity after work finishes. Status reads do not extend the idle window.

@@ -1,6 +1,6 @@
 [project]
 name = "codex-plugin"
-version = "0.2.35"
+version = "0.2.36"
 description = "Inkbox bridge for Codex — talk to your coding agent over email, SMS, iMessage, WhatsApp, and voice"
 requires-python = ">=3.11"
 dependencies = [
@@ -8,7 +8,7 @@ dependencies = [
   "croniter>=6.2,<7",
   "tzdata>=2025.1",
   "audioop-lts>=0.2.1; python_version >= '3.13'",
-  "inkbox>=0.7.29,<1.0.0",
+  "inkbox>=0.7.38,<1.0.0",
   "segno>=1.5",  # terminal QR codes for the iMessage connect step
 ]
 
@@ -32,3 +32,6 @@ markers = [
 [build-system]
 requires = ["setuptools==80.9.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.uv.sources]
+inkbox = { git = "https://github.com/inkbox-ai/inkbox.git", rev = "5ebde74b33bd560e9c9818f675ff0c5c6f1cb962", subdirectory = "sdk/python" }

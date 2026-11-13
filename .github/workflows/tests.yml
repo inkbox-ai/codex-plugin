@@ -33,15 +33,15 @@ jobs:
 
       # Live helper regressions exercise the SDK's real pagination offline.
       - name: Install test deps
-        run: uv pip install --system -e . pytest httpx aiohttp segno "croniter>=6.2,<7" "tzdata>=2025.1" "inkbox==0.7.29" "audioop-lts>=0.2.1; python_version >= '3.13'"
+        run: uv pip install --system -e . pytest httpx aiohttp segno "croniter>=6.2,<7" "tzdata>=2025.1" "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python" "audioop-lts>=0.2.1; python_version >= '3.13'"
 
-      - name: Verify released SDK in MCP interpreter
+      - name: Verify pinned SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
 
       - name: Run unit tests
         run: pytest -q
 
-  # Exercise Slack request and response contracts against the released SDK floor.
+  # Exercise Slack request and response contracts against the pinned SDK floor.
   slack-sdk:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
@@ -51,10 +51,10 @@ jobs:
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v8.1.0
-      - name: Install bridge and released SDK
+      - name: Install bridge and pinned SDK
         run: >-
-          uv pip install --system -e . pytest httpx "inkbox==0.7.29"
-      - name: Verify released SDK in MCP interpreter
+          uv pip install --system -e . pytest httpx "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python"
+      - name: Verify pinned SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
 
       - name: Require provisioning-workspace and identity-subscription support
@@ -79,7 +79,7 @@ jobs:
           tests/test_slack_attachments.py tests/test_slack_inbound_files.py tests/test_slack_progress.py tests/test_slack_streams.py
           tests/test_tools.py::test_coding_agent_tool_tier_is_registered
 
-  # Exercise optional native replies against the shared released SDK floor.
+  # Exercise optional native replies against the shared pinned SDK floor.
   imessage-sdk:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
@@ -88,11 +88,12 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Install bridge and released native-reply SDK
+      - uses: astral-sh/setup-uv@v8.1.0
+      - name: Install bridge and pinned native-reply SDK
         run: >-
-          pip install -e . pytest httpx
-          "inkbox==0.7.29"
-      - name: Verify released SDK in MCP interpreter
+          uv pip install --system -e . pytest httpx
+          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python"
+      - name: Verify pinned SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
 
       - name: Require native reply support
@@ -109,7 +110,7 @@ jobs:
           tests/test_imessage_state.py tests/test_imessage_gateway.py
           tests/test_imessage_sdk.py tests/test_companion.py
 
-  # Exercise Slack initialization against the same released SDK floor.
+  # Exercise Slack initialization against the same pinned SDK floor.
   slack-companion-sdk:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 15
@@ -122,11 +123,11 @@ jobs:
         with:
           node-version: "22"
       - uses: astral-sh/setup-uv@v8.1.0
-      - name: Install bridge and released Slack-aware SDK
+      - name: Install bridge and pinned Slack-aware SDK
         run: >-
-          uv pip install --system -e . pytest httpx
-          "inkbox==0.7.29"
-      - name: Verify released SDK in MCP interpreter
+          uv pip install --system -e . pytest httpx "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python"
+          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python"
+      - name: Verify pinned SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
 
       - name: Require Slack initialization support (do not silently skip)
@@ -163,19 +164,19 @@ jobs:
       - name: Install bridge + test deps
         run: |
           uv pip install --system \
-            "inkbox==0.7.29" \
+            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python" \
             -e . pytest
 
       - name: Install pinned Codex
         run: bash "$GITHUB_WORKSPACE/tests/ci/install_codex.sh"
 
-      - name: Verify released SDK in MCP interpreter
+      - name: Verify pinned SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
 
       - name: Contract tests vs real Codex
         run: pytest tests/contract -v
 
-  # Exercise complete Companion initialization with the released SDK and real
+  # Exercise complete Companion initialization with the pinned SDK and real
   # host, using the same supported SDK floor as the other verification lanes.
   companion-sdk:
     runs-on: blacksmith-2vcpu-ubuntu-2404
@@ -189,11 +190,11 @@ jobs:
         with:
           node-version: "22"
       - uses: astral-sh/setup-uv@v8.1.0
-      - name: Install released SDK and test dependencies
+      - name: Install pinned SDK and test dependencies
         run: >-
-          uv pip install --system -e . pytest httpx
-          "inkbox==0.7.29"
-      - name: Verify released SDK in MCP interpreter
+          uv pip install --system -e . pytest httpx "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python"
+          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python"
+      - name: Verify pinned SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
 
       - name: Verify helper is present (do not silently skip its tests)

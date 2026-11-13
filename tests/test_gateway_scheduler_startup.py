@@ -19,7 +19,8 @@ def _gateway(monkeypatch, tmp_path):
     monkeypatch.setattr(gateway, "AIOHTTP_AVAILABLE", True)
     monkeypatch.setattr(gateway, "INKBOX_AVAILABLE", True)
     monkeypatch.setattr(gateway, "Inkbox", lambda **kwargs: SimpleNamespace(
-        get_identity=lambda _: SimpleNamespace(agent_handle="test-agent"),
+        _base_url="https://inkbox.ai",
+        get_identity=lambda _: SimpleNamespace(id="synthetic-identity", agent_handle="test-agent"),
     ))
     sessions = SimpleNamespace(close_all=AsyncMock())
     monkeypatch.setattr(gateway, "SessionManager", lambda **kwargs: sessions)

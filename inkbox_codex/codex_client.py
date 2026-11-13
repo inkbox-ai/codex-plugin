@@ -185,6 +185,7 @@ class CodexAppServerClient:
         process_env: Optional[Dict[str, str]] = None,
         process_started: Optional[Callable[[int], None]] = None,
         turn_started: Optional[TurnStartedHandler] = None,
+        force_tool_approval: bool = False,
     ) -> None:
         self.observation_id = uuid.uuid4().hex
         self.cfg = cfg
@@ -196,6 +197,7 @@ class CodexAppServerClient:
         self._process_env = process_env
         self._process_started = process_started
         self.turn_started = turn_started
+        self.force_tool_approval = force_tool_approval
         self._isolated_process_group = isolate_process_group and os.name == "posix"
         self._owns_process_group = os.name == "posix"
         self._process_group_id: Optional[int] = None
@@ -257,6 +259,36 @@ class CodexAppServerClient:
             await self._initialize()
 
         params = self._thread_params()
+        if self.force_tool_approval:
+            saved = await self._request("config/read", {
+                "includeLayers": False, "cwd": self.cfg.project_dir or None,
+            })
+            servers = (saved.get("config") or {}).get("mcp_servers") or {}
+            if not isinstance(servers, dict) or len(servers) > 128:
+                raise CodexAppServerError("Native MCP approval configuration is unavailable")
+            config = params.setdefault("config", {})
+            if config is None:
+                config = params["config"] = {}
+            for name in ("inkbox", "inkbox_connected"):
+                supplied = config.pop(f"mcp_servers.{name}", None)
+                if supplied is not None:
+                    servers[name] = {**servers.get(name, {}), **supplied}
+            overrides = {}
+            for name, server in servers.items():
+                if not isinstance(name, str) or not isinstance(server, dict):
+                    raise CodexAppServerError("Native MCP approval configuration is invalid")
+                tools = server.get("tools") or {}
+                if not isinstance(tools, dict) or len(tools) > 4096:
+                    raise CodexAppServerError("Native MCP approval configuration exceeds its limits")
+                if any(not isinstance(settings, dict) for settings in tools.values()):
+                    raise CodexAppServerError("Native MCP tool approval configuration is invalid")
+                overrides[name] = {
+                    **{key: value for key, value in server.items() if value is not None},
+                    "default_tools_approval_mode": "prompt",
+                    "tools": {tool: {**settings, "approval_mode": "prompt"}
+                              for tool, settings in tools.items()},
+                }
+            config["mcp_servers"] = overrides
         if resume_thread_id:
             params["threadId"] = resume_thread_id
             result = await self._request("thread/resume", params)

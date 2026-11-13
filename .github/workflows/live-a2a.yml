@@ -63,7 +63,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/codex-home" "$RUNNER_TEMP/project"
 
       - name: Install bridge and protocol driver
-        run: pip install "inkbox==0.7.29" -e .
+        run: pip install "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python" -e .
 
       - name: Install Codex
         run: bash "$GITHUB_WORKSPACE/tests/ci/install_codex.sh"

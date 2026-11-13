@@ -17,13 +17,15 @@ from tests.test_whatsapp import IDENTITY, NOW
 
 @pytest.mark.skipif(shutil.which("codex") is None, reason="needs the codex CLI on PATH")
 def test_real_host_resolves_candidate_and_reads_dynamic_whatsapp_capability(tmp_path, monkeypatch):
-    assert version("inkbox") == "0.7.29"
+    assert version("inkbox") == "0.7.38"
     requests = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             requests.append(self.path)
-            if self.path == "/api/v1/identities/agent":
+            if self.path == "/api/whoami":
+                value = {"auth_type": "api_key", "auth_subtype": "api_key.admin_scoped"}
+            elif self.path == "/api/v1/identities/agent":
                 value = {"id": IDENTITY, "organization_id": "org_example", "agent_handle": "agent",
                          "whatsapp_enabled": False, "whatsapp_configured": True, "created_at": NOW, "updated_at": NOW}
             elif self.path == "/api/v1/identities/agent/channel-status":
@@ -54,7 +56,7 @@ def test_real_host_resolves_candidate_and_reads_dynamic_whatsapp_capability(tmp_
     server, names = build_inkbox_mcp_server_config(cfg, whatsapp_configured=True)
     assert "mcp__inkbox__inkbox_get_whatsapp_status" in names
     wrapper = tmp_path / "checked_mcp.py"
-    wrapper.write_text("from importlib.metadata import version\nfrom inkbox.agent_identity import AgentIdentity\nassert version('inkbox') == '0.7.29'\nassert callable(AgentIdentity.send_whatsapp)\nimport runpy\nrunpy.run_module('inkbox_codex.mcp_stdio', run_name='__main__')\n")
+    wrapper.write_text("from importlib.metadata import version\nfrom inkbox.agent_identity import AgentIdentity\nassert version('inkbox') == '0.7.38'\nassert callable(AgentIdentity.send_whatsapp)\nimport runpy\nrunpy.run_module('inkbox_codex.mcp_stdio', run_name='__main__')\n")
     server["args"] = [str(wrapper)]
 
     async def scenario():
@@ -72,7 +74,8 @@ def test_real_host_resolves_candidate_and_reads_dynamic_whatsapp_capability(tmp_
             assert result["limits"]["usage"] == {"whatsapp.texts_per_agent_identity_per_24h": 7}
             assert requests[-3:] == ["/api/v1/identities/agent", "/api/v1/identities/agent/channel-status",
                                     f"/api/v1/whatsapp/limits?agent_identity_id={IDENTITY}"]
-            assert all(path == "/api/v1/identities/agent" for path in requests[:-3])
+            assert "/api/whoami" in requests[:-3]
+            assert all(path in {"/api/v1/identities/agent", "/api/whoami"} for path in requests[:-3])
         finally:
             await host.disconnect()
     try:

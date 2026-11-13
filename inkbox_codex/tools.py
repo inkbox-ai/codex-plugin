@@ -1962,11 +1962,10 @@ def build_inkbox_mcp_server_config(cfg: Any, *, whatsapp_configured: bool = Fals
         "args": ["-m", "inkbox_codex.mcp_stdio"],
         "env": env,
         "env_vars": ["INKBOX_CODEX_VAULT_KEY"],
-        "startup_timeout_sec": 10.0,
-        "tool_timeout_sec": 60.0,
+        "startup_timeout_sec": 40.0,
+        "tool_timeout_sec": 120.0,
     }
-    if cfg.auto_approve_inkbox_tools:
-        server["default_tools_approval_mode"] = "approve"
+    server["default_tools_approval_mode"] = "approve" if cfg.auto_approve_inkbox_tools else "prompt"
     from .schedule_tools import SCHEDULE_TOOLS
 
     from .whatsapp import TOOLS as WHATSAPP_TOOLS

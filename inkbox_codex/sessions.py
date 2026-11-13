@@ -11,11 +11,13 @@ survive bridge restarts.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import secrets
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -431,6 +433,7 @@ class ContactSession:
 
         self._client_lock = asyncio.Lock()
         self._client: Optional[CodexAppServerClient] = None
+        self._catalog_refreshed_at = time.monotonic()
         self._connecting_client: Optional[CodexAppServerClient] = None
         self._last_closed_host = None
         self._queue: asyncio.Queue[_Turn] = managed_work.TurnQueue()
@@ -1436,8 +1439,9 @@ class ContactSession:
                 from .turn_authority import begin, bind, new_host
                 if self._host_epoch is None:
                     self._host_epoch = new_host(self.chat_id, self.cfg)
+                from .terminal_reply import source as reply_source
                 source = begin(self.chat_id, self.cfg, self._host_epoch, turn.reply_mode or "background",
-                               (turn.reply_meta or {}).get("imessage_context_nonce"))
+                               (turn.reply_meta or {}).get("imessage_context_nonce"), reply_source(turn.reply_mode, turn.reply_meta))
                 self._source_authority = source
                 client.turn_started = lambda thread_id, turn_id: bind(source, thread_id, turn_id)
                 run = client.run_detailed if turn.capture_tools else client.run
@@ -1471,6 +1475,16 @@ class ContactSession:
                 turn_result = await operation
             reply_text = turn_result.text if turn.capture_tools else turn_result
             reply = reply_text.strip()
+            from .terminal_reply import source as reply_source, blocked as terminal_reply_blocked
+            bound_reply = reply_source(turn.reply_mode, turn.reply_meta)
+            if bound_reply and self.identity_info.get("id") and self.identity_info.get("api_origin"):
+                from inkbox.remote_mcp import RemoteMcp
+                from .imessage import _private_dir
+                journal = _private_dir("remote_calls") / ("reply-" + hashlib.sha256(self.chat_id.encode()).hexdigest() + ".sqlite")
+                remote = RemoteMcp(api_key=self.cfg.api_key, base_url=self.identity_info["api_origin"],
+                    identity=self.identity_info["id"], journal_path=journal)
+                if terminal_reply_blocked(remote, bound_reply, journal):
+                    reply = "[SILENT]"
             if self._threaded_turn(turn) and not self._interrupting and not self._shutting_down:
                 already_sent = await self._imessage_state("result", turn.reply_meta or {}, reply)
                 if already_sent is True:
@@ -1727,7 +1741,8 @@ class ContactSession:
 
     async def _connect_client(self) -> CodexAppServerClient:
         if self._client is not None:
-            if getattr(self._client, "is_alive", True):
+            if (getattr(self._client, "is_alive", True)
+                    and (self._turn_active or time.monotonic() - self._catalog_refreshed_at < 300)):
                 return self._client
             client, self._client = self._client, None
             self.resume_session_id = client.thread_id or self.resume_session_id
@@ -1755,13 +1770,17 @@ class ContactSession:
         # including when a native thread is resumed after reconnect.
         client_cfg = (replace(self.cfg, codex_approval_policy="on-request", codex_sandbox="workspace-write")
                       if self.chat_id.startswith("chat:") else self.cfg)
+        server_config = deepcopy(self.mcp_server_config)
+        if self.chat_id.startswith("chat:"):
+            server_config["default_tools_approval_mode"] = "prompt"
         client = CodexAppServerClient(
             client_cfg,
             developer_instructions=developer_instructions,
-            mcp_server_config=self.mcp_server_config,
+            mcp_server_config=server_config,
             approval_handler=self._handle_codex_request,
             # Shell-invoked local commands use the same conversation as MCP.
             process_env={**os.environ, "INKBOX_CODEX_CHAT_ID": self.chat_id, HOST_ENV: self._host_epoch},
+            force_tool_approval=self.chat_id.startswith("chat:"),
         )
         # Capture what we resumed from before it's overwritten with the new
         # thread id below — otherwise the log claims every session resumed.
@@ -1783,6 +1802,7 @@ class ContactSession:
             if self._connecting_client is client:
                 self._connecting_client = None
         self._client = client
+        self._catalog_refreshed_at = time.monotonic()
         if self.on_session_id:
             self.resume_session_id = thread_id
             self.on_session_id(self.chat_id, thread_id)
