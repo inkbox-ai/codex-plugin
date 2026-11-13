@@ -163,3 +163,39 @@ def test_contact_compatibility_arguments_preserve_omitted_fields():
         "patch": {"emails": []},
         "idempotency_key": "operation",
     }
+
+
+def test_native_adapter_rejects_invalid_remote_arguments_before_submission(
+    router, monkeypatch
+):
+    descriptor = tool()
+    descriptor["inputSchema"] = {
+        "type": "object",
+        "properties": {"text": {"type": "string", "minLength": 2}},
+        "required": ["text"],
+        "additionalProperties": False,
+    }
+
+    async def refresh(self):
+        self._catalog = (descriptor,)
+        return [descriptor]
+
+    async def request(*args, **kwargs):
+        pytest.fail("Invalid arguments must not reach the transport")
+
+    monkeypatch.setattr(remote_tools.RemoteMcp, "refresh", refresh)
+    monkeypatch.setattr(remote_tools.RemoteMcp, "request", request)
+
+    async def scenario():
+        await router.refresh([])
+        with pytest.raises(remote_tools.RemoteToolError, match="remote schema"):
+            await router.call(
+                "example_dynamic",
+                {"text": "x"},
+                {
+                    "x-codex-turn-metadata": {"thread_id": "thread", "turn_id": "turn"},
+                    "callId": "invalid-native-call",
+                },
+            )
+
+    asyncio.run(scenario())

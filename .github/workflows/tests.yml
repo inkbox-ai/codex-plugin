@@ -33,7 +33,7 @@ jobs:
 
       # Live helper regressions exercise the SDK's real pagination offline.
       - name: Install test deps
-        run: uv pip install --system -e . pytest httpx aiohttp segno "croniter>=6.2,<7" "tzdata>=2025.1" "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@64bbc6d76c03dd970a14004777f7c6505226d101#subdirectory=sdk/python" "audioop-lts>=0.2.1; python_version >= '3.13'"
+        run: uv pip install --system -e . pytest httpx aiohttp segno "croniter>=6.2,<7" "tzdata>=2025.1" "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python" "audioop-lts>=0.2.1; python_version >= '3.13'"
 
       - name: Verify pinned SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
@@ -53,7 +53,7 @@ jobs:
       - uses: astral-sh/setup-uv@v8.1.0
       - name: Install bridge and pinned SDK
         run: >-
-          uv pip install --system -e . pytest httpx "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@64bbc6d76c03dd970a14004777f7c6505226d101#subdirectory=sdk/python"
+          uv pip install --system -e . pytest httpx "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python"
       - name: Verify pinned SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
 
@@ -92,7 +92,7 @@ jobs:
       - name: Install bridge and pinned native-reply SDK
         run: >-
           uv pip install --system -e . pytest httpx
-          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@64bbc6d76c03dd970a14004777f7c6505226d101#subdirectory=sdk/python"
+          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python"
       - name: Verify pinned SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
 
@@ -125,8 +125,8 @@ jobs:
       - uses: astral-sh/setup-uv@v8.1.0
       - name: Install bridge and pinned Slack-aware SDK
         run: >-
-          uv pip install --system -e . pytest httpx "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@64bbc6d76c03dd970a14004777f7c6505226d101#subdirectory=sdk/python"
-          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@64bbc6d76c03dd970a14004777f7c6505226d101#subdirectory=sdk/python"
+          uv pip install --system -e . pytest httpx "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python"
+          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python"
       - name: Verify pinned SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
 
@@ -164,7 +164,7 @@ jobs:
       - name: Install bridge + test deps
         run: |
           uv pip install --system \
-            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@64bbc6d76c03dd970a14004777f7c6505226d101#subdirectory=sdk/python" \
+            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python" \
             -e . pytest
 
       - name: Install pinned Codex
@@ -192,8 +192,8 @@ jobs:
       - uses: astral-sh/setup-uv@v8.1.0
       - name: Install pinned SDK and test dependencies
         run: >-
-          uv pip install --system -e . pytest httpx "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@64bbc6d76c03dd970a14004777f7c6505226d101#subdirectory=sdk/python"
-          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@64bbc6d76c03dd970a14004777f7c6505226d101#subdirectory=sdk/python"
+          uv pip install --system -e . pytest httpx "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python"
+          "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#subdirectory=sdk/python"
       - name: Verify pinned SDK in MCP interpreter
         run: python tests/ci/assert_released_sdk.py
 
