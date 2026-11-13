@@ -45,6 +45,8 @@ def sdk(monkeypatch, tmp_path):
     def handle(request):
         assert request.url.host == "example.com"
         state.requests.append(request)
+        if request.url.path == "/api/whoami":
+            return httpx.Response(200, json={"auth_type": "api_key", "auth_subtype": "api_key.admin_scoped"})
         if request.url.path == "/api/v1/identities/agent":
             return httpx.Response(200, json=dict(id=IDENTITY, organization_id="org_example", agent_handle="agent",
                 created_at=NOW, updated_at=NOW, imessage_enabled=True, whatsapp_configured=state.whatsapp_configured,
@@ -368,6 +370,8 @@ def test_mcp_refreshes_registration_and_failure_keeps_other_tools(sdk):
     assert "inkbox_send_whatsapp" not in names()
     sdk.whatsapp_configured = True
     assert "inkbox_send_whatsapp" in names()
-    server._client = NS(get_identity=lambda handle: (_ for _ in ()).throw(RuntimeError("offline")))
+    server._client = NS(whoami=sdk.client.whoami,
+                        get_identity=lambda handle: (_ for _ in ()).throw(RuntimeError("offline")))
+    server._remote_tools.client = server._client
     available = names()
     assert "inkbox_send_whatsapp" not in available and "inkbox_list_emails" in available

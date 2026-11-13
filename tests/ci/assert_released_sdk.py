@@ -1,4 +1,4 @@
-"""Prove the registered MCP interpreter resolves the real released SDK."""
+"""Prove the registered MCP interpreter resolves the selected SDK."""
 
 from importlib.metadata import version
 import os

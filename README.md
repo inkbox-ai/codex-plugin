@@ -1154,3 +1154,5 @@ Use a compatible SDK with WhatsApp Companion channel and sender-access support. 
 ### Externally registered schedules
 
 When timing is managed externally, saving a job is a local intent, not confirmation that it is scheduled or has executed. Read `registration_status` in the schedule result: `pending` means registration is still waiting, `registered` confirms acceptance, and `rejected` includes an actionable `registration_error`. A rejected revision is acknowledged once and does not retry indefinitely. Edit the same job to correct it; do not silently change the requested cadence. Execution is confirmed separately in schedule history.
+
+See [Remote Inkbox tools](REMOTE_TOOLS.md) for discovery, permissions, retained local capabilities and retry behavior.

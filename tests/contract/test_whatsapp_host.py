@@ -23,7 +23,9 @@ def test_real_host_resolves_candidate_and_reads_dynamic_whatsapp_capability(tmp_
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             requests.append(self.path)
-            if self.path == "/api/v1/identities/agent":
+            if self.path == "/api/whoami":
+                value = {"auth_type": "api_key", "auth_subtype": "api_key.admin_scoped"}
+            elif self.path == "/api/v1/identities/agent":
                 value = {"id": IDENTITY, "organization_id": "org_example", "agent_handle": "agent",
                          "whatsapp_enabled": False, "whatsapp_configured": True, "created_at": NOW, "updated_at": NOW}
             elif self.path == "/api/v1/identities/agent/channel-status":
@@ -72,7 +74,8 @@ def test_real_host_resolves_candidate_and_reads_dynamic_whatsapp_capability(tmp_
             assert result["limits"]["usage"] == {"whatsapp.texts_per_agent_identity_per_24h": 7}
             assert requests[-3:] == ["/api/v1/identities/agent", "/api/v1/identities/agent/channel-status",
                                     f"/api/v1/whatsapp/limits?agent_identity_id={IDENTITY}"]
-            assert all(path == "/api/v1/identities/agent" for path in requests[:-3])
+            assert "/api/whoami" in requests[:-3]
+            assert all(path in {"/api/v1/identities/agent", "/api/whoami"} for path in requests[:-3])
         finally:
             await host.disconnect()
     try:

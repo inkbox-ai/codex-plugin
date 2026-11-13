@@ -1080,6 +1080,8 @@ class InkboxGateway:
         mailbox = getattr(self._identity, "mailbox", None)
         phone = getattr(self._identity, "phone_number", None)
         identity_info = {
+            "id": str(self._identity.id),
+            "api_origin": self._inkbox._base_url,
             "handle": self._identity.agent_handle,
             "email": str(getattr(mailbox, "email_address", "") or ""),
             "phone": str(getattr(phone, "number", "") or ""),
@@ -4284,6 +4286,8 @@ class InkboxGateway:
             "conversation_id": conversation_id or None,
             "to": sender,
             "sender": sender,
+            "message_id": str(message.get("id") or envelope.get("id") or ""),
+            "recipients": [value for value in participants if value != local_phone] if is_group and local_phone else [sender] if not is_group else [],
             "conversation_kind": "group" if is_group else "direct",
             "raw_text": text,
             "contact": contact,

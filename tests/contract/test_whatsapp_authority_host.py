@@ -29,6 +29,9 @@ def test_actual_host_source_metadata_and_late_cancelled_tool(tmp_path, monkeypat
 
     class Handler(mock_openai.Handler):
         def do_GET(self):
+            if self.path == "/api/whoami":
+                self._send_json(200, {"auth_type": "api_key", "auth_subtype": "api_key.admin_scoped"})
+                return
             if urlsplit(self.path).path == f"/api/v1/whatsapp/conversations/{CONVERSATION}":
                 self._send_json(200, {"id": CONVERSATION, "agent_identity_id": IDENTITY,
                     "local_number": "+15550000001", "remote_number": "+15550000002",

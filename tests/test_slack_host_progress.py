@@ -165,7 +165,7 @@ def test_progress_recovery_requires_exclusive_gateway_ownership(tmp_path, monkey
     from inkbox_codex import gateway, slack_activity
     from inkbox_codex.config import BridgeConfig
     monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
-    sdk = NS(slack=NS(), get_identity=lambda _: NS(id='00000000-0000-4000-8000-000000000001',
+    sdk = NS(_base_url="https://inkbox.ai", slack=NS(), get_identity=lambda _: NS(id='00000000-0000-4000-8000-000000000001',
                                                   agent_handle='agent'))
     monkeypatch.setattr(gateway, 'Inkbox', lambda **kwargs: sdk)
     order = []

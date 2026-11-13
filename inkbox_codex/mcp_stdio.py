@@ -40,6 +40,7 @@ class InkboxMcpServer:
         self.identity = os.getenv("INKBOX_IDENTITY", "")
         self.base_url = os.getenv("INKBOX_BASE_URL", "").strip()
         self._client: Any = None
+        self._remote_tools = None
 
     def _inkbox(self) -> Any:
         if Inkbox is None:
@@ -83,14 +84,27 @@ class InkboxMcpServer:
                 configured = getattr(identity, "whatsapp_configured", False) is True
             except Exception:
                 print("WhatsApp capability lookup unavailable; listing core tools only.", file=sys.stderr)
-            return _response(message_id, {"tools": mcp_tool_list(whatsapp_configured=configured)})
+            catalog = mcp_tool_list(whatsapp_configured=configured)
+            if self.api_key and self.identity:
+                if self._remote_tools is None:
+                    from .remote_tools import RemoteTools
+                    self._remote_tools = RemoteTools(self._inkbox(), self.identity, self.api_key)
+                catalog = await self._remote_tools.refresh(catalog)
+            return _response(message_id, {"tools": catalog})
 
         if method == "tools/call":
             name = str(params.get("name") or "")
             args = params.get("arguments") or {}
+            if self._remote_tools is None and self.api_key and self.identity:
+                from .remote_tools import COMPATIBILITY_NAMES, RemoteToolError
+                if name in COMPATIBILITY_NAMES:
+                    raise RemoteToolError("List the current tool catalog before using a compatibility name")
             client = None if name.startswith("inkbox_schedule_") else self._inkbox()
             with mcp_request(params.get("_meta")):
-                result = await call_inkbox_tool(client, self.identity, name, args)
+                if self._remote_tools is not None and self._remote_tools.routes(name):
+                    result = await self._remote_tools.call(name, args, params.get("_meta"))
+                else:
+                    result = await call_inkbox_tool(client, self.identity, name, args)
             return _response(message_id, result)
 
         return _error(message_id, -32601, f"method not found: {method}")

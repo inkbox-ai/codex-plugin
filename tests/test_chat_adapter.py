@@ -66,6 +66,27 @@ def test_mcp_forms_are_not_mistaken_for_approval(params):
     asyncio.run(scenario())
 
 
+def test_explicit_yolo_accepts_mcp_permission_without_persistent_grant():
+    async def scenario():
+        async def run_chat(prompt, event, request, **kwargs):
+            response = await request("mcpServer/elicitation/request", {
+                "serverName": "example", "message": "Allow this tool?",
+                "requestedSchema": {"type": "object", "properties": {}},
+            })
+            assert response == {"action": "accept", "content": None}
+            return SimpleNamespace(text="Finished", aborted=False)
+
+        async def ask(_):
+            pytest.fail("Explicit YOLO should not request approval")
+
+        session = SimpleNamespace(run_chat=run_chat, resume_session_id="native")
+        adapter = ChatAdapter(SimpleNamespace(get=lambda _: session, sessions={}))
+        await adapter.run({"run_id": str(uuid4()), "session_id": str(uuid4()), "prompt": "Example",
+                           "options": {"approval_policy": "never", "sandbox": "danger-full-access"}}, lambda *_: None, ask)
+
+    asyncio.run(scenario())
+
+
 def test_native_chat_maps_permission_scope_and_structured_questions():
     asyncio.run(native_chat())
 

@@ -102,6 +102,11 @@ class ChatAdapter:
 
                 if not is_approval(params):
                     raise ValueError("Unsupported MCP input form")
+                options = spec.get("options") or {}
+                if (options.get("approval_policy") == "never"
+                        and options.get("sandbox") == "danger-full-access"
+                        and spec["session_id"] not in self.cancelled):
+                    return elicitation_response(params, "allow")
                 result = await ask(
                     {
                         "kind": "approval",
