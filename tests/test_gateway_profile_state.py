@@ -30,7 +30,7 @@ def test_configured_home_isolates_tunnel_without_moving_legacy_a2a_registry(monk
     assert gateway._tunnel_state_dir() == root / 'tunnel'
 
 
-def test_open_tunnel_only_clears_its_own_profile(monkeypatch, tmp_path):
+def test_open_tunnel_preserves_both_profiles_state(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, 'home', classmethod(lambda cls: tmp_path))
     primary = tmp_path / '.inkbox-codex/tunnel'
     primary.mkdir(parents=True)
@@ -48,7 +48,7 @@ def test_open_tunnel_only_clears_its_own_profile(monkeypatch, tmp_path):
     asyncio.run(instance._open_tunnel())
     assert connect.call_args.kwargs['state_dir'] == isolated / 'tunnel'
     assert connect.call_args.kwargs['name'] == 'isolated'
-    assert not stale.exists()
+    assert stale.read_text() == 'old-profile-tunnel'
     assert (primary / 'state.json').read_text() == 'preserve-other-profile'
 
 

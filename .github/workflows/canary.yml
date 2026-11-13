@@ -29,7 +29,7 @@ jobs:
       - name: Install bridge + test deps
         run: |
           uv pip install --system \
-            "inkbox==0.7.29" \
+            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@c35cb8334412e63fb329470acccf264429d337ca#subdirectory=sdk/python" \
             -e . pytest
 
       - name: Install pinned Codex

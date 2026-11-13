@@ -10,6 +10,7 @@ def test_codex_health_reports_api_key(monkeypatch):
 def test_codex_health_reports_subscription(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway.shutil, "which", lambda name: "/usr/bin/codex")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     home = tmp_path
     (home / ".codex").mkdir()
     (home / ".codex" / "auth.json").write_text("{}")
@@ -20,6 +21,7 @@ def test_codex_health_reports_subscription(tmp_path, monkeypatch):
 def test_codex_health_reports_missing_auth(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway.shutil, "which", lambda name: "/usr/bin/codex")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setattr(gateway.Path, "home", classmethod(lambda cls: tmp_path))
     assert "NOT authenticated" in gateway._codex_health()
 
