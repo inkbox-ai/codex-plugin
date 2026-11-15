@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.37
+
+- Deduplicate webhook retries by event ID even when each delivery has a new request ID.
+- Ignore the standard Inkbox email footer when handling approval and cancellation replies.
+
 ## 0.2.36
 
 - Reuse valid tunnel certificates across reconnects and renew mismatched or expired state with Inkbox SDK 0.7.38 or newer.
