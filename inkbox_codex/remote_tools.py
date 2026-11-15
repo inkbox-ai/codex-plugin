@@ -137,7 +137,7 @@ class RemoteTools:
         journal_name = hashlib.sha256(thread_id.encode()).hexdigest() + ".sqlite"
         return await self.remote.call(
             COMPATIBILITY_NAMES.get(name, name),
-            compatibility_arguments(name, arguments, operation_id),
+            compatibility_arguments(name, arguments),
             call_identity=operation_id,
             journal_path=self.root / journal_name,
             before_execute=lambda: validate(origin),

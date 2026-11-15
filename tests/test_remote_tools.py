@@ -146,7 +146,6 @@ def test_contact_compatibility_arguments_preserve_omitted_fields():
     assert remote_tools.compatibility_arguments(
         "inkbox_create_contact",
         {"given_name": "Example", "phones": ["+15550000001"]},
-        "operation",
     ) == {
         "contact": {
             "given_name": "Example",
@@ -154,14 +153,12 @@ def test_contact_compatibility_arguments_preserve_omitted_fields():
                 {"value_e164": "+15550000001", "label": None, "is_primary": True}
             ],
         },
-        "idempotency_key": "operation",
     }
     assert remote_tools.compatibility_arguments(
-        "inkbox_update_contact", {"contact_id": "contact", "emails": []}, "operation"
+        "inkbox_update_contact", {"contact_id": "contact", "emails": []}
     ) == {
         "contact_id": "contact",
         "patch": {"emails": []},
-        "idempotency_key": "operation",
     }
 
 
