@@ -83,7 +83,7 @@ jobs:
       - name: Install bridge + test deps
         run: |
           uv pip install --system \
-            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@b465550e4563ae3b75443ab44d269d15a6238132#subdirectory=sdk/python" \
+            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@84386f5ea022a9594fb901894f927ee444c2cf91#subdirectory=sdk/python" \
             -e . pytest fastapi 'uvicorn[standard]'
 
       - name: Install pinned Codex
