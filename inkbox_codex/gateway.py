@@ -1046,6 +1046,7 @@ class InkboxGateway:
             None
         """
         self._a2a_closing = False
+        self._voice_note_closing = False
         if not AIOHTTP_AVAILABLE:
             raise RuntimeError("aiohttp is not installed; run: pip install aiohttp")
         if not INKBOX_AVAILABLE:
