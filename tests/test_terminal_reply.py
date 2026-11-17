@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 from inkbox.remote_mcp import RemoteMcp, RemoteToolError
 
-from inkbox_codex.terminal_reply import blocked, send, source
+from inkbox_codex.terminal_reply import send, settlement, source
 
 
 def test_terminal_reply_reconciles_uncertainty_and_separates_new_source(tmp_path):
@@ -45,7 +45,7 @@ def test_terminal_reply_reconciles_uncertainty_and_separates_new_source(tmp_path
             identity="example",
             journal_path=path,
         )
-        assert blocked(reopened, bound, path)
+        assert settlement(reopened, bound, path) == "uncertain"
         with pytest.raises(RemoteToolError, match="pending"):
             await send(
                 remote,
@@ -65,7 +65,7 @@ def test_terminal_reply_reconciles_uncertainty_and_separates_new_source(tmp_path
         )
         assert len(calls) == 2
         new = {**bound, "source_id": "message-two"}
-        assert not blocked(reopened, new, path)
+        assert settlement(reopened, new, path) is None
         await send(
             remote, None, "example", new, {"text": "Finished"}, path, lambda: None
         )
@@ -94,7 +94,7 @@ def test_preparation_rejection_does_not_consume_final_reply(tmp_path):
                 remote, None, "example", bound, {"text": "Finished"}, path, lambda: None
             )
         )["isError"]
-        assert not blocked(remote, bound, path)
+        assert settlement(remote, bound, path) is None
 
     asyncio.run(run())
 
@@ -148,7 +148,7 @@ def test_reply_all_uses_current_server_destination_and_rechecks_source(tmp_path)
             "cc": ["other@example.com"],
             "bcc": [],
         }
-        assert not blocked(remote, bound, path)
+        assert settlement(remote, bound, path) is None
 
     asyncio.run(run())
 
@@ -192,6 +192,6 @@ def test_sms_receipt_requires_canonical_acceptance(tmp_path, changes):
             await send(
                 remote, None, "example", bound, {"text": "Finished"}, path, lambda: None
             )
-        assert blocked(remote, bound, path)
+        assert settlement(remote, bound, path) == "uncertain"
 
     asyncio.run(run())

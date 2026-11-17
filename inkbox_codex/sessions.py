@@ -79,6 +79,10 @@ IMESSAGE_BURST_QUIET_SECONDS = 0.75
 IMESSAGE_BURST_MAX_SECONDS = 2.0
 
 
+class _TerminalReplyUncertain(RuntimeError):
+    pass
+
+
 @dataclass
 class _Turn:
     """One unit of work for a session's single Codex client.
@@ -1094,6 +1098,10 @@ class ContactSession:
                         turn.completion.set_exception(CodexAppServerError("Gateway stopped before the reply was confirmed"))
                     else:
                         turn.completion.set_result(None)
+            except _TerminalReplyUncertain as exc:
+                outcome = "uncertain"
+                if turn.completion is not None and not turn.completion.done():
+                    turn.completion.set_exception(exc)
             except Exception as exc:
                 outcome = "cancelled" if self._interrupting else "failed"
                 if turn.completion is not None:
@@ -1475,7 +1483,8 @@ class ContactSession:
                 turn_result = await operation
             reply_text = turn_result.text if turn.capture_tools else turn_result
             reply = reply_text.strip()
-            from .terminal_reply import source as reply_source, blocked as terminal_reply_blocked
+            from .terminal_reply import settlement, source as reply_source
+            reply_state = None
             bound_reply = reply_source(turn.reply_mode, turn.reply_meta)
             if bound_reply and self.identity_info.get("id") and self.identity_info.get("api_origin"):
                 from inkbox.remote_mcp import RemoteMcp
@@ -1483,7 +1492,8 @@ class ContactSession:
                 journal = _private_dir("remote_calls") / ("reply-" + hashlib.sha256(self.chat_id.encode()).hexdigest() + ".sqlite")
                 remote = RemoteMcp(api_key=self.cfg.api_key, base_url=self.identity_info["api_origin"],
                     identity=self.identity_info["id"], journal_path=journal)
-                if terminal_reply_blocked(remote, bound_reply, journal):
+                reply_state = settlement(remote, bound_reply, journal)
+                if reply_state is not None:
                     reply = "[SILENT]"
             if self._threaded_turn(turn) and not self._interrupting and not self._shutting_down:
                 already_sent = await self._imessage_state("result", turn.reply_meta or {}, reply)
@@ -1492,6 +1502,8 @@ class ContactSession:
             if client.thread_id and self.on_session_id:
                 self.resume_session_id = client.thread_id
                 self.on_session_id(self.chat_id, client.thread_id)
+            if reply_state == "uncertain" and turn.future is None:
+                raise _TerminalReplyUncertain("Terminal reply delivery could not be confirmed")
         except Exception as exc:
             # A capture turn must always settle its waiter — surface the error
             # there. A normal turn re-raises so _drain shows the human a notice.

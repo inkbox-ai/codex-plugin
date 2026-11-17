@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.42
+
+- Retain managed inbound work when final reply delivery cannot be confirmed.
+
 ## 0.2.41
 
 ### Changed

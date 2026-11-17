@@ -5,7 +5,7 @@ import pytest
 from inkbox.remote_mcp import RemoteMcp, RemoteToolError
 
 from inkbox_codex.remote_compat import compatibility_arguments
-from inkbox_codex.terminal_reply import blocked, send, source
+from inkbox_codex.terminal_reply import send, settlement, source
 
 
 @pytest.mark.parametrize("action", ["create", "update", "delete"])
@@ -69,11 +69,11 @@ def test_terminal_reply_validates_public_schema_and_recovers_lost_response(tmp_p
         remote.request = request
         with pytest.raises(RemoteToolError, match="lost response"):
             await send(remote, client, "example", bound, {"text": "Done"}, path, lambda: None)
-        assert blocked(remote, bound, path)
+        assert settlement(remote, bound, path) == "uncertain"
         await send(remote, client, "example", bound, {"text": "Done"}, path, lambda: None)
         assert len(requests) == 3
         assert requests[1] == requests[2]
         assert "idempotency_key" not in requests[0]["arguments"]
-        assert blocked(remote, bound, path)
+        assert settlement(remote, bound, path) == "accepted"
 
     asyncio.run(run())

@@ -64,9 +64,9 @@ def source_hash(bound):
     ).hexdigest()
 
 
-def blocked(remote, bound, journal_path):
+def settlement(remote, bound, journal_path):
     if not bound:
-        return False
+        return None
     try:
         receipt = remote.terminal_replies(journal_path=journal_path).lookup(
             source_hash(bound)
@@ -75,15 +75,12 @@ def blocked(remote, bound, journal_path):
         logging.getLogger(__name__).warning(
             "Terminal reply receipt unavailable; automatic reply withheld"
         )
-        return True
-    return bool(
-        receipt
-        and (
-            receipt["state"] == "accepted"
-            or receipt["state"] == "pending"
-            and receipt["submitted"]
-        )
-    )
+        return "uncertain"
+    if receipt and receipt["state"] == "accepted":
+        return "accepted"
+    if receipt and receipt["state"] == "pending" and receipt["submitted"]:
+        return "uncertain"
+    return None
 
 
 async def send(
