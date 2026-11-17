@@ -767,6 +767,7 @@ def _delivery_failure_reply_instruction(
 # logged without waking the agent.
 TEXT_EVENTS = [
     "text.received",
+    "text.transcription_finished",
     "text.sent",
     "text.delivered",
     "text.delivery_failed",
@@ -774,6 +775,7 @@ TEXT_EVENTS = [
 ]
 IMESSAGE_EVENTS = [
     "imessage.received",
+    "imessage.transcription_finished",
     "imessage.sent",
     "imessage.delivered",
     "imessage.delivery_failed",
@@ -979,6 +981,7 @@ class InkboxGateway:
         self._managed_draining = False
         self._managed_ingress = 0
         self.sessions: Optional[SessionManager] = None
+        self._voice_note_closing = False
         self._slack_activity = None
         self._companion_receiver = None
         self._scheduler = None
@@ -1132,6 +1135,7 @@ class InkboxGateway:
         retire(self.cfg)
         await self._recover_imessage_inputs()
         receiver.recover()
+        self._voice_note_inbox().recover()
         await asyncio.to_thread(self._patch_identity_objects)
         await self._catch_up_a2a_tasks()
         await self._recover_hosted_call_completions()
@@ -1404,7 +1408,41 @@ class InkboxGateway:
             _reconcile({"agent_identity_id": identity.id}, CALL_EVENTS)
         logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
+    def _voice_note_inbox(self):
+        if getattr(self, "_voice_note_closing", False):
+            raise RuntimeError("Voice-note intake is shutting down")
+        from .voice_notes import VoiceNotes
+        inbox = getattr(self, "_voice_note_state", None)
+        if inbox is None:
+            root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
+            identity_id = str(self._identity.id)
+            inbox = self._voice_note_state = VoiceNotes(
+                root / f"voice-notes-{identity_id}.sqlite3", self._identity,
+                self._inkbox, self._deliver_voice_note,
+            )
+        return inbox
+
+    async def _deliver_voice_note(self, envelope):
+        event_type = envelope.get("event_type")
+        if event_type == "text.received":
+            return await self._on_text_received(envelope)
+        if event_type == "imessage.received":
+            return await self._on_imessage_received(envelope)
+        from .whatsapp import receive
+        return await receive(self, envelope)
+
+    def _voice_note_receipt(self, event_type, envelope):
+        from .voice_notes import FINISHED, RECEIVED, message_for, pending
+        if event_type in FINISHED:
+            self._voice_note_inbox().complete(envelope)
+            return web.json_response({"ok": True})
+        if event_type in RECEIVED and (pending(message_for(envelope)) or getattr(self, "_voice_note_state", None) is not None):
+            if self._voice_note_inbox().defer(envelope):
+                return web.json_response({"ok": True, "pending_transcription": True})
+        return None
+
     async def _cleanup(self) -> None:
+        self._voice_note_closing = True
         if self._managed_control is not None:
             await self._managed_control.close()
             self._managed_control = None
@@ -1448,6 +1486,9 @@ class InkboxGateway:
             await asyncio.gather(*jobs, return_exceptions=True)
         if getattr(self, "_companion_receiver", None) is not None:
             await self._companion_receiver.close()
+        if getattr(self, "_voice_note_state", None) is not None:
+            await self._voice_note_state.close()
+            self._voice_note_state = None
         if self.sessions is not None:
             await self.sessions.close_all()
         if getattr(self, "_slack_activity", None) is not None:
@@ -2119,6 +2160,12 @@ class InkboxGateway:
             or (envelope.get("direction") == "inbound" and envelope.get("local_phone_number"))
         )
 
+    async def _resolve_companion_voice_note(self, channel, message):
+        from .voice_notes import pending
+        if not pending(message):
+            return message
+        return await self._voice_note_inbox().resolve_message("text" if channel == "phone" else channel, message)
+
     async def _prepare_whatsapp_companion(self, envelope, *, enrich=False):
         from .whatsapp import prepare_companion
         return await prepare_companion(self, envelope, enrich=enrich)
@@ -2131,6 +2178,7 @@ class InkboxGateway:
                 cfg=self.cfg, client=self._inkbox, sessions=self.sessions,
                 sender_allowed=self._sender_allowed, mail_body=self._fetch_mail_body,
                 prepare_whatsapp=self._prepare_whatsapp_companion,
+                resolve_voice_note=self._resolve_companion_voice_note,
             )
         return self._companion_receiver
 
@@ -2218,6 +2266,10 @@ class InkboxGateway:
             ):
                 return web.Response(status=401, text="WhatsApp requires a valid Inkbox signature")
 
+        from .voice_notes import FINISHED
+        if source == "inkbox" and envelope.get("event_type") in FINISHED:
+            return self._voice_note_receipt(envelope["event_type"], envelope)
+
         if envelope.get("companion") is not None:
             # Context grants require a verified Inkbox signature even when the
             # operator permits unsigned ordinary webhooks for local testing.
@@ -2297,6 +2349,9 @@ class InkboxGateway:
 
         if event_type in (*SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT):
             return await self._on_slack_received(envelope)
+        voice_receipt = self._voice_note_receipt(event_type, envelope)
+        if voice_receipt is not None:
+            return voice_receipt
         if event_type == "message.received":
             return await self._on_mail_received(envelope)
         if event_type == "text.received":
@@ -4510,12 +4565,16 @@ class InkboxGateway:
         """
         if not media:
             return text
+        from .voice_notes import transcript_note
+        text += transcript_note(media)
         saved = await download_media(media, prefix=prefix)
         if image_paths is not None:
             image_paths.extend(item["path"] for item in saved if item["content_type"].startswith("image/"))
             from .slack_media import transcribe_audio
             for item in saved:
                 if not item["content_type"].startswith("audio/"):
+                    continue
+                if (item.get("transcription") or {}).get("status") == "completed":
                     continue
                 key = getattr(getattr(self.cfg, "realtime", None), "api_key", "")
                 try:

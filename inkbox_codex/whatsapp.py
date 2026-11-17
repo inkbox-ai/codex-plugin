@@ -29,7 +29,7 @@ REPLY_REJECTED_NOTICE = (
 )
 
 
-EVENTS = ["whatsapp.received", "whatsapp.sent", "whatsapp.delivered", "whatsapp.delivery_failed", "whatsapp.delivery_unconfirmed", "whatsapp.reaction_received"]
+EVENTS = ["whatsapp.received", "whatsapp.sent", "whatsapp.delivered", "whatsapp.delivery_failed", "whatsapp.delivery_unconfirmed", "whatsapp.reaction_received", "whatsapp.transcription_finished"]
 _REJECTED_SEND_CODES = {
     409: {"whatsapp_group_reply_required"},
     403: {"whatsapp_not_eligible", "whatsapp_access_required", "whatsapp_contact_not_allowed", "whatsapp_media_source_not_allowed"},
@@ -237,6 +237,7 @@ async def render_reply_context(gateway, item):
 
 async def with_media(gateway, message, text):
     """Refresh owned attachments and preserve native inputs for both receive paths."""
+    from .voice_notes import transcript_note
     media = message.get("media") or []
     if not media:
         return text, []
@@ -245,6 +246,7 @@ async def with_media(gateway, message, text):
     refreshed = []
     for item in media:
         if item.get("status") == "unavailable":
+            text += transcript_note([item])
             text += "\n[WhatsApp attachment unavailable]"
             continue
         try:
@@ -252,17 +254,20 @@ async def with_media(gateway, message, text):
                 require_method(identity, "get_whatsapp_media"), item["id"]
             )
         except Exception:
+            text += transcript_note([item])
             text += "\n[WhatsApp attachment unavailable; do not guess its contents]"
             continue
         if field(fresh, "status") == "ready" and field(fresh, "url"):
             refreshed.append(
                 {
+                    "transcription": item.get("transcription"),
                     "url": field(fresh, "url"),
                     "content_type": field(fresh, "content_type"),
                     "size": field(fresh, "size"),
                 }
             )
         else:
+            text += transcript_note([item])
             text += "\n[WhatsApp attachment unavailable]"
     image_paths = []
     body = await gateway._with_media(
