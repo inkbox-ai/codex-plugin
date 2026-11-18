@@ -188,12 +188,14 @@ def test_a2a_imessage_and_call_use_channel_coherent_subscriptions():
     )
 
     assert [created["event_types"] for created in subscriptions.created] == [
+        gateway_mod.TRANSCRIPTION_EVENTS,
         gateway_mod.A2A_EVENTS,
         WHATSAPP_EVENTS,
         gateway_mod.IMESSAGE_EVENTS,
         gateway_mod.CALL_EVENTS,
     ]
     assert [created["url"] for created in subscriptions.created] == [
+        "https://agent.inkboxwire.com/webhook",
         "https://agent.inkboxwire.com/webhook",
         "https://agent.inkboxwire.com/webhook",
         "https://agent.inkboxwire.com/webhook",
@@ -215,6 +217,7 @@ def test_imessage_reconcile_preserves_existing_a2a_channel_subscription():
 
     assert subscriptions.deleted == []
     assert subscriptions.created == [
+        {"agent_identity_id": "identity-1", "url": "https://agent.inkboxwire.com/webhook", "event_types": gateway_mod.TRANSCRIPTION_EVENTS},
         {
             "agent_identity_id": "identity-1",
             "url": "https://agent.inkboxwire.com/webhook",
@@ -240,7 +243,7 @@ def test_a2a_only_subscription_is_skipped_on_older_api():
         subscriptions=subscriptions,
     )
 
-    assert subscriptions.created == [{"agent_identity_id": "identity-1", "url": "https://agent.inkboxwire.com/webhook", "event_types": WHATSAPP_EVENTS}]
+    assert subscriptions.created == [{"agent_identity_id": "identity-1", "url": "https://agent.inkboxwire.com/webhook", "event_types": gateway_mod.TRANSCRIPTION_EVENTS}, {"agent_identity_id": "identity-1", "url": "https://agent.inkboxwire.com/webhook", "event_types": WHATSAPP_EVENTS}]
 
 
 def test_old_api_without_reactions_still_registers_direct_whatsapp_callbacks():
@@ -265,7 +268,7 @@ class _IdentityScopedWhatsAppSubscriptions(_FakeSubscriptions):
         if kwargs.get("scope") != "identity":
             return []
         self.lookups.append(kwargs)
-        if self.race and len(self.lookups) == 1:
+        if self.race and len(self.lookups) == 2:
             return []
         return list(self.existing)
 
@@ -286,7 +289,7 @@ def test_whatsapp_scoped_lookup_adopts_mixed_receiver_and_race():
         _patched_gateway(_Identity(phone=False), subscriptions=subscriptions)
         assert subscriptions.deleted == []
         assert len([row for row in subscriptions.created if row["event_types"] == WHATSAPP_EVENTS]) == int(race)
-        assert subscriptions.lookups == [{"agent_identity_id": "identity-1", "scope": "identity"}] * (1 + int(race))
+        assert subscriptions.lookups == [{"agent_identity_id": "identity-1", "scope": "identity"}] * (2 + int(race))
 
 
 def test_whatsapp_incomplete_mixed_receiver_is_not_deleted_on_conflict():

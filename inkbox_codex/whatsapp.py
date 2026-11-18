@@ -29,7 +29,7 @@ REPLY_REJECTED_NOTICE = (
 )
 
 
-EVENTS = ["whatsapp.received", "whatsapp.sent", "whatsapp.delivered", "whatsapp.delivery_failed", "whatsapp.delivery_unconfirmed", "whatsapp.reaction_received", "whatsapp.transcription_finished"]
+EVENTS = ["whatsapp.received", "whatsapp.sent", "whatsapp.delivered", "whatsapp.delivery_failed", "whatsapp.delivery_unconfirmed", "whatsapp.reaction_received"]
 _REJECTED_SEND_CODES = {
     409: {"whatsapp_group_reply_required"},
     403: {"whatsapp_not_eligible", "whatsapp_access_required", "whatsapp_contact_not_allowed", "whatsapp_media_source_not_allowed"},

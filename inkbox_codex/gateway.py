@@ -95,6 +95,7 @@ try:
     from .codex_client import CodexTurnResult, probe_codex
     from .a2a_delegations import find_by_task as find_a2a_delegation
     from .media import download_media, inbound_media_note
+    from .voice_notes import FINISHED
     from .hosted_sms_guard import hosted_sms_attempt_state
     from .prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
     from .realtime import (
@@ -126,6 +127,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from codex_client import CodexTurnResult, probe_codex
     from a2a_delegations import find_by_task as find_a2a_delegation
     from media import download_media, inbound_media_note
+    from voice_notes import FINISHED
     from hosted_sms_guard import hosted_sms_attempt_state
     from prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
     from realtime import (
@@ -767,7 +769,6 @@ def _delivery_failure_reply_instruction(
 # logged without waking the agent.
 TEXT_EVENTS = [
     "text.received",
-    "text.transcription_finished",
     "text.sent",
     "text.delivered",
     "text.delivery_failed",
@@ -775,7 +776,6 @@ TEXT_EVENTS = [
 ]
 IMESSAGE_EVENTS = [
     "imessage.received",
-    "imessage.transcription_finished",
     "imessage.sent",
     "imessage.delivered",
     "imessage.delivery_failed",
@@ -795,6 +795,13 @@ A2A_RECEIPT_TEMPLATE = "Task {task_id} received. Work is queued and starting."
 # Mail: inbound plus the two delivery-failure transitions that feed the loop
 # (_on_mail_delivery_failed). The success transitions stay unsubscribed — they
 # would pay signature cost on every outbound email for no behaviour.
+TRANSCRIPTION_EVENTS = [FINISHED]
+
+
+def _subscription_family(event_type: str) -> str:
+    return event_type if event_type in TRANSCRIPTION_EVENTS else event_type.split(".", 1)[0]
+
+
 MAIL_EVENTS = ["message.received", "message.bounced", "message.failed"]
 
 
@@ -1280,7 +1287,8 @@ class InkboxGateway:
             subscription_url: str = webhook_url,
         ) -> None:
             whatsapp = any(event.startswith("whatsapp.") for event in event_types)
-            lookup_kw = {**owner_kw, "scope": "identity"} if whatsapp else owner_kw
+            identity_scope = whatsapp or event_types == TRANSCRIPTION_EVENTS
+            lookup_kw = {**owner_kw, "scope": "identity"} if identity_scope else owner_kw
             subscriptions = self._inkbox.webhooks.subscriptions
             try:
                 existing = subscriptions.list(**lookup_kw)
@@ -1292,9 +1300,9 @@ class InkboxGateway:
                     return
                 raise
             desired_families = {
-                event_type.split(".", 1)[0] for event_type in event_types
+                _subscription_family(event_type) for event_type in event_types
             }
-            if whatsapp and any(sub.url == subscription_url and set(event_types).issubset(sub.event_types)
+            if identity_scope and any(sub.url == subscription_url and set(event_types).issubset(sub.event_types)
                                 for sub in existing):
                 return
             for sub in existing:
@@ -1304,12 +1312,12 @@ class InkboxGateway:
                 ):
                     return  # already wired
                 existing_families = {
-                    event_type.split(".", 1)[0] for event_type in sub.event_types
+                    _subscription_family(event_type) for event_type in sub.event_types
                 }
                 if (
                     sub.url.split("?", 1)[0].endswith(DEFAULT_WEBHOOK_PATH)
                     and desired_families & existing_families
-                    and (not whatsapp or (existing_families <= desired_families
+                    and (not identity_scope or (existing_families <= desired_families
                                           and sub.url == subscription_url))
                 ):
                     # Replace only this event channel. One identity may have
@@ -1318,13 +1326,19 @@ class InkboxGateway:
             try:
                 subscriptions.create(url=subscription_url, event_types=event_types, **owner_kw)
             except Exception as exc:
-                if whatsapp and getattr(exc, "status_code", None) == 409:
+                if identity_scope and getattr(exc, "status_code", None) == 409:
                     # Another startup may have installed the same receiver.
                     for sub in subscriptions.list(**lookup_kw):
                         if sub.url == subscription_url and set(event_types).issubset(sub.event_types):
                             return
                 raise
 
+        try:
+            _reconcile({"agent_identity_id": identity.id}, TRANSCRIPTION_EVENTS)
+        except ValueError as exc:
+            if not str(exc).startswith("Identity-wide webhook subscriptions are not supported by this server yet."):
+                raise
+            logger.warning("Transcription callbacks are unavailable on this API version")
         if identity.mailbox is not None:
             _reconcile({"mailbox_id": identity.mailbox.id}, MAIL_EVENTS)
             logger.info("[bridge] mailbox %s → %s", identity.mailbox.email_address, webhook_url)
@@ -1433,8 +1447,8 @@ class InkboxGateway:
         return await receive(self, envelope)
 
     def _voice_note_receipt(self, event_type, envelope):
-        from .voice_notes import FINISHED, RECEIVED, message_for, pending
-        if event_type in FINISHED:
+        from .voice_notes import RECEIVED, message_for, pending
+        if event_type == FINISHED:
             self._voice_note_inbox().complete(envelope)
             return web.json_response({"ok": True})
         if event_type in RECEIVED and (pending(message_for(envelope)) or getattr(self, "_voice_note_state", None) is not None):
@@ -2267,8 +2281,7 @@ class InkboxGateway:
             ):
                 return web.Response(status=401, text="WhatsApp requires a valid Inkbox signature")
 
-        from .voice_notes import FINISHED
-        if source == "inkbox" and envelope.get("event_type") in FINISHED:
+        if source == "inkbox" and envelope.get("event_type") == FINISHED:
             return self._voice_note_receipt(envelope["event_type"], envelope)
 
         if envelope.get("companion") is not None:
