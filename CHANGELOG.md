@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.36 (unreleased)
+## 0.2.43 (unreleased)
 
 - Wait up to 60 seconds for incoming voice-note transcripts, then read the message once before continuing with its original attachments.
 - Register transcription-completion notifications automatically and label generated voice-note text distinctly from typed messages.
