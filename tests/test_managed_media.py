@@ -81,3 +81,57 @@ def test_dispatch_refresh_failure_is_unknown_without_starting_agent(tmp_path, mo
             await asyncio.gather(task, return_exceptions=True)
             ingress.inbox.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_media_refresh_preserves_accepted_transcript_and_attachment_identity(legacy):
+    async def scenario():
+        accepted = {"id": "attachment-1", "url": "https://example.test/expired",
+                    "content_type": "audio/wav", "transcription": {"status": "completed", "text": "A recorded update."}}
+        original = {"event_type": "imessage.received", "data": {"message": {
+            "id": "source-message", "content": "Original caption", "media": [accepted]}}}
+        fresh = {"url": "https://example.test/refreshed", "content_type": "audio/wav"}
+        if not legacy:
+            fresh["id"] = "attachment-1"
+        gateway = SimpleNamespace(_identity=SimpleNamespace(get_imessage=Mock(return_value={
+            "id": "source-message", "content": "Ignored replacement text", "media": [fresh]})))
+        result = await refresh_media(gateway, original)
+        refreshed = result["data"]["message"]
+        assert refreshed["content"] == "Original caption"
+        assert refreshed["media"][0] == {**accepted, "url": "https://example.test/refreshed"}
+        assert original["data"]["message"]["media"][0]["url"] == "https://example.test/expired"
+    asyncio.run(scenario())
+
+
+def test_media_refresh_matches_ids_after_reordering_and_keeps_fresh_terminal_errors():
+    async def scenario():
+        original = {"event_type": "imessage.received", "data": {"message": {"id": "source-message", "media": [
+            {"id": "one", "transcription": {"status": "pending"}},
+            {"id": "two", "transcription": {"status": "completed", "text": "Original result"}},
+        ]}}}
+        gateway = SimpleNamespace(_identity=SimpleNamespace(get_imessage=Mock(return_value={
+            "id": "source-message", "media": [
+                {"id": "two", "url": "https://example.test/two"},
+                {"id": "one", "url": "https://example.test/one", "transcription": {"status": "failed", "error_code": "source_unavailable"}},
+            ]})))
+        result = (await refresh_media(gateway, original))["data"]["message"]["media"]
+        assert [item["id"] for item in result] == ["one", "two"]
+        assert result[0]["url"] == "https://example.test/one"
+        assert result[0]["transcription"] == {"status": "failed", "error_code": "source_unavailable"}
+        assert result[1]["transcription"] == {"status": "completed", "text": "Original result"}
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("foreign_message,foreign_attachment", [(True, False), (False, True)])
+def test_media_refresh_rejects_foreign_message_or_attachment(foreign_message, foreign_attachment):
+    async def scenario():
+        original = {"event_type": "imessage.received", "data": {"message": {"id": "source-message", "media": [
+            {"id": "attachment-1", "transcription": {"status": "completed", "text": "Accepted result"}},
+        ]}}}
+        gateway = SimpleNamespace(_identity=SimpleNamespace(get_imessage=Mock(return_value={
+            "id": "other-message" if foreign_message else "source-message", "media": [
+                {"id": "other-attachment" if foreign_attachment else "attachment-1", "url": "https://example.test/other"},
+            ]})))
+        with pytest.raises(ValueError, match="identity"):
+            await refresh_media(gateway, original)
+    asyncio.run(scenario())

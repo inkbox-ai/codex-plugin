@@ -64,7 +64,7 @@ class ManagedIngress:
 async def refresh_media(gateway, payload):
     """Refresh expiring media at dispatch, including deliveries with no retry.
 
-    Read through the identity-scoped SDK. Only media is replaced; routing and
+    Read through the identity-scoped SDK. Only media URLs are refreshed; routing and
     sender authorization continue to use the accepted delivery. Lookup failures
     propagate so a media-only message cannot silently run without its files.
     """
@@ -82,8 +82,29 @@ async def refresh_media(gateway, payload):
         raise ValueError('Media message identity required')
     lookup = gateway._identity.get_text if channel == 'text.received' else gateway._identity.get_imessage
     fresh = await asyncio.to_thread(lookup, message_id)
+    fresh_id = fresh.get('id') if isinstance(fresh, dict) else getattr(fresh, 'id', None)
+    if fresh_id is not None and str(fresh_id) != str(message_id):
+        raise ValueError('Fresh media message identity mismatch')
     media = fresh.get('media') if isinstance(fresh, dict) else fresh.media
     if not media:
         raise ValueError('Fresh media unavailable')
     media = [asdict(item) if is_dataclass(item) else dict(item) for item in media]
-    return {**payload, 'data': {**payload['data'], key: {**message, 'media': media}}}
+    accepted = message['media']
+    modern = any(item.get('id') for item in media)
+    by_id = {str(item['id']): item for item in media if item.get('id')}
+    refreshed = []
+    for index, item in enumerate(accepted):
+        match = by_id.get(str(item['id'])) if modern and item.get('id') else None
+        if match is None and not modern and len(media) == len(accepted):
+            candidate = media[index]
+            if not (item.get('content_type') and candidate.get('content_type')
+                    and item['content_type'] != candidate['content_type']):
+                match = candidate
+        if match is None:
+            raise ValueError('Fresh attachment identity unavailable')
+        current = {**item, 'url': match.get('url')}
+        result = match.get('transcription')
+        if isinstance(result, dict) and result.get('status') in {'completed', 'failed', 'skipped'}:
+            current['transcription'] = result
+        refreshed.append(current)
+    return {**payload, 'data': {**payload['data'], key: {**message, 'media': refreshed}}}
