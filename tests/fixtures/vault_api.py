@@ -43,6 +43,8 @@ class VaultAPI:
         self.requests.append(request)
         assert request.method == "GET"
         assert request.headers["X-API-Key"] == "synthetic-agent-key"
+        if request.url.path == "/api/whoami":
+            return httpx.Response(200, json={"auth_type": "api_key", "auth_subtype": "api_key.admin_scoped"})
         if request.url.path == "/api/v1/contacts":
             return httpx.Response(200, json=[])
         path = request.url.path.removeprefix("/api/v1/vault")

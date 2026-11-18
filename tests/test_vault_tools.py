@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -24,6 +25,11 @@ def vault(monkeypatch, tmp_path):
     monkeypatch.setattr("inkbox._config._CONFIG_PATH", tmp_path / "missing-config")
     monkeypatch.setattr("inkbox._http.httpx.HTTPTransport", lambda **kw: httpx.MockTransport(api.respond))
     server = InkboxMcpServer()
+    from inkbox_codex.remote_tools import RemoteTools
+    client = server._inkbox()
+    monkeypatch.setattr(client, "whoami", lambda: SimpleNamespace(auth_subtype="api_key.admin_scoped"))
+    server._remote_tools = RemoteTools(client, server.identity, server.api_key)
+    asyncio.run(server._remote_tools.refresh([]))
     yield server, api
     if server._client is not None:
         server._client.close()

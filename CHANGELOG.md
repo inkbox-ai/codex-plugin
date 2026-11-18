@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.42
+
+- Retain managed inbound work when final reply delivery cannot be confirmed.
+
+## 0.2.41
+
+### Changed
+- Require Inkbox SDK 0.7.39 for durable messaging and remote tool handling.
+
+## 0.2.40
+
+- Make managed diagnostics use a recent runtime health report instead of terminal signing-key or ordinary webhook settings. Keep standalone checks and report unavailable runtime evidence.
+
+## 0.2.39
+
+- Accept empty MCP continuation input requests through the pinned SDK revision.
+
+- Keep contact and terminal-reply MCP arguments within the advertised schema while retaining durable operation identity and retry receipts.
+
+## 0.2.38
+
+- Retry incomplete live-test call cleanup and verify calls have ended between tests.
+
+## 0.2.37
+
+- Deduplicate incoming message and call-completion retries by event ID even when each delivery has a new request ID.
+- Ignore the standard Inkbox email footer when handling approval and cancellation replies.
+
+## 0.2.36
+
+- Reuse valid tunnel certificates across reconnects and renew mismatched or expired state with Inkbox SDK 0.7.38 or newer.
+- Bound tunnel startup and reconcile cancelled attempts before reconnecting, including late listener cleanup.
+
 ## 0.2.35
 
 - Report durable managed message and chat completion timestamps so supervisors can count inactivity after work finishes. Status reads do not extend the idle window.

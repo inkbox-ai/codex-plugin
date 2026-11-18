@@ -29,6 +29,9 @@ def test_actual_host_source_metadata_and_late_cancelled_tool(tmp_path, monkeypat
 
     class Handler(mock_openai.Handler):
         def do_GET(self):
+            if self.path == "/api/whoami":
+                self._send_json(200, {"auth_type": "api_key", "auth_subtype": "api_key.admin_scoped"})
+                return
             if urlsplit(self.path).path == f"/api/v1/whatsapp/conversations/{CONVERSATION}":
                 self._send_json(200, {"id": CONVERSATION, "agent_identity_id": IDENTITY,
                     "local_number": "+15550000001", "remote_number": "+15550000002",
@@ -141,7 +144,10 @@ def test_actual_host_source_metadata_and_late_cancelled_tool(tmp_path, monkeypat
                 while not dispatched.exists():
                     await asyncio.sleep(0.01)
             await asyncio.wait_for(tool_dispatched(), 10)
-            actual_origin = json.loads(dispatched.read_text())["x-codex-turn-metadata"]
+            metadata = json.loads(dispatched.read_text())
+            assert metadata["callId"] == "call_source"
+            assert metadata["itemId"] == "fc_source"
+            actual_origin = metadata["x-codex-turn-metadata"]
             assert actual_origin["thread_id"] == host.thread_id
             assert actual_origin["turn_id"] == host._current_turn_id
             if origin == "native-stopped":

@@ -46,7 +46,7 @@ def new_host(chat_id: str, cfg: Any) -> str:
 
 
 def begin(chat_id: str, cfg: Any, host_epoch: str, channel: str,
-          native_nonce: str | None = None) -> dict[str, Any]:
+          native_nonce: str | None = None, reply_source: dict | None = None) -> dict[str, Any]:
     """Publish only a source actually submitted to this host, never an arrival hint."""
     path = _path(chat_id)
     with _context_lock(path):
@@ -57,6 +57,7 @@ def begin(chat_id: str, cfg: Any, host_epoch: str, channel: str,
         record = {
             **record, "source_epoch": secrets.token_hex(16), "state": "active",
             "channel": channel, "native_nonce": native_nonce, "thread_id": None, "turn_id": None,
+            "reply_source": reply_source,
         }
         _write_context(path, record)
         return record

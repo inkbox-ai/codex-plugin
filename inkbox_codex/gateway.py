@@ -1080,6 +1080,8 @@ class InkboxGateway:
         mailbox = getattr(self._identity, "mailbox", None)
         phone = getattr(self._identity, "phone_number", None)
         identity_info = {
+            "id": str(self._identity.id),
+            "api_origin": self._inkbox._base_url,
             "handle": self._identity.agent_handle,
             "email": str(getattr(mailbox, "email_address", "") or ""),
             "phone": str(getattr(phone, "number", "") or ""),
@@ -1225,13 +1227,12 @@ class InkboxGateway:
         # filter those before the runtime starts so they don't bury real logs.
         _install_tunnel_log_filter()
         state_dir = _tunnel_state_dir()
-        # Wipe SDK tunnel state so a stale tunnel_id can't wedge reconnects.
-        shutil.rmtree(state_dir, ignore_errors=True)
-        state_dir.mkdir(parents=True, exist_ok=True)
 
         name = self.cfg.tunnel_name or self.cfg.identity
-        self._tunnel = await asyncio.to_thread(
-            inkbox_tunnel_connect,
+        from .tunnel_bootstrap import connect_tunnel
+
+        self._tunnel = await connect_tunnel(
+            self, inkbox_tunnel_connect,
             self._inkbox,
             name=name,
             forward_to=f"http://127.0.0.1:{self.cfg.port}",
@@ -2240,7 +2241,11 @@ class InkboxGateway:
                 return web.Response(status=422, text=str(exc))
             return web.json_response({"ok": True, "deduped": not fresh})
 
-        if self._dedup_begin(request_id):
+        event_id = envelope.get("id") if source == "inkbox" and envelope.get("event_type") in (
+            "message.received", "text.received", "imessage.received", "call.ended",
+        ) else None
+        dedup_id = f"inkbox:event:{event_id}" if isinstance(event_id, str) and event_id else request_id
+        if self._dedup_begin(dedup_id):
             return web.json_response({"ok": True, "deduped": True})
         try:
             event_type = str(envelope.get("event_type") or "")
@@ -2269,9 +2274,9 @@ class InkboxGateway:
                 logger.debug("[bridge] ignored event %s (source=%s)", event_type, source)
                 response = web.json_response({"ok": True, "ignored": event_type})
         except Exception:
-            self._dedup_rollback(request_id)
+            self._dedup_rollback(dedup_id)
             raise
-        self._dedup_commit(request_id)
+        self._dedup_commit(dedup_id)
         return response
 
     async def _route_inkbox_event(
@@ -3890,6 +3895,8 @@ class InkboxGateway:
 
         subject = str(message.get("subject") or "")
         body_text = await asyncio.to_thread(self._fetch_mail_body, message)
+        if body_text.rstrip().endswith("\n\nSent via Inkbox (https://inkbox.ai)"):
+            body_text = body_text.rstrip().removesuffix("\n\nSent via Inkbox (https://inkbox.ai)")
         if message.get("has_attachments"):
             saved = await self._fetch_mail_attachments(message)
             body_text = (body_text + inbound_media_note(saved)).strip()
@@ -4285,6 +4292,8 @@ class InkboxGateway:
             "conversation_id": conversation_id or None,
             "to": sender,
             "sender": sender,
+            "message_id": str(message.get("id") or envelope.get("id") or ""),
+            "recipients": [value for value in participants if value != local_phone] if is_group and local_phone else [sender] if not is_group else [],
             "conversation_kind": "group" if is_group else "direct",
             "raw_text": text,
             "contact": contact,

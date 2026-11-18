@@ -25,12 +25,13 @@ pytestmark = pytest.mark.skipif(CODEX_BIN is None, reason="contract suite: needs
 @pytest.mark.parametrize("decision", ["accept", "decline"])
 @pytest.mark.parametrize("policy_source", ["config-file", "launcher"])
 @pytest.mark.parametrize("managed_chat", [False, True], ids=["channel", "managed-chat"])
-def test_inkbox_override_preserves_other_server_tool_approval(tmp_path, monkeypatch, resume, decision, policy_source, managed_chat):
+def test_inkbox_override_preserves_other_server_tool_approval(tmp_path, monkeypatch, resume, decision, policy_source, managed_chat, target_inkbox=False):
     root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(root / "tests" / "live"))
     import mock_openai
 
     model_requests = []
+    target_name = "inkbox" if target_inkbox else "example"
 
     class ToolCallHandler(mock_openai.Handler):
         def _respond_responses(self, request):
@@ -39,7 +40,7 @@ def test_inkbox_override_preserves_other_server_tool_approval(tmp_path, monkeypa
                 return super()._respond_responses(request)
             item = {
                 "type": "function_call", "id": "fc_example", "call_id": "call_example",
-                "name": "lookup_example", "namespace": "mcp__example", "arguments": "{}", "status": "completed",
+                "name": "lookup_example", "namespace": f"mcp__{target_name}", "arguments": "{}", "status": "completed",
             }
             response = {
                 "id": "resp_example", "object": "response", "status": "completed",
@@ -68,11 +69,12 @@ def test_inkbox_override_preserves_other_server_tool_approval(tmp_path, monkeypa
         'model = "mock-model"\nmodel_provider = "mock"\n'
         '[model_providers.mock]\nname = "Mock"\n'
         f'base_url = "http://127.0.0.1:{server.server_port}/v1"\nwire_api = "responses"\n'
-        '[mcp_servers.example]\n'
+        f'[mcp_servers.{target_name}]\n'
         f'command = {json.dumps(sys.executable)}\n'
         f'args = {json.dumps([str(fixture), str(executed)])}\n'
+        + ('default_tools_approval_mode = "approve"\n[mcp_servers.inkbox.tools.lookup_example]\napproval_mode = "approve"\n' if target_inkbox else '')
         + ('[mcp_servers.example.tools.lookup_example]\napproval_mode = "prompt"\n'
-           if policy_source == "config-file" else "")
+           if policy_source == "config-file" and not target_inkbox else "")
     )
     codex_bin = CODEX_BIN
     if policy_source == "launcher":
@@ -99,8 +101,10 @@ def test_inkbox_override_preserves_other_server_tool_approval(tmp_path, monkeypa
                        codex_sandbox="read-only")
     client = CodexAppServerClient(
         cfg, developer_instructions="Local MCP policy contract.", approval_handler=approve,
+        force_tool_approval=managed_chat,
         mcp_server_config={"command": sys.executable,
-                           "args": [str(fixture), str(tmp_path / "inkbox-executed")]},
+                           "args": [str(fixture), str(executed if target_inkbox else tmp_path / "inkbox-executed")],
+                           **({"default_tools_approval_mode": "prompt"} if target_inkbox else {})},
     )
     cards = []
 
@@ -144,10 +148,18 @@ def test_inkbox_override_preserves_other_server_tool_approval(tmp_path, monkeypa
     assert len(model_requests) == (3 if resume else 2)
     assert len(approvals) == 1, "The host did not enforce the other server's prompt policy"
     assert approvals[0][0] == "mcpServer/elicitation/request"
-    assert approvals[0][1]["serverName"] == "example"
+    assert approvals[0][1]["serverName"] == target_name
     assert executed.exists() is (decision == "accept"), "Tool execution did not honor the approval decision"
     assert not (tmp_path / "inkbox-executed").exists(), "Called the wrong MCP server"
     if managed_chat:
         assert len(cards) == 1
         assert cards[0]["decisions"] == ["approve_once", "deny"]
         assert cards[0]["effective_scope"] == "operation"
+
+
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize("decision", ["accept", "decline"])
+def test_browser_ask_overrides_saved_inkbox_autoapprove(tmp_path, monkeypatch, resume, decision):
+    test_inkbox_override_preserves_other_server_tool_approval(
+        tmp_path, monkeypatch, resume, decision, "config-file", True, target_inkbox=True,
+    )

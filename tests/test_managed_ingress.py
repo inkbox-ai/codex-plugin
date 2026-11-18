@@ -1,5 +1,7 @@
 import asyncio
+import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 from aiohttp import web
@@ -15,6 +17,7 @@ from inkbox_codex.managed_work import (
 )
 from inkbox_codex.sessions import _Turn
 from tests.test_managed_inbox import event
+from tests.test_sessions import make_session
 
 
 def test_acceptance_is_not_completion_and_conversations_are_independent(tmp_path, monkeypatch):
@@ -72,6 +75,55 @@ def test_batched_turn_settles_both_deliveries_and_recovery_is_retained():
         await recovery
         await asyncio.sleep(0)
         assert await first.done and await second.done
+    asyncio.run(scenario())
+
+
+def test_uncertain_terminal_reply_retains_managed_inbound_payload(tmp_path, monkeypatch):
+    import inkbox.remote_mcp
+
+    monkeypatch.setenv('INKBOX_CODEX_HOME', str(tmp_path))
+
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.identity_info.update(id='identity', api_origin='https://api.example.test')
+        session._ensure_client = AsyncMock(return_value=SimpleNamespace(
+            thread_id='thread', run=AsyncMock(return_value='Automatic fallback'),
+        ))
+        journal = SimpleNamespace(lookup=lambda _: {'state': 'pending', 'submitted': True})
+        monkeypatch.setattr(inkbox.remote_mcp, 'RemoteMcp', lambda **_: SimpleNamespace(
+            terminal_replies=lambda **_: journal,
+        ))
+
+        async def route(_, payload):
+            session._queue.put_nowait(_Turn(
+                text='Synthetic inbound',
+                reply_mode='email',
+                reply_meta={'message_id': payload['id'], 'sender': 'sender@example.test'},
+            ))
+            await session._drain()
+            return web.json_response({'ok': True})
+
+        gateway = SimpleNamespace(
+            cfg=SimpleNamespace(base_url='https://api.example.test', identity='example'),
+            _route_inkbox_event=route,
+        )
+        activation = str(uuid4())
+        payload = event(activation)
+        ingress = ManagedIngress(gateway, activation)
+        try:
+            ingress.inbox.accept(payload)
+            ingress.start()
+            async with asyncio.timeout(2):
+                while ingress.inbox.accept(payload)['state'] == 'accepted':
+                    await asyncio.sleep(0.01)
+            assert ingress.inbox.accept(payload)['state'] == 'unknown'
+            row = ingress.inbox.db.execute('SELECT payload FROM deliveries').fetchone()
+            assert json.loads(row[0]) == payload
+            assert ingress.inbox.claim() is None and sent == []
+        finally:
+            await ingress.close()
+
     asyncio.run(scenario())
 
 

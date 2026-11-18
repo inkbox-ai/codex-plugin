@@ -863,6 +863,72 @@ def test_session_stamps_chat_id_into_tool_env():
     asyncio.run(scenario())
 
 
+def test_browser_mcp_policy_overrides_saved_autoapprove_without_leaking(monkeypatch):
+    created = []
+
+    class Client:
+        thread_id = "native-thread"
+
+        def __init__(self, config, **options):
+            created.append((config, options))
+
+        async def connect(self, resume):
+            return self.thread_id
+
+    monkeypatch.setattr(sessions_mod, "CodexAppServerClient", Client)
+
+    async def scenario():
+        browser = make_session([])
+        browser.chat_id = "chat:browser"
+        browser.cfg.auto_approve_inkbox_tools = True
+        browser.mcp_server_config["default_tools_approval_mode"] = "approve"
+        await browser._ensure_client()
+        assert created[-1][1]["mcp_server_config"]["default_tools_approval_mode"] == "prompt"
+        assert browser.mcp_server_config["default_tools_approval_mode"] == "approve"
+        channel = make_session([])
+        channel.mcp_server_config["default_tools_approval_mode"] = "approve"
+        await channel._ensure_client()
+        assert created[-1][1]["mcp_server_config"]["default_tools_approval_mode"] == "approve"
+
+    asyncio.run(scenario())
+
+
+def test_catalog_refresh_waits_for_idle_and_resumes_same_native_thread(monkeypatch):
+    connected, disconnected = [], []
+
+    class Client:
+        thread_id = "native-thread"
+        is_alive = True
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def connect(self, resume):
+            connected.append(resume)
+            return self.thread_id
+
+        async def disconnect(self):
+            disconnected.append(self.thread_id)
+
+    monkeypatch.setattr(sessions_mod, "CodexAppServerClient", Client)
+
+    async def scenario():
+        session = make_session([])
+        old = session._client = Client()
+        session._catalog_refreshed_at = sessions_mod.time.monotonic() - 301
+        session._turn_active = True
+        assert await session._ensure_client() is old
+        assert disconnected == []
+        session._turn_active = False
+        assert await session._ensure_client() is not old
+        assert connected == ["native-thread"]
+        assert disconnected == ["native-thread"]
+        assert await session._ensure_client() is session._client
+        assert len(connected) == 1
+
+    asyncio.run(scenario())
+
+
 def test_codex_turn_timeout_restarts_client():
     async def scenario():
         sent = []
