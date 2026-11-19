@@ -1052,6 +1052,8 @@ class InkboxGateway:
         self._hosted_call_registry_path = state_root / "hosted_call_completions.json"
         self._hosted_call_registry_owner = uuid.uuid4().hex
         self._hosted_call_jobs: Dict[str, asyncio.Task[Any]] = {}
+        self._inbound_path = state_root / "inbound_events.json"
+        self._inbound = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1123,7 +1125,9 @@ class InkboxGateway:
         self._voice_note_inbox()
         await self._start_http_server()
 
-        if self.cfg.public_url:
+        if self.cfg.delivery_mode == "local":
+            logger.info("[bridge] local delivery mode: no tunnel, loopback listener only")
+        elif self.cfg.public_url:
             self._public_url = self.cfg.public_url.rstrip("/")
             self._public_host = self._public_url.split("://", 1)[-1]
         else:
@@ -1167,6 +1171,8 @@ class InkboxGateway:
         await asyncio.to_thread(self._patch_identity_objects)
         await self._catch_up_a2a_tasks()
         await self._recover_hosted_call_completions()
+        if self.cfg.delivery_mode == "local":
+            self._inbound_events().recover()
 
         logger.info(
             "[bridge] serving — %s / %s / %s → Codex in %s; readiness at /ready",
@@ -1213,7 +1219,8 @@ class InkboxGateway:
                 return
 
     async def _start_http_server(self) -> None:
-        app = web.Application()
+        local = self.cfg.delivery_mode == "local"
+        app = web.Application(client_max_size=2 * 1024 * 1024) if local else web.Application()
         app.cleanup_ctx.append(self._readiness_monitor)
         app.router.add_get("/health", self._handle_health)
         app.router.add_get("/ready", self._handle_ready)
@@ -1221,9 +1228,10 @@ class InkboxGateway:
         app.router.add_get(INKBOX_WS_PATH, self._handle_call_ws)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
-        site = web.TCPSite(self._runner, self.cfg.host, self.cfg.port)
+        host = "127.0.0.1" if local else self.cfg.host
+        site = web.TCPSite(self._runner, host, self.cfg.port)
         await site.start()
-        logger.info("[bridge] webhook server on %s:%d", self.cfg.host, self.cfg.port)
+        logger.info("[bridge] webhook server on %s:%d", host, self.cfg.port)
 
     async def _readiness_monitor(self, app):
         task = asyncio.create_task(self._check_codex_readiness())
@@ -1286,6 +1294,9 @@ class InkboxGateway:
 
     def _patch_identity_objects(self) -> None:
         """Point the identity's mailbox/phone/iMessage events at this server."""
+        if self.cfg.delivery_mode == "local":
+            # Events are delivered locally; there is no public URL to register.
+            return
         if self.cfg.slack_enabled and not self.cfg.skip_webhook_reconcile:
             self._reconcile_slack()
         if self.cfg.skip_webhook_reconcile:
@@ -1506,6 +1517,9 @@ class InkboxGateway:
 
     async def _cleanup(self) -> None:
         self._voice_note_closing = True
+        if getattr(self, "_inbound", None) is not None:
+            await self._inbound.close()
+            self._inbound = None
         if self._managed_control is not None:
             await self._managed_control.close()
             self._managed_control = None
@@ -2313,6 +2327,23 @@ class InkboxGateway:
                 return web.Response(status=503, text="Temporarily unavailable")
             return web.json_response(receipt, status=202)
 
+        if envelope.get("event_type") == "inbound.received":
+            if source != "inkbox" or not provider.verify(
+                body=body, headers=dict(request.headers), url=str(request.url),
+                secret=self._provider_secret("inkbox"),
+            ):
+                return web.Response(status=401, text="Invalid signature")
+            if self.cfg.delivery_mode != "local":
+                return web.json_response({"ok": True, "ignored": "inbound.received"})
+            data = envelope.get("data")
+            if not isinstance(data, dict) or not data.get("event_id"):
+                return web.Response(status=400, text="invalid inbound event")
+            try:
+                fresh = self._inbound_events().accept(data)
+            except OSError:
+                return web.Response(status=503, text="Temporarily unavailable")
+            return web.json_response({"ok": True, "deduped": not fresh})
+
         if os.getenv("INKBOX_HOSTED_ACTIVATION_ID"):
             # A legacy subscription must not bypass managed event selection.
             if source != "inkbox" or not provider.verify(
@@ -2668,6 +2699,43 @@ class InkboxGateway:
                 ),
             )
             logger.exception("[bridge] hosted post-call reconciliation failed: %s", call_id)
+
+    def _inbound_events(self):
+        if self._inbound is None:
+            from .inbound_events import InboundEvents
+            self._inbound = InboundEvents(
+                self._inbound_path, self._run_inbound_agent, self._report_inbound_failure,
+            )
+        return self._inbound
+
+    async def _run_inbound_agent(self, data: Dict[str, Any], body: Optional[str]) -> None:
+        from .inbound_events import agent_text, dedupe_key
+
+        if self.sessions is None:
+            raise RuntimeError("sessions are not ready")
+        name = str((data.get("source") or {}).get("name") or "inbound")
+        meta = {
+            "external": True, "source": name, "event": "inbound.received",
+            "event_key": dedupe_key(data),
+            "verified": data.get("signature_verified") is True,
+        }
+        # Mode "external" has no reply channel (noreply).
+        await self.sessions.get(f"inbound:{name}").handle_inbound(agent_text(data, body), "external", meta)
+
+    async def _report_inbound_failure(self, data: Dict[str, Any], error: str) -> None:
+        event_id = str(data.get("event_id") or "")
+        inbound = getattr(self._inkbox, "inbound", None)
+        report = getattr(inbound, "report_inbound_event_result", None)
+        if report is None:
+            logger.error("[inbound] event %s failed; this SDK cannot report it: %s", event_id, error)
+            return
+        try:
+            await asyncio.to_thread(
+                report, self._identity.agent_handle, str((data.get("source") or {}).get("id") or ""),
+                event_id, status="failed", error=error,
+            )
+        except Exception:
+            logger.exception("[inbound] could not report failure for %s", event_id)
 
     async def _on_external_event(
         self,

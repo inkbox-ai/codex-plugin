@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.44 (unreleased)
+
+- Add `INKBOX_DELIVERY_MODE=local`: no tunnel or webhook registration, a loopback-only listener, and 2 MiB request bodies with unchanged signature verification.
+- Handle `inbound.received` events in local delivery mode: deduplicated by delivery ID (falling back to event ID) so retries run once and replays run again, queued durably, and run as an agent turn or a script. Scripts run up to 5 times (retries after 10 s, 30 s, 2 min, and 10 min, 120 s timeout each) before the failure is reported. Bodies over 64 KiB are truncated in the agent message.
+- Require Inkbox SDK 0.7.41.
+
 ## 0.2.43 (unreleased)
 
 - Wait up to 60 seconds for incoming voice-note transcripts, then read the message once before continuing with its original attachments.
