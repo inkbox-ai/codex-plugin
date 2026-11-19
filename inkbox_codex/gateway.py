@@ -95,7 +95,7 @@ try:
     from .codex_client import CodexTurnResult, probe_codex
     from .a2a_delegations import find_by_task as find_a2a_delegation
     from .media import download_media, inbound_media_note
-    from .voice_notes import FINISHED
+    from .voice_notes import FINISHED, finished_unsupported
     from .hosted_sms_guard import hosted_sms_attempt_state
     from .prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
     from .realtime import (
@@ -127,7 +127,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from codex_client import CodexTurnResult, probe_codex
     from a2a_delegations import find_by_task as find_a2a_delegation
     from media import download_media, inbound_media_note
-    from voice_notes import FINISHED
+    from voice_notes import FINISHED, finished_unsupported
     from hosted_sms_guard import hosted_sms_attempt_state
     from prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
     from realtime import (
@@ -815,23 +815,6 @@ async def _to_thread_to_completion(function: Any, *args: Any, **kwargs: Any) -> 
         raise
 
 
-def _transcription_subscription_unsupported(exc: Exception) -> bool:
-    if isinstance(exc, ValueError):
-        return str(exc).startswith("Identity-wide webhook subscriptions are not supported by this server yet.")
-    errors = getattr(exc, "detail", None)
-    if getattr(exc, "status_code", None) != 422 or not isinstance(errors, list) or not errors:
-        return False
-    # The API reports one enum error per channel when none recognize the event.
-    return all(
-        isinstance(error, dict)
-        and error.get("type") == "enum"
-        and isinstance(error.get("loc"), list)
-        and error["loc"][:3] == ["body", "event_types", 0]
-        and error.get("input") == FINISHED
-        for error in errors
-    )
-
-
 def _is_unsupported_a2a_event_types(exc: Exception) -> bool:
     detail = str(getattr(exc, "detail", exc))
     return (
@@ -1396,7 +1379,7 @@ class InkboxGateway:
         try:
             _reconcile({"agent_identity_id": identity.id}, TRANSCRIPTION_EVENTS)
         except Exception as exc:
-            if not _transcription_subscription_unsupported(exc):
+            if not finished_unsupported(exc):
                 raise
             logger.warning("Transcription callbacks are unavailable on this API version")
         if identity.mailbox is not None:
@@ -1502,6 +1485,8 @@ class InkboxGateway:
             return await self._on_text_received(envelope)
         if event_type == "imessage.received":
             return await self._on_imessage_received(envelope)
+        if str(event_type).startswith("slack."):
+            return await self._on_slack_received(envelope, transcripts_resolved=True)
         from .whatsapp import receive
         return await receive(self, envelope)
 
@@ -4374,7 +4359,9 @@ class InkboxGateway:
             f"{self._public_url}{DEFAULT_WEBHOOK_PATH}?channel=slack",
         )
 
-    async def _on_slack_received(self, envelope: Dict[str, Any]) -> "web.Response":
+    async def _on_slack_received(
+        self, envelope: Dict[str, Any], *, transcripts_resolved: bool = False,
+    ) -> "web.Response":
         from .slack import SLACK_STOP_EVENT, inbound_message, inbound_stop
 
         if not self.cfg.slack_enabled:
@@ -4393,12 +4380,17 @@ class InkboxGateway:
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
         if not meta["slack_addressed"] and not self.sessions.has_session(chat_id):
             return web.json_response({"ok": True, "ignored": "unwatched-thread"})
+        if not transcripts_resolved and envelope.get("event_type") != SLACK_STOP_EVENT:
+            # Only a message this gateway would admit waits for its transcript.
+            voice_receipt = self._voice_note_receipt(envelope["event_type"], envelope)
+            if voice_receipt is not None:
+                return voice_receipt
         event_key = f"slack:{envelope['id']}"
         if self._dedup_begin(event_key):
             return web.json_response({"ok": True, "deduped": True})
         try:
             from .slack_media import with_attachments
-            body = await with_attachments(self._inkbox, body, meta, cfg=self.cfg)
+            body = await with_attachments(self._inkbox, body, meta)
             await self.sessions.get(chat_id).handle_inbound(body, "slack", meta)
         except BaseException:
             self._dedup_rollback(event_key)
@@ -4729,20 +4721,6 @@ class InkboxGateway:
         saved = await download_media(media, prefix=prefix)
         if image_paths is not None:
             image_paths.extend(item["path"] for item in saved if item["content_type"].startswith("image/"))
-            from .slack_media import transcribe_audio
-            for item in saved:
-                if not item["content_type"].startswith("audio/"):
-                    continue
-                if (item.get("transcription") or {}).get("status") == "completed":
-                    continue
-                key = getattr(getattr(self.cfg, "realtime", None), "api_key", "")
-                try:
-                    if not key:
-                        raise ValueError("Transcription credential unavailable")
-                    transcript = await transcribe_audio(item, key)
-                    text += f"\n[Voice note {item['position']} — automatically transcribed]\n{transcript}"
-                except Exception:
-                    text += "\n[Voice note could not be transcribed; do not guess its contents]"
         return (text + inbound_media_note(saved)).strip()
 
     # ------------------------------------------------------------------

@@ -8,6 +8,7 @@
 - At most 100 inbound events (64 MiB) wait locally; a new delivery beyond that is refused with a retryable 503 before it is acknowledged, while a retry of a delivery already stored still gets its receipt. At most 4 inbound scripts run at once.
 - The 30-minute inbound turn limit counts from the turn's start, not its wait behind earlier turns, and an expired turn is interrupted instead of running on after it is reported failed.
 - Require Inkbox SDK 0.7.41; setup installs and checks for it.
+- Wait for Slack voice-note transcripts like SMS, iMessage, and WhatsApp, and use them instead of transcribing Slack or WhatsApp audio locally with the realtime voice credential.
 
 ## 0.2.43 (unreleased)
 

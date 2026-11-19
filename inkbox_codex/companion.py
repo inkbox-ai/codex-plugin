@@ -908,7 +908,7 @@ class Receiver:
     async def submit(self, event, text, meta, *, trigger=None, source_ids=None):
         if event.channel == "slack" and (trigger is None or trigger["id"] == event.source_id):
             from .slack_media import with_attachments
-            text = await with_attachments(self.client, text, meta, cfg=self.cfg)
+            text = await with_attachments(self.client, text, meta)
         meta = {**meta, "companion_receipt_token": uuid4().hex}
         session_key = event.session_key(self.namespace)
         session = self.sessions.get(session_key)
@@ -987,6 +987,11 @@ class Receiver:
         if self.resolve_voice_note is not None and event.channel in {"phone", "imessage", "whatsapp"}:
             field = "text_message" if event.channel == "phone" else "message"
             event.envelope["data"][field] = await self.resolve_voice_note(event.channel, event.envelope["data"][field])
+        if self.resolve_voice_note is not None and event.channel == "slack":
+            from .voice_notes import message_for, store_message
+            message = message_for(event.envelope)
+            if message:
+                store_message(event.envelope, await self.resolve_voice_note("slack", message))
         if event.channel == "whatsapp" and not event.envelope["_codex_whatsapp_source"].get("whatsapp_enriched"):
             # Receipt admission/HTTP acknowledgement must not wait on attachment
             # downloads or contact lookups. Persist enrichment for restart replay.
