@@ -14,6 +14,7 @@ from inkbox_codex.voice_notes import (
     unconfirmed_ids,
     message_for,
     pending,
+    store_message,
     transcript_note,
 )
 from inkbox_codex import gateway
@@ -403,3 +404,263 @@ def test_gateway_retries_saved_message_after_sessions_start(tmp_path, monkeypatc
         assert recovered.db.execute("SELECT done FROM voice_notes").fetchone() == (1,)
         await recovered.close()
     asyncio.run(run())
+
+
+SLACK_MESSAGE = "00000000-0000-4000-8000-0000000000aa"
+SLACK_CONNECTION = "00000000-0000-4000-8000-000000000002"
+
+
+def slack_envelope(status="pending", *, event_id="evt_slack", count=1):
+    from tests.test_slack import event
+
+    result = event(message_id=SLACK_MESSAGE, event={"type": "message", "text": "<@U_AGENT> typed caption", "files": [
+        {
+            "id": f"F_AUDIO_{index}",
+            "name": "memo.m4a",
+            "mimetype": "audio/mp4",
+            "transcription": {
+                "status": status,
+                "text": "Move the review to Thursday." if status == "completed" else None,
+                "error_code": "transcription_failed" if status == "failed" else None,
+            },
+        }
+        for index in range(count)
+    ]})
+    result["id"] = event_id
+    return result
+
+
+def slack_completion(original, status="completed"):
+    result = deepcopy(original)
+    result["id"] = "separate-slack-completion"
+    result["event_type"] = "message.transcription_finished"
+    result["data"]["channel"] = "slack"
+    for item in result["data"]["event"]["files"]:
+        item["transcription"] = {
+            "status": status,
+            "text": "Move the review to Thursday." if status == "completed" else None,
+            "error_code": "transcription_failed" if status == "failed" else None,
+        }
+    return result
+
+
+def test_slack_message_is_keyed_by_retained_message_id_and_written_back():
+    original = slack_envelope()
+    message = message_for(original)
+    assert message["id"] == SLACK_MESSAGE and message["connection_id"] == SLACK_CONNECTION
+    assert pending(message)
+    assert message_for(slack_completion(original))["id"] == SLACK_MESSAGE
+    assert VoiceNotes.key("slack", message) == f"slack:{SLACK_MESSAGE}"
+    resolved = merge_results(message, message_for(slack_completion(original)))
+    store_message(original, resolved)
+    assert original["data"]["event"]["text"] == "<@U_AGENT> typed caption"
+    assert original["data"]["event"]["files"][0]["transcription"]["status"] == "completed"
+    legacy = slack_envelope()
+    legacy["data"].pop("message_id")
+    assert message_for(legacy) == {}
+
+
+def test_slack_pending_receipt_waits_for_completion_and_wakes_once(tmp_path):
+    async def run():
+        delivered = []
+
+        async def deliver(item):
+            delivered.append(item)
+
+        state = inbox(tmp_path, deliver)
+        original = slack_envelope()
+        assert state.defer(original)
+        assert state.defer(deepcopy(original))
+        assert delivered == []
+        mismatched = slack_completion(original)
+        mismatched["data"]["message_id"] = "00000000-0000-4000-8000-0000000000bb"
+        state.complete(mismatched)
+        assert state.db.execute(
+            "SELECT COUNT(*) FROM voice_notes WHERE key=? AND completion IS NOT NULL", (f"slack:{SLACK_MESSAGE}",)
+        ).fetchone()[0] == 0
+        other_connection = slack_completion(original)
+        other_connection["data"]["connection_id"] = "00000000-0000-4000-8000-0000000000cc"
+        state.complete(other_connection)
+        await asyncio.sleep(0)
+        assert delivered == []
+        state.complete(slack_completion(original))
+        await next(iter(state.tasks.values()))
+        assert len(delivered) == 1
+        assert delivered[0]["event_type"] == "slack.mention_received"
+        assert delivered[0]["data"]["event"]["text"] == "<@U_AGENT> typed caption"
+        assert "[Voice note 1 — automatically transcribed]\nMove the review to Thursday." in transcript_note(
+            delivered[0]["data"]["event"]["files"]
+        )
+        state.complete(slack_completion(original))
+        assert state.defer(original)
+        assert len(delivered) == 1
+        await state.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("outcome", ["completed", "pending", "failed", "error", "missing"])
+def test_slack_deadline_polls_archive_once_then_delivers_original(tmp_path, outcome):
+    async def run():
+        delivered, reads = [], []
+        original = slack_envelope()
+
+        def get(path, **kwargs):
+            reads.append((path, kwargs))
+            if outcome == "error":
+                raise OSError("read unavailable")
+            if outcome == "missing":
+                return {"messages": []}
+            current = message_for(slack_envelope(outcome))
+            return {"messages": [{
+                "id": SLACK_MESSAGE, "connection_id": SLACK_CONNECTION, "conversation_id": "C_TEST",
+                "text": "Replacement text must not be used", "files": current["media"],
+            }]}
+
+        async def deliver(item):
+            delivered.append(item)
+
+        state = inbox(
+            tmp_path, deliver, wait=0,
+            client=types.SimpleNamespace(_api_http=types.SimpleNamespace(get=get)),
+        )
+        state.defer(original)
+        await next(iter(state.tasks.values()))
+        assert reads == [(
+            f"/slack/connections/{SLACK_CONNECTION}/archive/messages",
+            {"params": {"message_id": SLACK_MESSAGE}, "timeout": 10},
+        )]
+        assert len(delivered) == 1
+        event = delivered[0]["data"]["event"]
+        assert event["text"] == "<@U_AGENT> typed caption"
+        assert (
+            "[Voice note 1 — automatically transcribed]" in transcript_note(event["files"])
+            if outcome == "completed"
+            else "transcript unavailable" in transcript_note(event["files"])
+        )
+        state.complete(slack_completion(original))
+        assert len(delivered) == 1
+        await state.close()
+
+    asyncio.run(run())
+
+
+def test_slack_failed_completion_delivers_original_attachment_notice(tmp_path):
+    async def run():
+        delivered = []
+
+        async def deliver(item):
+            delivered.append(item)
+
+        state = inbox(tmp_path, deliver)
+        original = slack_envelope()
+        state.defer(original)
+        state.complete(slack_completion(original, "failed"))
+        await next(iter(state.tasks.values()))
+        note = transcript_note(delivered[0]["data"]["event"]["files"])
+        assert "[Voice note 1: transcript unavailable; process the original attachment normally" in note
+        await state.close()
+
+    asyncio.run(run())
+
+
+def test_slack_hosted_runtime_does_not_wait_again(tmp_path, monkeypatch):
+    monkeypatch.setenv("INKBOX_HOSTED_MODE", "1")
+
+    async def run():
+        async def deliver(item):
+            raise AssertionError("The normal consumer owns this turn")
+
+        state = inbox(tmp_path, deliver)
+        try:
+            original = slack_envelope()
+            assert not state.defer(original)
+            item = message_for(original)
+            assert await asyncio.wait_for(state.resolve_message("slack", item), 0.1) is item
+            assert not state.tasks
+        finally:
+            await state.close()
+
+    asyncio.run(run())
+
+
+def test_slack_label_matches_other_channels():
+    from inkbox_codex.slack import inbound_message
+    from tests.test_slack import IDENTITY
+
+    _, body, meta = inbound_message(slack_envelope("completed", count=2), IDENTITY)
+    assert body.startswith("<@U_AGENT> typed caption\n\n[Voice note 1 — automatically transcribed]\n"
+                           "Move the review to Thursday.\n\n[Voice note 2 — automatically transcribed]")
+    assert meta["raw_text"] == "<@U_AGENT> typed caption"
+    assert "Move the review" not in body.split("Attachment references", 1)[1]
+    _, plain, _ = inbound_message(slack_envelope("completed") | {"data": {
+        **slack_envelope()["data"], "event": {"type": "message", "text": "hello", "files": [{"id": "F_DOC"}]}}}, IDENTITY)
+    assert "Voice note" not in plain
+
+
+def test_gateway_defers_pending_slack_voice_note_and_wakes_once(tmp_path, monkeypatch):
+    from tests.test_slack import IDENTITY, Sessions
+    from inkbox_codex.config import BridgeConfig
+
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    downloads = []
+
+    async def with_attachments(_client, text, meta):
+        downloads.append(meta["slack_files"])
+        return text
+
+    monkeypatch.setattr("inkbox_codex.slack_media.with_attachments", with_attachments)
+
+    async def run():
+        bridge = gateway.InkboxGateway(BridgeConfig(slack_enabled=True))
+        bridge._identity = types.SimpleNamespace(id=IDENTITY)
+        bridge.sessions = Sessions()
+        original = slack_envelope()
+        try:
+            first = await bridge._on_slack_received(original)
+            assert b'"pending_transcription": true' in first.body
+            again = await bridge._on_slack_received(deepcopy(original))
+            assert b'"pending_transcription": true' in again.body
+            assert not bridge.sessions.turns and not downloads
+            bridge._voice_note_receipt("message.transcription_finished", slack_completion(original))
+            await next(iter(bridge._voice_note_state.tasks.values()))
+            assert len(bridge.sessions.turns) == 1
+            _, body, mode, meta = bridge.sessions.turns[0]
+            assert mode == "slack" and meta["raw_text"] == "<@U_AGENT> typed caption"
+            assert "[Voice note 1 — automatically transcribed]\nMove the review to Thursday." in body
+            assert len(downloads) == 1
+            bridge._voice_note_receipt("message.transcription_finished", slack_completion(original))
+            await bridge._on_slack_received(deepcopy(original))
+            await asyncio.sleep(0)
+            assert len(bridge.sessions.turns) == 1
+            transcribed = slack_envelope("completed", event_id="evt_ready")
+            transcribed["data"]["message_id"] = "00000000-0000-4000-8000-0000000000dd"
+            await bridge._on_slack_received(transcribed)
+            assert len(bridge.sessions.turns) == 2
+        finally:
+            if getattr(bridge, "_voice_note_state", None) is not None:
+                await bridge._voice_note_state.close()
+
+    asyncio.run(run())
+
+
+def test_slack_subscription_selects_completions_and_tolerates_older_servers():
+    from inkbox_codex.slack import (
+        SLACK_MESSAGE_SUBSCRIPTION_EVENTS, SLACK_SUBSCRIPTION_EVENTS, reconcile_subscription,
+    )
+
+    assert "message.transcription_finished" in SLACK_SUBSCRIPTION_EVENTS
+    assert "message.transcription_finished" not in SLACK_MESSAGE_SUBSCRIPTION_EVENTS
+    client = Mock()
+    rejected = Exception("unsupported")
+    rejected.status_code = 422
+    rejected.detail = [{"type": "enum", "loc": ["body", "event_types", 6],
+                        "input": "message.transcription_finished"}]
+    client.webhooks.subscriptions.list.return_value = []
+    client.webhooks.subscriptions.create.side_effect = [rejected, None]
+    reconcile_subscription(client, "identity-1", "https://agent.example/webhook?channel=slack")
+    attempts = [call.kwargs["event_types"] for call in client.webhooks.subscriptions.create.call_args_list]
+    assert attempts == [list(SLACK_SUBSCRIPTION_EVENTS), list(SLACK_MESSAGE_SUBSCRIPTION_EVENTS)]
+    client.webhooks.subscriptions.create.side_effect = Exception("server error")
+    with pytest.raises(Exception, match="server error"):
+        reconcile_subscription(client, "identity-1", "https://agent.example/webhook?channel=slack")

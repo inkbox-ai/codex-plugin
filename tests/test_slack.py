@@ -278,7 +278,8 @@ def test_subscription_reconciliation_does_not_remove_other_receivers():
         "url": "https://agent.example/webhook?channel=slack",
         "event_types": ["slack.dm_received", "slack.group_dm_received",
                         "slack.channel_message_received", "slack.mention_received",
-                        "slack.thread_reply_received", "slack.session_stopped"],
+                        "slack.thread_reply_received", "slack.session_stopped",
+                        "message.transcription_finished"],
     }
     assert set(created["event_types"]) == set(SLACK_SUBSCRIPTION_EVENTS)
     assert "slack.channel_message_received" in created["event_types"]
