@@ -815,6 +815,23 @@ async def _to_thread_to_completion(function: Any, *args: Any, **kwargs: Any) -> 
         raise
 
 
+def _transcription_subscription_unsupported(exc: Exception) -> bool:
+    if isinstance(exc, ValueError):
+        return str(exc).startswith("Identity-wide webhook subscriptions are not supported by this server yet.")
+    errors = getattr(exc, "detail", None)
+    if getattr(exc, "status_code", None) != 422 or not isinstance(errors, list) or not errors:
+        return False
+    # The API reports one enum error per channel when none recognize the event.
+    return all(
+        isinstance(error, dict)
+        and error.get("type") == "enum"
+        and isinstance(error.get("loc"), list)
+        and error["loc"][:3] == ["body", "event_types", 0]
+        and error.get("input") == FINISHED
+        for error in errors
+    )
+
+
 def _is_unsupported_a2a_event_types(exc: Exception) -> bool:
     detail = str(getattr(exc, "detail", exc))
     return (
@@ -1367,8 +1384,8 @@ class InkboxGateway:
 
         try:
             _reconcile({"agent_identity_id": identity.id}, TRANSCRIPTION_EVENTS)
-        except ValueError as exc:
-            if not str(exc).startswith("Identity-wide webhook subscriptions are not supported by this server yet."):
+        except Exception as exc:
+            if not _transcription_subscription_unsupported(exc):
                 raise
             logger.warning("Transcription callbacks are unavailable on this API version")
         if identity.mailbox is not None:
