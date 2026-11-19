@@ -163,7 +163,7 @@ def test_hosted_delivery_is_persisted_then_run(tmp_path, monkeypatch):
     text, mode, meta = calls[0]
     assert mode == "external" and meta["event_key"] == envelope["data"]["delivery_id"]
     assert text.index("UNTRUSTED") < text.index("Record each paid invoice.") < text.index('{"paid": true}')
-    assert _rows(tmp_path / "inbound.sqlite3") == {envelope["data"]["delivery_id"]: ("done", 1)}
+    assert _rows(tmp_path / "inbound.sqlite3") == {envelope["data"]["delivery_id"]: ("done", 0)}
 
 
 def test_hosted_delivery_requires_inkbox_signature(tmp_path, monkeypatch):
@@ -317,13 +317,14 @@ def test_failure_report_gives_up_after_a_day(tmp_path, clock):
     events.accept(_data())
     _run(events)
     assert tries and tries[-1] - tries[0] <= 86400
-    assert _rows(tmp_path / "e.sqlite3") == {_data()["delivery_id"]: ("done", 5)}
+    assert _rows(tmp_path / "e.sqlite3") == {_data()["delivery_id"]: ("done", 0)}
 
 
-def test_agent_handler_failure_is_reported(tmp_path, clock):
-    reports = []
+def test_agent_handler_failure_is_reported_once_without_rerun(tmp_path, clock):
+    turns, reports = [], []
 
     async def agent(data, body):
+        turns.append(body)
         raise RuntimeError("sessions are not ready")
 
     async def report(data, error):
@@ -332,8 +333,35 @@ def test_agent_handler_failure_is_reported(tmp_path, clock):
     events = InboundEvents(tmp_path / "e.sqlite3", agent, report)
     events.accept(_data())
     _run(events)
-    assert reports == ["RuntimeError: sessions are not ready"]
-    assert clock.sleeps == [10, 30, 120, 600]
+    assert turns == [None] and reports == ["RuntimeError: sessions are not ready"]
+    assert clock.sleeps == []
+
+
+def test_interrupted_agent_turn_is_reported_not_repeated(tmp_path):
+    path = tmp_path / "e.sqlite3"
+    started, reports = asyncio.Event(), []
+
+    async def blocking_agent(data, body):
+        started.set()
+        await asyncio.Event().wait()
+
+    async def stop_mid_turn():
+        first = InboundEvents(path, blocking_agent, None)
+        first.accept(_data())
+        first.recover()
+        await started.wait()
+        await first.close()
+
+    asyncio.run(stop_mid_turn())
+
+    async def agent(data, body):
+        raise AssertionError("turn repeated")
+
+    async def report(data, error):
+        reports.append(error)
+
+    _run(InboundEvents(path, agent, report))
+    assert reports == ["agent turn was interrupted by a restart"]
 
 
 def test_script_output_turn_failure_reports_without_rerun(tmp_path, clock, monkeypatch):
@@ -353,7 +381,7 @@ def test_script_output_turn_failure_reports_without_rerun(tmp_path, clock, monke
     events = InboundEvents(tmp_path / "e.sqlite3", agent, report)
     events.accept(_data({"type": "script", "command": "x"}))
     _run(events)
-    assert runs == ["x"] and reports == ["RuntimeError: no session"]
+    assert runs == ["x"] and reports == ["RuntimeError: no session"] and clock.sleeps == []
 
 
 def test_replay_with_new_delivery_id_runs_again(tmp_path):
@@ -440,15 +468,20 @@ def test_failure_report_outcomes(tmp_path, monkeypatch, status, retried):
         asyncio.run(gw._report_inbound_failure(_data(), "bad"))
 
 
-def test_pending_work_counts_as_activity(tmp_path, monkeypatch):
+def test_pending_work_counts_as_activity_but_pending_reports_do_not(tmp_path, monkeypatch):
     gw = _gateway(tmp_path, monkeypatch)
-    gw._inbound_events().accept(_data())
+    events = gw._inbound_events()
+    events.accept(_data())
+    events.accept(_data({"type": "script", "command": "x"}, delivery_id="retry-wait"))
+    events._update("retry-wait", runs=1, due=10**12)
+    events.accept(_data(delivery_id="report"))
+    events._fail("report", "bad")
 
     async def readiness():
         return {"companion": {"readable": True}, "codex": {"startup_ok": True}}
 
     monkeypatch.setattr(gw, "_readiness", readiness)
-    assert asyncio.run(gw.managed_status())["active"] == 1
+    assert asyncio.run(gw.managed_status())["active"] == 2
 
 
 def test_local_mode_skips_identity_registration(tmp_path, monkeypatch):

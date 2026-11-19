@@ -60,19 +60,17 @@ def agent_text(data: Dict[str, Any], body: Optional[str] = None) -> str:
     return "\n".join(parts)
 
 
-class HandlerFailed(Exception):
-    """The handler failed; ``retry`` is False when it must not run again."""
-
-    def __init__(self, error: str, *, retry: bool = True):
+class ScriptFailed(Exception):
+    def __init__(self, error: str):
         super().__init__(error)
         self.error = error
-        self.retry = retry
 
 
 class InboundEvents:
     """Durably queue, dedupe and process ``inbound.received`` events.
 
-    Rows move ``pending`` (handler runs left) -> ``report`` (failure to report) -> ``done``.
+    Rows move ``pending`` (script runs left) -> ``agent`` (turn to start) -> ``turn`` (turn started)
+    -> ``report`` (failure to report) -> ``done``. An agent turn never runs twice.
     """
 
     def __init__(
@@ -104,17 +102,19 @@ class InboundEvents:
         if not key:
             raise ValueError("missing delivery_id")
         now = time.time()
+        state = "pending" if (data.get("handler") or {}).get("type") == "script" else "agent"
         self.db.execute("DELETE FROM events WHERE state='done' AND updated<?", (now - DONE_TTL_S,))
         inserted = self.db.execute(
-            "INSERT OR IGNORE INTO events(delivery_id, state, data, due, updated) VALUES(?, 'pending', ?, ?, ?)",
-            (key, json.dumps(data), now, now),
+            "INSERT OR IGNORE INTO events(delivery_id, state, data, due, updated) VALUES(?, ?, ?, ?, ?)",
+            (key, state, json.dumps(data), now, now),
         ).rowcount == 1
         if inserted and self.started:
             self._spawn(key)
         return inserted
 
     def pending(self) -> int:
-        return self.db.execute("SELECT count(*) FROM events WHERE state != 'done'").fetchone()[0]
+        """Events still to handle, including script retry waits; pending failure reports are not counted."""
+        return self.db.execute("SELECT count(*) FROM events WHERE state IN ('pending', 'agent', 'turn')").fetchone()[0]
 
     def recover(self) -> None:
         """Start processing; events accepted before this wait until it runs."""
@@ -151,6 +151,10 @@ class InboundEvents:
             # The row stays where it was; the next start resumes it.
             logger.exception("[inbound] delivery %s could not be processed", key)
 
+    def _fail(self, key: str, error: str) -> None:
+        now = time.time()
+        self._update(key, state="report", error=error[-500:] or "failed", failed_at=now, due=now)
+
     async def _drive(self, key: str) -> None:
         row = self._row(key)
         data = json.loads(row["data"])
@@ -160,20 +164,39 @@ class InboundEvents:
             # Counted before running so a crash mid-run still uses up the attempt.
             self._update(key, runs=runs)
             try:
-                await self._run_handler(data)
+                out = await self._run_script(data)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                failure = exc if isinstance(exc, HandlerFailed) else HandlerFailed(f"{type(exc).__name__}: {exc}")
-                logger.warning("[inbound] delivery %s run %d failed: %s", key, runs, failure.error[-200:])
-                if failure.retry and runs < MAX_RUNS:
+                error = exc.error if isinstance(exc, ScriptFailed) else f"{type(exc).__name__}: {exc}"
+                logger.warning("[inbound] delivery %s run %d failed: %s", key, runs, error[-200:])
+                if runs < MAX_RUNS:
                     self._update(key, due=time.time() + RETRY_DELAYS_S[runs - 1])
                 else:
-                    now = time.time()
-                    self._update(key, state="report", error=failure.error[-500:] or "failed", failed_at=now, due=now)
+                    self._fail(key, error)
+            else:
+                if out.strip():
+                    data["script_output"] = out
+                    self._update(key, state="agent", data=json.dumps(data))
+                else:
+                    self._update(key, state="done", data=None)
+            row = self._row(key)
+        if row["state"] == "turn":
+            # The turn was running when the plugin stopped; it is not repeated.
+            self._fail(key, "agent turn was interrupted by a restart")
+        elif row["state"] == "agent":
+            self._update(key, state="turn")
+            script = (data.get("handler") or {}).get("type") == "script"
+            try:
+                await self.run_agent(data, data.get("script_output") if script else None)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[inbound] delivery %s agent turn failed: %s", key, exc)
+                self._fail(key, f"{type(exc).__name__}: {exc}")
             else:
                 self._update(key, state="done", data=None)
-            row = self._row(key)
+        row = self._row(key)
         while row["state"] == "report":
             await self._wait(row["due"])
             try:
@@ -192,11 +215,7 @@ class InboundEvents:
                 self._update(key, state="done", data=None)
             row = self._row(key)
 
-    async def _run_handler(self, data: Dict[str, Any]) -> None:
-        handler = data.get("handler") or {}
-        if handler.get("type") != "script":
-            await self.run_agent(data, None)
-            return
+    async def _run_script(self, data: Dict[str, Any]) -> str:
         request = data.get("request") or {}
         stdin = json.dumps({
             "source": (data.get("source") or {}).get("name"),
@@ -205,15 +224,10 @@ class InboundEvents:
             "body": request.get("body") or "",
             "body_encoding": request.get("body_encoding") or "utf8",
         }).encode()
-        ok, out, error = await run_script(str(handler.get("command") or ""), stdin)
+        ok, out, error = await run_script(str((data.get("handler") or {}).get("command") or ""), stdin)
         if not ok:
-            raise HandlerFailed(error or "script failed")
-        if out.strip():
-            try:
-                await self.run_agent(data, out)
-            except Exception as exc:
-                # The script already ran; report instead of running it again.
-                raise HandlerFailed(f"{type(exc).__name__}: {exc}", retry=False) from exc
+            raise ScriptFailed(error or "script failed")
+        return out
 
 
 async def run_script(command: str, stdin: bytes, timeout: float = SCRIPT_TIMEOUT_S) -> tuple[bool, str, str]:
