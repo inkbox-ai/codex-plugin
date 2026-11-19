@@ -284,12 +284,13 @@ class _IdentityScopedWhatsAppSubscriptions(_FakeSubscriptions):
 def test_whatsapp_scoped_lookup_adopts_mixed_receiver_and_race():
     for race in (False, True):
         rows = [types.SimpleNamespace(id="mixed", url="https://agent.inkboxwire.com/webhook",
-                                     event_types=[*WHATSAPP_EVENTS, "a2a.task.created"])]
+                                     event_types=[*WHATSAPP_EVENTS, "whatsapp.future", "a2a.task.created"])]
         subscriptions = _IdentityScopedWhatsAppSubscriptions(rows, race=race)
+        _patched_gateway(_Identity(phone=False), subscriptions=subscriptions)
         _patched_gateway(_Identity(phone=False), subscriptions=subscriptions)
         assert subscriptions.deleted == []
         assert len([row for row in subscriptions.created if row["event_types"] == WHATSAPP_EVENTS]) == int(race)
-        assert subscriptions.lookups == [{"agent_identity_id": "identity-1", "scope": "identity"}] * (2 + int(race))
+        assert subscriptions.lookups == [{"agent_identity_id": "identity-1", "scope": "identity"}] * (4 + int(race))
 
 
 def test_whatsapp_incomplete_mixed_receiver_is_not_deleted_on_conflict():
@@ -299,6 +300,7 @@ def test_whatsapp_incomplete_mixed_receiver_is_not_deleted_on_conflict():
     subscriptions = _IdentityScopedWhatsAppSubscriptions(rows)
     with pytest.raises(RuntimeError, match="Subscription conflict"):
         _patched_gateway(_Identity(phone=False), subscriptions=subscriptions)
+    assert subscriptions.created[-1]["event_types"] == [e for e in WHATSAPP_EVENTS if e != "whatsapp.sent"]
     assert subscriptions.deleted == []
 
 

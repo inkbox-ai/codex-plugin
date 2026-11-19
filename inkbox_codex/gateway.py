@@ -1302,6 +1302,35 @@ class InkboxGateway:
             desired_families = {
                 _subscription_family(event_type) for event_type in event_types
             }
+            if whatsapp:
+                # Disjoint subscriptions may share a URL. Create only the difference;
+                # replacing a shared row could discard another registrant's events.
+                wanted = list(event_types)
+                while True:
+                    covering = [
+                        row for row in existing
+                        if row.url == subscription_url and any(event in wanted for event in row.event_types)
+                    ]
+                    covered = {event for row in covering for event in row.event_types}
+                    missing = [event for event in wanted if event not in covered]
+                    if not missing:
+                        return
+                    try:
+                        subscriptions.create(
+                            url=subscription_url, event_types=missing, **owner_kw
+                        )
+                        return
+                    except Exception as exc:
+                        if getattr(exc, "status_code", None) != 409:
+                            raise
+                        existing = subscriptions.list(**lookup_kw)
+                        if not any(
+                            row.url == subscription_url and event in missing
+                            for row in existing for event in row.event_types
+                        ):
+                            raise
+                        wanted = missing
+
             if identity_scope and any(sub.url == subscription_url and set(event_types).issubset(sub.event_types)
                                 for sub in existing):
                 return
