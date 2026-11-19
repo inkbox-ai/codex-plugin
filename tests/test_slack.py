@@ -747,7 +747,9 @@ def test_existing_message_subscription_extends_selection_for_native_stop(gw):
                                                 if event != "slack.session_stopped"],
     )]
     reconcile_subscription(client, IDENTITY, url)
+    # The missing stop event is appended after the events the subscription already selects.
     client.webhooks.subscriptions.update.assert_called_once_with(
-        "ours", event_types=list(SLACK_SUBSCRIPTION_EVENTS), scope="identity",
+        "ours", event_types=[*(event for event in SLACK_SUBSCRIPTION_EVENTS if event != "slack.session_stopped"),
+                             "slack.session_stopped"], scope="identity",
     )
     client.webhooks.subscriptions.create.assert_not_called()
