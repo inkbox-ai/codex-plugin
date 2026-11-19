@@ -187,14 +187,15 @@ def test_plain_reply_is_durable_without_native_imessage_flag_and_status_never_wa
     asyncio.run(run())
 
 
-def test_signature_is_required_even_when_generic_signature_check_is_disabled(sdk):
+@pytest.mark.parametrize("event_type", ["whatsapp.delivered", "message.transcription_finished"])
+def test_signature_is_required_even_when_generic_signature_check_is_disabled(sdk, event_type):
     from tests.test_webhook_providers import _FakeRequest
 
     gw = bridge(sdk)
     gw.cfg.require_signature = False
     gw.cfg.external_events_enabled = True
     gw._on_external_event = AsyncMock()
-    request = _FakeRequest(json.dumps({"event_type": "whatsapp.delivered", "data": {"message": message()}}).encode())
+    request = _FakeRequest(json.dumps({"event_type": event_type, "data": {"message": message()}}).encode())
     response = asyncio.run(gw._handle_webhook(request))
     assert response.status == 401
     gw._on_external_event.assert_not_awaited()

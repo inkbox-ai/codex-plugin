@@ -2274,12 +2274,13 @@ class InkboxGateway:
                 return web.Response(status=401, text="Invalid signature")
             return web.json_response({"ok": True, "ignored": "managed-delivery-required"})
 
-        if str(envelope.get("event_type") or "").startswith("whatsapp."):
+        event_type = str(envelope.get("event_type") or "")
+        if event_type == FINISHED or event_type.startswith("whatsapp."):
             if source != "inkbox" or not provider.verify(
                 body=body, headers=dict(request.headers), url=str(request.url),
                 secret=self._provider_secret("inkbox"),
             ):
-                return web.Response(status=401, text="WhatsApp requires a valid Inkbox signature")
+                return web.Response(status=401, text="This event requires a valid Inkbox signature")
 
         if source == "inkbox" and envelope.get("event_type") == FINISHED:
             return self._voice_note_receipt(envelope["event_type"], envelope)
