@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 logger = logging.getLogger(__name__)
 
 SCRIPT_TIMEOUT_S = 120.0
+TURN_TIMEOUT_S = 1800
 RETRY_DELAYS_S = (10, 30, 120, 600)
 MAX_RUNS = len(RETRY_DELAYS_S) + 1
 MAX_PROMPT_BODY_BYTES = 64 * 1024

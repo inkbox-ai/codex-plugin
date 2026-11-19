@@ -2718,6 +2718,7 @@ class InkboxGateway:
         return self._inbound
 
     async def _run_inbound_agent(self, data: Dict[str, Any], body: Optional[str]) -> None:
+        from . import inbound_events
         from .inbound_events import agent_text, dedupe_key
 
         if self.sessions is None:
@@ -2729,7 +2730,11 @@ class InkboxGateway:
             "verified": data.get("signature_verified") is True,
         }
         # Mode "external" has no reply channel (noreply).
-        await self.sessions.get(f"inbound:{name}").run_external(agent_text(data, body), meta)
+        turn = self.sessions.get(f"inbound:{name}").run_external(agent_text(data, body), meta)
+        try:
+            await asyncio.wait_for(turn, inbound_events.TURN_TIMEOUT_S)
+        except TimeoutError:
+            raise TimeoutError(f"agent turn did not finish within {inbound_events.TURN_TIMEOUT_S // 60} minutes") from None
 
     async def _report_inbound_failure(self, data: Dict[str, Any], error: str) -> None:
         """Report a failed delivery; raises when the report should be retried."""

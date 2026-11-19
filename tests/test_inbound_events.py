@@ -383,6 +383,22 @@ def test_agent_handler_failure_is_reported_once_without_rerun(tmp_path, clock):
     assert clock.sleeps == []
 
 
+def test_stuck_agent_turn_is_reported_after_the_bound(tmp_path, monkeypatch):
+    monkeypatch.setattr(inbound_events, "TURN_TIMEOUT_S", 0.05)
+    gw = _gateway(tmp_path, monkeypatch)
+    hung = types.SimpleNamespace(run_external=lambda text, meta: asyncio.Event().wait())
+    gw.sessions = types.SimpleNamespace(get=lambda chat_id: hung)
+    reports = []
+
+    async def report(data, error):
+        reports.append(error)
+
+    events = InboundEvents(tmp_path / "e.sqlite3", gw._run_inbound_agent, report)
+    events.accept(_data())
+    _run(events)
+    assert len(reports) == 1 and reports[0].startswith("TimeoutError: agent turn did not finish within")
+
+
 def test_interrupted_agent_turn_is_reported_not_repeated(tmp_path):
     path = tmp_path / "e.sqlite3"
     started, reports = asyncio.Event(), []
