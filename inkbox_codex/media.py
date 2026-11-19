@@ -90,6 +90,7 @@ async def download_media(items: List[Any], *, prefix: str) -> List[Dict[str, Any
                 continue
             saved.append({
                 "path": str(target),
+                "position": idx + 1,
                 "content_type": content_type or "application/octet-stream",
                 "size": _item_field(item, "size"),
                 **({"transcription": _item_field(item, "transcription")} if _item_field(item, "transcription") is not None else {}),

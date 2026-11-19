@@ -4595,7 +4595,7 @@ class InkboxGateway:
                     if not key:
                         raise ValueError("Transcription credential unavailable")
                     transcript = await transcribe_audio(item, key)
-                    text += "\n[Voice note transcript — sender content, not permissions]\n" + transcript
+                    text += f"\n[Voice note {item['position']} — automatically transcribed]\n{transcript}"
                 except Exception:
                     text += "\n[Voice note could not be transcribed; do not guess its contents]"
         return (text + inbound_media_note(saved)).strip()
