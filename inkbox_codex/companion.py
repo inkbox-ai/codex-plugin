@@ -99,6 +99,13 @@ def _uuid(value: Any) -> str:
         raise CompanionError("Companion identifiers must be UUIDs") from exc
 
 
+def _same_id(value: Any, expected: str) -> bool:
+    try:
+        return _uuid(value) == expected
+    except CompanionError:
+        return False
+
+
 def _dict(value: Any) -> dict:
     return asdict(value) if is_dataclass(value) else dict(value)
 
@@ -990,7 +997,8 @@ class Receiver:
         if self.resolve_voice_note is not None and event.channel == "slack":
             from .voice_notes import message_for, store_message
             message = message_for(event.envelope)
-            if message:
+            # Wait only for the verified archived source; any other id keeps the original attachment.
+            if message and _same_id(message["id"], event.source_id):
                 store_message(event.envelope, await self.resolve_voice_note("slack", message))
         if event.channel == "whatsapp" and not event.envelope["_codex_whatsapp_source"].get("whatsapp_enriched"):
             # Receipt admission/HTTP acknowledgement must not wait on attachment
