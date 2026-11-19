@@ -968,3 +968,29 @@ def test_codex_turn_timeout_restarts_client():
         assert session._turn_active is False
 
     asyncio.run(scenario())
+
+
+def test_run_external_waits_for_the_turn_outcome():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        texts = []
+
+        class FakeClient:
+            thread_id = "thread-1"
+            fail = False
+
+            async def run(self, text, **_options):
+                texts.append(text)
+                if self.fail:
+                    raise CodexAppServerError("turn failed")
+                return "done"
+
+        session._client = FakeClient()
+        await asyncio.wait_for(session.run_external("work", {"external": True, "source": "billing"}), 5)
+        session._client.fail = True
+        with pytest.raises(CodexAppServerError, match="turn failed"):
+            await asyncio.wait_for(session.run_external("work", {"external": True, "source": "billing"}), 5)
+        assert len(texts) == 2 and sent == []
+
+    asyncio.run(scenario())

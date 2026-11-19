@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import json
 import sqlite3
@@ -115,9 +116,9 @@ class _Session:
         self.calls = calls
         self.queue = TurnQueue()
 
-    async def handle_inbound(self, text, mode, meta):
+    async def run_external(self, text, meta):
         self.queue.put_nowait(_Turn(text=text))
-        self.calls.append((text, mode, meta))
+        self.calls.append((text, "external", meta))
 
 
 def test_hosted_delivery_is_persisted_then_run(tmp_path, monkeypatch):
@@ -206,9 +207,17 @@ def test_outside_local_mode_is_ignored(tmp_path, monkeypatch):
     assert not (tmp_path / "inbound.sqlite3").exists()
 
 
+def test_base64_body_is_shown_when_it_is_utf8():
+    encoded = base64.b64encode("café ✓".encode()).decode()
+    text = agent_text(_data(body=encoded, body_encoding="base64"))
+    assert text.endswith("Body:\ncafé ✓")
+    big = base64.b64encode(b"x" * 70000).decode()
+    assert agent_text(_data(body=big, body_encoding="base64")).endswith("x" * 65536 + "\n(truncated)")
+
+
 def test_binary_body_is_not_inlined():
-    text = agent_text(_data(body="AAEC", body_encoding="base64"))
-    assert "binary body" in text and "AAEC" not in text
+    text = agent_text(_data(body="AAEC/w==", body_encoding="base64"))
+    assert "(binary body, 4 bytes, not shown)" in text and "AAEC" not in text
 
 
 def test_script_empty_stdout_needs_no_turn(tmp_path, monkeypatch):
@@ -303,12 +312,13 @@ def test_failure_report_retries_without_rerunning_script(tmp_path, clock, monkey
     assert clock.sleeps[-2:] == [30, 60]
 
 
-def test_failure_report_gives_up_after_a_day(tmp_path, clock):
+def test_failure_report_keeps_retrying_past_a_day(tmp_path, clock):
     tries = []
 
     async def report(data, error):
         tries.append(clock.now[0])
-        raise RuntimeError("down")
+        if clock.now[0] - tries[0] < 2 * 86400:
+            raise RuntimeError("down")
 
     async def agent(data, body):
         raise RuntimeError("sessions are not ready")
@@ -316,8 +326,44 @@ def test_failure_report_gives_up_after_a_day(tmp_path, clock):
     events = InboundEvents(tmp_path / "e.sqlite3", agent, report)
     events.accept(_data())
     _run(events)
-    assert tries and tries[-1] - tries[0] <= 86400
+    assert tries[-1] - tries[0] >= 2 * 86400 and max(clock.sleeps) == 3600
     assert _rows(tmp_path / "e.sqlite3") == {_data()["delivery_id"]: ("done", 0)}
+
+
+def test_pending_report_is_retried_immediately_on_start(tmp_path, clock):
+    path = tmp_path / "e.sqlite3"
+    first = InboundEvents(path, None, None)
+    first.accept(_data())
+    first._fail(_data()["delivery_id"], "bad")
+    first._update(_data()["delivery_id"], due=clock.now[0] + 3600)
+    first.db.close()
+    reports = []
+
+    async def report(data, error):
+        reports.append(error)
+
+    _run(InboundEvents(path, None, report))
+    assert reports == ["bad"] and clock.sleeps == []
+
+
+def test_interrupted_last_script_run_is_not_repeated(tmp_path, clock, monkeypatch):
+    async def fake_run(command, stdin):
+        raise AssertionError("sixth run")
+
+    reports = []
+
+    async def report(data, error):
+        reports.append(error)
+
+    monkeypatch.setattr(inbound_events, "run_script", fake_run)
+    path = tmp_path / "e.sqlite3"
+    first = InboundEvents(path, None, None)
+    first.accept(_data({"type": "script", "command": "x"}))
+    # Five runs counted; the fifth was cut off by a restart.
+    first._update(_data()["delivery_id"], runs=5, error="bad")
+    first.db.close()
+    _run(InboundEvents(path, None, report))
+    assert reports == ["bad"]
 
 
 def test_agent_handler_failure_is_reported_once_without_rerun(tmp_path, clock):

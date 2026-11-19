@@ -2729,7 +2729,7 @@ class InkboxGateway:
             "verified": data.get("signature_verified") is True,
         }
         # Mode "external" has no reply channel (noreply).
-        await self.sessions.get(f"inbound:{name}").handle_inbound(agent_text(data, body), "external", meta)
+        await self.sessions.get(f"inbound:{name}").run_external(agent_text(data, body), meta)
 
     async def _report_inbound_failure(self, data: Dict[str, Any], error: str) -> None:
         """Report a failed delivery; raises when the report should be retried."""

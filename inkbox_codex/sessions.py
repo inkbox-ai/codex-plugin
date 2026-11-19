@@ -1691,6 +1691,17 @@ class ContactSession:
             self._worker = asyncio.create_task(self._drain())
         return await future
 
+    async def run_external(self, text: str, meta: Dict[str, Any]) -> None:
+        """Run one turn with no reply channel and wait for it; raises when the turn fails."""
+        completion = asyncio.get_running_loop().create_future()
+        turn = _Turn(text=frame_inbound("external", meta, text), reply_mode="external",
+                     reply_meta=deepcopy(meta), completion=completion)
+        await self._notify_turn_activity(turn, "accepted")
+        await self._queue.put(turn)
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+        await completion
+
     async def run_consult_detailed(
         self,
         query: str,
