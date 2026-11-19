@@ -90,18 +90,31 @@ async def refresh_media(gateway, payload):
         raise ValueError('Fresh media unavailable')
     media = [asdict(item) if is_dataclass(item) else dict(item) for item in media]
     accepted = message['media']
-    modern = any(item.get('id') for item in media)
-    by_id = {str(item['id']): item for item in media if item.get('id')}
+    by_id = {}
+    for index, item in enumerate(media):
+        if item.get('id'):
+            attachment_id = str(item['id'])
+            if attachment_id in by_id:
+                raise ValueError('Ambiguous fresh attachment identity')
+            by_id[attachment_id] = index
+    positional = fresh_id is not None and len(media) == len(accepted)
+    used = set()
     refreshed = []
     for index, item in enumerate(accepted):
-        match = by_id.get(str(item['id'])) if modern and item.get('id') else None
-        if match is None and not modern and len(media) == len(accepted):
+        if item.get('id') and by_id:
+            match_index = by_id.get(str(item['id']))
+        elif positional:
             candidate = media[index]
-            if not (item.get('content_type') and candidate.get('content_type')
+            if (item.get('content_type') and candidate.get('content_type')
                     and item['content_type'] != candidate['content_type']):
-                match = candidate
-        if match is None:
+                raise ValueError('Fresh attachment content type mismatch')
+            match_index = index
+        else:
+            match_index = None
+        if match_index is None or match_index in used:
             raise ValueError('Fresh attachment identity unavailable')
+        used.add(match_index)
+        match = media[match_index]
         current = {**item, 'url': match.get('url')}
         result = match.get('transcription')
         if isinstance(result, dict) and result.get('status') in {'completed', 'failed', 'skipped'}:

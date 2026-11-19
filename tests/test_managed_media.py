@@ -39,7 +39,7 @@ def test_queued_media_refreshes_without_delivery_retry(tmp_path, monkeypatch, ch
                 inbox.accept(original)
                 _, queued = inbox.claim()
                 assert not await download_media(queued['data'][key]['media'], prefix='old')
-                get = Mock(return_value={'media': [{'url': str(server.make_url('/fresh'))}]})
+                get = Mock(return_value={'id': 'source-message', 'media': [{'url': str(server.make_url('/fresh'))}]})
                 gateway = SimpleNamespace(_identity=SimpleNamespace(**{lookup: get}))
                 refreshed = await refresh_media(gateway, queued)
                 get.assert_called_once_with('source-message')
@@ -135,3 +135,36 @@ def test_media_refresh_rejects_foreign_message_or_attachment(foreign_message, fo
         with pytest.raises(ValueError, match="identity"):
             await refresh_media(gateway, original)
     asyncio.run(scenario())
+
+
+def test_media_refresh_matches_legacy_position_alongside_reordered_known_ids():
+    accepted = [{"id": "one"}, {"content_type": "audio/wav"}, {"id": "three"}]
+    original = {"event_type": "imessage.received", "data": {"message": {"id": "source", "media": accepted}}}
+    fresh = [{"id": key, "url": f"https://example.test/{key}"} for key in ("three", "two", "one")]
+    fresh[1].update(content_type="audio/wav", transcription={"status": "completed", "text": "Hello"})
+    lookup = Mock(return_value={"id": "source", "media": fresh})
+    gateway = SimpleNamespace(_identity=SimpleNamespace(get_imessage=lookup))
+    result = asyncio.run(refresh_media(gateway, original))["data"]["message"]["media"]
+    assert result == [
+        {**accepted[0], "url": fresh[2]["url"]},
+        {**accepted[1], "url": fresh[1]["url"], "transcription": fresh[1]["transcription"]},
+        {**accepted[2], "url": fresh[0]["url"]},
+    ]
+
+
+@pytest.mark.parametrize("message_id,accepted,fresh", [
+    (None, [{}], [{"id": "new"}]),
+    ("other", [{}], [{"id": "new"}]),
+    ("source", [{}], [{"id": "one"}, {"id": "two"}]),
+    ("source", [{"content_type": "audio/wav"}], [{"id": "new", "content_type": "image/png"}]),
+    ("source", [{}, {"id": "known"}], [{"id": "one"}, {"id": "other"}]),
+    ("source", [{}, {"id": "known"}], [{"id": "known"}, {"id": "other"}]),
+    ("source", [{"id": "known"}, {}], [{"id": "other"}, {"id": "known"}]),
+    ("source", [{}, {}], [{"id": "same"}, {"id": "same"}]),
+])
+def test_media_refresh_rejects_incompatible_positional_matches(message_id, accepted, fresh):
+    original = {"event_type": "imessage.received", "data": {"message": {"id": "source", "media": accepted}}}
+    lookup = Mock(return_value={"id": message_id, "media": fresh})
+    gateway = SimpleNamespace(_identity=SimpleNamespace(get_imessage=lookup))
+    with pytest.raises(ValueError, match="identity|content type"):
+        asyncio.run(refresh_media(gateway, original))
