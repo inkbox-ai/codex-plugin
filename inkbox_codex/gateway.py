@@ -2428,6 +2428,9 @@ class InkboxGateway:
                 if len(self._call_meta_by_id) > 100:
                     self._call_meta_by_id.pop(next(iter(self._call_meta_by_id)), None)
             return web.json_response({"ok": True})
+        if event_type.startswith("slack.") and not self.cfg.slack_enabled:
+            # A disabled channel never holds or polls its voice notes.
+            return web.json_response({"ok": True, "ignored": "slack-disabled"})
         voice_receipt = self._voice_note_receipt(event_type, envelope)
         if voice_receipt is not None:
             return voice_receipt
@@ -4377,7 +4380,12 @@ class InkboxGateway:
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
         if not meta["slack_addressed"] and not self.sessions.has_session(chat_id):
             return web.json_response({"ok": True, "ignored": "unwatched-thread"})
-        event_key = f"slack:{envelope['id']}"
+        # One Slack message can arrive under several envelopes; its retained
+        # message ID is the admission identity when present.
+        message_id = (envelope.get("data") or {}).get("message_id")
+        if envelope.get("event_type") == SLACK_STOP_EVENT or not isinstance(message_id, str) or not message_id:
+            message_id = envelope["id"]
+        event_key = f"slack:{message_id}"
         if self._dedup_begin(event_key):
             return web.json_response({"ok": True, "deduped": True})
         try:
