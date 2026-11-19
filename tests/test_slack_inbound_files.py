@@ -177,9 +177,8 @@ def test_failed_transcript_preserves_download_without_local_transcription(gw, cl
 
 
 def test_companion_waits_for_pending_slack_transcript(tmp_path, monkeypatch, client):
-    from tests.test_slack_companion import fixture, gateway, live, session_for
+    from tests.test_slack_companion import fixture, gateway, live, session_for, source_id
     from tests.test_companion import drained
-    message_id = "00000000-0000-4000-8000-0000000000ee"
     async def scenario():
         initial = fixture()
         gateway_instance, _, slack = gateway(monkeypatch, tmp_path, initial)
@@ -192,7 +191,7 @@ def test_companion_waits_for_pending_slack_transcript(tmp_path, monkeypatch, cli
             session = session_for(gateway_instance, initial)
             session._client.events.clear()
             incoming = live(initial)
-            incoming["data"]["message_id"] = message_id
+            incoming["data"]["message_id"] = source_id(incoming)
             incoming["data"]["event"]["files"] = [
                 {"id": "F_AUDIO", "name": "memo.m4a", "transcription": {"status": "pending"}}]
             await receiver.accept(incoming)
@@ -213,6 +212,39 @@ def test_companion_waits_for_pending_slack_transcript(tmp_path, monkeypatch, cli
             gateway_instance._voice_note_receipt(finished["event_type"], finished)
             await asyncio.sleep(0)
             assert len(session._client.events) == 1
+        finally:
+            await receiver.close()
+            if getattr(gateway_instance, "_voice_note_state", None) is not None:
+                await gateway_instance._voice_note_state.close()
+    asyncio.run(scenario())
+
+
+def test_companion_mismatched_slack_message_id_delivers_attachment_without_waiting(tmp_path, monkeypatch, client):
+    from tests.test_slack_companion import fixture, gateway, live, session_for
+    from tests.test_companion import drained
+    async def scenario():
+        initial = fixture()
+        gateway_instance, _, slack = gateway(monkeypatch, tmp_path, initial)
+        slack.get_file = client.slack.get_file
+        slack.download_file = client.slack.download_file
+        receiver = gateway_instance._companion()
+        try:
+            await receiver.accept(initial)
+            await drained(receiver)
+            session = session_for(gateway_instance, initial)
+            session._client.events.clear()
+            incoming = live(initial)
+            incoming["data"]["message_id"] = "00000000-0000-4000-8000-0000000000ee"
+            incoming["data"]["event"]["files"] = [
+                {"id": "F_AUDIO", "name": "memo.m4a", "transcription": {"status": "pending"}}]
+            await receiver.accept(incoming)
+            await drained(receiver)
+            assert len(session._client.events) == 1
+            _, text = session._client.events[0]
+            assert '"status": "downloaded"' in text
+            assert "[Voice note 1: transcript unavailable;" in text
+            slack.download_file.assert_called_once()
+            assert getattr(gateway_instance, "_voice_note_state", None) is None
         finally:
             await receiver.close()
             if getattr(gateway_instance, "_voice_note_state", None) is not None:
