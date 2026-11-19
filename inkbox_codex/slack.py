@@ -25,11 +25,10 @@ SLACK_ATTENTION_EVENTS = tuple(
     event for event in SLACK_INCOMING_EVENTS if event != "slack.channel_message_received"
 )
 SLACK_STOP_EVENT = "slack.session_stopped"
+SLACK_SUBSCRIPTION_EVENTS = (*SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT)
 # Slack voice-note completions reach only a receiver that also selects the
 # original message, so they share the Slack subscription.
 SLACK_TRANSCRIPTION_EVENT = "message.transcription_finished"
-SLACK_MESSAGE_SUBSCRIPTION_EVENTS = (*SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT)
-SLACK_SUBSCRIPTION_EVENTS = (*SLACK_MESSAGE_SUBSCRIPTION_EVENTS, SLACK_TRANSCRIPTION_EVENT)
 SLACK_MAX_TEXT_LENGTH = 12000
 SLACK_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
@@ -79,7 +78,7 @@ def slack_resource(client: Any) -> Any:
 def reconcile_subscription(client: Any, identity_id: Any, url: str) -> None:
     slack_resource(client)
     subscriptions = client.webhooks.subscriptions
-    events = list(SLACK_MESSAGE_SUBSCRIPTION_EVENTS)
+    events = list(SLACK_SUBSCRIPTION_EVENTS)
     rows = [sub for sub in subscriptions.list(agent_identity_id=identity_id, scope="identity", url=url) if sub.url == url]
     covered = set()
     message_subscriptions = []

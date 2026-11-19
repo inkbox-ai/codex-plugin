@@ -15,9 +15,9 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 
 try:
-    from .slack import SLACK_INCOMING_EVENTS
+    from .slack import SLACK_INCOMING_EVENTS, SLACK_TRANSCRIPTION_EVENT
 except ImportError:  # pragma: no cover - direct local import fallback
-    from slack import SLACK_INCOMING_EVENTS
+    from slack import SLACK_INCOMING_EVENTS, SLACK_TRANSCRIPTION_EVENT
 
 logger = logging.getLogger(__name__)
 RECEIVED = {
@@ -26,7 +26,7 @@ RECEIVED = {
     "whatsapp.received": "whatsapp",
     **{event_type: "slack" for event_type in SLACK_INCOMING_EVENTS},
 }
-FINISHED = "message.transcription_finished"
+FINISHED = SLACK_TRANSCRIPTION_EVENT
 WAIT_SECONDS = 60.0
 POLL_SECONDS = 10.0
 

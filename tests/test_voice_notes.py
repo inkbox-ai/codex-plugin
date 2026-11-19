@@ -565,6 +565,30 @@ def test_slack_deadline_polls_archive_once_then_delivers_original(tmp_path, outc
     asyncio.run(run())
 
 
+def test_slack_shutdown_retains_original_and_does_not_restart_sixty_second_deadline(tmp_path):
+    async def run():
+        delivered = []
+
+        async def deliver(item):
+            delivered.append(item)
+
+        first = inbox(tmp_path, deliver)
+        first.defer(slack_envelope())
+        deadline = first.db.execute("SELECT deadline FROM voice_notes").fetchone()[0]
+        await first.close()
+        second = inbox(tmp_path, deliver)
+        assert second.db.execute("SELECT deadline FROM voice_notes").fetchone()[0] == deadline
+        second.complete(slack_completion(slack_envelope()))
+        second.recover()
+        await next(iter(second.tasks.values()))
+        assert len(delivered) == 1
+        assert delivered[0]["event_type"] == "slack.mention_received"
+        assert delivered[0]["data"]["event"]["files"][0]["transcription"]["status"] == "completed"
+        await second.close()
+
+    asyncio.run(run())
+
+
 def test_slack_failed_completion_delivers_original_attachment_notice(tmp_path):
     async def run():
         delivered = []
@@ -668,13 +692,30 @@ def test_gateway_defers_pending_slack_voice_note_and_wakes_once(tmp_path, monkey
     asyncio.run(run())
 
 
-def test_slack_subscription_selects_completions_and_tolerates_older_servers():
-    from inkbox_codex.slack import (
-        SLACK_MESSAGE_SUBSCRIPTION_EVENTS, SLACK_SUBSCRIPTION_EVENTS, reconcile_subscription,
-    )
+def test_disabled_slack_does_not_hold_pending_voice_note(tmp_path, monkeypatch):
+    from tests.test_slack import IDENTITY, Sessions
+    from inkbox_codex.config import BridgeConfig
 
-    assert "message.transcription_finished" in SLACK_SUBSCRIPTION_EVENTS
-    assert "message.transcription_finished" not in SLACK_MESSAGE_SUBSCRIPTION_EVENTS
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+
+    async def run():
+        bridge = gateway.InkboxGateway(BridgeConfig(slack_enabled=False))
+        bridge._identity = types.SimpleNamespace(id=IDENTITY)
+        bridge.sessions = Sessions()
+        original = slack_envelope()
+        response = await bridge._route_inkbox_event(original["event_type"], original)
+        assert b'"ignored": "slack-disabled"' in response.body
+        assert getattr(bridge, "_voice_note_state", None) is None
+        assert not bridge.sessions.turns
+
+    asyncio.run(run())
+
+
+def test_slack_subscription_selects_completions_and_tolerates_older_servers():
+    from inkbox_codex.slack import SLACK_SUBSCRIPTION_EVENTS, reconcile_subscription
+    from inkbox_codex.voice_notes import FINISHED
+
+    assert FINISHED == "message.transcription_finished" and FINISHED not in SLACK_SUBSCRIPTION_EVENTS
     client = Mock()
     rejected = Exception("unsupported")
     rejected.status_code = 422
@@ -684,7 +725,7 @@ def test_slack_subscription_selects_completions_and_tolerates_older_servers():
     client.webhooks.subscriptions.create.side_effect = [rejected, None]
     reconcile_subscription(client, "identity-1", "https://agent.example/webhook?channel=slack")
     attempts = [call.kwargs["event_types"] for call in client.webhooks.subscriptions.create.call_args_list]
-    assert attempts == [list(SLACK_SUBSCRIPTION_EVENTS), list(SLACK_MESSAGE_SUBSCRIPTION_EVENTS)]
+    assert attempts == [[*SLACK_SUBSCRIPTION_EVENTS, FINISHED], list(SLACK_SUBSCRIPTION_EVENTS)]
     client.webhooks.subscriptions.create.side_effect = Exception("server error")
     with pytest.raises(Exception, match="server error"):
         reconcile_subscription(client, "identity-1", "https://agent.example/webhook?channel=slack")
@@ -738,13 +779,12 @@ def test_slack_completion_moves_onto_one_message_subscription(case):
         "fresh": [],
         # A completion-only receiver never gets Slack completions; the message row must hold it.
         "standalone_completion": [
-            row("messages", [event for event in SLACK_SUBSCRIPTION_EVENTS if event != finished]),
+            row("messages", SLACK_SUBSCRIPTION_EVENTS),
             row("completion", [finished]),
         ],
         "split_message_rows": [
             row("dm", ["slack.dm_received", finished]),
-            row("messages", [event for event in SLACK_SUBSCRIPTION_EVENTS
-                             if event not in {"slack.dm_received", finished}]),
+            row("messages", [event for event in SLACK_SUBSCRIPTION_EVENTS if event != "slack.dm_received"]),
         ],
     }[case]
     subscriptions = _UniqueSubscriptions(rows)
@@ -752,7 +792,7 @@ def test_slack_completion_moves_onto_one_message_subscription(case):
     reconcile_subscription(client, "identity-1", url)
     holders = [sub for sub in subscriptions.rows.values() if finished in sub.event_types]
     assert len(holders) == 1 and set(holders[0].event_types) & set(SLACK_INCOMING_EVENTS)
-    assert {event for sub in subscriptions.rows.values() for event in sub.event_types} == set(SLACK_SUBSCRIPTION_EVENTS)
+    assert {event for sub in subscriptions.rows.values() for event in sub.event_types} == {*SLACK_SUBSCRIPTION_EVENTS, finished}
     if case == "standalone_completion":
         assert subscriptions.writes == [("delete", "completion"), ("update", "messages")]
     if case == "split_message_rows":
