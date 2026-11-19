@@ -56,16 +56,16 @@ def test_voice_notes_preserve_text_and_do_not_invent_transcripts(sdk, monkeypatc
         gw = bridge(sdk)
         gw.cfg.realtime.api_key = "synthetic" if outcome != "unconfigured" else ""
         monkeypatch.setattr(gateway, "download_media", AsyncMock(return_value=[{
-            "path": "/tmp/voice-fixture.ogg", "content_type": "audio/ogg"}]))
+            "position": 2, "path": "/tmp/voice-fixture.ogg", "content_type": "audio/ogg"}]))
         transcribe = AsyncMock(return_value="Please send the summary")
         if outcome == "failure":
             transcribe.side_effect = ValueError("Synthetic failure")
         monkeypatch.setattr("inkbox_codex.slack_media.transcribe_audio", transcribe)
         paths = []
-        body = await gw._with_media("Original caption", [{"url": "https://example.com/audio"}],
+        body = await gw._with_media("Original caption", [{}, {"url": "https://example.com/audio"}],
                                     prefix="whatsapp-fixture", image_paths=paths)
         assert "Original caption" in body and not paths
-        assert ("Please send the summary" in body) == (outcome == "success")
+        assert ("[Voice note 2 — automatically transcribed]\nPlease send the summary" in body) == (outcome == "success")
         assert ("do not guess" in body) == (outcome != "success")
         if outcome == "unconfigured":
             transcribe.assert_not_awaited()

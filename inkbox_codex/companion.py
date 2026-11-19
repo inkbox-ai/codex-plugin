@@ -421,10 +421,11 @@ class Inbox:
 
 
 class Receiver:
-    def __init__(self, *, cfg, client, sessions, sender_allowed: Callable, mail_body: Callable, prepare_whatsapp: Callable | None = None):
+    def __init__(self, *, cfg, client, sessions, sender_allowed: Callable, mail_body: Callable, prepare_whatsapp: Callable | None = None, resolve_voice_note: Callable | None = None):
         self.cfg, self.client, self.sessions = cfg, client, sessions
         self.sender_allowed, self.mail_body = sender_allowed, mail_body
         self.prepare_whatsapp = prepare_whatsapp
+        self.resolve_voice_note = resolve_voice_note
         namespace = hashlib.sha256(f"{cfg.base_url}|{cfg.identity}".encode()).hexdigest()
         self.namespace = namespace
         self.inbox = Inbox(inbox_path(cfg))
@@ -983,6 +984,9 @@ class Receiver:
                 # Match ordinary inbound filtering: discard this input without
                 # blocking a later, permitted sponsor in the same scope.
                 return
+        if self.resolve_voice_note is not None and event.channel in {"phone", "imessage", "whatsapp"}:
+            field = "text_message" if event.channel == "phone" else "message"
+            event.envelope["data"][field] = await self.resolve_voice_note(event.channel, event.envelope["data"][field])
         if event.channel == "whatsapp" and not event.envelope["_codex_whatsapp_source"].get("whatsapp_enriched"):
             # Receipt admission/HTTP acknowledgement must not wait on attachment
             # downloads or contact lookups. Persist enrichment for restart replay.
@@ -1043,7 +1047,8 @@ class Receiver:
                 raise CompanionError("Invalid Companion Slack message")
             return incoming[1]
         message = event.envelope["data"]["text_message" if event.channel == "phone" else "message"]
-        text = event.text
+        from .voice_notes import transcript_note
+        text = event.text + transcript_note(message.get("media") or [])
         if event.channel == "whatsapp":
             text = event.envelope["_codex_whatsapp_source"]["whatsapp_body"]
         if event.channel == "mail":

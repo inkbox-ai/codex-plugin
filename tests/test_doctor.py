@@ -14,6 +14,7 @@ def test_voice_config_probe_failures_do_not_mark_identity_unreachable(
     monkeypatch, tmp_path,
 ):
     identity = types.SimpleNamespace(
+        id="identity-1",
         mailbox=types.SimpleNamespace(email_address="agent@example.com"),
         phone_number=types.SimpleNamespace(number="+15551234567"),
         imessage_enabled=False,

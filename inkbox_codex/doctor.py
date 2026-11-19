@@ -147,6 +147,13 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
         except Exception as exc:
             checks.append(("identity reachable", False, str(exc)))
         else:
+            from .voice_notes import inbox_path, unconfirmed_ids
+            try:
+                ids = unconfirmed_ids(inbox_path(str(identity.id)))
+            except (OSError, sqlite3.Error):
+                checks.append(("Unconfirmed voice notes", False, "Cannot read the local inbox"))
+            else:
+                checks.append(("Unconfirmed voice notes", not ids, f"{len(ids)}" + (": " + ", ".join(ids) if ids else "")))
             mailbox = getattr(identity, "mailbox", None)
             phone = getattr(identity, "phone_number", None)
             detail = ", ".join(filter(None, [
