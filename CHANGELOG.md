@@ -3,7 +3,7 @@
 ## 0.2.44 (unreleased)
 
 - Add `INKBOX_DELIVERY_MODE=local`: no tunnel or webhook registration, a loopback-only listener, and 2 MiB request bodies with unchanged signature verification.
-- Handle `inbound.received` events in local delivery mode: deduplicated by delivery ID (falling back to event ID) so retries run once and replays run again, queued durably, and run as an agent turn or a script. Scripts run up to 5 times (retries after 10 s, 30 s, 2 min, and 10 min, 120 s timeout each) before the failure is reported. Bodies over 64 KiB are truncated in the agent message.
+- Handle `inbound.received` events, including hosted deliveries: each event is stored durably before it is acknowledged, deduplicated by `delivery_id` (retries run once, replays run again), and runs as an agent turn or a script from a local queue that resumes after a restart. Pending events and backoff waits count as activity. Scripts run up to 5 times (retries after 10 s, 30 s, 2 min, and 10 min; 120 s timeout each); output is read continuously, keeping up to 64 KiB of stdout and the last 4 KiB of stderr. Script and agent failures are reported to Inkbox with the `delivery_id`; the report is retried with backoff for up to 24 hours without running the script again. A valid Inkbox signature is always required. Bodies over 64 KiB are truncated in the agent message.
 - Require Inkbox SDK 0.7.41.
 
 ## 0.2.43 (unreleased)

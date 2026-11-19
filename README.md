@@ -1033,7 +1033,7 @@ without TOTP must have it configured before the agent can generate codes.
 | `CODEX_MODEL` | no | CLI default | Model override for bridged sessions. |
 | `INKBOX_REQUIRE_SIGNATURE` | no | `true` | Refuse unsigned inbound webhooks unless `false`. |
 | `INKBOX_SKIP_WEBHOOK_RECONCILE` | no | `false` | Leave webhook subscriptions untouched on start. For deployments that provision them ahead of time, where the destination is fixed or this API key may not change it. They must already point at this bridge's webhook URL, or nothing arrives. |
-| `INKBOX_DELIVERY_MODE` | no | unset | `local`: open no tunnel, register no webhook URL, and listen on `127.0.0.1` only (bodies up to 2 MiB, Inkbox signature still required). Events from inbound sources (`inbound.received`) are handled only in this mode: `agent` handlers start a turn in the `inbound:<source>` session; `script` handlers run the command with the event as JSON on stdin (120 s timeout, retried with backoff, failure reported back to Inkbox). |
+| `INKBOX_DELIVERY_MODE` | no | unset | `local`: open no tunnel, register no webhook URL, and listen on `127.0.0.1` only (bodies up to 2 MiB, Inkbox signature still required). Events from inbound sources (`inbound.received`) are handled in this mode and on hosted agents: `agent` handlers start a turn in the `inbound:<source>` session; `script` handlers run the command with the event as JSON on stdin (120 s timeout, up to 5 runs, failure reported back to Inkbox). |
 | `INKBOX_CONTACT_MEMORIES_ENABLED` | no | `true` | Add memories supplied with the matched webhook contact as background context. |
 | `INKBOX_BASE_URL` | no | SDK default | Override the Inkbox API base URL. |
 | `INKBOX_PUBLIC_URL` | no | - | Public bridge URL. Omit to use an Inkbox tunnel. |

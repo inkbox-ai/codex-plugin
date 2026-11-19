@@ -1052,7 +1052,7 @@ class InkboxGateway:
         self._hosted_call_registry_path = state_root / "hosted_call_completions.json"
         self._hosted_call_registry_owner = uuid.uuid4().hex
         self._hosted_call_jobs: Dict[str, asyncio.Task[Any]] = {}
-        self._inbound_path = state_root / "inbound_events.json"
+        self._inbound_path = state_root / "inbound_events.sqlite3"
         self._inbound = None
 
     # ------------------------------------------------------------------
@@ -1171,7 +1171,7 @@ class InkboxGateway:
         await asyncio.to_thread(self._patch_identity_objects)
         await self._catch_up_a2a_tasks()
         await self._recover_hosted_call_completions()
-        if self.cfg.delivery_mode == "local":
+        if self.cfg.delivery_mode == "local" or os.getenv("INKBOX_HOSTED_ACTIVATION_ID"):
             self._inbound_events().recover()
 
         logger.info(
@@ -1745,6 +1745,8 @@ class InkboxGateway:
             active += summary['pending'] + summary['active']
             ingress_unknown |= bool(summary['unknown'] or any(task.done() for task in ingress.tasks))
         active += sum(not task.done() for task in self._hosted_call_jobs.values())
+        if getattr(self, "_inbound", None) is not None:
+            active += self._inbound.pending()
         active += sum(not task.done() for tasks in self._a2a_jobs.values() for task in tasks)
         scheduler = self._scheduler
         if scheduler is None or scheduler.store is None:
@@ -2327,7 +2329,7 @@ class InkboxGateway:
                 return web.Response(status=503, text="Temporarily unavailable")
             return web.json_response(receipt, status=202)
 
-        if envelope.get("event_type") == "inbound.received":
+        if envelope.get("event_type") == "inbound.received" and not os.getenv("INKBOX_HOSTED_ACTIVATION_ID"):
             if source != "inkbox" or not provider.verify(
                 body=body, headers=dict(request.headers), url=str(request.url),
                 secret=self._provider_secret("inkbox"),
@@ -2335,14 +2337,7 @@ class InkboxGateway:
                 return web.Response(status=401, text="Invalid signature")
             if self.cfg.delivery_mode != "local":
                 return web.json_response({"ok": True, "ignored": "inbound.received"})
-            data = envelope.get("data")
-            if not isinstance(data, dict) or not data.get("event_id"):
-                return web.Response(status=400, text="invalid inbound event")
-            try:
-                fresh = self._inbound_events().accept(data)
-            except OSError:
-                return web.Response(status=503, text="Temporarily unavailable")
-            return web.json_response({"ok": True, "deduped": not fresh})
+            return self._accept_inbound(envelope)
 
         if os.getenv("INKBOX_HOSTED_ACTIVATION_ID"):
             # A legacy subscription must not bypass managed event selection.
@@ -2468,6 +2463,8 @@ class InkboxGateway:
             return await self._on_a2a_event(envelope)
         if event_type == "call.ended":
             return await self._on_hosted_call_ended(envelope)
+        if event_type == "inbound.received":
+            return self._accept_inbound(envelope)
         # Outbound delivery failures: tell the agent its message didn't land so
         # it can retry or reach the human another way.
         if event_type == "text.delivery_failed":
@@ -2700,6 +2697,18 @@ class InkboxGateway:
             )
             logger.exception("[bridge] hosted post-call reconciliation failed: %s", call_id)
 
+    def _accept_inbound(self, envelope: Dict[str, Any]) -> "web.Response":
+        """Persist one verified ``inbound.received`` event; it runs from the local queue."""
+        data = envelope.get("data")
+        if (not isinstance(data, dict) or not data.get("event_id") or not data.get("delivery_id")
+                or not isinstance(data.get("source"), dict) or not data["source"].get("id")):
+            return web.Response(status=400, text="invalid inbound event")
+        try:
+            fresh = self._inbound_events().accept(data)
+        except (OSError, sqlite3.Error):
+            return web.Response(status=503, text="Temporarily unavailable")
+        return web.json_response({"ok": True, "deduped": not fresh})
+
     def _inbound_events(self):
         if self._inbound is None:
             from .inbound_events import InboundEvents
@@ -2723,6 +2732,7 @@ class InkboxGateway:
         await self.sessions.get(f"inbound:{name}").handle_inbound(agent_text(data, body), "external", meta)
 
     async def _report_inbound_failure(self, data: Dict[str, Any], error: str) -> None:
+        """Report a failed delivery; raises when the report should be retried."""
         event_id = str(data.get("event_id") or "")
         inbound = getattr(self._inkbox, "inbound", None)
         report = getattr(inbound, "report_inbound_event_result", None)
@@ -2731,11 +2741,17 @@ class InkboxGateway:
             return
         try:
             await asyncio.to_thread(
-                report, self._identity.agent_handle, str((data.get("source") or {}).get("id") or ""),
-                event_id, status="failed", error=error,
+                report, self._identity.agent_handle, str(data["source"]["id"]), event_id,
+                status="failed", error=error, delivery_id=str(data["delivery_id"]),
             )
-        except Exception:
-            logger.exception("[inbound] could not report failure for %s", event_id)
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            # 409 means the event was delivered again since; other client errors cannot succeed later.
+            if isinstance(status, int) and 400 <= status < 500 and status not in (408, 429):
+                if status != 409:
+                    logger.error("[inbound] failure report for %s rejected: %s", event_id, exc)
+                return
+            raise
 
     async def _on_external_event(
         self,
