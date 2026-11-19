@@ -499,6 +499,26 @@ def test_slack_pending_receipt_waits_for_completion_and_wakes_once(tmp_path):
     asyncio.run(run())
 
 
+def test_slack_completion_before_original_is_cached_without_waking(tmp_path):
+    async def run():
+        delivered = []
+
+        async def deliver(item):
+            delivered.append(item)
+
+        state = inbox(tmp_path, deliver)
+        original = slack_envelope()
+        state.complete(slack_completion(original))
+        assert not state.tasks and not delivered
+        state.defer(original)
+        await next(iter(state.tasks.values()))
+        assert len(delivered) == 1 and not pending(message_for(delivered[0]))
+        assert delivered[0]["data"]["event"]["text"] == "<@U_AGENT> typed caption"
+        await state.close()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("outcome", ["completed", "pending", "failed", "error", "missing"])
 def test_slack_deadline_polls_archive_once_then_delivers_original(tmp_path, outcome):
     async def run():
@@ -616,10 +636,14 @@ def test_gateway_defers_pending_slack_voice_note_and_wakes_once(tmp_path, monkey
         bridge._identity = types.SimpleNamespace(id=IDENTITY)
         bridge.sessions = Sessions()
         original = slack_envelope()
+
+        def route(item):
+            return bridge._route_inkbox_event(item["event_type"], item)
+
         try:
-            first = await bridge._on_slack_received(original)
+            first = await route(original)
             assert b'"pending_transcription": true' in first.body
-            again = await bridge._on_slack_received(deepcopy(original))
+            again = await route(deepcopy(original))
             assert b'"pending_transcription": true' in again.body
             assert not bridge.sessions.turns and not downloads
             bridge._voice_note_receipt("message.transcription_finished", slack_completion(original))
@@ -630,12 +654,12 @@ def test_gateway_defers_pending_slack_voice_note_and_wakes_once(tmp_path, monkey
             assert "[Voice note 1 — automatically transcribed]\nMove the review to Thursday." in body
             assert len(downloads) == 1
             bridge._voice_note_receipt("message.transcription_finished", slack_completion(original))
-            await bridge._on_slack_received(deepcopy(original))
+            await route(deepcopy(original))
             await asyncio.sleep(0)
             assert len(bridge.sessions.turns) == 1
             transcribed = slack_envelope("completed", event_id="evt_ready")
             transcribed["data"]["message_id"] = "00000000-0000-4000-8000-0000000000dd"
-            await bridge._on_slack_received(transcribed)
+            await route(transcribed)
             assert len(bridge.sessions.turns) == 2
         finally:
             if getattr(bridge, "_voice_note_state", None) is not None:
@@ -664,3 +688,75 @@ def test_slack_subscription_selects_completions_and_tolerates_older_servers():
     client.webhooks.subscriptions.create.side_effect = Exception("server error")
     with pytest.raises(Exception, match="server error"):
         reconcile_subscription(client, "identity-1", "https://agent.example/webhook?channel=slack")
+
+
+class _UniqueSubscriptions:
+    """One active subscription per URL may select a given event, as the API enforces."""
+
+    def __init__(self, rows):
+        self.rows = {row.id: row for row in rows}
+        self.writes = []
+
+    def _check(self, sub_id, url, events):
+        for row in self.rows.values():
+            if row.id != sub_id and row.url == url and row.status == "active" and set(row.event_types) & set(events):
+                error = Exception("conflict")
+                error.status_code = 409
+                raise error
+
+    def list(self, **kwargs):
+        return [types.SimpleNamespace(**vars(row)) for row in self.rows.values() if row.url == kwargs["url"]]
+
+    def create(self, *, agent_identity_id, url, event_types):
+        self._check(None, url, event_types)
+        sub_id = f"created-{len(self.rows)}"
+        self.rows[sub_id] = types.SimpleNamespace(id=sub_id, url=url, status="active", event_types=list(event_types))
+        self.writes.append(("create", sub_id))
+
+    def update(self, sub_id, *, event_types, scope):
+        assert scope == "identity"
+        self._check(sub_id, self.rows[sub_id].url, event_types)
+        self.rows[sub_id].event_types = list(event_types)
+        self.writes.append(("update", sub_id))
+
+    def delete(self, sub_id):
+        del self.rows[sub_id]
+        self.writes.append(("delete", sub_id))
+
+
+@pytest.mark.parametrize("case", ["fresh", "standalone_completion", "split_message_rows"])
+def test_slack_completion_moves_onto_one_message_subscription(case):
+    from inkbox_codex.slack import SLACK_INCOMING_EVENTS, SLACK_SUBSCRIPTION_EVENTS, reconcile_subscription
+
+    url = "https://agent.example/webhook?channel=slack"
+    finished = "message.transcription_finished"
+
+    def row(sub_id, events):
+        return types.SimpleNamespace(id=sub_id, url=url, status="active", event_types=list(events))
+
+    rows = {
+        "fresh": [],
+        # A completion-only receiver never gets Slack completions; the message row must hold it.
+        "standalone_completion": [
+            row("messages", [event for event in SLACK_SUBSCRIPTION_EVENTS if event != finished]),
+            row("completion", [finished]),
+        ],
+        "split_message_rows": [
+            row("dm", ["slack.dm_received", finished]),
+            row("messages", [event for event in SLACK_SUBSCRIPTION_EVENTS
+                             if event not in {"slack.dm_received", finished}]),
+        ],
+    }[case]
+    subscriptions = _UniqueSubscriptions(rows)
+    client = types.SimpleNamespace(slack=object(), webhooks=types.SimpleNamespace(subscriptions=subscriptions))
+    reconcile_subscription(client, "identity-1", url)
+    holders = [sub for sub in subscriptions.rows.values() if finished in sub.event_types]
+    assert len(holders) == 1 and set(holders[0].event_types) & set(SLACK_INCOMING_EVENTS)
+    assert {event for sub in subscriptions.rows.values() for event in sub.event_types} == set(SLACK_SUBSCRIPTION_EVENTS)
+    if case == "standalone_completion":
+        assert subscriptions.writes == [("delete", "completion"), ("update", "messages")]
+    if case == "split_message_rows":
+        assert subscriptions.writes == []
+    writes = list(subscriptions.writes)
+    reconcile_subscription(client, "identity-1", url)  # Restart changes nothing.
+    assert subscriptions.writes == writes

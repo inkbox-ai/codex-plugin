@@ -95,7 +95,7 @@ try:
     from .codex_client import CodexTurnResult, probe_codex
     from .a2a_delegations import find_by_task as find_a2a_delegation
     from .media import download_media, inbound_media_note
-    from .voice_notes import FINISHED, finished_unsupported
+    from .voice_notes import FINISHED, transcription_unsupported
     from .hosted_sms_guard import hosted_sms_attempt_state
     from .prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
     from .realtime import (
@@ -127,7 +127,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from codex_client import CodexTurnResult, probe_codex
     from a2a_delegations import find_by_task as find_a2a_delegation
     from media import download_media, inbound_media_note
-    from voice_notes import FINISHED, finished_unsupported
+    from voice_notes import FINISHED, transcription_unsupported
     from hosted_sms_guard import hosted_sms_attempt_state
     from prompts import contact_marker, inject_contact_memories, normalize_contact_memories, strip_markdown
     from realtime import (
@@ -1379,7 +1379,7 @@ class InkboxGateway:
         try:
             _reconcile({"agent_identity_id": identity.id}, TRANSCRIPTION_EVENTS)
         except Exception as exc:
-            if not finished_unsupported(exc):
+            if not transcription_unsupported(exc):
                 raise
             logger.warning("Transcription callbacks are unavailable on this API version")
         if identity.mailbox is not None:
@@ -1486,7 +1486,7 @@ class InkboxGateway:
         if event_type == "imessage.received":
             return await self._on_imessage_received(envelope)
         if str(event_type).startswith("slack."):
-            return await self._on_slack_received(envelope, transcripts_resolved=True)
+            return await self._on_slack_received(envelope)
         from .whatsapp import receive
         return await receive(self, envelope)
 
@@ -2428,13 +2428,13 @@ class InkboxGateway:
                 if len(self._call_meta_by_id) > 100:
                     self._call_meta_by_id.pop(next(iter(self._call_meta_by_id)), None)
             return web.json_response({"ok": True})
+        voice_receipt = self._voice_note_receipt(event_type, envelope)
+        if voice_receipt is not None:
+            return voice_receipt
         from .slack import SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT
 
         if event_type in (*SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT):
             return await self._on_slack_received(envelope)
-        voice_receipt = self._voice_note_receipt(event_type, envelope)
-        if voice_receipt is not None:
-            return voice_receipt
         if event_type == "message.received":
             return await self._on_mail_received(envelope)
         if event_type == "text.received":
@@ -4358,9 +4358,7 @@ class InkboxGateway:
             f"{self._public_url}{DEFAULT_WEBHOOK_PATH}?channel=slack",
         )
 
-    async def _on_slack_received(
-        self, envelope: Dict[str, Any], *, transcripts_resolved: bool = False,
-    ) -> "web.Response":
+    async def _on_slack_received(self, envelope: Dict[str, Any]) -> "web.Response":
         from .slack import SLACK_STOP_EVENT, inbound_message, inbound_stop
 
         if not self.cfg.slack_enabled:
@@ -4379,11 +4377,6 @@ class InkboxGateway:
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
         if not meta["slack_addressed"] and not self.sessions.has_session(chat_id):
             return web.json_response({"ok": True, "ignored": "unwatched-thread"})
-        if not transcripts_resolved and envelope.get("event_type") != SLACK_STOP_EVENT:
-            # Only a message this gateway would admit waits for its transcript.
-            voice_receipt = self._voice_note_receipt(envelope["event_type"], envelope)
-            if voice_receipt is not None:
-                return voice_receipt
         event_key = f"slack:{envelope['id']}"
         if self._dedup_begin(event_key):
             return web.json_response({"ok": True, "deduped": True})

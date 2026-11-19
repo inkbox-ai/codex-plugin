@@ -302,9 +302,9 @@ Replies remain deduplicated by the stable event ID, not the selected category.
   automatically resent. Reuse the exact idempotency key when retrying an explicit
   send. Webhook duplicate suppression follows the gateway's existing bounded,
   in-memory behavior.
-- Incoming attachments are downloaded locally, and voice memos are transcribed
-  when a voice API key is configured. See attachment behavior below. Arbitrary
-  reaction tools are not included.
+- Incoming attachments are downloaded locally, and voice memos use the transcript
+  delivered with the message; no local transcription credential is used. See
+  attachment behavior below. Arbitrary reaction tools are not included.
 
 `INKBOX_ALLOWED_USERS` accepts Slack user IDs or workspace-qualified `T_ID:U_ID`
 entries. An empty list admits all human senders whose events reach the identity.
