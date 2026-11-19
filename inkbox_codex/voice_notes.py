@@ -83,8 +83,8 @@ def _envelope(channel: str, message: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def finished_unsupported(exc: Exception) -> bool:
-    """The server rejected only the completion event, so other events still register."""
+def transcription_unsupported(exc: Exception) -> bool:
+    """Recognize a server that does not offer the completion event yet."""
     if isinstance(exc, ValueError):
         return str(exc).startswith("Identity-wide webhook subscriptions are not supported by this server yet.")
     errors = getattr(exc, "detail", None)
@@ -95,7 +95,9 @@ def finished_unsupported(exc: Exception) -> bool:
         isinstance(error, dict)
         and error.get("type") == "enum"
         and isinstance(error.get("loc"), list)
+        and len(error["loc"]) >= 3
         and error["loc"][:2] == ["body", "event_types"]
+        and type(error["loc"][2]) is int
         and error.get("input") == FINISHED
         for error in errors
     )
