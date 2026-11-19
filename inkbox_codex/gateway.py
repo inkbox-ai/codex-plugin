@@ -1458,13 +1458,11 @@ class InkboxGateway:
     def _voice_note_inbox(self):
         if getattr(self, "_voice_note_closing", False):
             raise RuntimeError("Voice-note intake is shutting down")
-        from .voice_notes import VoiceNotes
+        from .voice_notes import VoiceNotes, inbox_path
         inbox = getattr(self, "_voice_note_state", None)
         if inbox is None:
-            root = Path(os.getenv("INKBOX_CODEX_HOME") or (Path.home() / ".inkbox-codex"))
-            identity_id = str(self._identity.id)
             inbox = self._voice_note_state = VoiceNotes(
-                root / f"voice-notes-{identity_id}.sqlite3", self._identity,
+                inbox_path(str(self._identity.id)), self._identity,
                 self._inkbox, self._deliver_voice_note,
                 ready=lambda: self.sessions is not None and self._identity is not None,
             )
