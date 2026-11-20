@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.45 (unreleased)
+
+- Wait for Slack voice-note transcripts like SMS, iMessage, and WhatsApp, and use them instead of transcribing Slack or WhatsApp audio locally with the realtime voice credential.
+- Wake the agent once for a Slack message delivered under several event categories.
+
 ## 0.2.44 (unreleased)
 
 - Add `INKBOX_DELIVERY_MODE=local`: no tunnel or webhook registration, a loopback-only listener, and 2 MiB request bodies with unchanged signature verification.
@@ -8,8 +13,6 @@
 - At most 100 inbound events (64 MiB) wait locally; a new delivery beyond that is refused with a retryable 503 before it is acknowledged, while a retry of a delivery already stored still gets its receipt. At most 4 inbound scripts run at once.
 - The 30-minute inbound turn limit counts from the turn's start, not its wait behind earlier turns, and an expired turn is interrupted instead of running on after it is reported failed.
 - Require Inkbox SDK 0.7.41; setup installs and checks for it.
-- Wait for Slack voice-note transcripts like SMS, iMessage, and WhatsApp, and use them instead of transcribing Slack or WhatsApp audio locally with the realtime voice credential.
-- Wake the agent once for a Slack message delivered under several event categories.
 
 ## 0.2.43 (unreleased)
 
