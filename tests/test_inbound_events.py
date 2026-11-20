@@ -116,7 +116,7 @@ class _Session:
         self.calls = calls
         self.queue = TurnQueue()
 
-    async def run_external(self, text, meta):
+    async def run_external(self, text, meta, *, timeout=None):
         self.queue.put_nowait(_Turn(text=text))
         self.calls.append((text, "external", meta))
 
@@ -160,7 +160,7 @@ def test_hosted_delivery_is_persisted_then_run(tmp_path, monkeypatch):
         await asyncio.wait_for(scenario(), 10)
 
     asyncio.run(bounded())
-    assert chats == ["inbound:billing"] and len(calls) == 1
+    assert chats == ["inbound:inbsrc_1"] and len(calls) == 1
     text, mode, meta = calls[0]
     assert mode == "external" and meta["event_key"] == envelope["data"]["delivery_id"]
     assert text.index("UNTRUSTED") < text.index("Record each paid invoice.") < text.index('{"paid": true}')
@@ -386,7 +386,8 @@ def test_agent_handler_failure_is_reported_once_without_rerun(tmp_path, clock):
 def test_stuck_agent_turn_is_reported_after_the_bound(tmp_path, monkeypatch):
     monkeypatch.setattr(inbound_events, "TURN_TIMEOUT_S", 0.05)
     gw = _gateway(tmp_path, monkeypatch)
-    hung = types.SimpleNamespace(run_external=lambda text, meta: asyncio.Event().wait())
+    hung = types.SimpleNamespace(
+        run_external=lambda text, meta, timeout: asyncio.wait_for(asyncio.Event().wait(), timeout))
     gw.sessions = types.SimpleNamespace(get=lambda chat_id: hung)
     reports = []
 
@@ -513,9 +514,6 @@ def test_failure_report_sends_delivery_id(tmp_path, monkeypatch):
     assert seen == [(("agent", "inbsrc_1", "inbev_1"),
                      {"status": "failed", "error": "bad", "delivery_id": _data()["delivery_id"]})]
 
-    gw._inkbox = object()
-    asyncio.run(gw._report_inbound_failure(_data(), "bad"))  # older SDK: logged, done
-
 
 @pytest.mark.parametrize(("status", "retried"), [(409, False), (404, False), (429, True), (500, True), (None, True)])
 def test_failure_report_outcomes(tmp_path, monkeypatch, status, retried):
@@ -589,3 +587,90 @@ def test_local_listener_binds_loopback_with_large_bodies(tmp_path, monkeypatch):
         Application=App, AppRunner=Runner, TCPSite=Site))
     asyncio.run(gw._start_http_server())
     assert seen == {"app": {"client_max_size": 2 * 1024 * 1024}, "host": "127.0.0.1"}
+
+
+def test_sessions_are_keyed_by_source_id(tmp_path, monkeypatch):
+    gw = _gateway(tmp_path, monkeypatch)
+    chats, calls = [], []
+    session = _Session(calls)
+    gw.sessions = types.SimpleNamespace(get=lambda chat_id: chats.append(chat_id) or session)
+    same_name = _data()
+    same_name["source"] = {**same_name["source"], "id": "inbsrc_2"}
+    asyncio.run(gw._run_inbound_agent(_data(), None))
+    asyncio.run(gw._run_inbound_agent(same_name, None))
+    assert chats == ["inbound:inbsrc_1", "inbound:inbsrc_2"]
+    assert [meta["source"] for _text, _mode, meta in calls] == ["billing", "billing"]
+
+
+def _fill(events):
+    for index in range(inbound_events.MAX_PENDING_EVENTS):
+        events.accept(_data(delivery_id=f"fill-{index}"))
+
+
+def test_full_queue_refuses_new_local_deliveries(tmp_path, monkeypatch):
+    gw = _gateway(tmp_path, monkeypatch)
+    first = asyncio.run(gw._handle_webhook(_Request(_envelope(_data()))))
+    assert first.status == 200
+    _fill(gw._inbound_events())
+    assert gw._inbound.full()
+    refused = asyncio.run(gw._handle_webhook(_Request(_envelope(_data(delivery_id="new")))))
+    assert refused.status == 503
+    # A retry of a stored delivery still dedupes.
+    repeat = asyncio.run(gw._handle_webhook(_Request(_envelope(_data()))))
+    assert repeat.status == 200 and json.loads(repeat.text)["deduped"] is True
+
+
+def test_queue_is_full_by_bytes(tmp_path, monkeypatch):
+    monkeypatch.setattr(inbound_events, "MAX_PENDING_BYTES", 2000)
+    events = InboundEvents(tmp_path / "e.sqlite3", None, None)
+    events.accept(_data(body="x" * 2000))
+    with pytest.raises(inbound_events.InboundFull):
+        events.accept(_data(delivery_id="next"), bounded=True)
+    events._update(_data()["delivery_id"], state="done", data=None)
+    assert events.accept(_data(delivery_id="next"), bounded=True) is True
+
+
+def test_full_queue_refuses_hosted_deliveries_before_acceptance(tmp_path, monkeypatch):
+    from inkbox_codex.managed_ingress import ManagedIngress
+
+    activation = str(uuid4())
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    monkeypatch.setenv("INKBOX_HOSTED_ACTIVATION_ID", activation)
+    gw = _gateway(tmp_path, monkeypatch)
+    _fill(gw._inbound_events())
+
+    async def scenario():
+        ingress = ManagedIngress(gw, activation)
+        gw._managed_control = types.SimpleNamespace(ingress=ingress)
+        ingress.start()
+        try:
+            response = await gw._handle_webhook(_Request(_hosted(_data(), activation)))
+            assert response.status == 503
+            assert ingress.inbox.summary()["pending"] == 0
+        finally:
+            await ingress.close()
+            await gw._inbound.close()
+
+    asyncio.run(scenario())
+
+
+def test_scripts_run_at_most_four_at_once(tmp_path, monkeypatch):
+    running, peak, turns = [0], [0], []
+
+    async def fake_run(command, stdin):
+        running[0] += 1
+        peak[0] = max(peak[0], running[0])
+        await asyncio.sleep(0.01)
+        running[0] -= 1
+        return True, "", ""
+
+    async def run_agent(data, body):
+        turns.append(body)
+
+    monkeypatch.setattr(inbound_events, "run_script", fake_run)
+    events = InboundEvents(tmp_path / "e.sqlite3", run_agent, None)
+    for index in range(10):
+        events.accept(_data({"type": "script", "command": "x"}, delivery_id=f"d{index}"))
+    _run(events)
+    assert peak[0] == inbound_events.MAX_RUNNING_SCRIPTS and events.pending() == 0
+    assert set(_rows(tmp_path / "e.sqlite3").values()) == {("done", 1)}

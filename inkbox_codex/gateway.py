@@ -2322,6 +2322,9 @@ class InkboxGateway:
             if ingress is None or any(task.done() for task in ingress.tasks):
                 return web.Response(status=503, text="Temporarily unavailable")
             try:
+                # Refused here so the sender retries; a dispatched delivery can no longer be refused.
+                if envelope.get("event_type") == "inbound.received" and self._inbound_events().full():
+                    return web.Response(status=503, text="Temporarily unavailable")
                 receipt = ingress.inbox.accept(envelope)
             except InboxError:
                 return web.Response(status=409, text="Invalid or conflicting delivery")
@@ -2337,7 +2340,7 @@ class InkboxGateway:
                 return web.Response(status=401, text="Invalid signature")
             if self.cfg.delivery_mode != "local":
                 return web.json_response({"ok": True, "ignored": "inbound.received"})
-            return self._accept_inbound(envelope)
+            return self._accept_inbound(envelope, bounded=True)
 
         if os.getenv("INKBOX_HOSTED_ACTIVATION_ID"):
             # A legacy subscription must not bypass managed event selection.
@@ -2697,15 +2700,17 @@ class InkboxGateway:
             )
             logger.exception("[bridge] hosted post-call reconciliation failed: %s", call_id)
 
-    def _accept_inbound(self, envelope: Dict[str, Any]) -> "web.Response":
+    def _accept_inbound(self, envelope: Dict[str, Any], *, bounded: bool = False) -> "web.Response":
         """Persist one verified ``inbound.received`` event; it runs from the local queue."""
+        from .inbound_events import InboundFull
+
         data = envelope.get("data")
         if (not isinstance(data, dict) or not data.get("event_id") or not data.get("delivery_id")
                 or not isinstance(data.get("source"), dict) or not data["source"].get("id")):
             return web.Response(status=400, text="invalid inbound event")
         try:
-            fresh = self._inbound_events().accept(data)
-        except (OSError, sqlite3.Error):
+            fresh = self._inbound_events().accept(data, bounded=bounded)
+        except (InboundFull, OSError, sqlite3.Error):
             return web.Response(status=503, text="Temporarily unavailable")
         return web.json_response({"ok": True, "deduped": not fresh})
 
@@ -2723,31 +2728,26 @@ class InkboxGateway:
 
         if self.sessions is None:
             raise RuntimeError("sessions are not ready")
-        name = str((data.get("source") or {}).get("name") or "inbound")
+        source = data["source"]
         meta = {
-            "external": True, "source": name, "event": "inbound.received",
+            "external": True, "source": str(source.get("name") or "inbound"), "event": "inbound.received",
             "event_key": dedupe_key(data),
             "verified": data.get("signature_verified") is True,
         }
-        # Mode "external" has no reply channel (noreply).
-        turn = self.sessions.get(f"inbound:{name}").run_external(agent_text(data, body), meta)
+        # Mode "external" has no reply channel (noreply). Names can repeat or change; the id cannot.
+        session = self.sessions.get(f"inbound:{source['id']}")
         try:
-            await asyncio.wait_for(turn, inbound_events.TURN_TIMEOUT_S)
+            await session.run_external(agent_text(data, body), meta, timeout=inbound_events.TURN_TIMEOUT_S)
         except TimeoutError:
             raise TimeoutError(f"agent turn did not finish within {inbound_events.TURN_TIMEOUT_S // 60} minutes") from None
 
     async def _report_inbound_failure(self, data: Dict[str, Any], error: str) -> None:
         """Report a failed delivery; raises when the report should be retried."""
         event_id = str(data.get("event_id") or "")
-        inbound = getattr(self._inkbox, "inbound", None)
-        report = getattr(inbound, "report_inbound_event_result", None)
-        if report is None:
-            logger.error("[inbound] event %s failed; this SDK cannot report it: %s", event_id, error)
-            return
         try:
             await asyncio.to_thread(
-                report, self._identity.agent_handle, str(data["source"]["id"]), event_id,
-                status="failed", error=error, delivery_id=str(data["delivery_id"]),
+                self._inkbox.inbound.report_inbound_event_result, self._identity.agent_handle,
+                str(data["source"]["id"]), event_id, status="failed", error=error, delivery_id=str(data["delivery_id"]),
             )
         except Exception as exc:
             status = getattr(exc, "status_code", None)

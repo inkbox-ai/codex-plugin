@@ -25,6 +25,9 @@ MAX_STDOUT_BYTES = 64 * 1024
 MAX_STDERR_BYTES = 4 * 1024
 REPORT_MAX_DELAY_S = 3600
 DONE_TTL_S = 7 * 86400
+MAX_PENDING_EVENTS = 100
+MAX_PENDING_BYTES = 64 * 1024 * 1024
+MAX_RUNNING_SCRIPTS = 4
 
 
 def cap_body(body: str) -> str:
@@ -82,6 +85,10 @@ def agent_text(data: Dict[str, Any], body: Optional[str] = None) -> str:
     return "\n".join(parts)
 
 
+class InboundFull(Exception):
+    """The local queue is full; the sender should retry later."""
+
+
 class ScriptFailed(Exception):
     def __init__(self, error: str):
         super().__init__(error)
@@ -105,6 +112,7 @@ class InboundEvents:
         self.report_failure = report_failure
         self.tasks: set[asyncio.Task[Any]] = set()
         self.started = False
+        self.script_slots = asyncio.Semaphore(MAX_RUNNING_SCRIPTS)
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, isolation_level=None)
         # WAL with FULL sync makes each commit durable before the delivery is acknowledged.
@@ -122,14 +130,27 @@ class InboundEvents:
         columns = ", ".join(f"{name}=?" for name in values)
         self.db.execute(f"UPDATE events SET {columns} WHERE delivery_id=?", (*values.values(), key))
 
-    def accept(self, data: Dict[str, Any]) -> bool:
-        """Persist one event; returns False when its delivery was already seen."""
+    def full(self) -> bool:
+        count, size = self.db.execute(
+            "SELECT count(*), coalesce(sum(length(data)), 0) FROM events WHERE state != 'done'"
+        ).fetchone()
+        return count >= MAX_PENDING_EVENTS or size >= MAX_PENDING_BYTES
+
+    def accept(self, data: Dict[str, Any], *, bounded: bool = False) -> bool:
+        """Persist one event; returns False when its delivery was already seen.
+
+        With ``bounded``, raises InboundFull instead of growing a full queue.
+        """
         key = dedupe_key(data)
         if not key:
             raise ValueError("missing delivery_id")
         now = time.time()
         state = "pending" if (data.get("handler") or {}).get("type") == "script" else "agent"
         self.db.execute("DELETE FROM events WHERE state='done' AND updated<?", (now - DONE_TTL_S,))
+        if self.db.execute("SELECT 1 FROM events WHERE delivery_id=?", (key,)).fetchone():
+            return False
+        if bounded and self.full():
+            raise InboundFull("inbound queue is full")
         inserted = self.db.execute(
             "INSERT OR IGNORE INTO events(delivery_id, state, data, due, updated) VALUES(?, ?, ?, ?, ?)",
             (key, state, json.dumps(data), now, now),
@@ -193,10 +214,11 @@ class InboundEvents:
                 break
             await self._wait(row["due"])
             runs = row["runs"] + 1
-            # Counted before running so a crash mid-run still uses up the attempt.
-            self._update(key, runs=runs)
             try:
-                out = await self._run_script(data)
+                async with self.script_slots:
+                    # Counted before running so a crash mid-run still uses up the attempt.
+                    self._update(key, runs=runs)
+                    out = await self._run_script(data)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

@@ -994,3 +994,85 @@ def test_run_external_waits_for_the_turn_outcome():
         assert len(texts) == 2 and sent == []
 
     asyncio.run(scenario())
+
+
+def test_run_external_timeout_interrupts_the_running_turn():
+    async def scenario():
+        session = make_session([])
+        released = asyncio.Event()
+
+        class FakeClient:
+            thread_id = "thread-1"
+            interrupts = 0
+
+            async def run(self, text, **_options):
+                await released.wait()
+                return ""
+
+            async def interrupt(self):
+                FakeClient.interrupts += 1
+                released.set()
+
+        session._client = FakeClient()
+        with pytest.raises(TimeoutError):
+            await session.run_external("work", {"external": True, "source": "billing"}, timeout=0.05)
+        await asyncio.wait_for(session._worker, 5)
+        assert FakeClient.interrupts == 1 and session._turn_active is False
+
+    asyncio.run(scenario())
+
+
+def test_run_external_timeout_excludes_queue_wait():
+    async def scenario():
+        session = make_session([])
+        gate = asyncio.Event()
+        texts = []
+
+        class FakeClient:
+            thread_id = "thread-1"
+
+            async def run(self, text, **_options):
+                texts.append(text)
+                if len(texts) == 1:
+                    await gate.wait()
+                return ""
+
+        session._client = FakeClient()
+        first = asyncio.create_task(session.run_external("first", {"external": True, "source": "a"}))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(
+            session.run_external("second", {"external": True, "source": "a"}, timeout=0.1))
+        await asyncio.sleep(0.3)
+        gate.set()
+        await asyncio.wait_for(asyncio.gather(first, second), 5)
+        assert len(texts) == 2
+
+    asyncio.run(scenario())
+
+
+def test_run_external_timeout_drops_a_still_queued_turn():
+    async def scenario():
+        session = make_session([])
+        gate = asyncio.Event()
+        texts = []
+
+        class FakeClient:
+            thread_id = "thread-1"
+
+            async def run(self, text, **_options):
+                texts.append(text)
+                await gate.wait()
+                return ""
+
+        session._client = FakeClient()
+        first = asyncio.create_task(session.run_external("first", {"external": True, "source": "a"}))
+        await asyncio.sleep(0)
+        waiting = asyncio.create_task(session.run_external("second", {"external": True, "source": "a"}))
+        await asyncio.sleep(0.05)
+        waiting.cancel()
+        gate.set()
+        await asyncio.wait_for(first, 5)
+        await asyncio.wait_for(session._worker, 5)
+        assert len(texts) == 1
+
+    asyncio.run(scenario())
