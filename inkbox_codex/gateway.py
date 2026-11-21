@@ -2742,8 +2742,9 @@ class InkboxGateway:
         }
         # Mode "external" has no reply channel (noreply). Names can repeat or change; the id cannot.
         session = self.sessions.get(f"inbound:{source['id']}")
+        text = agent_text(data, body, self._inbound_events().event_files(data, body))
         try:
-            await session.run_external(agent_text(data, body), meta, timeout=inbound_events.TURN_TIMEOUT_S)
+            await session.run_external(text, meta, timeout=inbound_events.TURN_TIMEOUT_S)
         except TimeoutError:
             raise TimeoutError(f"agent turn did not finish within {inbound_events.TURN_TIMEOUT_S // 60} minutes") from None
 
