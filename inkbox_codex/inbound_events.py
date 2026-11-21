@@ -9,6 +9,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -33,6 +34,8 @@ MAX_RUNNING_SCRIPTS = 4
 MAX_INLINE_BODY_BYTES = 4096
 FILES_TTL_S = 7 * 86400
 SWEEP_INTERVAL_S = 3600
+MEDIA_TYPE = re.compile(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+")
+SAFE_SEGMENT = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,199}")
 DIRECTIVE = ("No person reads this thread and your reply is not delivered anywhere; "
              "act with your tools if action is needed.")
 
@@ -82,16 +85,22 @@ def content_type(request: Dict[str, Any]) -> str:
     return next((str(value) for key, value in headers.items() if str(key).lower() == "content-type"), "")
 
 
+def media_type(request: Dict[str, Any]) -> str:
+    """The bare media type for the trusted header; ``unknown`` unless it is well-formed."""
+    value = content_type(request).split(";", 1)[0].strip().lower()
+    return value if MEDIA_TYPE.fullmatch(value) else "unknown"
+
+
 def write_event_files(root: Path, data: Dict[str, Any], body: bytes) -> Path:
-    """Write ``body`` and ``request.json`` to ``root/<event_id>/`` atomically; returns that directory."""
-    event_id = str(data.get("event_id") or "")
-    if not event_id or event_id.startswith(".") or Path(event_id).name != event_id:
-        raise ValueError(f"unusable event id {event_id!r}")
+    """Write ``body`` and ``request.json`` to ``root/<delivery_id>/`` atomically; returns that directory."""
+    delivery_id = str(data.get("delivery_id") or "")
+    if not SAFE_SEGMENT.fullmatch(delivery_id):
+        raise ValueError(f"unusable delivery id {delivery_id!r}")
     request = data.get("request") or {}
     source = data.get("source") or {}
     meta = {
-        "event_id": event_id,
-        "delivery_id": data.get("delivery_id"),
+        "event_id": data.get("event_id"),
+        "delivery_id": delivery_id,
         "received_at": data.get("received_at"),
         "source": {"id": source.get("id"), "name": source.get("name")},
         "signature_verified": data.get("signature_verified") is True,
@@ -108,8 +117,8 @@ def write_event_files(root: Path, data: Dict[str, Any], body: bytes) -> Path:
         for name, content in (("body", body), ("request.json", json.dumps(meta, indent=2).encode() + b"\n")):
             with open(os.open(tmp / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as file:
                 file.write(content)
-        target = root / event_id
-        # A retry or replay of the same event replaces its earlier files.
+        target = root / delivery_id
+        # A replay is a new delivery, so this only replaces identical files from a retry.
         shutil.rmtree(target, ignore_errors=True)
         os.rename(tmp, target)
     except BaseException:
@@ -160,7 +169,7 @@ def agent_text(data: Dict[str, Any], body: Optional[str] = None, files: Optional
     parts = [
         f"[inkbox:inbound source={name}] Webhook event received by inbound source \"{name}\".",
         f"Signature: {signature}",
-        f"Received: {data.get('received_at')} · Content type: {content_type(request) or 'unknown'} "
+        f"Received: {data.get('received_at')} · Content type: {media_type(request)} "
         f"· Size: {body_bytes(request)} bytes",
     ]
     if files is None:
@@ -179,13 +188,14 @@ def agent_text(data: Dict[str, Any], body: Optional[str] = None, files: Optional
         parts.append(cap_body(body if script else request_body(request)))
         return "\n".join(parts)
     raw = body.encode("utf-8") if script else raw_body(request)
+    subject = "The script output" if script else "The body"
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        parts.append(f"The body is binary ({len(raw)} bytes). Read it from {files / 'body'} if you need it.")
+        parts.append(f"{subject} is binary ({len(raw)} bytes). Read it from {files / 'body'} if you need it.")
     else:
         parts.append(text if len(raw) <= MAX_INLINE_BODY_BYTES else
-                     f"The body is {len(raw)} bytes, too large to show here. "
+                     f"{subject} is {len(raw)} bytes, too large to show here. "
                      f"Read it from {files / 'body'} if you need it.")
     return "\n".join(parts)
 
@@ -218,9 +228,9 @@ class InboundEvents:
         self.tasks: set[asyncio.Task[Any]] = set()
         self.started = False
         self.script_slots = asyncio.Semaphore(MAX_RUNNING_SCRIPTS)
-        # The agent is given absolute paths.
-        self.files_root = path.parent.absolute() / "inbound" / "events"
-        self.swept_at = 0.0
+        # Under the home directory, which the agent can read; the agent is given absolute paths.
+        self.files_root = Path.home().absolute() / ".inkbox" / "inbound" / "events"
+        self.sweep_timer: Optional[asyncio.TimerHandle] = None
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, isolation_level=None)
         # WAL with FULL sync makes each commit durable before the delivery is acknowledged.
@@ -281,18 +291,19 @@ class InboundEvents:
             self._spawn(key)
 
     def _sweep(self) -> None:
-        self.swept_at = time.time()
-        sweep_event_files(self.files_root, self.swept_at)
+        """Sweep now and again every SWEEP_INTERVAL_S until closed."""
+        if self.sweep_timer is not None:
+            self.sweep_timer.cancel()
+        sweep_event_files(self.files_root, time.time())
+        self.sweep_timer = asyncio.get_running_loop().call_later(SWEEP_INTERVAL_S, self._sweep)
 
     def event_files(self, data: Dict[str, Any], body: Optional[str] = None) -> Optional[Path]:
         """Write the event's files (``body`` is script output); None when they could not be written."""
-        if time.time() - self.swept_at >= SWEEP_INTERVAL_S:
-            self._sweep()
         try:
             raw = raw_body(data.get("request") or {}) if body is None else body.encode("utf-8")
             return write_event_files(self.files_root, data, raw)
-        except (OSError, ValueError) as exc:
-            logger.warning("[inbound] event files for %s could not be written: %s", data.get("event_id"), exc)
+        except Exception as exc:
+            logger.warning("[inbound] event files for %s could not be written: %s", data.get("delivery_id"), exc)
             return None
 
     def _spawn(self, key: str) -> None:
@@ -302,6 +313,8 @@ class InboundEvents:
         task.add_done_callback(self.tasks.discard)
 
     async def close(self) -> None:
+        if self.sweep_timer is not None:
+            self.sweep_timer.cancel()
         for task in list(self.tasks):
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
