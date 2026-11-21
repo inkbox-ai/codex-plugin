@@ -3,7 +3,7 @@
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import Mock
 
 import pytest
 
@@ -117,15 +117,17 @@ def test_released_sdk_download_wire(client):
         sdk.close()
 
 
+def transcribed(status="completed", text="Please inspect the uploaded report."):
+    return {"status": status, "text": text if status == "completed" else None,
+            "error_code": None if status == "completed" else "transcription_failed"}
+
+
 def test_companion_live_audio_reaches_host(tmp_path, monkeypatch, client):
     from tests.test_slack_companion import fixture, gateway, live, session_for
     from tests.test_companion import drained
     async def scenario():
         initial = fixture()
         gateway_instance, _, slack = gateway(monkeypatch, tmp_path, initial)
-        gateway_instance.cfg.realtime.api_key = "synthetic-voice-key"
-        transcribe = AsyncMock(return_value="Please inspect the uploaded report.")
-        monkeypatch.setattr(slack_media, "transcribe_audio", transcribe)
         slack.get_file = client.slack.get_file
         slack.download_file = client.slack.download_file
         receiver = gateway_instance._companion()
@@ -135,13 +137,14 @@ def test_companion_live_audio_reaches_host(tmp_path, monkeypatch, client):
             session = session_for(gateway_instance, initial)
             session._client.events.clear()
             incoming = live(initial)
-            incoming["data"]["event"]["files"] = [{"id": "F_AUDIO", "name": "memo.m4a"}]
+            incoming["data"]["event"]["files"] = [
+                {"id": "F_AUDIO", "name": "memo.m4a", "transcription": transcribed()}]
             await receiver.accept(incoming)
             await drained(receiver)
             assert len(session._client.events) == 1
             kind, text = session._client.events[0]
             assert kind == "run" and '"status": "downloaded"' in text
-            assert "Please inspect the uploaded report." in text
+            assert "[Voice note 1 — automatically transcribed]\nPlease inspect the uploaded report." in text
             assert '"path":' in text
             slack.download_file.assert_called_once()
         finally:
@@ -149,75 +152,101 @@ def test_companion_live_audio_reaches_host(tmp_path, monkeypatch, client):
     asyncio.run(scenario())
 
 
-def test_gateway_transcribes_before_host_without_promoting_control_commands(gw, client, monkeypatch):
+def test_gateway_labels_transcript_without_promoting_control_commands(gw, client):
     gw._inkbox = client
     gw.cfg.realtime.api_key = "synthetic-voice-key"
-    transcribe = AsyncMock(return_value="/stop")
-    monkeypatch.setattr(slack_media, "transcribe_audio", transcribe)
-    asyncio.run(gw._on_slack_received(audio_event()))
+    incoming = audio_event()
+    incoming["data"]["event"]["files"][0]["transcription"] = transcribed(text="/stop")
+    asyncio.run(gw._on_slack_received(incoming))
     _, body, _, meta = gw.sessions.turns[0]
-    assert '"transcript": "/stop"' in body
+    assert "[Voice note 1 — automatically transcribed]\n/stop" in body
     assert meta["raw_text"] == ""
-    assert transcribe.await_args.args[1] == "synthetic-voice-key"
+    assert "synthetic-voice-key" not in body
 
 
-def test_transcription_failure_preserves_download(client, monkeypatch):
-    monkeypatch.setattr(slack_media, "transcribe_audio", AsyncMock(side_effect=TimeoutError("private")))
-    _, body, meta = inbound_message(audio_event(), IDENTITY)
-    cfg = NS(realtime=NS(api_key="synthetic-voice-key"))
-    body = asyncio.run(slack_media.with_attachments(client, body, meta, cfg=cfg))
-    assert '"status": "downloaded"' in body and '"transcription_status": "failed"' in body
-    assert "private" not in body and "synthetic-voice-key" not in body
+def test_failed_transcript_preserves_download_without_local_transcription(gw, client):
+    gw._inkbox = client
+    gw.cfg.realtime.api_key = "synthetic-voice-key"
+    incoming = audio_event()
+    incoming["data"]["event"]["files"][0]["transcription"] = transcribed("failed")
+    asyncio.run(gw._on_slack_received(incoming))
+    _, body, _, _ = gw.sessions.turns[0]
+    assert "[Voice note 1: transcript unavailable;" in body and "do not guess" in body
+    assert '"status": "downloaded"' in body
+    assert not hasattr(slack_media, "transcribe_audio")
 
 
-def test_missing_voice_key_does_not_call_transcription(client, monkeypatch):
-    transcribe = AsyncMock()
-    monkeypatch.setattr(slack_media, "transcribe_audio", transcribe)
-    _, body, meta = inbound_message(audio_event(), IDENTITY)
-    body = asyncio.run(slack_media.with_attachments(client, body, meta))
-    assert "not transcribed" in body and "INKBOX_REALTIME_API_KEY" in body
-    transcribe.assert_not_awaited()
-
-
-@pytest.mark.parametrize("status,payload,expected", [
-    (200, {"text": "Inspect the report."}, "Inspect the report."),
-    (200, {"text": " "}, None),
-    (200, {"text": "a" * (slack_media.MAX_TRANSCRIPT_CHARS + 1)}, None),
-    (401, {"error": "not authorized"}, None),
-])
-def test_transcription_multipart_wire(tmp_path, monkeypatch, status, payload, expected):
-    from aiohttp import web
-    path = tmp_path / "memo.m4a"
-    path.write_bytes(b"synthetic-audio")
+def test_companion_waits_for_pending_slack_transcript(tmp_path, monkeypatch, client):
+    from tests.test_slack_companion import fixture, gateway, live, session_for, source_id
+    from tests.test_companion import drained
     async def scenario():
-        seen = []
-        async def handle(request):
-            assert request.headers["Authorization"] == "Bearer synthetic-voice-key"
-            reader = await request.multipart()
-            fields = {}
-            async for part in reader:
-                fields[part.name] = bytes(await part.read())
-                if part.name == "file":
-                    assert part.filename == "memo.m4a" and part.headers["Content-Type"] == "audio/mp4"
-            assert fields == {"model": b"gpt-transcribe", "file": b"synthetic-audio"}
-            seen.append(True)
-            return web.json_response(payload, status=status)
-        app = web.Application()
-        app.router.add_post("/transcriptions", handle)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "127.0.0.1", 0)
-        await site.start()
-        port = site._server.sockets[0].getsockname()[1]
-        monkeypatch.setattr(slack_media, "TRANSCRIPTION_URL", f"http://127.0.0.1:{port}/transcriptions")
+        initial = fixture()
+        gateway_instance, _, slack = gateway(monkeypatch, tmp_path, initial)
+        slack.get_file = client.slack.get_file
+        slack.download_file = client.slack.download_file
+        receiver = gateway_instance._companion()
         try:
-            attachment = {"path": str(path), "content_type": "audio/mp4"}
-            if expected is None:
-                with pytest.raises(Exception):
-                    await slack_media.transcribe_audio(attachment, "synthetic-voice-key")
-            else:
-                assert await slack_media.transcribe_audio(attachment, "synthetic-voice-key") == expected
-            assert seen == [True]
+            await receiver.accept(initial)
+            await drained(receiver)
+            session = session_for(gateway_instance, initial)
+            session._client.events.clear()
+            incoming = live(initial)
+            incoming["data"]["message_id"] = source_id(incoming)
+            incoming["data"]["event"]["files"] = [
+                {"id": "F_AUDIO", "name": "memo.m4a", "transcription": {"status": "pending"}}]
+            await receiver.accept(incoming)
+            await asyncio.sleep(0.05)
+            assert session._client.events == []
+            finished = {
+                "id": "evt_slack_finished", "event_type": "message.transcription_finished",
+                "data": {**incoming["data"], "channel": "slack", "event": {
+                    **incoming["data"]["event"],
+                    "files": [{"id": "F_AUDIO", "name": "memo.m4a", "transcription": transcribed()}],
+                }},
+            }
+            gateway_instance._voice_note_receipt(finished["event_type"], finished)
+            await drained(receiver)
+            assert len(session._client.events) == 1
+            _, text = session._client.events[0]
+            assert "[Voice note 1 — automatically transcribed]\nPlease inspect the uploaded report." in text
+            gateway_instance._voice_note_receipt(finished["event_type"], finished)
+            await asyncio.sleep(0)
+            assert len(session._client.events) == 1
         finally:
-            await runner.cleanup()
+            await receiver.close()
+            if getattr(gateway_instance, "_voice_note_state", None) is not None:
+                await gateway_instance._voice_note_state.close()
+    asyncio.run(scenario())
+
+
+def test_companion_mismatched_slack_message_id_delivers_attachment_without_waiting(tmp_path, monkeypatch, client):
+    from tests.test_slack_companion import fixture, gateway, live, session_for
+    from tests.test_companion import drained
+    async def scenario():
+        initial = fixture()
+        gateway_instance, _, slack = gateway(monkeypatch, tmp_path, initial)
+        slack.get_file = client.slack.get_file
+        slack.download_file = client.slack.download_file
+        receiver = gateway_instance._companion()
+        try:
+            await receiver.accept(initial)
+            await drained(receiver)
+            session = session_for(gateway_instance, initial)
+            session._client.events.clear()
+            incoming = live(initial)
+            incoming["data"]["message_id"] = "00000000-0000-4000-8000-0000000000ee"
+            incoming["data"]["event"]["files"] = [
+                {"id": "F_AUDIO", "name": "memo.m4a", "transcription": {"status": "pending"}}]
+            await receiver.accept(incoming)
+            await drained(receiver)
+            assert len(session._client.events) == 1
+            _, text = session._client.events[0]
+            assert '"status": "downloaded"' in text
+            assert "[Voice note 1: transcript unavailable;" in text
+            slack.download_file.assert_called_once()
+            assert getattr(gateway_instance, "_voice_note_state", None) is None
+        finally:
+            await receiver.close()
+            if getattr(gateway_instance, "_voice_note_state", None) is not None:
+                await gateway_instance._voice_note_state.close()
     asyncio.run(scenario())

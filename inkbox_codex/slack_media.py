@@ -8,14 +8,10 @@ import os
 from pathlib import Path
 import tempfile
 
-import aiohttp
-
 from .media import media_dir
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_INBOUND_FILES = 4
-TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
-MAX_TRANSCRIPT_CHARS = 16000
 
 
 def download_file(resource, connection_id: str, file_id: str) -> dict:
@@ -42,29 +38,12 @@ def download_file(resource, connection_id: str, file_id: str) -> dict:
             "content_type": getattr(file, "mimetype", None) or "application/octet-stream"}
 
 
-async def transcribe_audio(attachment: dict, api_key: str) -> str:
-    """Transcribe a downloaded voice memo using the existing voice credential."""
-    path = Path(attachment["path"])
-    with path.open("rb") as audio:
-        form = aiohttp.FormData()
-        form.add_field("model", "gpt-transcribe")
-        form.add_field("file", audio, filename=path.name, content_type=attachment["content_type"])
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
-            async with session.post(TRANSCRIPTION_URL, data=form,
-                                    headers={"Authorization": f"Bearer {api_key}"},
-                                    allow_redirects=False) as response:
-                response.raise_for_status()
-                result = await response.json()
-    text = result.get("text") if isinstance(result, dict) else None
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("No speech transcript was returned")
-    if len(text) > MAX_TRANSCRIPT_CHARS:
-        raise ValueError("Voice memo transcript exceeds the input limit")
-    return text.strip()
+async def with_attachments(client, text: str, meta: dict) -> str:
+    """Enrich an admitted message; failures never discard its original text.
 
-
-async def with_attachments(client, text: str, meta: dict, *, cfg=None) -> str:
-    """Enrich an admitted message; failures never discard its original text."""
+    Voice-note transcripts come with the message itself, never from a local
+    transcription request.
+    """
     files = meta.get("slack_files") or []
     if not files:
         return text
@@ -80,18 +59,6 @@ async def with_attachments(client, text: str, meta: dict, *, cfg=None) -> str:
                             "note": "Attachment could not be downloaded; do not claim to have read it."})
             continue
         result["status"] = "downloaded"
-        if result["content_type"].split(";", 1)[0].startswith("audio/"):
-            key = getattr(getattr(cfg, "realtime", None), "api_key", "")
-            if not key:
-                result.update(transcription_status="unavailable",
-                              note="Voice memo downloaded but not transcribed. Configure INKBOX_REALTIME_API_KEY or OPENAI_API_KEY for transcription.")
-            else:
-                try:
-                    result["transcript"] = await transcribe_audio(result, key)
-                    result["transcription_status"] = "succeeded"
-                except Exception:
-                    result.update(transcription_status="failed",
-                                  note="Voice memo downloaded but transcription failed; do not guess its contents.")
         results.append(result)
     if len(files) > MAX_INBOUND_FILES:
         results.append({"status": "limited", "note": "Only the first four attachments were fetched. Use inkbox_slack_download_file for others."})
