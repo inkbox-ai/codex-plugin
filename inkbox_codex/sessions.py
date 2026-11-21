@@ -1691,6 +1691,42 @@ class ContactSession:
             self._worker = asyncio.create_task(self._drain())
         return await future
 
+    async def run_external(self, text: str, meta: Dict[str, Any], *, timeout: Optional[float] = None) -> None:
+        """Run one turn with no reply channel and wait for it; raises when the turn fails.
+
+        ``timeout`` starts when the turn starts, not while it waits in the queue; on
+        expiry the turn is interrupted and TimeoutError is raised.
+        """
+        loop = asyncio.get_running_loop()
+        completion = loop.create_future()
+        started = loop.create_future()
+
+        async def mark_started() -> None:
+            if not started.done():
+                started.set_result(None)
+
+        turn = _Turn(text=frame_inbound("external", meta, text), reply_mode="external",
+                     reply_meta=deepcopy(meta), completion=completion, before_submit=mark_started)
+        await self._notify_turn_activity(turn, "accepted")
+        await self._queue.put(turn)
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+        try:
+            if timeout is None:
+                await completion
+                return
+            await asyncio.wait((started, completion), return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait_for(asyncio.shield(completion), timeout)
+        except TimeoutError:
+            if self._current_turn is turn:
+                self._interrupting = True
+                if self._turn_active and self._client is not None:
+                    await self._interrupt_client()
+            raise
+        finally:
+            # A cancelled completion also keeps a still-queued turn from starting.
+            completion.cancel()
+
     async def run_consult_detailed(
         self,
         query: str,
