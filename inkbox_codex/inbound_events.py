@@ -76,6 +76,8 @@ def request_body(request: Dict[str, Any]) -> str:
 
 
 def content_type(request: Dict[str, Any]) -> str:
+    if request.get("content_type"):
+        return str(request["content_type"])
     headers = request.get("headers") or {}
     return next((str(value) for key, value in headers.items() if str(key).lower() == "content-type"), "")
 
