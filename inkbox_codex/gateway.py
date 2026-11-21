@@ -1076,7 +1076,7 @@ class InkboxGateway:
         if not AIOHTTP_AVAILABLE:
             raise RuntimeError("aiohttp is not installed; run: pip install aiohttp")
         if not INKBOX_AVAILABLE:
-            raise RuntimeError("inkbox SDK is not installed; run: uv pip install 'inkbox>=0.7.29,<1.0.0'")
+            raise RuntimeError("inkbox SDK is not installed; run: uv pip install 'inkbox>=0.7.41,<1.0.0'")
         if not self.cfg.api_key or not self.cfg.identity:
             raise RuntimeError("INKBOX_API_KEY and INKBOX_IDENTITY must be set (see README)")
         if self.cfg.voice_stack_invalid_value:
@@ -2323,7 +2323,13 @@ class InkboxGateway:
                 return web.Response(status=503, text="Temporarily unavailable")
             try:
                 # Refused here so the sender retries; a dispatched delivery can no longer be refused.
-                if envelope.get("event_type") == "inbound.received" and self._inbound_events().full():
+                # A retry of a stored delivery still gets its receipt.
+                stored = ingress.inbox.db.execute(
+                    "SELECT 1 FROM deliveries WHERE activation=? AND event_id=?",
+                    (ingress.inbox.activation_id, (envelope.get("hosted_delivery") or {}).get("event_id")),
+                ).fetchone()
+                if (envelope.get("event_type") == "inbound.received" and not stored
+                        and self._inbound_events().full()):
                     return web.Response(status=503, text="Temporarily unavailable")
                 receipt = ingress.inbox.accept(envelope)
             except InboxError:

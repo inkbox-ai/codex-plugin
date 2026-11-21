@@ -81,7 +81,7 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
         import inkbox  # noqa: F401
         checks.append(("inkbox SDK", True, "installed"))
     except ImportError:
-        checks.append(("inkbox SDK", False, "uv pip install 'inkbox>=0.7.29,<1.0.0'"))
+        checks.append(("inkbox SDK", False, "uv pip install 'inkbox>=0.7.41,<1.0.0'"))
 
     checks.append((
         "INKBOX_IMESSAGE_THREADED_REPLIES", True,

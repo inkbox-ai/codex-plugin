@@ -654,6 +654,34 @@ def test_full_queue_refuses_hosted_deliveries_before_acceptance(tmp_path, monkey
     asyncio.run(scenario())
 
 
+def test_full_queue_still_answers_a_stored_hosted_delivery(tmp_path, monkeypatch):
+    from inkbox_codex.managed_ingress import ManagedIngress
+
+    activation = str(uuid4())
+    monkeypatch.setenv("INKBOX_CODEX_HOME", str(tmp_path))
+    monkeypatch.setenv("INKBOX_HOSTED_ACTIVATION_ID", activation)
+    gw = _gateway(tmp_path, monkeypatch)
+    envelope = _hosted(_data(), activation)
+
+    async def scenario():
+        # Not started, so the stored delivery stays pending.
+        ingress = ManagedIngress(gw, activation)
+        gw._managed_control = types.SimpleNamespace(ingress=ingress)
+        try:
+            first = await gw._handle_webhook(_Request(envelope))
+            assert first.status == 202
+            _fill(gw._inbound_events())
+            repeat = await gw._handle_webhook(_Request(envelope))
+            assert repeat.status == 202 and json.loads(repeat.text) == json.loads(first.text)
+            fresh = await gw._handle_webhook(_Request(_hosted(_data(delivery_id="new"), activation)))
+            assert fresh.status == 503
+        finally:
+            await ingress.close()
+            await gw._inbound.close()
+
+    asyncio.run(scenario())
+
+
 def test_scripts_run_at_most_four_at_once(tmp_path, monkeypatch):
     running, peak, turns = [0], [0], []
 
