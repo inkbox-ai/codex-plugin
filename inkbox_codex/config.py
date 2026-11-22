@@ -115,6 +115,8 @@ class BridgeConfig:
     # provision them ahead of time, where the destination is fixed or this
     # API key may not change it; they must already point at this bridge.
     skip_webhook_reconcile: bool = False
+    # "local": events arrive on the loopback listener; no tunnel, no public URL.
+    delivery_mode: str = ""
     slack_enabled: bool = False
     imessage_threaded_replies: bool = False
     # Wake the agent on unrecognised (external) webhooks. Off by default;
@@ -249,6 +251,9 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
     companion_response_mode = (os.getenv("INKBOX_COMPANION_RESPONSE_MODE") or "safe").strip().lower()
     if companion_response_mode not in {"safe", "relaxed"}:
         raise ValueError("INKBOX_COMPANION_RESPONSE_MODE must be safe or relaxed")
+    delivery_mode = (os.getenv("INKBOX_DELIVERY_MODE") or "").strip().lower()
+    if delivery_mode not in {"", "local"}:
+        raise ValueError("INKBOX_DELIVERY_MODE must be local or unset")
     realtime_api_key = str(
         os.getenv("INKBOX_REALTIME_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
     ).strip()
@@ -270,6 +275,7 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         allow_all_users=env_flag("INKBOX_ALLOW_ALL_USERS", False),
         require_signature=env_flag("INKBOX_REQUIRE_SIGNATURE", True),
         skip_webhook_reconcile=env_flag("INKBOX_SKIP_WEBHOOK_RECONCILE", False),
+        delivery_mode=delivery_mode,
         slack_enabled=env_flag("INKBOX_SLACK_ENABLED", False),
         imessage_threaded_replies=env_flag("INKBOX_IMESSAGE_THREADED_REPLIES", False),
         external_events_enabled=env_flag("INKBOX_EXTERNAL_EVENTS_ENABLED", False),
