@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.45 (unreleased)
+
+- Wait for Slack voice-note transcripts like SMS, iMessage, and WhatsApp, and use them instead of transcribing Slack or WhatsApp audio locally with the realtime voice credential.
+- Wake the agent once for a Slack message delivered under several event categories.
+
 ## 0.2.44 (unreleased)
 
 - Add `INKBOX_DELIVERY_MODE=local`: no tunnel or webhook registration, a loopback-only listener, and 2 MiB request bodies with unchanged signature verification.

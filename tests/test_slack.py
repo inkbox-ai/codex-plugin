@@ -13,7 +13,7 @@ from inkbox_codex.gateway import InkboxGateway
 from inkbox_codex.prompts import frame_inbound
 from inkbox_codex.sessions import SessionManager, _Turn
 from inkbox_codex.slack import (
-    SLACK_SUBSCRIPTION_EVENTS, SLACK_INCOMING_EVENTS, inbound_message,
+    SLACK_SUBSCRIPTION_EVENTS, SLACK_INCOMING_EVENTS, SLACK_TRANSCRIPTION_EVENT, inbound_message,
     reconcile_subscription, run_tool, send_reply,
 )
 from inkbox_codex.tools import build_inkbox_mcp_server_config, call_inkbox_tool, mcp_tool_list
@@ -22,6 +22,8 @@ from tests.test_sessions import make_session
 
 IDENTITY = "00000000-0000-4000-8000-000000000001"
 CONNECTION = "00000000-0000-4000-8000-000000000002"
+# A Slack receiver also selects voice-note completions on the same subscription.
+SLACK_SELECTION = (*SLACK_SUBSCRIPTION_EVENTS, SLACK_TRANSCRIPTION_EVENT)
 
 
 @pytest.fixture(autouse=True)
@@ -78,6 +80,25 @@ def test_mention_thread_followup_and_duplicate_deliveries(gw):
         assert len(gw.sessions.turns) == 2
         assert gw.sessions.turns[0][0] == gw.sessions.turns[1][0]
         assert gw.sessions.turns[0][3]["thread_ts"] == "1234567890.000001"
+
+    asyncio.run(scenario())
+
+
+def test_one_message_under_several_envelopes_wakes_once(gw):
+    async def scenario():
+        message_id = "00000000-0000-4000-8000-0000000000aa"
+        mention = event(message_id=message_id)
+        await gw._on_slack_received(mention)
+        # The same message reaches the now-watched thread as a channel message.
+        channel = event(message_id=message_id, message_kinds=["channel"])
+        channel["id"], channel["event_type"] = "evt_channel", "slack.channel_message_received"
+        response = await gw._on_slack_received(channel)
+        assert b'"deduped": true' in response.body
+        assert len(gw.sessions.turns) == 1
+        other = event(message_id="00000000-0000-4000-8000-0000000000bb", message_ts="1234567890.000002")
+        other["id"] = "evt_other"
+        await gw._on_slack_received(other)
+        assert len(gw.sessions.turns) == 2
 
     asyncio.run(scenario())
 
@@ -278,9 +299,10 @@ def test_subscription_reconciliation_does_not_remove_other_receivers():
         "url": "https://agent.example/webhook?channel=slack",
         "event_types": ["slack.dm_received", "slack.group_dm_received",
                         "slack.channel_message_received", "slack.mention_received",
-                        "slack.thread_reply_received", "slack.session_stopped"],
+                        "slack.thread_reply_received", "slack.session_stopped",
+                        "message.transcription_finished"],
     }
-    assert set(created["event_types"]) == set(SLACK_SUBSCRIPTION_EVENTS)
+    assert set(created["event_types"]) == set(SLACK_SELECTION)
     assert "slack.channel_message_received" in created["event_types"]
     client.webhooks.subscriptions.delete.assert_not_called()
     existing = NS(id="ours", status="active", **created)
@@ -304,7 +326,7 @@ def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection(mixed,
     row = {
         "id": "00000000-0000-4000-8000-000000000003", "organization_id": "org_test",
         "agent_identity_id": IDENTITY, "url": url, "status": "active",
-        "event_types": list(reversed(SLACK_SUBSCRIPTION_EVENTS)),
+        "event_types": list(reversed(SLACK_SELECTION)),
         "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
     }
     if mixed or upgrade:
@@ -333,7 +355,7 @@ def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection(mixed,
         assert request.method == "POST"
         assert json.loads(request.content) == {
             "agent_identity_id": IDENTITY, "url": url,
-            "event_types": list(SLACK_SUBSCRIPTION_EVENTS),
+            "event_types": list(SLACK_SELECTION),
         }
         rows.append(row)
         return httpx.Response(201, json=rows[0])
@@ -354,7 +376,7 @@ def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection(mixed,
 def test_subscription_coverage_reuses_mixed_and_split_event_sets(split):
     client = Mock()
     url = "https://agent.example/webhook?channel=slack"
-    first, *remaining = SLACK_SUBSCRIPTION_EVENTS
+    first, *remaining = SLACK_SELECTION
     rows = [NS(id="ours", url=url, status="active", event_types=["message.received", first])]
     if split:
         rows.append(NS(url=url, status="active", event_types=remaining))
@@ -742,11 +764,13 @@ def test_existing_message_subscription_extends_selection_for_native_stop(gw):
     client = Mock()
     url = "https://agent.example/webhook"
     client.webhooks.subscriptions.list.return_value = [NS(
-        id="ours", url=url, status="active", event_types=[event for event in SLACK_SUBSCRIPTION_EVENTS
+        id="ours", url=url, status="active", event_types=[event for event in SLACK_SELECTION
                                                 if event != "slack.session_stopped"],
     )]
     reconcile_subscription(client, IDENTITY, url)
+    # The missing stop event is appended after the events the subscription already selects.
     client.webhooks.subscriptions.update.assert_called_once_with(
-        "ours", event_types=list(SLACK_SUBSCRIPTION_EVENTS), scope="identity",
+        "ours", event_types=[*(event for event in SLACK_SELECTION if event != "slack.session_stopped"),
+                             "slack.session_stopped"], scope="identity",
     )
     client.webhooks.subscriptions.create.assert_not_called()

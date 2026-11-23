@@ -26,6 +26,9 @@ SLACK_ATTENTION_EVENTS = tuple(
 )
 SLACK_STOP_EVENT = "slack.session_stopped"
 SLACK_SUBSCRIPTION_EVENTS = (*SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT)
+# Slack voice-note completions reach only a receiver that also selects the
+# original message, so they share the Slack subscription.
+SLACK_TRANSCRIPTION_EVENT = "message.transcription_finished"
 SLACK_MAX_TEXT_LENGTH = 12000
 SLACK_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
@@ -76,29 +79,64 @@ def reconcile_subscription(client: Any, identity_id: Any, url: str) -> None:
     slack_resource(client)
     subscriptions = client.webhooks.subscriptions
     events = list(SLACK_SUBSCRIPTION_EVENTS)
+    rows = [sub for sub in subscriptions.list(agent_identity_id=identity_id, scope="identity", url=url) if sub.url == url]
     covered = set()
     message_subscriptions = []
-    for sub in subscriptions.list(agent_identity_id=identity_id, scope="identity", url=url):
+    for sub in rows:
         overlap = set(sub.event_types) & set(events)
-        if sub.url == url and overlap:
+        if overlap:
             if sub.status != "active":
                 raise RuntimeError("The Slack subscription is paused; resume it before starting")
             covered.update(overlap)
             if overlap.intersection(SLACK_INCOMING_EVENTS):
                 message_subscriptions.append(sub)
     missing = [event for event in events if event not in covered]
-    if not missing:
-        return
-    if message_subscriptions:
+    # Keep the completion on the Slack message subscription; a URL holds each event once.
+    target = next((sub for sub in message_subscriptions if SLACK_TRANSCRIPTION_EVENT in sub.event_types), None)
+    if target is None and message_subscriptions:
         # Extend the existing receiver: a second channel-only subscription
         # would deliver mentions again under another event category.
-        sub = max(message_subscriptions, key=lambda item: len(set(item.event_types).intersection(SLACK_INCOMING_EVENTS)))
-        subscriptions.update(sub.id, event_types=list(dict.fromkeys([*sub.event_types, *missing])), scope="identity")
+        target = max(message_subscriptions, key=lambda item: len(set(item.event_types).intersection(SLACK_INCOMING_EVENTS)))
+    finished = target is None or SLACK_TRANSCRIPTION_EVENT not in target.event_types
+    if not missing and not finished:
         return
-    # A test receiver must not replace another receiver or another channel.
-    subscriptions.create(
-        agent_identity_id=identity_id, url=url, event_types=missing,
-    )
+    if finished:
+        # Each event may sit on only one active subscription per URL, so move it to the target.
+        _release_finished(subscriptions, [sub for sub in rows if sub is not target])
+
+    def apply(wanted: list[str]) -> None:
+        if target is not None:
+            subscriptions.update(target.id, event_types=list(dict.fromkeys([*target.event_types, *wanted])), scope="identity")
+        else:
+            # A test receiver must not replace another receiver or another channel.
+            subscriptions.create(agent_identity_id=identity_id, url=url, event_types=wanted)
+
+    try:
+        apply([*missing, *([SLACK_TRANSCRIPTION_EVENT] if finished else [])])
+    except Exception as exc:
+        from .voice_notes import transcription_unsupported
+
+        if not finished or not transcription_unsupported(exc):
+            raise
+        # Slack messages still arrive; voice notes keep their original attachments.
+        logger.warning("Slack transcription callbacks are unavailable on this API version")
+        if missing:
+            apply(missing)
+
+
+def _release_finished(subscriptions: Any, rows: list) -> None:
+    for sub in rows:
+        if sub.status != "active" or SLACK_TRANSCRIPTION_EVENT not in sub.event_types:
+            continue
+        remaining = [event for event in sub.event_types if event != SLACK_TRANSCRIPTION_EVENT]
+        if remaining:
+            subscriptions.update(sub.id, event_types=remaining, scope="identity")
+            continue
+        try:
+            subscriptions.delete(sub.id)
+        except Exception as exc:
+            if getattr(exc, "status_code", None) != 404:
+                raise
 
 
 def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] | None:
@@ -141,6 +179,9 @@ def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] |
     body = raw
     files = event.get("files")
     if isinstance(files, list) and files:
+        from .voice_notes import transcript_note
+
+        body += transcript_note([file for file in files if isinstance(file, dict)])
         body += "\nAttachment references (not downloaded): " + json.dumps([
             {key: file[key] for key in ("id", "name", "mimetype", "size") if key in file}
             for file in files if isinstance(file, dict)

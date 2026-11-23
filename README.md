@@ -302,9 +302,9 @@ Replies remain deduplicated by the stable event ID, not the selected category.
   automatically resent. Reuse the exact idempotency key when retrying an explicit
   send. Webhook duplicate suppression follows the gateway's existing bounded,
   in-memory behavior.
-- Incoming attachments are downloaded locally, and voice memos are transcribed
-  when a voice API key is configured. See attachment behavior below. Arbitrary
-  reaction tools are not included.
+- Incoming attachments are downloaded locally, and voice memos use the transcript
+  delivered with the message; no local transcription credential is used. See
+  attachment behavior below. Arbitrary reaction tools are not included.
 
 `INKBOX_ALLOWED_USERS` accepts Slack user IDs or workspace-qualified `T_ID:U_ID`
 entries. An empty list admits all human senders whose events reach the identity.
@@ -398,7 +398,7 @@ unrelated channels and bot messages should remain quiet. The preflight does not
 send messages. Live delivery can only be verified after connecting the workspace
 and starting the harness.
 
-Incoming Slack attachments are downloaded automatically (up to four files per message, 10 MiB each). The agent receives local paths and explicit per-file outcomes; unavailable files do not discard the message. Use `inkbox_slack_get_file` to inspect an accessible file and `inkbox_slack_download_file` to retrieve additional files. Downloads use the configured identity’s access and are saved under `INKBOX_CODEX_MEDIA_DIR` (default `~/.inkbox-codex/media`). Voice memos are transcribed before the message reaches Codex when `INKBOX_REALTIME_API_KEY` (or its existing fallback `OPENAI_API_KEY`) is configured. This sends the audio to the transcription API using that credential, independently of the selected live-call voice stack. Without a key, or if transcription fails, the audio file remains available and the agent receives an explicit notice rather than a guessed transcript.
+Incoming Slack attachments are downloaded automatically (up to four files per message, 10 MiB each). The agent receives local paths and explicit per-file outcomes; unavailable files do not discard the message. Use `inkbox_slack_get_file` to inspect an accessible file and `inkbox_slack_download_file` to retrieve additional files. Downloads use the configured identity’s access and are saved under `INKBOX_CODEX_MEDIA_DIR` (default `~/.inkbox-codex/media`). Voice memos use the transcript delivered with the message, as described in [Incoming voice notes](#incoming-voice-notes); no local transcription credential is used.
 
 Local attachments use `inkbox_slack_upload_file`: provide a regular local file (1 byte–10 MiB), the original Slack destination and `source_event_id` from the request metadata, and a stable idempotency key. The tool reads relative paths from the original project directory and reports the upload operation. A local path in a reply is not an uploaded file. Unknown outcomes are retained without blind resends; inspect a returned operation with `inkbox_slack_get_operation`. A lost response retains a source-scoped idempotency key for read-only inspection when the SDK supports `get_operation_by_key`; SDK 0.7.15 cannot inspect a missing operation ID, and retains that unresolved receipt without resending.
 
@@ -1142,7 +1142,7 @@ Normal final answers reply to the original WhatsApp conversation automatically. 
 
 After an uncertain send, preserve its `idempotency_key` and `media_id`. Use `inkbox_lookup_whatsapp_send`, then `inkbox_get_whatsapp_message` to inspect the original result; do not upload again or choose a new key to recover it. Use one E.164 string to start a direct conversation; recipient arrays and comma-separated recipients are rejected. Existing direct conversations use `conversation_id`. Explicit `reply_to_message_id` quotes a visible message in that conversation. Thread reads and named/custom reactions have dedicated tools. New ordinary replies and tool sends are plain chat messages. Use an explicit quote only to refer to an older message, distinguish multiple requests, or identify a specific attachment. Existing saved sends keep their original quote, payload, and request key during recovery. Reaction-triggered replies remain plain. An explicit quoted reply is never automatically replaced by a plain response, including after a rejected or uncertain send. Reaction updates from peers are contextual signals, not new commands. Typing, voice and remote-read receipts are not supported. Local `inkbox_mark_whatsapp_read` only updates visible history.
 
-Inbound images are attached to the native Codex turn, including photos without captions. Voice notes use the existing transcription credential when configured; unavailable transcripts are reported without guessing. Requested outgoing media uses `inkbox_upload_whatsapp_media` followed by `inkbox_send_whatsapp`; a local path in the final answer does not send a file.
+Inbound images are attached to the native Codex turn, including photos without captions. Voice notes use the transcript delivered with the message; unavailable transcripts are reported without guessing. Requested outgoing media uses `inkbox_upload_whatsapp_media` followed by `inkbox_send_whatsapp`; a local path in the final answer does not send a file.
 
 WhatsApp requires Inkbox SDK 0.7.29 or newer (below 1.0.0). Its 15 tools are registered only when the bound identity reports `whatsapp_configured=true`. This uses configuration rather than current sending permission, so configured identities with restricted sending can still inspect status and accessible history. Capability is refreshed on MCP tool discovery; reconnect the session after enabling WhatsApp if the host caches its tool list. If discovery cannot read the identity, WhatsApp tools stay hidden while other tools remain available. Each operation still checks current access through the API.
 
@@ -1173,3 +1173,5 @@ messages or prove end-to-end delivery.
 ### Incoming voice notes
 
 Incoming audio keeps its original attachment. When transcription is pending, the gateway waits up to 60 seconds for its completion notification, then reads the message once. Available transcripts are labeled as auto-generated voice-note text, not typed messages. If transcription fails, remains pending, or cannot be read, the original attachment follows the existing message-handling path. Completion notifications are registered automatically and do not create a second agent turn.
+
+Slack voice memos follow the same wait, read, and label rules, matched by the received event's message ID; their completion notifications are added to the Slack subscription.
