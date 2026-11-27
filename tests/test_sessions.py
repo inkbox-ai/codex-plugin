@@ -996,6 +996,25 @@ def test_run_external_waits_for_the_turn_outcome():
     asyncio.run(scenario())
 
 
+def test_run_consult_raises_instead_of_returning_failed_turn_text():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+
+        class FakeClient:
+            thread_id = "thread-1"
+
+            async def run(self, text, **_options):
+                raise CodexAppServerError("turn failed")
+
+        session._client = FakeClient()
+        with pytest.raises(CodexAppServerError, match="turn failed"):
+            await asyncio.wait_for(session.run_consult("work", a2a_context={"task_id": "t"}), 5)
+        assert sent == []
+
+    asyncio.run(scenario())
+
+
 def test_run_external_timeout_interrupts_the_running_turn():
     async def scenario():
         session = make_session([])

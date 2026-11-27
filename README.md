@@ -995,6 +995,11 @@ without opening a browser for each request.
    `INKBOX_API_KEY`. Keep the key out of chat and source control.
 3. Restart the bridge with `inkbox-codex restart`, or restart its service if you
    run it through a service manager.
+
+   If the agent is hosted by Inkbox, a key exported in a shell or set in a local
+   environment never reaches it. Instead, save the key as a Secret named
+   `INKBOX_CODEX_VAULT_KEY` in the identity's **Env vars** tab in the Inkbox Console,
+   and retry once the agent shows the change applied.
 4. Ask: "Get the current 2FA code for my Example login from Inkbox Vault."
 
 The agent uses `inkbox_list_vault_secrets` to find the login, then calls
@@ -1009,8 +1014,9 @@ use the agent-scoped key configured by setup.
 
 The bridge unlocks the vault only when a credential or 2FA tool needs it. An
 incorrect bridge vault key or failed unlock returns a tool error; messaging and
-metadata listing remain available. Correct the key locally and restart, or retry
-after a temporary service failure.
+metadata listing remain available. Correct the key locally and restart (hosted by
+Inkbox: update the Secret in the identity's Env vars tab), or retry after a
+temporary service failure.
 
 Use the bridge-specific `INKBOX_CODEX_VAULT_KEY` rather than the SDK-wide
 `INKBOX_VAULT_KEY` or `vault_key` in `~/.inkbox/config`. Those SDK-wide settings
@@ -1028,7 +1034,7 @@ without TOTP must have it configured before the agent can generate codes.
 | `INKBOX_API_KEY` | yes | - | Agent-scoped Inkbox API key. |
 | `INKBOX_IDENTITY` | yes | - | Inkbox agent identity handle. |
 | `INKBOX_SIGNING_KEY` | inbound | - | Webhook HMAC secret for signed inbound events. |
-| `INKBOX_CODEX_VAULT_KEY` | vault reads / 2FA | - | Vault unlock key, supplied locally and used only when a credential or 2FA tool needs it. See [Vault and 2FA codes](#vault-and-2fa-codes). |
+| `INKBOX_CODEX_VAULT_KEY` | vault reads / 2FA | - | Vault unlock key, supplied locally (hosted by Inkbox: a Secret in the identity's Env vars tab) and used only when a credential or 2FA tool needs it. See [Vault and 2FA codes](#vault-and-2fa-codes). |
 | `CODEX_PROJECT_DIR` | yes | cwd | Directory Codex works in. |
 | `CODEX_MODEL` | no | CLI default | Model override for bridged sessions. |
 | `INKBOX_REQUIRE_SIGNATURE` | no | `true` | Refuse unsigned inbound webhooks unless `false`. |

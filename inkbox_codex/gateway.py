@@ -792,6 +792,7 @@ A2A_TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 A2A_SETTLED_STATES = A2A_TERMINAL_STATES | {"input_required", "auth_required"}
 A2A_ADMISSION_CLOSING = "__closing__"
 A2A_RECEIPT_TEMPLATE = "Task {task_id} received. Work is queued and starting."
+A2A_TURN_FAILED_REASON = "The agent hit an error and could not finish this task."
 # Mail: inbound plus the two delivery-failure transitions that feed the loop
 # (_on_mail_delivery_failed). The success transitions stay unsubscribed — they
 # would pay signature cost on every outbound email for no behaviour.
@@ -3657,6 +3658,28 @@ class InkboxGateway:
             raise
         except Exception:
             logger.exception("[bridge] A2A turn failed: %s", task_id)
+            message_id = str(data.get("message_id") or "")
+            # A fence owned by this message means an outcome was already attempted.
+            if a2a_progress_fence_owner(task_id) != message_id:
+                try:
+                    gate = await self._acquire_a2a_progress_gate(task_id)
+                    try:
+                        fence_a2a_progress(task_id, message_id)
+                        authoritative = await asyncio.to_thread(
+                            self._identity.a2a_task, task_id
+                        )
+                        if _a2a_state(authoritative.state) not in A2A_SETTLED_STATES:
+                            await _to_thread_to_completion(
+                                self._identity.a2a_reply,
+                                task_id,
+                                intent="fail",
+                                text=A2A_TURN_FAILED_REASON,
+                            )
+                    finally:
+                        release_a2a_progress_gate(gate)
+                    self._write_a2a_registry(registry_key, data, "finalized")
+                except Exception:
+                    logger.warning("[bridge] Could not fail A2A task %s", task_id)
         finally:
             await self._stop_a2a_progress(task_id, registry_key)
 

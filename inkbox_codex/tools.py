@@ -1601,7 +1601,9 @@ async def call_inkbox_tool(client: Any, identity_handle: str, name: str, args: D
                 if not vault_key:
                     raise ValueError(
                         "Vault is locked. Set INKBOX_CODEX_VAULT_KEY in the bridge's local "
-                        "environment and restart it. Do not send the key in chat."
+                        "environment and restart it. If this agent is hosted by Inkbox, save "
+                        "it instead as a Secret in the identity's Env vars tab and retry once "
+                        "the change is applied. Do not send the key in chat."
                     )
                 vault = client.vault.unlock(vault_key)
             if name == "inkbox_get_totp_code":

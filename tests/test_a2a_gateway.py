@@ -153,6 +153,66 @@ def test_a2a_gateway_persists_dedupes_and_completes(tmp_path, monkeypatch):
     ]
 
 
+class _FailingSession(_Session):
+    async def run_consult(self, prompt, *, a2a_context=None, activity_handler=None):
+        self.calls.append((prompt, dict(a2a_context or {})))
+        raise RuntimeError("Synthetic model failure detail")
+
+
+def test_a2a_failed_turn_fails_task_with_generic_reason(tmp_path, monkeypatch):
+    async def inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_mod.asyncio, "to_thread", inline)
+    gateway = _gateway(tmp_path)
+    gateway.sessions.session = _FailingSession()
+
+    async def scenario():
+        await gateway._on_a2a_event(_event())
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(scenario())
+    registry = json.loads(gateway._a2a_registry_path.read_text())
+
+    assert registry["task-1:message-1"]["state"] == "finalized"
+    assert gateway.replies[-1] == (
+        "task-1",
+        {"intent": "fail", "text": gateway_mod.A2A_TURN_FAILED_REASON},
+    )
+    assert "Synthetic model failure" not in json.dumps(gateway.replies)
+
+
+def test_a2a_failed_turn_after_attempted_outcome_is_not_failed_again(
+    tmp_path, monkeypatch
+):
+    async def inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_mod.asyncio, "to_thread", inline)
+    gateway = _gateway(tmp_path)
+
+    class Session(_Session):
+        async def run_consult(self, prompt, *, a2a_context=None, activity_handler=None):
+            gate = acquire_a2a_progress_gate("task-1")
+            try:
+                fence_a2a_progress("task-1", "message-1")
+            finally:
+                release_a2a_progress_gate(gate)
+            raise RuntimeError("explicit outcome delivery was not confirmed")
+
+    gateway.sessions.session = Session()
+
+    async def scenario():
+        await gateway._on_a2a_event(_event())
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(scenario())
+    registry = json.loads(gateway._a2a_registry_path.read_text())
+
+    assert [kwargs["intent"] for _task_id, kwargs in gateway.replies] == ["progress"]
+    assert registry["task-1:message-1"]["state"] == "running"
+
+
 def test_a2a_receipt_reports_default_three_minute_frequency(tmp_path, monkeypatch):
     async def inline(function, *args, **kwargs):
         return function(*args, **kwargs)
