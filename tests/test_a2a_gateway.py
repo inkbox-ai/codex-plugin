@@ -8,6 +8,7 @@ import pytest
 from inkbox_codex import gateway as gateway_mod
 from inkbox_codex import tools as tools_mod
 from inkbox_codex.a2a_progress_gate import (
+    a2a_progress_fence_owner,
     acquire_a2a_progress_gate,
     fence_a2a_progress,
     release_a2a_progress_gate,
@@ -211,6 +212,103 @@ def test_a2a_failed_turn_after_attempted_outcome_is_not_failed_again(
 
     assert [kwargs["intent"] for _task_id, kwargs in gateway.replies] == ["progress"]
     assert registry["task-1:message-1"]["state"] == "running"
+
+
+def test_a2a_failed_turn_retries_transient_read_error(tmp_path, monkeypatch):
+    async def inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_mod.asyncio, "to_thread", inline)
+    monkeypatch.setattr(gateway_mod, "A2A_FAIL_RETRY_DELAYS", (0.0, 0.0))
+    gateway = _gateway(tmp_path)
+    task = gateway._identity.a2a_task("task-1")
+    reads = []
+
+    def flaky_read(_task_id):
+        reads.append(_task_id)
+        if len(reads) == 1:
+            raise RuntimeError("transient read error")
+        return task
+
+    class Session(_FailingSession):
+        async def run_consult(self, prompt, *, a2a_context=None, activity_handler=None):
+            gateway._identity.a2a_task = flaky_read
+            return await super().run_consult(prompt, a2a_context=a2a_context)
+
+    gateway.sessions.session = Session()
+
+    async def scenario():
+        await gateway._on_a2a_event(_event())
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(scenario())
+    registry = json.loads(gateway._a2a_registry_path.read_text())
+
+    assert gateway.replies[-1] == (
+        "task-1",
+        {"intent": "fail", "text": gateway_mod.A2A_TURN_FAILED_REASON},
+    )
+    assert registry["task-1:message-1"]["state"] == "finalized"
+    assert a2a_progress_fence_owner("task-1") == "message-1"
+
+
+def test_a2a_unsent_failure_leaves_task_retryable(tmp_path, monkeypatch):
+    async def inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_mod.asyncio, "to_thread", inline)
+    monkeypatch.setattr(gateway_mod, "A2A_FAIL_RETRY_DELAYS", (0.0, 0.0))
+    gateway = _gateway(tmp_path)
+    attempts = []
+    record_reply = gateway._identity.a2a_reply
+
+    def reply(task_id, **kwargs):
+        if kwargs["intent"] == "fail":
+            attempts.append(task_id)
+            raise RuntimeError("send failed")
+        return record_reply(task_id, **kwargs)
+
+    gateway._identity.a2a_reply = reply
+    gateway.sessions.session = _FailingSession()
+
+    async def scenario():
+        await gateway._on_a2a_event(_event())
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(scenario())
+    registry = json.loads(gateway._a2a_registry_path.read_text())
+
+    assert len(attempts) == 3
+    assert a2a_progress_fence_owner("task-1") == ""
+    assert registry["task-1:message-1"]["state"] == "running"
+
+
+def test_a2a_failed_turn_rechecks_fence_under_gate(tmp_path, monkeypatch):
+    async def inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_mod.asyncio, "to_thread", inline)
+    gateway = _gateway(tmp_path)
+    gateway.sessions.session = _FailingSession()
+    acquire = gateway._acquire_a2a_progress_gate
+
+    async def acquire_after_tool_outcome(task_id):
+        # The tool process fences this message while the gateway waits for the gate.
+        gate = acquire_a2a_progress_gate(task_id)
+        try:
+            fence_a2a_progress(task_id, "message-1")
+        finally:
+            release_a2a_progress_gate(gate)
+        return await acquire(task_id)
+
+    async def scenario():
+        await gateway._on_a2a_event(_event())
+        gateway._acquire_a2a_progress_gate = acquire_after_tool_outcome
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(scenario())
+
+    assert [kwargs["intent"] for _task_id, kwargs in gateway.replies] == ["progress"]
 
 
 def test_a2a_receipt_reports_default_three_minute_frequency(tmp_path, monkeypatch):

@@ -2,7 +2,7 @@
 
 ## 0.2.46 (unreleased)
 
-- Fail an inbound A2A task with a generic reason when its Codex turn fails before any outcome was sent, instead of leaving the task working. Raw error details are not sent to the caller.
+- Fail an inbound A2A task with a generic reason when its Codex turn fails before any outcome was sent, instead of leaving the task working. Raw error details are not sent to the caller. The failure is retried briefly, and if it still cannot be sent the task stays eligible for catch-up when a self-hosted bridge restarts.
 - Explain how to set `INKBOX_CODEX_VAULT_KEY` for an agent hosted by Inkbox: save it as a Secret in the identity's Env vars tab, since a key exported in a shell does not reach the agent.
 
 ## 0.2.45 (unreleased)
